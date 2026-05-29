@@ -1,0 +1,12 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "type": "command",
+        "command": "python3 ~/.copilot/hooks/palace-reflex.py",
+        "cwd": ".",
+        "timeout": 3
+      }
+    ]
+  }
+}
