@@ -23,10 +23,28 @@ TRIGGER_TOOLS = frozenset({
     "read_page",
     "github_repo",
     "github_text_search",
+    "semantic_search",
 })
+
+# Workspace search tools: only fire on the second-or-later call in the recent
+# window. First targeted lookup is allowed without recall (matches the skill).
+REPEAT_SEARCH_TOOLS = frozenset({"grep_search", "file_search"})
 
 SUBAGENT_TOOLS = frozenset({"runSubagent", "Explore"})
 RECALL_AGENT_NAMES = frozenset({"explore"})
+
+# Broad terminal probes inside run_in_terminal. Patterns match what the skill
+# enumerates: `find ./|/|~`, `grep -r/-R`, `ls -*R`, `locate `,
+# `(apt-cache|brew|npm|pip|cargo|gem) search`.
+BROAD_PROBE_PATTERNS = (
+    re.compile(r"(?<![\w-])find\s+[./~]"),
+    re.compile(r"(?<![\w-])grep\s+-[a-zA-Z]*[rR]"),
+    re.compile(r"(?<![\w-])ls\s+-[a-zA-Z]*R"),
+    re.compile(r"(?<![\w-])locate\s+\S"),
+    re.compile(r"(?<![\w-])(?:apt-cache|brew|npm|pip|cargo|gem)\s+search\b"),
+)
+
+TERMINAL_TOOL = "run_in_terminal"
 
 SATISFY_PATTERN = re.compile(r"mempalace_search")
 
@@ -58,12 +76,17 @@ def append(path: Path, name: str) -> None:
         pass
 
 
-def is_trigger(tool_name: str, tool_input: dict) -> bool:
+def is_trigger(tool_name: str, tool_input: dict, recent: list[str]) -> bool:
     if tool_name in TRIGGER_TOOLS:
+        return True
+    if tool_name in REPEAT_SEARCH_TOOLS and tool_name in recent:
         return True
     if tool_name in SUBAGENT_TOOLS:
         agent = str(tool_input.get("agentName", "")).lower()
         return agent in RECALL_AGENT_NAMES
+    if tool_name == TERMINAL_TOOL:
+        command = str(tool_input.get("command", ""))
+        return any(p.search(command) for p in BROAD_PROBE_PATTERNS)
     return False
 
 
@@ -82,7 +105,7 @@ def main() -> int:
     path = buffer_path(session_id)
     recent = load_recent(path)
     satisfied = any(SATISFY_PATTERN.search(name) for name in recent)
-    triggered = is_trigger(tool_name, tool_input if isinstance(tool_input, dict) else {})
+    triggered = is_trigger(tool_name, tool_input if isinstance(tool_input, dict) else {}, recent)
 
     append(path, tool_name)
 

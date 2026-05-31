@@ -1,6 +1,6 @@
 ---
 name: mempalace
-description: Local AI memory across sessions and projects (ChromaDB + SQLite under `~/.mempalace/`). Load this skill BOTH on explicit requests ("save/search/remember", "palace", "wings/rooms/drawers", "/mempalace:*") AND proactively at the start of non-trivial work that touches a project, library, or topic the user may have worked on before. The MemPalace MCP server exposes 30 `mempalace_*` tools; if they aren't present in the current harness, fall back to the `mempalace` CLI. This skill teaches the full read/save/diary/KG loop, not just one-off lookups.
+description: Use when the user mentions save/search/remember/palace/wings/rooms/drawers/mining/tunnels/diary/KG/`/mempalace:*`; when starting non-trivial work on a project, library, or topic that may have prior context; when about to invoke external fact-finding (web fetch, github search, semantic_search, Explore subagent, broad terminal probes) without recent recall; or when wrapping up a session that produced a verified project fact, debugging root cause, decision rationale, or workflow lesson worth keeping.
 ---
 
 # MemPalace
@@ -32,79 +32,11 @@ If you're unsure, run `mempalace status` once — it works in both worlds.
 
 ## Harness-specific MCP config locations
 
-The same server binary is registered in different files per harness:
+Different harnesses register the same server binary in different files. Full table in [references/harness-config.md](references/harness-config.md).
 
-| Harness | Config file |
-|---|---|
-| VS Code / Copilot Chat in VS Code | `~/Library/Application Support/Code/User/mcp.json` |
-| GitHub Copilot CLI | `~/.copilot/mcp-config.json` (managed via `copilot mcp add/list/get/remove`) |
-| Claude Code | `~/.claude/mcp.json` |
-| Cursor | `~/.cursor/mcp.json` |
+## MCP tools
 
-Canonical stdio command (any harness):
-```
-/Users/eugene/.local/share/uv/tools/mempalace/bin/python -m mempalace.mcp_server
-```
-with env `MEMPALACE_PATH=~/.mempalace`.
-
-## MCP Tools (30, prefixed `mempalace_*`)
-
-The MCP server exposes 30 tools; the table below groups them. **Discoverable** via the MCP `list-tools` capability — the count and surface may grow.
-
-### Palace — read
-| Tool | Purpose |
-|---|---|
-| `mempalace_status` | Palace status & stats (wings/rooms/drawers) |
-| `mempalace_list_wings` | List all wings |
-| `mempalace_list_rooms` | List rooms in a wing |
-| `mempalace_list_drawers` | List drawers in a wing/room |
-| `mempalace_get_drawer` | Fetch a single drawer by id |
-| `mempalace_get_taxonomy` | Full wing/room/drawer tree |
-| `mempalace_search` | Semantic search (args: `query`, optional `wing`, `room`) |
-| `mempalace_check_duplicate` | Check whether a memory already exists before adding |
-| `mempalace_memories_filed_away` | Recently-filed drawer summary |
-| `mempalace_get_aaak_spec` | Retrieve the AAAK compression dialect spec |
-
-### Palace — write
-| Tool | Purpose |
-|---|---|
-| `mempalace_add_drawer` | Add a new memory (drawer) |
-| `mempalace_update_drawer` | Update an existing drawer in place |
-| `mempalace_delete_drawer` | Delete a memory (drawer) |
-
-### Tunnels (cross-wing connections)
-| Tool | Purpose |
-|---|---|
-| `mempalace_list_tunnels` | List all tunnels |
-| `mempalace_find_tunnels` | Find tunnels between two wings |
-| `mempalace_create_tunnel` | Add a tunnel (room↔room across wings) |
-| `mempalace_delete_tunnel` | Remove a tunnel |
-| `mempalace_follow_tunnels` | Traverse tunnels from a room |
-| `mempalace_traverse` | Walk halls + tunnels from a room |
-| `mempalace_graph_stats` | Connectivity stats |
-
-### Knowledge Graph (triples)
-| Tool | Purpose |
-|---|---|
-| `mempalace_kg_query` | Query KG triples |
-| `mempalace_kg_add` | Add a triple |
-| `mempalace_kg_invalidate` | Invalidate a triple (soft-delete with timestamp) |
-| `mempalace_kg_timeline` | View triple lifecycle history |
-| `mempalace_kg_stats` | Triple/entity/relationship counts |
-
-### Agent diary
-| Tool | Purpose |
-|---|---|
-| `mempalace_diary_write` | Persist a diary entry (per-agent journal) |
-| `mempalace_diary_read` | Read prior diary entries |
-
-### Maintenance
-| Tool | Purpose |
-|---|---|
-| `mempalace_sync` | Prune drawers whose source files are gitignored/deleted |
-| `mempalace_reconnect` | Re-open the chroma client (after drift) |
-| `mempalace_hook_settings` | Inspect/adjust auto-save hook configuration |
-| `mempalace_memories_filed_away` | Recently-filed drawer summary (also under Read) |
+The MCP server exposes ~30 tools prefixed `mempalace_*`, grouped as read / write / tunnels / knowledge graph / diary / maintenance. Full catalog in [references/mcp-tools.md](references/mcp-tools.md). The current toolset is discoverable via MCP `list-tools`.
 
 ## When to use this skill — proactive vs reactive
 
@@ -121,6 +53,8 @@ Two hard rules; matched to the global instructions in `~/.copilot/copilot-instru
 If hits answer the question, use them and skip the external call. If hits are partial, proceed with the external tool and note which gap you're filling.
 
 Skip recall only for: pure syntax / language Q&A with no project context, a single trivial edit to a known file, or when the user said "don't check memory".
+
+**Audit hook coverage.** The `palace-reflex.py` hook audits a subset of the rule and injects a reminder when it sees a violation: web/github tools, `semantic_search`, `Explore` subagents, and `run_in_terminal` commands matching broad-probe patterns (`find ./…`, `grep -r/-R`, `ls -*R`, `locate`, `(apt-cache|brew|npm|pip|cargo|gem) search`). The rest — second-or-later `grep_search`/`file_search` on the same topic, ad-hoc shell probes outside those patterns — is on the honor system.
 
 **Rule 2 — Save every new fact.** Triggers — if any fires in a turn, persist before ending:
 
@@ -201,7 +135,7 @@ The diary is the audit trail of whether memory is actually helping. Without diar
 Drawers are paragraph-sized memories that get embedded for semantic search. Triples are structured `(subject, predicate, object)` facts that get joined / aggregated.
 
 Add a triple via `mempalace_kg_add` when the fact is:
-- **Atomic** — fits as subject/predicate/object (e.g., `voxexmachina depends_on FsShelter`)
+- **Atomic** — fits as subject/predicate/object (e.g., `nextjs depends_on react`)
 - **Queryable as structured data** — you'd want to ask "what does X depend on?" or "list everything authored by Y"
 - **Invalidatable** — the relationship can become false; KG supports invalidation with `kg_invalidate` (timeline preserved)
 
@@ -214,7 +148,7 @@ Hybrid pattern: add a drawer for the full reasoning, then a few triples for the 
 
 ### Tunnels — cross-wing links
 
-Tunnels connect a room in one wing to a room in another wing (e.g., `voxexmachina/design → voxnovel/general` because the new project was inspired by the old). Create them sparingly via `mempalace_create_tunnel` after noticing a real cross-project relationship. They're navigation aids, not search results.
+Tunnels connect a room in one wing to a room in another wing (e.g., `react/hooks → preact/general` because the new project borrowed an idea from the old). Create them sparingly via `mempalace_create_tunnel` after noticing a real cross-project relationship. They're navigation aids, not search results.
 
 ### Status
 1. `mempalace_status` → wings/rooms/drawers counts.
@@ -257,22 +191,7 @@ Walk: Python ≥3.9 → `uv tool install mempalace` (or `pip`) → `mempalace in
 
 ## HNSW drift / recovery
 
-ChromaDB persists HNSW indexes lazily. If the server restarts while sqlite has rows newer than the on-disk HNSW segment, it **quarantines** the stale segment (renaming to `<id>.drift-YYYYMMDD-HHMMSS`) and rebuilds the index in memory. Search continues to work via the in-memory index; only the on-disk copy is invalidated.
-
-**Symptoms:**
-- `mempalace status` prints "Quarantined corrupt HNSW segment …" at startup
-- `mempalace repair-status` shows `hnsw count: (no flushed metadata yet)` and `status: UNKNOWN`
-- Multiple `*.drift-*` directories accumulate under `~/.mempalace/palace/`
-
-**Recovery (non-destructive):**
-1. `mempalace repair --mode max-seq-id` — un-poisons any legacy 0.6.x corrupted rows. No-op if clean.
-2. `rm -rf ~/.mempalace/palace/*.drift-*` — orphaned quarantined copies, safe to delete after confirming the active (non-drift) segment exists for the same id.
-3. Restart any harness whose MCP server is still pointing at the old in-memory index.
-
-**Recovery (full rebuild):**
-- `mempalace repair --mode from-sqlite --archive-existing --backup` rebuilds HNSW from sqlite rows. Stop the MCP server first (kill the `mempalace.mcp_server` PID and let the harness restart it).
-
-**Root cause:** usually a non-graceful shutdown of the MCP server (kill -9, host sleep, OOM). Mitigate by giving the server time to flush before harness reload.
+ChromaDB quarantines stale on-disk HNSW segments after non-graceful shutdowns and rebuilds in memory; search keeps working. Symptoms, non-destructive cleanup, and full-rebuild recovery in [references/hnsw-recovery.md](references/hnsw-recovery.md).
 
 ## Auto-save hooks (where most writes actually come from)
 

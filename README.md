@@ -12,10 +12,13 @@ audit hook that nags when an external tool is about to run without a prior `memp
 - **[skills/mempalace/SKILL.md](skills/mempalace/SKILL.md)** — full skill: 30 MCP tools (read/write/tunnels/KG/diary),
   proactive vs reactive use, mining hygiene, HNSW drift recovery, auto-save hook notes.
 - **[hooks/palace-reflex.json](hooks/palace-reflex.json) + [hooks/palace-reflex.py](hooks/palace-reflex.py)** —
-  `PreToolUse` audit hook. Maintains a per-session ring buffer of recent tool calls under `$TMPDIR`. When a
-  trigger tool (`fetch_webpage`, `open_browser_page`, `read_page`, `github_repo`, `github_text_search`, or
-  `runSubagent` with `agentName == "Explore"`) fires without a recent `mempalace_search`, it injects a one-line
-  reminder via `hookSpecificOutput.additionalContext`. Non-blocking — audit, not gate.
+  `PreToolUse` audit hook. Maintains a per-session ring buffer of recent tool calls under `$TMPDIR`. Fires when
+  a trigger tool runs without a recent `mempalace_search`, injecting a one-line reminder via
+  `hookSpecificOutput.additionalContext`. Non-blocking — audit, not gate. Triggers: `fetch_webpage`,
+  `open_browser_page`, `read_page`, `github_repo`, `github_text_search`, `semantic_search`, `runSubagent` with
+  `agentName == "Explore"`, second-or-later `grep_search`/`file_search` in the same window, and
+  `run_in_terminal` commands matching broad-probe patterns (`find ./…`, `grep -r/-R`, `ls -*R`, `locate`,
+  `(apt-cache|brew|npm|pip|cargo|gem) search`).
 - **[memories/mempalace-first.md](memories/mempalace-first.md)** — terse auto-loaded reflex stub designed for
   Copilot's user memory (`/memories/`). First 200 lines of user memory are auto-loaded into every conversation,
   so the rule is in context even when the full instructions get pushed out.
@@ -65,9 +68,13 @@ echo '{"session_id":"test","tool_name":"mempalace_search","tool_input":{},"hook_
   | python3 hooks/palace-reflex.py
 echo '{"session_id":"test","tool_name":"fetch_webpage","tool_input":{},"hook_event_name":"PreToolUse"}' \
   | python3 hooks/palace-reflex.py
+
+# Broad terminal probe inside run_in_terminal → reminder fires (use a fresh session id)
+echo '{"session_id":"probe","tool_name":"run_in_terminal","tool_input":{"command":"grep -r foo ."},"hook_event_name":"PreToolUse"}' \
+  | python3 hooks/palace-reflex.py
 ```
 
-The first call prints the reminder; the second pair is silent.
+The first call prints the reminder; the second pair is silent; the broad-probe call prints the reminder.
 
 ## Harness compatibility
 
