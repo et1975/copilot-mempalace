@@ -10,6 +10,8 @@ Before any of these, call `mempalace_search` once:
 
 If palace answers, skip the external call. Skip the palace call only for: pure syntax Q&A, single trivial edits, or user said "don't check memory".
 
+**Query craft:** name the entity (file path, symbol, error string), not the category ("skill", "fact", "pattern"). Always set `wing=` when the project is obvious. Use `max_distance≈0.5` for "is there a drawer about X"; leave default for exploratory. Keep queries ≤ ~8 tokens.
+
 ## Save every new fact
 Triggers (any one → save before ending turn): verified project fact, debug root cause + fix, decision with rationale, user preference, workflow that worked after friction, gotcha/edge case, cross-project link, atomic `X relation Y` triple.
 

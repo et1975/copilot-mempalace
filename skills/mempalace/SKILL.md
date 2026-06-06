@@ -100,9 +100,19 @@ mempalace instructions <init|search|mine|status|help>
 ### Search (most common)
 1. Parse query → extract wing/room hints and semantic terms.
 2. If unsure of taxonomy, call `mempalace_list_wings` / `mempalace_list_rooms` / `mempalace_get_taxonomy` first.
-3. Call `mempalace_search(query, wing?, room?)`.
+3. Call `mempalace_search(query, wing?, room?, max_distance?)`.
 4. Present results with **wing → room → drawer** attribution and similarity scores; group by room.
 5. Offer follow-ups: drill deeper, `mempalace_traverse` for related rooms, `mempalace_find_tunnels` for cross-domain links.
+
+**Query craft — what actually moves recall quality:**
+
+- **Name the entity, not the category.** Use terms that live in the drawers: file paths (`AttributorBolt.fs`), symbols (`UMXArr.tag`), error strings, version pins. Category words ("skill", "fact", "memory", "drawer", "pattern") match the high-frequency noise wings (`.copilot` has 7000+ mined drawers) and crowd out real hits.
+- **Always set `wing` when the project is obvious.** Past wins in the diary all had wing filters; misses didn't. Filtering halves recall noise for free.
+- **Tighten `max_distance` for specific lookups.** Default 1.5 is permissive. Use `~0.5` when asking "is there a drawer about X"; leave it open for exploratory "what do I have on this area" queries.
+- **Keep queries ≤ ~8 tokens, no stop-words.** Embeddings dilute fast. Three named terms beat a sentence.
+- **If recall fails, don't reword and retry blindly** — check the taxonomy (`list_wings` / `list_rooms`) or fall through to the external tool and save the gap to the diary.
+
+**Drawer hygiene (compounds on every future search):** lead the drawer with a one-line title-like sentence using the searchable terms (entity, file path, error string). Avoid pasting long boilerplate (license headers, full markdown sections) — that's how generic docs files become the noise champion in unfiltered searches.
 
 ### Add a drawer
 1. `mempalace_check_duplicate` with the candidate content.
