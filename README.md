@@ -25,23 +25,65 @@ audit hook that nags when an external tool is about to run without a prior `memp
 
 ## Requirements
 
-- [MemPalace](https://github.com/mempalace/mempalace) installed and exposed as an MCP server in your harness.
-  Verify with `mempalace status` and confirm the harness lists `mempalace_*` tools.
+- [MemPalace](https://github.com/mempalace/mempalace) installed (`uv tool install mempalace` or `pip install mempalace`).
+  Verify with `mempalace status`.
+- MemPalace exposed as an MCP server in your harness — see [Step 0](#step-0--register-mempalace-as-an-mcp-server) below.
 - Python 3 on `PATH` (for the hook). The hook fails silently if Python is missing.
 
 ## Install
 
-Copy or symlink into your Copilot config. For VS Code / Copilot Chat the config root is `~/.copilot/`.
+### Step 0 — Register MemPalace as an MCP server
+
+The skill, hook, and instructions all assume the agent can see `mempalace_*` tools. They aren't wired by default —
+register the server once per harness. The canonical command (`mempalace mcp` prints the latest form) is:
+
+```
+mempalace-mcp
+```
+
+This binary ships with the `mempalace` install and is on `PATH` after `uv tool install` / `pip install`.
+
+**GitHub Copilot CLI:**
 
 ```bash
-# 1. Instructions (concatenate or replace your existing copilot-instructions.md)
+copilot mcp add mempalace -- mempalace-mcp
+# verify
+copilot mcp list | grep mempalace
+```
+
+**VS Code / Copilot Chat** — edit `~/Library/Application Support/Code/User/mcp.json` (macOS) /
+`%APPDATA%\Code\User\mcp.json` (Windows) / `~/.config/Code/User/mcp.json` (Linux):
+
+```jsonc
+{
+  "servers": {
+    "mempalace": {
+      "type": "stdio",
+      "command": "mempalace-mcp"
+    }
+  }
+}
+```
+
+Restart the harness, then confirm `mempalace_*` tools appear in the agent's toolset (in VS Code: open the Copilot
+Chat tool picker; in the CLI: `copilot mcp get mempalace`). Other harnesses (Claude Code, Cursor) use the same
+`mempalace-mcp` command in their respective config files — see [`skills/mempalace/references/harness-config.md`](skills/mempalace/references/harness-config.md).
+
+Optional: pin a non-default palace location with `mempalace-mcp --palace /path/to/palace`.
+
+### Step 1 — Copy or symlink the customization pack
+
+For VS Code / Copilot Chat the config root is `~/.copilot/`.
+
+```bash
+# 1.1 Instructions (concatenate or replace your existing copilot-instructions.md)
 cat copilot-instructions.md >> ~/.copilot/copilot-instructions.md
 
-# 2. Skill
+# 1.2 Skill
 mkdir -p ~/.copilot/skills
 ln -s "$(pwd)/skills/mempalace" ~/.copilot/skills/mempalace
 
-# 3. Hook (both files together so the JSON's relative reference resolves)
+# 1.3 Hook (both files together so the JSON's relative reference resolves)
 mkdir -p ~/.copilot/hooks
 ln -s "$(pwd)/hooks/palace-reflex.json" ~/.copilot/hooks/palace-reflex.json
 ln -s "$(pwd)/hooks/palace-reflex.py"   ~/.copilot/hooks/palace-reflex.py

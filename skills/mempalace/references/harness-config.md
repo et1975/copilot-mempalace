@@ -12,7 +12,8 @@ The same MemPalace server binary is registered in different files per harness:
 Canonical stdio command (any harness):
 
 ```
-/Users/eugene/.local/share/uv/tools/mempalace/bin/python -m mempalace.mcp_server
+mempalace-mcp
 ```
 
-with env `MEMPALACE_PATH=~/.mempalace`.
+Installed on `PATH` by `uv tool install mempalace` / `pip install mempalace`. Optional `--palace /path/to/palace`
+to override the default `~/.mempalace`. Run `mempalace mcp` for the authoritative setup snippet.
