@@ -15,7 +15,7 @@ import os
 import sqlite3
 from typing import Any
 
-from dream_lib import group_logical_drawers
+from dream_lib import extract_session_id, group_logical_drawers
 
 
 def bind_palace(palace_path: str) -> str:
@@ -44,19 +44,7 @@ def _field(res: Any, key: str) -> Any:
     return getattr(res, key, None)
 
 
-def load_logical_drawers(
-    palace_path: str, wing: str | None = None, room: str | None = None
-) -> list[dict[str, Any]]:
-    """Read drawers (optionally scoped) and return logical drawers with mean embeddings."""
-    from mempalace.palace import get_collection  # lazy: heavy import
-
-    col = get_collection(palace_path)
-    kwargs: dict[str, Any] = {"include": ["documents", "metadatas", "embeddings"]}
-    where = _where(wing, room)
-    if where:
-        kwargs["where"] = where
-    res = col.get(**kwargs)
-
+def _rows_from_collection_result(res: Any) -> list[dict[str, Any]]:
     ids = _field(res, "ids") or []
     docs = _field(res, "documents")
     metas = _field(res, "metadatas")
@@ -73,7 +61,102 @@ def load_logical_drawers(
                 "embedding": emb,
             }
         )
-    return group_logical_drawers(rows)
+    return rows
+
+
+def _mean_vectors(vectors: list[list[float]]) -> list[float]:
+    vectors = [v for v in vectors if v]
+    if not vectors:
+        return []
+    n = len(vectors)
+    dim = len(vectors[0])
+    return [sum(v[i] for v in vectors) / n for i in range(dim)]
+
+
+def _group_by_parent(rows: list[dict[str, Any]], key_fields: tuple[str, ...]) -> list[dict[str, Any]]:
+    groups: dict[str, list[dict[str, Any]]] = {}
+    order: list[str] = []
+    for row in rows:
+        meta = row.get("metadata") or {}
+        key = next((meta[field] for field in key_fields if meta.get(field)), row["id"])
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(row)
+
+    logical = []
+    for key in order:
+        members = sorted(
+            groups[key],
+            key=lambda row: (row.get("metadata") or {}).get("chunk_index", 0),
+        )
+        meta0 = members[0].get("metadata") or {}
+        logical.append(
+            {
+                "id": key,
+                "member_ids": [member["id"] for member in members],
+                "text": "\n".join(member.get("text", "") for member in members),
+                "embedding": _mean_vectors([member.get("embedding") or [] for member in members]),
+                "metadata": meta0,
+                "wing": meta0.get("wing"),
+                "room": meta0.get("room"),
+            }
+        )
+    return logical
+
+
+def load_logical_drawers(
+    palace_path: str, wing: str | None = None, room: str | None = None
+) -> list[dict[str, Any]]:
+    """Read drawers (optionally scoped) and return logical drawers with mean embeddings."""
+    from mempalace.palace import get_collection  # lazy: heavy import
+
+    col = get_collection(palace_path)
+    kwargs: dict[str, Any] = {"include": ["documents", "metadatas", "embeddings"]}
+    where = _where(wing, room)
+    if where:
+        kwargs["where"] = where
+    res = col.get(**kwargs)
+    return group_logical_drawers(_rows_from_collection_result(res))
+
+
+def load_observation_entries(
+    palace_path: str,
+    wing: str | None = None,
+    rooms: tuple[str, ...] = ("diary",),
+) -> list[dict[str, Any]]:
+    """Read diary/observation drawers as logical entries for pattern induction."""
+    from mempalace.palace import get_collection  # lazy: heavy import
+
+    col = get_collection(palace_path)
+    rows = []
+    room_names = tuple(room.strip() for room in rooms if room and room.strip())
+    for room in room_names:
+        kwargs: dict[str, Any] = {"include": ["documents", "metadatas", "embeddings"]}
+        where = _where(wing, room)
+        if where:
+            kwargs["where"] = where
+        rows.extend(_rows_from_collection_result(col.get(**kwargs)))
+
+    entries = []
+    for logical in _group_by_parent(rows, ("parent_entry_id", "parent_drawer_id")):
+        meta = logical.get("metadata") or {}
+        text = logical["text"]
+        entries.append(
+            {
+                "id": logical["id"],
+                "member_ids": logical["member_ids"],
+                "text": text,
+                "embedding": logical["embedding"],
+                "session_id": extract_session_id(text),
+                "agent": meta.get("agent"),
+                "date": meta.get("date"),
+                "topic": meta.get("topic"),
+                "wing": meta.get("wing"),
+                "room": meta.get("room"),
+            }
+        )
+    return entries
 
 
 def load_active_triples(palace_path: str) -> list[dict[str, Any]]:

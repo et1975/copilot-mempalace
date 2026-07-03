@@ -25,7 +25,7 @@ import sys
 from typing import Any
 
 import dream_palace
-from dream_lib import apply_contradiction_decisions, apply_merge_decisions
+from dream_lib import apply_contradiction_decisions, apply_merge_decisions, apply_pattern_decisions
 
 
 def _resolve_decisions(worklist: dict[str, Any]) -> list[dict[str, Any]]:
@@ -74,6 +74,39 @@ def _resolve_contradiction_decisions(worklist: dict[str, Any]) -> list[dict[str,
                 "subject": item["subject"],
                 "predicate": item["predicate"],
                 "invalidate": invalidate,
+            }
+        )
+    return resolved
+
+
+def _first_scope_room(scope: dict[str, Any]) -> str | None:
+    rooms = scope.get("rooms")
+    if isinstance(rooms, str):
+        rooms = [room.strip() for room in rooms.split(",") if room.strip()]
+    if rooms:
+        return rooms[0]
+    return scope.get("room")
+
+
+def _resolve_pattern_decisions(worklist: dict[str, Any]) -> list[dict[str, Any]]:
+    """Extract concrete pattern surface/skip decisions from an adjudicated worklist."""
+    resolved = []
+    scope = worklist.get("scope", {})
+    for item in worklist.get("items", []):
+        decision = item.get("decision")
+        if not decision or decision.get("action") != "surface":
+            resolved.append({"action": "skip"})
+            continue
+        members = item.get("members", [])
+        first = members[0] if members else {}
+        evidence = item.get("evidence", {})
+        resolved.append(
+            {
+                "action": "surface",
+                "wing": decision.get("wing") or first.get("wing") or scope.get("wing"),
+                "room": decision.get("room") or first.get("room") or _first_scope_room(scope),
+                "text": decision["text"],
+                "supported_by": decision.get("supported_by") or evidence.get("support_ids", []),
             }
         )
     return resolved
@@ -137,6 +170,19 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0
 
+        if task == "pattern":
+            decisions = _resolve_pattern_decisions(worklist)
+            writer = _DryRunWriter()
+            report = apply_pattern_decisions(decisions, writer)
+            for line in writer.planned:
+                print(line)
+            print(
+                f"[dry-run] would surface {report['surfaced']}, skip {report['skipped']}, "
+                f"errors {len(report['errors'])}",
+                file=sys.stderr,
+            )
+            return 1 if report["errors"] else 0
+
         if task == "merge":
             decisions = _resolve_decisions(worklist)
             writer: Any = _DryRunWriter()
@@ -162,6 +208,14 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"adopted: invalidated {report['invalidated']}, skipped {report['skipped']}, "
             f"facts {len(report['invalidated_facts'])}, errors {len(report['errors'])}",
+            file=sys.stderr,
+        )
+    elif task == "pattern":
+        decisions = _resolve_pattern_decisions(worklist)
+        report = apply_pattern_decisions(decisions, dream_palace.MempalaceWriter())
+        print(
+            f"adopted (pattern): surfaced {report['surfaced']}, skipped {report['skipped']}, "
+            f"errors {len(report['errors'])}",
             file=sys.stderr,
         )
     elif task == "merge":

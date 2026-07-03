@@ -73,6 +73,135 @@ class TestLoadActiveTriples(unittest.TestCase):
             ])
 
 
+class TestLoadObservationEntries(unittest.TestCase):
+    def _with_fake_collection(self, ids, documents, metadatas, embeddings):
+        original_mempalace = sys.modules.get("mempalace")
+        original_palace_module = sys.modules.get("mempalace.palace")
+        calls = []
+
+        class FakeCollection:
+            def get(self, **kwargs):
+                calls.append(kwargs)
+                return {
+                    "ids": ids,
+                    "documents": documents,
+                    "metadatas": metadatas,
+                    "embeddings": embeddings,
+                }
+
+        palace_module = types.ModuleType("mempalace.palace")
+        palace_module.get_collection = lambda palace_path: FakeCollection()
+        sys.modules["mempalace"] = types.ModuleType("mempalace")
+        sys.modules["mempalace.palace"] = palace_module
+        return original_mempalace, original_palace_module, calls
+
+    def _restore_fake_collection(self, original_mempalace, original_palace_module):
+        if original_mempalace is None:
+            sys.modules.pop("mempalace", None)
+        else:
+            sys.modules["mempalace"] = original_mempalace
+        if original_palace_module is None:
+            sys.modules.pop("mempalace.palace", None)
+        else:
+            sys.modules["mempalace.palace"] = original_palace_module
+
+    def test_groups_diary_chunks_by_parent_entry_id(self):
+        originals = self._with_fake_collection(
+            ids=["chunk-2", "chunk-1"],
+            documents=["continued pattern", "SESSION_ID: 12345678-abcd first pattern"],
+            metadatas=[
+                {
+                    "parent_entry_id": "entry-1",
+                    "chunk_index": 1,
+                    "wing": "wing_copilot-cli",
+                    "room": "diary",
+                    "agent": "Copilot CLI",
+                    "date": "2026-07-03",
+                    "topic": "dreaming",
+                },
+                {
+                    "parent_entry_id": "entry-1",
+                    "chunk_index": 0,
+                    "wing": "wing_copilot-cli",
+                    "room": "diary",
+                    "agent": "Copilot CLI",
+                    "date": "2026-07-03",
+                    "topic": "dreaming",
+                },
+            ],
+            embeddings=[[3.0, 5.0], [1.0, 3.0]],
+        )
+        try:
+            entries = dream_palace.load_observation_entries("/palace", wing="wing_copilot-cli")
+        finally:
+            self._restore_fake_collection(originals[0], originals[1])
+
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["id"], "entry-1")
+        self.assertEqual(entries[0]["member_ids"], ["chunk-1", "chunk-2"])
+        self.assertEqual(
+            entries[0]["text"],
+            "SESSION_ID: 12345678-abcd first pattern\ncontinued pattern",
+        )
+        self.assertEqual(entries[0]["embedding"], [2.0, 4.0])
+        self.assertEqual(entries[0]["session_id"], "12345678-abcd")
+        self.assertEqual(entries[0]["agent"], "Copilot CLI")
+        self.assertEqual(entries[0]["date"], "2026-07-03")
+        self.assertEqual(entries[0]["topic"], "dreaming")
+        self.assertEqual(entries[0]["wing"], "wing_copilot-cli")
+        self.assertEqual(entries[0]["room"], "diary")
+        self.assertEqual(originals[2][0]["where"], {"$and": [{"wing": "wing_copilot-cli"}, {"room": "diary"}]})
+
+    def test_single_chunk_row_passes_through(self):
+        originals = self._with_fake_collection(
+            ids=["drawer-1"],
+            documents=["SESSION_ID: abcdef12 one chunk"],
+            metadatas=[
+                {
+                    "wing": "wing_copilot-cli",
+                    "room": "diary",
+                    "agent": "Copilot CLI",
+                    "date": "2026-07-03",
+                    "topic": "single",
+                }
+            ],
+            embeddings=[[0.5, 0.25]],
+        )
+        try:
+            entries = dream_palace.load_observation_entries("/palace")
+        finally:
+            self._restore_fake_collection(originals[0], originals[1])
+
+        self.assertEqual(entries, [
+            {
+                "id": "drawer-1",
+                "member_ids": ["drawer-1"],
+                "text": "SESSION_ID: abcdef12 one chunk",
+                "embedding": [0.5, 0.25],
+                "session_id": "abcdef12",
+                "agent": "Copilot CLI",
+                "date": "2026-07-03",
+                "topic": "single",
+                "wing": "wing_copilot-cli",
+                "room": "diary",
+            }
+        ])
+
+    def test_session_id_is_none_when_no_session_token(self):
+        originals = self._with_fake_collection(
+            ids=["legacy-1"],
+            documents=["legacy diary entry without a session token"],
+            metadatas=[{"wing": "wing_copilot-cli", "room": "diary"}],
+            embeddings=[[1.0]],
+        )
+        try:
+            entries = dream_palace.load_observation_entries("/palace")
+        finally:
+            self._restore_fake_collection(originals[0], originals[1])
+
+        self.assertIsNone(entries[0]["session_id"])
+
+
 class TestKgWriter(unittest.TestCase):
     def test_uses_knowledge_graph_with_palace_relative_db_path(self):
         original_mempalace = sys.modules.get("mempalace")
