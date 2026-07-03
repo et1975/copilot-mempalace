@@ -25,7 +25,7 @@ import sys
 from typing import Any
 
 import dream_palace
-from dream_lib import apply_merge_decisions
+from dream_lib import apply_contradiction_decisions, apply_merge_decisions
 
 
 def _resolve_decisions(worklist: dict[str, Any]) -> list[dict[str, Any]]:
@@ -53,6 +53,32 @@ def _resolve_decisions(worklist: dict[str, Any]) -> list[dict[str, Any]]:
     return resolved
 
 
+def _resolve_contradiction_decisions(worklist: dict[str, Any]) -> list[dict[str, Any]]:
+    """Extract concrete KG invalidate/skip decisions from an adjudicated worklist."""
+    resolved = []
+    for item in worklist.get("items", []):
+        decision = item.get("decision")
+        if not decision or decision.get("action") != "invalidate":
+            resolved.append({"action": "skip"})
+            continue
+        invalidate = decision.get("invalidate")
+        if invalidate is None:
+            keep = decision.get("keep")
+            invalidate = [
+                c["object"] for c in item.get("candidates", [])
+                if c.get("object") != keep
+            ]
+        resolved.append(
+            {
+                "action": "invalidate",
+                "subject": item["subject"],
+                "predicate": item["predicate"],
+                "invalidate": invalidate,
+            }
+        )
+    return resolved
+
+
 class _DryRunWriter:
     def __init__(self) -> None:
         self.planned: list[str] = []
@@ -67,6 +93,25 @@ class _DryRunWriter:
         return {"success": True}
 
 
+class _DryRunKgWriter:
+    def __init__(self) -> None:
+        self.planned: list[str] = []
+
+    def invalidate(self, subject: str, predicate: str, object: str, ended: str | None = None) -> Any:
+        self.planned.append(f"INVALIDATE {subject} {predicate}={object}")
+        return {"success": True}
+
+
+def _worklist_task(worklist: dict[str, Any]) -> str:
+    task = worklist.get("task")
+    if task:
+        return task
+    items = worklist.get("items", [])
+    if items:
+        return items[0].get("kind", "merge")
+    return "merge"
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--palace", required=True, help="Path to the mempalace palace directory")
@@ -77,25 +122,60 @@ def main(argv: list[str] | None = None) -> int:
     path = dream_palace.bind_palace(args.palace)
     with open(args.decisions, encoding="utf-8") as fh:
         worklist = json.load(fh)
-    decisions = _resolve_decisions(worklist)
+    task = _worklist_task(worklist)
 
     if args.dry_run:
-        writer: Any = _DryRunWriter()
-        report = apply_merge_decisions(decisions, writer)
-        for line in writer.planned:
-            print(line)
+        if task == "contradiction":
+            decisions = _resolve_contradiction_decisions(worklist)
+            kg_writer = _DryRunKgWriter()
+            report = apply_contradiction_decisions(decisions, kg_writer)
+            for line in kg_writer.planned:
+                print(line)
+            print(
+                f"[dry-run] would invalidate {report['invalidated']}, skip {report['skipped']}",
+                file=sys.stderr,
+            )
+            return 0
+
+        if task == "merge":
+            decisions = _resolve_decisions(worklist)
+            writer: Any = _DryRunWriter()
+            report = apply_merge_decisions(decisions, writer)
+            for line in writer.planned:
+                print(line)
+            print(
+                f"[dry-run] would merge {report['merged']}, skip {report['skipped']}",
+                file=sys.stderr,
+            )
+            return 0
+
+        print(f"unknown dreaming task: {task}", file=sys.stderr)
+        return 2
+
+    if task == "contradiction":
+        decisions = _resolve_contradiction_decisions(worklist)
+        kg_writer = dream_palace.KgWriter(path)
+        try:
+            report = apply_contradiction_decisions(decisions, kg_writer)
+        finally:
+            kg_writer.close()
         print(
-            f"[dry-run] would merge {report['merged']}, skip {report['skipped']}",
+            f"adopted: invalidated {report['invalidated']}, skipped {report['skipped']}, "
+            f"facts {len(report['invalidated_facts'])}, errors {len(report['errors'])}",
             file=sys.stderr,
         )
-        return 0
+    elif task == "merge":
+        decisions = _resolve_decisions(worklist)
+        report = apply_merge_decisions(decisions, dream_palace.MempalaceWriter())
+        print(
+            f"adopted: merged {report['merged']}, skipped {report['skipped']}, "
+            f"deleted {len(report['deleted'])}, errors {len(report['errors'])}",
+            file=sys.stderr,
+        )
+    else:
+        print(f"unknown dreaming task: {task}", file=sys.stderr)
+        return 2
 
-    report = apply_merge_decisions(decisions, dream_palace.MempalaceWriter())
-    print(
-        f"adopted: merged {report['merged']}, skipped {report['skipped']}, "
-        f"deleted {len(report['deleted'])}, errors {len(report['errors'])}",
-        file=sys.stderr,
-    )
     for err in report["errors"]:
         print(f"  ERROR {err}", file=sys.stderr)
     return 1 if report["errors"] else 0
