@@ -1,5 +1,7 @@
 # Upstream proposal — read-only `mempalace_find_duplicates` MCP tool
 
+**Filed:** [MemPalace/mempalace#1919](https://github.com/MemPalace/mempalace/issues/1919) (2026-07-03).
+
 Paste-ready GitHub issue for **MemPalace/mempalace**. File at:
 <https://github.com/MemPalace/mempalace/issues/new>
 
