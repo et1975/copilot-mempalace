@@ -34,6 +34,8 @@ A "new fact" is anything you'd want to recall next time the topic comes up. Conc
 
 Flow per fact: `mempalace_check_duplicate` → if novel, `mempalace_add_drawer` with the right wing/room → one-line confirmation in the reply ("saved: wing X / room Y").
 
+**Discover schemas before writing.** `mempalace_*` tools are deferred — their parameter schemas aren't in context until you look them up. Before the first call to any mempalace *write* tool in a session (`add_drawer`, `kg_add`, `diary_write`, …), run the harness tool-search on that exact tool name to load its live schema, then use those param names verbatim. Don't call a write tool from memory: they have non-obvious required fields and reject unknown params.
+
 Skip only: trivia, restatements of well-known programming facts, routine code edits that taught nothing project-level.
 
 ## Rule 3 — End-of-turn checklist (non-trivial turns)
@@ -47,7 +49,7 @@ Before composing the final reply, answer silently:
 ```
 session: <brief topic>
 recalled: <query used> -> <N hits, useful? yes/no/partial>   (or "none — see lapse")
-saved: <wing/room, drawer title>   (or "none")
+saved: <wing/room, one-line drawer summary>   (or "none")
 notes: <one-sentence assessment>   (optional)
 ```
 

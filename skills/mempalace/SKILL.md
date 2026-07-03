@@ -119,6 +119,8 @@ mempalace instructions <init|search|mine|status|help>
 2. If novel → `mempalace_add_drawer` with wing/room and content.
 3. Briefly confirm placement (one line: "saved to wing X / room Y").
 
+**Discover the schema before writing.** These tools are deferred/lazy-loaded — their parameter schemas aren't in context until you look them up. Before the first call to any `mempalace_*` write tool in a session (`add_drawer`, `kg_add`, `diary_write`, `update_drawer`, `create_tunnel`, …), run the harness tool-search on that exact tool name to load its live JSON schema, then copy those param names verbatim. Don't call a write tool from memory — several have non-obvious required fields (e.g. `diary_write` requires `agent_name`) and reject unknown params. Failure modes and why guessing goes wrong: [references/mcp-tools.md](references/mcp-tools.md#known-first-call-gotchas).
+
 ### Diary workflow
 
 The diary is the audit trail of whether memory is actually helping. Without diary entries, recall gaps are invisible and we can't tell if saves get reused.
@@ -131,7 +133,7 @@ The diary is the audit trail of whether memory is actually helping. Without diar
    ```
    session: <brief topic>
    recalled: <query used> -> <N hits, useful? yes/no/partial>
-   saved: <wing/room, drawer title>   (or "none")
+   saved: <wing/room, one-line drawer summary>   (or "none")
    notes: <one-sentence assessment>   (optional)
    ```
 2. **AAAK compressed dialect** (what the MCP server description encourages — example: `SESSION:2026-04-04|built.palace.graph+diary.tools|ALC.req:agent.diaries.in.aaak|★★★`). Retrieve the spec with `mempalace_get_aaak_spec`. AAAK is denser but degrades semantic embedding quality, so prefer plain English unless the user has explicitly opted in to AAAK.

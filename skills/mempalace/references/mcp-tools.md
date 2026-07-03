@@ -2,6 +2,18 @@
 
 The MCP server exposes ~30 tools, all prefixed `mempalace_*`. Discoverable via the MCP `list-tools` capability — the count and surface may grow.
 
+> **Discover the schema; never call a write tool from memory.** These tools are deferred/lazy-loaded in most harnesses: their parameter schemas are **not** in your context until you search for them. The table below lists each tool's *purpose only* — deliberately not its parameters, because hand-copied signatures drift as the surface grows. **Before your first call to any `mempalace_*` write tool in a session, run the harness tool-search on that exact tool name** (e.g. `tool_search` / the deferred-tool lookup). That surfaces the tool's live JSON schema — required fields, optional fields, exact names — which you then copy verbatim. The write tools have non-obvious required fields and reject unknown params, so guessing from the prose here will fail on the first call. See [Known first-call gotchas](#known-first-call-gotchas) for why guessing goes wrong.
+
+## Known first-call gotchas
+
+You don't need these if you discover the schema first — but they explain the failure mode. Prose about "drawers", "facts", and "diary entries" tends to prime three wrong guesses:
+
+- `add_drawer` — models invent a `title` param. There is none; the searchable lead line goes inside `content`.
+- `kg_add` — models pass `fact` (colliding with other tools' `fact` param) or `source`. It's a triple: `subject` / `predicate` / `object`, with provenance under `source_file` / `source_drawer_id` / `source_closet`.
+- `diary_write` — models omit `agent_name`, assuming the wing is derived. `agent_name` is required.
+
+The fix for all three is the same: run tool-search first and read the real schema.
+
 ## Palace — read
 
 | Tool | Purpose |
