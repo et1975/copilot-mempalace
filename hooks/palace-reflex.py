@@ -2,39 +2,58 @@
 """PreToolUse audit hook: nag when external fact-finding bypasses mempalace_search.
 
 Reads Copilot's hook JSON from stdin. Maintains a per-session ring buffer of
-recent tool names under $TMPDIR. If the current tool is in the "needs recall"
-set and no mempalace_search occurred in the recent window, injects a one-line
-reminder via hookSpecificOutput.additionalContext (non-blocking).
+recent canonical capability tokens under $TMPDIR. If the current tool needs
+recall and no mempalace_search occurred in the recent window, injects a
+one-line reminder via hookSpecificOutput.additionalContext (non-blocking).
+
+Tool names are canonicalized to harness-neutral capability ids so the hook
+fires identically under VS Code Copilot Chat and Copilot CLI.
 
 Failure mode: any error → exit 0 silently. This is an audit, not a gate.
 """
 from __future__ import annotations
 
 import json
-import os
 import re
 import sys
 import tempfile
 from pathlib import Path
 
-TRIGGER_TOOLS = frozenset({
-    "fetch_webpage",
-    "open_browser_page",
-    "read_page",
-    "github_repo",
-    "github_text_search",
-    "semantic_search",
-})
+_I = re.IGNORECASE
 
-# Workspace search tools: only fire on the second-or-later call in the recent
-# window. First targeted lookup is allowed without recall (matches the skill).
-REPEAT_SEARCH_TOOLS = frozenset({"grep_search", "file_search"})
+# Capability id -> alias pattern covering both harnesses (VS Code Copilot Chat
+# and Copilot CLI). Anchored + case-insensitive so PascalCase CLI names
+# (Bash, Grep, ...) and snake_case VS Code names collapse onto one capability.
+CAPABILITY_PATTERNS = {
+    # always-fire: external fact-finding
+    "web": re.compile(
+        r"^(?:web_fetch|web_search|fetch_webpage|open_browser_page|read_page)$", _I
+    ),
+    "github": re.compile(
+        r"^(?:github_repo|github_text_search|github-mcp-server-.+)$", _I
+    ),
+    "semantic": re.compile(r"^semantic_search$", _I),
+    # repeat-fire: workspace search (only 2nd+ use in the window)
+    "ws_grep": re.compile(r"^(?:grep_search|grep)$", _I),
+    "ws_files": re.compile(r"^(?:file_search|glob)$", _I),
+    # conditional: subagent (only recall-type agents)
+    "subagent": re.compile(r"^(?:runsubagent|explore|task)$", _I),
+    # conditional: terminal broad-probe
+    "terminal": re.compile(r"^(?:run_in_terminal|bash)$", _I),
+}
 
-SUBAGENT_TOOLS = frozenset({"runSubagent", "Explore"})
+# Capabilities that always warrant a recall check.
+ALWAYS_FIRE = frozenset({"web", "github", "semantic"})
+# Workspace-search capabilities: fire only on the second-or-later call in the
+# recent window. First targeted lookup is allowed without recall.
+REPEAT_FIRE = frozenset({"ws_grep", "ws_files"})
+
+# Only these agent identities count as recall-type subagents. CLI passes
+# agent_type=explore; VS Code passes agentName=Explore (both lowercase equal).
 RECALL_AGENT_NAMES = frozenset({"explore"})
 
-# Broad terminal probes inside run_in_terminal. Patterns match what the skill
-# enumerates: `find ./|/|~`, `grep -r/-R`, `ls -*R`, `locate `,
+# Broad terminal probes inside the terminal capability. Patterns match what the
+# skill enumerates: `find ./|/|~`, `grep -r/-R`, `ls -*R`, `locate `,
 # `(apt-cache|brew|npm|pip|cargo|gem) search`.
 BROAD_PROBE_PATTERNS = (
     re.compile(r"(?<![\w-])find\s+[./~]"),
@@ -44,12 +63,40 @@ BROAD_PROBE_PATTERNS = (
     re.compile(r"(?<![\w-])(?:apt-cache|brew|npm|pip|cargo|gem)\s+search\b"),
 )
 
-TERMINAL_TOOL = "run_in_terminal"
-
+# Matched by substring on the raw tool name (CLI: mempalace-mempalace_search;
+# VS Code: mempalace_search) before it is canonicalized into the buffer.
 SATISFY_PATTERN = re.compile(r"mempalace_search")
+SATISFY_TOKEN = "satisfy"
 
 WINDOW = 6
 SAFE_SESSION = re.compile(r"[^A-Za-z0-9_.-]")
+
+
+def capability_of(tool_name: str) -> str | None:
+    for cap, pat in CAPABILITY_PATTERNS.items():
+        if pat.match(tool_name):
+            return cap
+    return None
+
+
+def canonical_token(tool_name: str) -> str:
+    """Harness-neutral buffer token: satisfy marker, capability id, or raw name.
+
+    Storing the capability id (not the raw name) lets repeat detection work
+    across harnesses: a CLI `Grep` followed by a VS Code `grep_search` both
+    become `ws_grep`.
+    """
+    if SATISFY_PATTERN.search(tool_name):
+        return SATISFY_TOKEN
+    return capability_of(tool_name) or tool_name
+
+
+def arg(tool_input: dict, *keys: str) -> str:
+    """First present key wins — absorbs harness arg-name drift."""
+    for k in keys:
+        if k in tool_input:
+            return str(tool_input[k])
+    return ""
 
 
 def buffer_path(session_id: str) -> Path:
@@ -76,16 +123,16 @@ def append(path: Path, name: str) -> None:
         pass
 
 
-def is_trigger(tool_name: str, tool_input: dict, recent: list[str]) -> bool:
-    if tool_name in TRIGGER_TOOLS:
+def is_trigger(tool_name: str, tool_input: dict, recent_caps: list[str]) -> bool:
+    cap = capability_of(tool_name)
+    if cap in ALWAYS_FIRE:
         return True
-    if tool_name in REPEAT_SEARCH_TOOLS and tool_name in recent:
+    if cap in REPEAT_FIRE and cap in recent_caps:
         return True
-    if tool_name in SUBAGENT_TOOLS:
-        agent = str(tool_input.get("agentName", "")).lower()
-        return agent in RECALL_AGENT_NAMES
-    if tool_name == TERMINAL_TOOL:
-        command = str(tool_input.get("command", ""))
+    if cap == "subagent":
+        return arg(tool_input, "agentName", "agent_type").lower() in RECALL_AGENT_NAMES
+    if cap == "terminal":
+        command = arg(tool_input, "command")
         return any(p.search(command) for p in BROAD_PROBE_PATTERNS)
     return False
 
@@ -103,11 +150,13 @@ def main() -> int:
         return 0
 
     path = buffer_path(session_id)
-    recent = load_recent(path)
-    satisfied = any(SATISFY_PATTERN.search(name) for name in recent)
-    triggered = is_trigger(tool_name, tool_input if isinstance(tool_input, dict) else {}, recent)
+    recent = load_recent(path)  # canonical tokens from earlier calls in window
+    satisfied = SATISFY_TOKEN in recent
+    triggered = is_trigger(
+        tool_name, tool_input if isinstance(tool_input, dict) else {}, recent
+    )
 
-    append(path, tool_name)
+    append(path, canonical_token(tool_name))
 
     if triggered and not satisfied:
         msg = (
