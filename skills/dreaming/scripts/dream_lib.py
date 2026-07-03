@@ -12,11 +12,18 @@ plain ``decisions``.
 """
 from __future__ import annotations
 
+from datetime import datetime
 import math
 import re
 from typing import Any
 
 WORKLIST_VERSION = 1
+DEG_CAP = 5
+
+_EPHEMERAL_RE = re.compile(
+    r"\b(?:for now|this session|temporarily|one-off|throwaway|scratch|just for this)\b",
+    re.IGNORECASE,
+)
 
 
 def cosine_similarity(a: list[float], b: list[float]) -> float:
@@ -130,6 +137,112 @@ def cluster_duplicates(drawers: list[dict[str, Any]], tau: float) -> list[dict[s
         ]
         clusters.append({"members": [drawers[k] for k in members], "pair_sims": pair_sims})
     return clusters
+
+
+def compute_redundancy(drawers: list[dict[str, Any]]) -> dict[str, float]:
+    """Return each drawer's maximum cosine similarity to any other drawer."""
+    scores = {d["id"]: 0.0 for d in drawers}
+    for i in range(len(drawers)):
+        for j in range(i + 1, len(drawers)):
+            s = cosine_similarity(drawers[i].get("embedding") or [], drawers[j].get("embedding") or [])
+            s = max(0.0, s)
+            scores[drawers[i]["id"]] = max(scores[drawers[i]["id"]], s)
+            scores[drawers[j]["id"]] = max(scores[drawers[j]["id"]], s)
+    return scores
+
+
+def _detect_ephemeral(text: str) -> bool:
+    return _EPHEMERAL_RE.search(text) is not None
+
+
+def _parse_iso(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def _age_days(filed_at: Any, now: datetime) -> int:
+    filed = _parse_iso(filed_at)
+    if filed is None:
+        return 0
+    comparison_now = now
+    if filed.tzinfo is not None and comparison_now.tzinfo is None:
+        filed = filed.replace(tzinfo=None)
+    elif filed.tzinfo is None and comparison_now.tzinfo is not None:
+        comparison_now = comparison_now.replace(tzinfo=None)
+    return max(0, (comparison_now - filed).days)
+
+
+def _clamp01(value: float) -> float:
+    return max(0.0, min(1.0, value))
+
+
+def drawer_salience(
+    drawer: dict[str, Any],
+    redundancy: float,
+    kg_degree: int,
+    now: datetime,
+    half_life_days: float = 180.0,
+    weights: dict[str, float] | None = None,
+) -> dict[str, Any]:
+    """Score one drawer for pruning; lower ``v`` means weaker / more prunable."""
+    age_days = _age_days(drawer.get("filed_at"), now)
+    negatives = _detect_ephemeral(drawer.get("text", ""))
+    recency = math.exp(-age_days / half_life_days) if half_life_days > 0.0 else 0.0
+    deg = min(max(kg_degree, 0), DEG_CAP) / DEG_CAP
+
+    w = {
+        "recency": 0.4,
+        "kg_degree": 0.4,
+        "redundancy": 0.3,
+        "negatives": 0.5,
+    }
+    if weights is not None:
+        w.update(weights)
+
+    v = _clamp01(
+        w["recency"] * recency
+        + w["kg_degree"] * deg
+        - w["redundancy"] * _clamp01(redundancy)
+        - (w["negatives"] if negatives else 0.0)
+    )
+    return {
+        "id": drawer["id"],
+        "age_days": age_days,
+        "kg_degree": kg_degree,
+        "redundancy": round(redundancy, 4),
+        "negatives": negatives,
+        "v": round(v, 4),
+    }
+
+
+def select_prune_candidates(
+    scored: list[dict[str, Any]],
+    v_min: float,
+    age_floor_days: int,
+) -> list[dict[str, Any]]:
+    """Select drawers using the multi-gate AND.
+
+    Expected shape: each element is the original logical drawer dict augmented
+    with a ``salience`` sub-dict from ``drawer_salience`` and optional ``pinned``.
+    """
+    candidates = []
+    for d in scored:
+        salience = d.get("salience", d)
+        if (
+            salience.get("v", 1.0) < v_min
+            and salience.get("age_days", 0) >= age_floor_days
+            and salience.get("kg_degree", 0) == 0
+            and not d.get("pinned", False)
+        ):
+            candidates.append(d)
+    return candidates
 
 
 def extract_session_id(text: str) -> str | None:
@@ -277,6 +390,37 @@ def build_pattern_worklist(
     return {
         "version": WORKLIST_VERSION,
         "task": "pattern",
+        "scope": scope,
+        "params": params,
+        "instructions": instructions,
+        "items": items,
+    }
+
+
+def build_prune_worklist(
+    candidates: list[dict[str, Any]],
+    scope: dict[str, Any],
+    params: dict[str, Any],
+    instructions: str | None = None,
+) -> dict[str, Any]:
+    """Produce the deterministic worklist of prune candidates."""
+    items = []
+    for c in candidates:
+        items.append(
+            {
+                "kind": "prune",
+                "id": c["id"],
+                "member_ids": c.get("member_ids", [c["id"]]),
+                "text": c.get("text", ""),
+                "wing": c.get("wing"),
+                "room": c.get("room"),
+                "salience": c["salience"],
+                "decision": None,
+            }
+        )
+    return {
+        "version": WORKLIST_VERSION,
+        "task": "prune",
         "scope": scope,
         "params": params,
         "instructions": instructions,
@@ -453,4 +597,39 @@ def apply_contradiction_decisions(decisions: list[dict[str, Any]], writer: Any) 
                     }
                 )
         report["invalidated"] += 1
+    return report
+
+
+def apply_prune_decisions(decisions: list[dict[str, Any]], archiver: Any) -> dict[str, Any]:
+    """Execute approved prune decisions through ``archiver.archive_then_delete``."""
+    report: dict[str, Any] = {
+        "pruned": 0,
+        "kept": 0,
+        "archived": [],
+        "errors": [],
+    }
+    for d in decisions:
+        if d.get("action") != "prune":
+            report["kept"] += 1
+            continue
+        salience = d.get("salience", {})
+        if salience.get("kg_degree", 0) > 0 or d.get("pinned", False):
+            report["errors"].append({"stage": "protected", "error": "protected drawer", "decision": d})
+            continue
+        record = {
+            "id": d["id"],
+            "member_ids": d.get("member_ids", [d["id"]]),
+            "wing": d.get("wing"),
+            "room": d.get("room"),
+            "text": d.get("text", ""),
+            "salience": salience,
+            "pruned_at": datetime.now().isoformat(),
+        }
+        try:
+            archiver.archive_then_delete(record)
+            report["archived"].append(record)
+            report["pruned"] += 1
+        except Exception as exc:  # noqa: BLE001 - record and continue; archive failure deletes nothing
+            report["errors"].append({"stage": "archive", "error": str(exc), "decision": d})
+            continue
     return report

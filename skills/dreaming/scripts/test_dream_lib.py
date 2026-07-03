@@ -2,6 +2,7 @@
 
 Run: cd skills/dreaming/scripts && python3 -m unittest -v
 """
+from datetime import datetime
 import unittest
 
 import dream_lib as dl
@@ -300,6 +301,291 @@ class TestBuildPatternWorklist(unittest.TestCase):
         self.assertEqual(item["evidence"]["support"], 2)
         self.assertEqual(item["evidence"]["support_ids"], ["s1", "s2"])
         self.assertEqual(item["members"][0]["session_id"], "s1")
+
+
+class TestComputeRedundancy(unittest.TestCase):
+    def test_identical_pair_scores_one_each(self):
+        drawers = [
+            {"id": "a", "embedding": [1.0, 0.0]},
+            {"id": "b", "embedding": [1.0, 0.0]},
+        ]
+
+        redundancy = dl.compute_redundancy(drawers)
+
+        self.assertAlmostEqual(redundancy["a"], 1.0)
+        self.assertAlmostEqual(redundancy["b"], 1.0)
+
+    def test_orthogonal_pair_scores_zero_each(self):
+        drawers = [
+            {"id": "a", "embedding": [1.0, 0.0]},
+            {"id": "b", "embedding": [0.0, 1.0]},
+        ]
+
+        self.assertEqual(dl.compute_redundancy(drawers), {"a": 0.0, "b": 0.0})
+
+    def test_singleton_scores_zero(self):
+        self.assertEqual(dl.compute_redundancy([{"id": "a", "embedding": [1.0]}]), {"a": 0.0})
+
+
+class TestDrawerSalience(unittest.TestCase):
+    def setUp(self):
+        self.now = datetime.fromisoformat("2026-07-03T20:20:12")
+
+    def _drawer(self, filed_at="2026-01-04T20:20:12", text="durable memory"):
+        return {"id": "d1", "text": text, "filed_at": filed_at}
+
+    def test_kg_degree_increases_salience(self):
+        low = dl.drawer_salience(self._drawer(), redundancy=0.0, kg_degree=0, now=self.now)
+        high = dl.drawer_salience(self._drawer(), redundancy=0.0, kg_degree=5, now=self.now)
+
+        self.assertGreaterEqual(high["v"], low["v"])
+
+    def test_redundancy_decreases_salience(self):
+        low = dl.drawer_salience(self._drawer(), redundancy=0.0, kg_degree=0, now=self.now)
+        high = dl.drawer_salience(self._drawer(), redundancy=1.0, kg_degree=0, now=self.now)
+
+        self.assertLessEqual(high["v"], low["v"])
+
+    def test_age_decreases_salience(self):
+        recent = dl.drawer_salience(
+            self._drawer(filed_at="2026-07-01T20:20:12"),
+            redundancy=0.0,
+            kg_degree=0,
+            now=self.now,
+        )
+        old = dl.drawer_salience(
+            self._drawer(filed_at="2025-07-03T20:20:12"),
+            redundancy=0.0,
+            kg_degree=0,
+            now=self.now,
+        )
+
+        self.assertLessEqual(old["v"], recent["v"])
+
+    def test_ephemeral_negative_decreases_salience(self):
+        durable = dl.drawer_salience(
+            self._drawer(text="durable memory"),
+            redundancy=0.0,
+            kg_degree=0,
+            now=self.now,
+        )
+        ephemeral = dl.drawer_salience(
+            self._drawer(text="keep this for now in this session"),
+            redundancy=0.0,
+            kg_degree=0,
+            now=self.now,
+        )
+
+        self.assertTrue(ephemeral["negatives"])
+        self.assertLess(ephemeral["v"], durable["v"])
+
+    def test_salience_is_clamped_between_zero_and_one(self):
+        high = dl.drawer_salience(
+            self._drawer(filed_at="2026-07-03T20:20:12"),
+            redundancy=0.0,
+            kg_degree=100,
+            now=self.now,
+            weights={"recency": 1.0, "kg_degree": 1.0, "redundancy": 0.0, "negatives": 0.0},
+        )
+        low = dl.drawer_salience(
+            self._drawer(text="throwaway scratch just for this"),
+            redundancy=1.0,
+            kg_degree=0,
+            now=self.now,
+            weights={"recency": 0.0, "kg_degree": 0.0, "redundancy": 1.0, "negatives": 1.0},
+        )
+
+        self.assertGreaterEqual(high["v"], 0.0)
+        self.assertLessEqual(high["v"], 1.0)
+        self.assertGreaterEqual(low["v"], 0.0)
+        self.assertLessEqual(low["v"], 1.0)
+
+    def test_detects_all_ephemeral_markers(self):
+        markers = ["for now", "this session", "temporarily", "one-off", "throwaway", "scratch", "just for this"]
+        for marker in markers:
+            with self.subTest(marker=marker):
+                scored = dl.drawer_salience(self._drawer(text=f"Keep {marker}"), 0.0, 0, self.now)
+                self.assertTrue(scored["negatives"])
+
+    def test_age_days_from_filed_at_and_missing_is_zero(self):
+        scored = dl.drawer_salience(
+            self._drawer(filed_at="2026-06-03T20:20:12Z"),
+            redundancy=0.0,
+            kg_degree=0,
+            now=self.now,
+        )
+        missing = dl.drawer_salience(
+            self._drawer(filed_at=None),
+            redundancy=0.0,
+            kg_degree=0,
+            now=self.now,
+        )
+
+        self.assertEqual(scored["age_days"], 30)
+        self.assertEqual(missing["age_days"], 0)
+
+
+class TestSelectPruneCandidates(unittest.TestCase):
+    def _drawer(self, _id, v, age_days, kg_degree=0, pinned=False):
+        return {
+            "id": _id,
+            "text": _id,
+            "member_ids": [_id],
+            "wing": "w",
+            "room": "r",
+            "pinned": pinned,
+            "salience": {
+                "id": _id,
+                "age_days": age_days,
+                "kg_degree": kg_degree,
+                "redundancy": 1.0,
+                "negatives": True,
+                "v": v,
+            },
+        }
+
+    def test_selects_only_when_all_gates_hold(self):
+        selected = dl.select_prune_candidates(
+            [
+                self._drawer("qualifies", v=0.1, age_days=365),
+                self._drawer("has_kg", v=0.1, age_days=365, kg_degree=1),
+                self._drawer("too_recent", v=0.1, age_days=10),
+                self._drawer("pinned", v=0.1, age_days=365, pinned=True),
+                self._drawer("high_value", v=0.9, age_days=365),
+            ],
+            v_min=0.2,
+            age_floor_days=180,
+        )
+
+        self.assertEqual([d["id"] for d in selected], ["qualifies"])
+
+
+class TestBuildPruneWorklist(unittest.TestCase):
+    def test_shape_and_salience(self):
+        candidate = {
+            "id": "d1",
+            "member_ids": ["p1"],
+            "text": "old scratch",
+            "wing": "w",
+            "room": "r",
+            "salience": {"id": "d1", "age_days": 365, "kg_degree": 0, "redundancy": 1.0, "negatives": True, "v": 0.0},
+        }
+
+        wl = dl.build_prune_worklist(
+            [candidate],
+            scope={"wing": "w"},
+            params={"v_min": 0.2, "age_floor_days": 180},
+            instructions="review carefully",
+        )
+
+        self.assertEqual(wl["version"], dl.WORKLIST_VERSION)
+        self.assertEqual(wl["task"], "prune")
+        self.assertEqual(wl["scope"], {"wing": "w"})
+        self.assertEqual(wl["params"], {"v_min": 0.2, "age_floor_days": 180})
+        self.assertEqual(wl["instructions"], "review carefully")
+        self.assertEqual(len(wl["items"]), 1)
+        item = wl["items"][0]
+        self.assertEqual(item["kind"], "prune")
+        self.assertEqual(item["id"], "d1")
+        self.assertEqual(item["member_ids"], ["p1"])
+        self.assertEqual(item["text"], "old scratch")
+        self.assertEqual(item["wing"], "w")
+        self.assertEqual(item["room"], "r")
+        self.assertEqual(item["salience"], candidate["salience"])
+        self.assertIsNone(item["decision"])
+
+
+class _FakeArchiver:
+    def __init__(self, fail_ids=None):
+        self.calls = []
+        self.archived = []
+        self.deleted = []
+        self.fail_ids = set(fail_ids or [])
+
+    def archive_then_delete(self, record):
+        self.calls.append(record)
+        if record["id"] in self.fail_ids:
+            raise RuntimeError(f"archive failed for {record['id']}")
+        self.archived.append(record)
+        self.deleted.extend(record["member_ids"])
+        return {"archived": record["id"]}
+
+
+class TestApplyPruneDecisions(unittest.TestCase):
+    def _prune_decision(self, _id="d1", kg_degree=0, pinned=False):
+        return {
+            "action": "prune",
+            "id": _id,
+            "member_ids": [f"{_id}-p"],
+            "wing": "w",
+            "room": "r",
+            "text": "old scratch",
+            "pinned": pinned,
+            "salience": {"id": _id, "age_days": 365, "kg_degree": kg_degree, "redundancy": 1.0, "negatives": True, "v": 0.0},
+        }
+
+    def test_valid_prune_archives_then_deletes_once(self):
+        archiver = _FakeArchiver()
+
+        report = dl.apply_prune_decisions([self._prune_decision()], archiver)
+
+        self.assertEqual(report["pruned"], 1)
+        self.assertEqual(report["kept"], 0)
+        self.assertEqual(len(archiver.calls), 1)
+        self.assertEqual(len(report["archived"]), 1)
+        record = archiver.calls[0]
+        self.assertEqual(record["id"], "d1")
+        self.assertEqual(record["member_ids"], ["d1-p"])
+        self.assertEqual(record["wing"], "w")
+        self.assertEqual(record["room"], "r")
+        self.assertEqual(record["text"], "old scratch")
+        self.assertEqual(record["salience"]["kg_degree"], 0)
+        self.assertIn("pruned_at", record)
+        self.assertEqual(archiver.deleted, ["d1-p"])
+
+    def test_keep_is_counted_without_archiver_call(self):
+        archiver = _FakeArchiver()
+
+        report = dl.apply_prune_decisions([{"action": "keep"}], archiver)
+
+        self.assertEqual(report["kept"], 1)
+        self.assertEqual(report["pruned"], 0)
+        self.assertEqual(archiver.calls, [])
+
+    def test_protected_kg_decision_records_error_without_archiver_call(self):
+        archiver = _FakeArchiver()
+
+        report = dl.apply_prune_decisions([self._prune_decision(kg_degree=1)], archiver)
+
+        self.assertEqual(report["pruned"], 0)
+        self.assertEqual(archiver.calls, [])
+        self.assertEqual(report["errors"][0]["stage"], "protected")
+        self.assertEqual(report["errors"][0]["error"], "protected drawer")
+
+    def test_protected_pinned_decision_records_error_without_archiver_call(self):
+        archiver = _FakeArchiver()
+
+        report = dl.apply_prune_decisions([self._prune_decision(pinned=True)], archiver)
+
+        self.assertEqual(report["pruned"], 0)
+        self.assertEqual(archiver.calls, [])
+        self.assertEqual(report["errors"][0]["stage"], "protected")
+
+    def test_archive_failure_is_recorded_and_later_decisions_continue(self):
+        archiver = _FakeArchiver(fail_ids={"bad"})
+        decisions = [
+            self._prune_decision(_id="bad"),
+            self._prune_decision(_id="good"),
+        ]
+
+        report = dl.apply_prune_decisions(decisions, archiver)
+
+        self.assertEqual(report["pruned"], 1)
+        self.assertEqual(len(report["errors"]), 1)
+        self.assertEqual(report["errors"][0]["stage"], "archive")
+        self.assertIn("archive failed for bad", report["errors"][0]["error"])
+        self.assertEqual([r["id"] for r in archiver.archived], ["good"])
+        self.assertEqual(archiver.deleted, ["good-p"])
 
 
 class _FakeWriter:
