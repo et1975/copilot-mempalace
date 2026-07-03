@@ -13,6 +13,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import json
 import sys
 
@@ -20,15 +21,24 @@ import dream_palace
 from dream_lib import (
     build_contradiction_worklist,
     build_pattern_worklist,
+    build_prune_worklist,
     build_worklist,
+    compute_redundancy,
+    drawer_salience,
     group_observation_themes,
+    select_prune_candidates,
 )
+
+
+def _degree_for(drawer: dict, degrees: dict[str, int]) -> int:
+    ids = {drawer["id"], *drawer.get("member_ids", [])}
+    return sum(degrees.get(drawer_id, 0) for drawer_id in ids)
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--palace", required=True, help="Path to the mempalace palace directory")
-    ap.add_argument("--task", choices=["merge", "contradiction", "pattern"], default="merge",
+    ap.add_argument("--task", choices=["merge", "contradiction", "pattern", "prune"], default="merge",
                     help="Dreaming task to harvest (default merge)")
     ap.add_argument("--wing", help="Scope merge harvest to this wing (ignored for contradiction)")
     ap.add_argument("--room", help="Scope merge harvest to this room (ignored for contradiction)")
@@ -36,6 +46,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="Cosine-similarity threshold; defaults to 0.9 for merge and 0.75 for pattern")
     ap.add_argument("--min-support", type=int, default=3,
                     help="Minimum distinct sessions for pattern themes (default 3)")
+    ap.add_argument("--v-min", type=float, default=0.35,
+                    help="Maximum salience value for prune candidates (default 0.35)")
+    ap.add_argument("--age-floor-days", type=int, default=30,
+                    help="Minimum drawer age for prune candidates (default 30)")
     ap.add_argument("--rooms", default="diary",
                     help="Comma-separated rooms for pattern observation harvest (default diary)")
     ap.add_argument("--instructions", help="Optional steering note recorded in the worklist")
@@ -75,6 +89,47 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"harvested {len(entries)} observation entries -> {len(worklist['items'])} "
             f"pattern theme(s) spanning >= {args.min_support} sessions -> {args.out}",
+            file=sys.stderr,
+        )
+        return 0
+
+    if args.task == "prune":
+        drawers = dream_palace.load_logical_drawers(path, wing=args.wing, room=args.room)
+        degrees = dream_palace.kg_source_degree(path)
+        redundancy = compute_redundancy(drawers)
+        now = datetime.now()
+        scored = []
+        for drawer in drawers:
+            metadata = drawer.get("metadata") or {}
+            drawer_for_salience = {**drawer, "filed_at": metadata.get("filed_at", drawer.get("filed_at"))}
+            scored.append(
+                {
+                    **drawer,
+                    "salience": drawer_salience(
+                        drawer_for_salience,
+                        redundancy[drawer["id"]],
+                        _degree_for(drawer, degrees),
+                        now=now,
+                    ),
+                    "pinned": metadata.get("pinned", False),
+                }
+            )
+        candidates = select_prune_candidates(
+            scored,
+            v_min=args.v_min,
+            age_floor_days=args.age_floor_days,
+        )
+        worklist = build_prune_worklist(
+            candidates,
+            scope={"palace": path, "wing": args.wing, "room": args.room, "task": "prune"},
+            params={"v_min": args.v_min, "age_floor_days": args.age_floor_days},
+            instructions=args.instructions,
+        )
+        with open(args.out, "w", encoding="utf-8") as fh:
+            json.dump(worklist, fh, indent=2, ensure_ascii=False)
+        print(
+            f"harvested {len(drawers)} drawers -> {len(worklist['items'])} prune candidate(s) "
+            f"(v<v_min, age>=floor, kg_degree=0) -> {args.out}",
             file=sys.stderr,
         )
         return 0

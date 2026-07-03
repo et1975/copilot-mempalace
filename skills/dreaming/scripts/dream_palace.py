@@ -11,11 +11,12 @@ variable, which mempalace's config layer reads. Call ``bind_palace(path)``
 """
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 from typing import Any
 
-from dream_lib import extract_session_id, group_logical_drawers
+from dream_lib import extract_session_id
 
 
 def bind_palace(palace_path: str) -> str:
@@ -117,7 +118,7 @@ def load_logical_drawers(
     if where:
         kwargs["where"] = where
     res = col.get(**kwargs)
-    return group_logical_drawers(_rows_from_collection_result(res))
+    return _group_by_parent(_rows_from_collection_result(res), ("parent_drawer_id",))
 
 
 def load_observation_entries(
@@ -191,6 +192,32 @@ def load_active_triples(palace_path: str) -> list[dict[str, Any]]:
         con.close()
 
 
+def kg_source_degree(palace_path: str) -> dict[str, int]:
+    """Return per-drawer counts of KG triples sourced from each drawer id."""
+    db_path = os.path.join(palace_path, "knowledge_graph.sqlite3")
+    if not os.path.exists(db_path):
+        return {}
+
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except sqlite3.OperationalError:
+        con = sqlite3.connect(db_path)
+
+    try:
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            """
+            SELECT source_drawer_id, COUNT(*) AS n
+            FROM triples
+            WHERE source_drawer_id IS NOT NULL
+            GROUP BY source_drawer_id
+            """
+        ).fetchall()
+        return {row["source_drawer_id"]: int(row["n"]) for row in rows}
+    finally:
+        con.close()
+
+
 class MempalaceWriter:
     """Writes through the sanctioned MCP tool handlers against the bound palace."""
 
@@ -206,6 +233,34 @@ class MempalaceWriter:
 
     def delete_drawer(self, drawer_id: str) -> Any:
         return self._tools["mempalace_delete_drawer"]["handler"](drawer_id=drawer_id)
+
+
+class Archiver:
+    """Archive-before-delete guarantees reversibility.
+
+    Deletes go through the sanctioned handler so the closet/AAAK index is purged.
+    """
+
+    def __init__(self, archive_path: str, writer: Any | None = None) -> None:
+        self.archive_path = os.path.abspath(os.path.expanduser(archive_path))
+        self._writer = writer if writer is not None else MempalaceWriter()
+
+    def archive_then_delete(self, record: dict[str, Any]) -> dict[str, Any]:
+        parent = os.path.dirname(self.archive_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+
+        with open(self.archive_path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False))
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+
+        deleted = []
+        for drawer_id in record.get("member_ids", [record["id"]]):
+            self._writer.delete_drawer(drawer_id)
+            deleted.append(drawer_id)
+        return {"archived": record["id"], "deleted": deleted}
 
 
 class KgWriter:

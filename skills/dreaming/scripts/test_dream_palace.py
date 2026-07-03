@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import json
 import sqlite3
 import sys
 import tempfile
@@ -71,6 +72,97 @@ class TestLoadActiveTriples(unittest.TestCase):
                     "extracted_at": "2024-01-02",
                 }
             ])
+
+
+class TestKgSourceDegree(unittest.TestCase):
+    def test_missing_kg_returns_empty_dict(self):
+        with _test_tmpdir() as palace:
+            self.assertEqual(dream_palace.kg_source_degree(palace), {})
+
+    def test_counts_triples_by_source_drawer_id(self):
+        with _test_tmpdir() as palace:
+            db_path = os.path.join(palace, "knowledge_graph.sqlite3")
+            con = sqlite3.connect(db_path)
+            con.executescript(
+                """
+                CREATE TABLE triples (
+                    id TEXT PRIMARY KEY,
+                    subject TEXT,
+                    predicate TEXT,
+                    object TEXT,
+                    valid_from TEXT,
+                    valid_to TEXT,
+                    source_drawer_id TEXT
+                );
+                INSERT INTO triples (id, subject, predicate, object, source_drawer_id) VALUES
+                    ('t1', 's', 'p', 'o1', 'drawer-1'),
+                    ('t2', 's', 'p', 'o2', 'drawer-1'),
+                    ('t3', 's', 'p', 'o3', 'chunk-2'),
+                    ('t4', 's', 'p', 'o4', NULL);
+                """
+            )
+            con.commit()
+            con.close()
+
+            self.assertEqual(
+                dream_palace.kg_source_degree(palace),
+                {"drawer-1": 2, "chunk-2": 1},
+            )
+
+
+class TestArchiver(unittest.TestCase):
+    def test_archive_then_delete_appends_jsonl_before_deleting_members(self):
+        with _test_tmpdir() as td:
+            archive_path = os.path.join(td, "cold", "archive.jsonl")
+            record = {
+                "id": "logical-1",
+                "member_ids": ["chunk-1", "chunk-2"],
+                "wing": "wing",
+                "room": "room",
+                "text": "forgettable",
+                "salience": {"v": 0.1, "kg_degree": 0},
+                "pruned_at": "2026-07-03T20:00:00",
+            }
+
+            class FakeWriter:
+                def __init__(self):
+                    self.deleted = []
+                    self.archive_seen_at_delete = []
+
+                def delete_drawer(self, drawer_id):
+                    with open(archive_path, encoding="utf-8") as fh:
+                        self.archive_seen_at_delete.append(fh.read())
+                    self.deleted.append(drawer_id)
+                    return {"deleted": drawer_id}
+
+            writer = FakeWriter()
+            result = dream_palace.Archiver(archive_path, writer=writer).archive_then_delete(record)
+
+            with open(archive_path, encoding="utf-8") as fh:
+                lines = fh.readlines()
+            self.assertEqual([json.loads(line) for line in lines], [record])
+            self.assertEqual(writer.deleted, ["chunk-1", "chunk-2"])
+            self.assertEqual([json.loads(writer.archive_seen_at_delete[0])], [record])
+            self.assertEqual(result, {"archived": "logical-1", "deleted": ["chunk-1", "chunk-2"]})
+
+    def test_archive_failure_does_not_delete(self):
+        with _test_tmpdir() as td:
+            archive_path = os.path.join(td, "archive-dir")
+            os.mkdir(archive_path)
+
+            class FakeWriter:
+                def __init__(self):
+                    self.deleted = []
+
+                def delete_drawer(self, drawer_id):
+                    self.deleted.append(drawer_id)
+
+            writer = FakeWriter()
+            archiver = dream_palace.Archiver(archive_path, writer=writer)
+
+            with self.assertRaises(IsADirectoryError):
+                archiver.archive_then_delete({"id": "d1", "member_ids": ["d1"]})
+            self.assertEqual(writer.deleted, [])
 
 
 class TestLoadObservationEntries(unittest.TestCase):

@@ -110,6 +110,64 @@ class TestHarvestPatternTask(unittest.TestCase):
             )
 
 
+class TestHarvestPruneTask(unittest.TestCase):
+    def test_prune_task_writes_prune_worklist(self):
+        drawers = [
+            {
+                "id": "drawer-1",
+                "member_ids": ["drawer-1"],
+                "text": "temporary note for now",
+                "embedding": [1.0, 0.0],
+                "metadata": {"filed_at": "2000-01-01T00:00:00", "pinned": False},
+                "wing": "wing",
+                "room": "room",
+            },
+            {
+                "id": "drawer-2",
+                "member_ids": ["drawer-2"],
+                "text": "temporary note for now duplicate",
+                "embedding": [1.0, 0.0],
+                "metadata": {"filed_at": "2000-01-01T00:00:00", "pinned": True},
+                "wing": "wing",
+                "room": "room",
+            },
+        ]
+        with _test_tmpdir() as td:
+            out = os.path.join(td, "worklist.json")
+            stderr = io.StringIO()
+            with mock.patch.object(dream_harvest.dream_palace, "bind_palace", return_value="/bound"), \
+                 mock.patch.object(dream_harvest.dream_palace, "load_logical_drawers", return_value=drawers) as load_drawers, \
+                 mock.patch.object(dream_harvest.dream_palace, "kg_source_degree", return_value={}), \
+                 contextlib.redirect_stderr(stderr):
+                rc = dream_harvest.main([
+                    "--palace", "/palace",
+                    "--task", "prune",
+                    "--wing", "wing",
+                    "--room", "room",
+                    "--v-min", "0.35",
+                    "--age-floor-days", "30",
+                    "--out", out,
+                ])
+
+            self.assertEqual(rc, 0)
+            load_drawers.assert_called_once_with("/bound", wing="wing", room="room")
+            with open(out, encoding="utf-8") as fh:
+                worklist = json.load(fh)
+            self.assertEqual(worklist["task"], "prune")
+            self.assertEqual(
+                worklist["scope"],
+                {"palace": "/bound", "wing": "wing", "room": "room", "task": "prune"},
+            )
+            self.assertEqual(worklist["params"], {"v_min": 0.35, "age_floor_days": 30})
+            self.assertEqual([item["id"] for item in worklist["items"]], ["drawer-1"])
+            self.assertEqual(worklist["items"][0]["kind"], "prune")
+            self.assertEqual(worklist["items"][0]["salience"]["kg_degree"], 0)
+            self.assertIn(
+                "harvested 2 drawers -> 1 prune candidate(s) (v<v_min, age>=floor, kg_degree=0)",
+                stderr.getvalue(),
+            )
+
+
 class TestAdoptContradictionTask(unittest.TestCase):
     def test_resolve_defaults_invalidate_to_all_candidates_except_keep(self):
         worklist = {
@@ -268,6 +326,100 @@ class TestAdoptPatternTask(unittest.TestCase):
             self.assertIn("ADD  wing_copilot-cli/diary: Recurring pattern worth surfacing....", stdout.getvalue())
             self.assertNotIn("DEL", stdout.getvalue())
             self.assertIn("[dry-run] would surface 1, skip 0, errors 0", stderr.getvalue())
+
+
+class TestAdoptPruneTask(unittest.TestCase):
+    def test_resolve_prune_decisions_defaults_to_item_fields_and_keeps_by_default(self):
+        salience = {"v": 0.12, "age_days": 400, "kg_degree": 0}
+        worklist = {
+            "task": "prune",
+            "items": [
+                {
+                    "kind": "prune",
+                    "id": "drawer-1",
+                    "member_ids": ["chunk-1", "chunk-2"],
+                    "wing": "wing",
+                    "room": "room",
+                    "text": "forgettable",
+                    "salience": salience,
+                    "decision": {"action": "prune"},
+                },
+                {
+                    "kind": "prune",
+                    "id": "drawer-2",
+                    "member_ids": ["drawer-2"],
+                    "wing": "wing",
+                    "room": "room",
+                    "text": "conservative default",
+                    "salience": salience,
+                    "decision": {"action": "keep"},
+                },
+                {
+                    "kind": "prune",
+                    "id": "drawer-3",
+                    "member_ids": ["drawer-3"],
+                    "wing": "wing",
+                    "room": "room",
+                    "text": "omitted decision",
+                    "salience": salience,
+                    "decision": None,
+                },
+            ],
+        }
+
+        decisions = dream_adopt._resolve_prune_decisions(worklist)
+
+        self.assertEqual(decisions, [
+            {
+                "action": "prune",
+                "id": "drawer-1",
+                "member_ids": ["chunk-1", "chunk-2"],
+                "wing": "wing",
+                "room": "room",
+                "text": "forgettable",
+                "salience": salience,
+            },
+            {"action": "keep"},
+            {"action": "keep"},
+        ])
+
+    def test_dry_run_prune_records_archive_delete_plan_without_real_archiver(self):
+        worklist = {
+            "task": "prune",
+            "items": [
+                {
+                    "kind": "prune",
+                    "id": "drawer-1",
+                    "member_ids": ["chunk-1"],
+                    "wing": "wing",
+                    "room": "room",
+                    "text": "forgettable",
+                    "salience": {"v": 0.12, "age_days": 400, "kg_degree": 0},
+                    "decision": {"action": "prune"},
+                }
+            ],
+        }
+        with _test_tmpdir() as td:
+            decisions_path = os.path.join(td, "decisions.json")
+            with open(decisions_path, "w", encoding="utf-8") as fh:
+                json.dump(worklist, fh)
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            with mock.patch.object(dream_adopt.dream_palace, "bind_palace", return_value="/bound"), \
+                 mock.patch.object(dream_adopt.dream_palace, "Archiver", side_effect=AssertionError("real archiver used")), \
+                 contextlib.redirect_stdout(stdout), \
+                 contextlib.redirect_stderr(stderr):
+                rc = dream_adopt.main([
+                    "--palace", "/palace",
+                    "--decisions", decisions_path,
+                    "--archive-file", os.path.join(td, "archive.jsonl"),
+                    "--dry-run",
+                ])
+
+            self.assertEqual(rc, 0)
+            self.assertIn("PRUNE drawer-1 (archive+delete)", stdout.getvalue())
+            self.assertIn("[dry-run] would prune 1, keep 0, errors 0", stderr.getvalue())
 
 
 if __name__ == "__main__":

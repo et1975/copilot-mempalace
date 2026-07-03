@@ -25,7 +25,12 @@ import sys
 from typing import Any
 
 import dream_palace
-from dream_lib import apply_contradiction_decisions, apply_merge_decisions, apply_pattern_decisions
+from dream_lib import (
+    apply_contradiction_decisions,
+    apply_merge_decisions,
+    apply_pattern_decisions,
+    apply_prune_decisions,
+)
 
 
 def _resolve_decisions(worklist: dict[str, Any]) -> list[dict[str, Any]]:
@@ -112,6 +117,28 @@ def _resolve_pattern_decisions(worklist: dict[str, Any]) -> list[dict[str, Any]]
     return resolved
 
 
+def _resolve_prune_decisions(worklist: dict[str, Any]) -> list[dict[str, Any]]:
+    """Extract concrete prune/keep decisions from an adjudicated worklist."""
+    resolved = []
+    for item in worklist.get("items", []):
+        decision = item.get("decision")
+        if not decision or decision.get("action") != "prune":
+            resolved.append({"action": "keep"})
+            continue
+        resolved.append(
+            {
+                "action": "prune",
+                "id": decision.get("id") or item["id"],
+                "member_ids": decision.get("member_ids") or item.get("member_ids", [item["id"]]),
+                "wing": decision.get("wing") or item.get("wing"),
+                "room": decision.get("room") or item.get("room"),
+                "text": decision.get("text") or item.get("text", ""),
+                "salience": decision.get("salience") or item.get("salience", {}),
+            }
+        )
+    return resolved
+
+
 class _DryRunWriter:
     def __init__(self) -> None:
         self.planned: list[str] = []
@@ -135,6 +162,15 @@ class _DryRunKgWriter:
         return {"success": True}
 
 
+class _DryRunArchiver:
+    def __init__(self) -> None:
+        self.planned: list[str] = []
+
+    def archive_then_delete(self, record: dict[str, Any]) -> dict[str, Any]:
+        self.planned.append(f"PRUNE {record['id']} (archive+delete)")
+        return {"archived": record["id"], "deleted": record.get("member_ids", [record["id"]])}
+
+
 def _worklist_task(worklist: dict[str, Any]) -> str:
     task = worklist.get("task")
     if task:
@@ -149,6 +185,7 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--palace", required=True, help="Path to the mempalace palace directory")
     ap.add_argument("--decisions", required=True, help="Path to the adjudicated decisions.json")
+    ap.add_argument("--archive-file", default="archive.jsonl", help="Append-only prune archive JSONL path")
     ap.add_argument("--dry-run", action="store_true", help="Print planned changes; write nothing")
     args = ap.parse_args(argv)
 
@@ -195,6 +232,19 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0
 
+        if task == "prune":
+            decisions = _resolve_prune_decisions(worklist)
+            archiver = _DryRunArchiver()
+            report = apply_prune_decisions(decisions, archiver)
+            for line in archiver.planned:
+                print(line)
+            print(
+                f"[dry-run] would prune {report['pruned']}, keep {report['kept']}, "
+                f"errors {len(report['errors'])}",
+                file=sys.stderr,
+            )
+            return 1 if report["errors"] else 0
+
         print(f"unknown dreaming task: {task}", file=sys.stderr)
         return 2
 
@@ -224,6 +274,14 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"adopted: merged {report['merged']}, skipped {report['skipped']}, "
             f"deleted {len(report['deleted'])}, errors {len(report['errors'])}",
+            file=sys.stderr,
+        )
+    elif task == "prune":
+        decisions = _resolve_prune_decisions(worklist)
+        report = apply_prune_decisions(decisions, dream_palace.Archiver(args.archive_file))
+        print(
+            f"adopted (prune): pruned {report['pruned']}, kept {report['kept']}, "
+            f"errors {len(report['errors'])}",
             file=sys.stderr,
         )
     else:
