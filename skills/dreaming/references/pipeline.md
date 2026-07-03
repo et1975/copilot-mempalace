@@ -13,8 +13,8 @@ Design basis for the dreaming scripts. Filed in the palace under wing
 
 ## The dream as a function
 
-`Δ : (M_in, S, θ) ↦ M_out`, with `M_in` immutable. v1 realises only the
-dedup/merge task; the store `M` is the set of logical drawers in a wing/room.
+`Δ : (M_in, S, θ) ↦ M_out`, with `M_in` immutable. The store `M` includes
+logical drawers in a wing/room and the palace-local temporal KG.
 
 ### Task: dedup / merge (v1)
 
@@ -24,10 +24,34 @@ dedup/merge task; the store `M` is the set of logical drawers in a wing/room.
 - Fold `μ(C)` = one synthesised drawer per cluster (the agent's job, Phase 2).
 - Soundness constraint: `μ(C)` must preserve every atomic fact in `C`.
 
-### Reserved future tasks (not in v1)
+### Task: contradiction / staleness
 
-- `contradiction` — same-`(subject,predicate)` KG triples with different
-  objects → keep newest, `kg_invalidate` the rest (AGM belief revision).
+- Detection is mechanical: harvest reads currently-active KG triples and groups
+  every `(subject, predicate)` pair with **2+ distinct objects**.
+- These groups are only **candidates**. Some predicates are legitimately
+  multi-valued (`knows`); others are functional (`lives_in`, `status_is`) where
+  multiple current objects are stale or contradictory.
+- Harvest provides a recency hint (`newest_object`) by sorting candidates on
+  `(valid_from || "", extracted_at || "")` descending, but it never auto-resolves.
+- Adjudication is cognitive: the agent decides whether the predicate should be
+  functional, which object is authoritative, and which objects to retire.
+- Adoption is non-destructive belief revision: `KnowledgeGraph.invalidate(...)`
+  sets `valid_to` on retired facts. It does **not** delete rows.
+- Fixpoint: re-harvest after adoption should remove the resolved functional
+  contradiction. Legitimately multi-valued skipped groups may still surface.
+
+> **KG path safety:** do not write contradictions through the
+> `mempalace_kg_invalidate` MCP handler from these scripts. In mempalace 3.5.0,
+> the handler resolves the palace-local KG only when the MCP server process was
+> started with a CLI `--palace` flag (`_palace_flag_given`). Library imports have
+> no such flag, so the handler can target the user's default
+> `~/.mempalace/knowledge_graph.sqlite3` regardless of
+> `MEMPALACE_PALACE_PATH`. `dream_palace.KgWriter` therefore constructs
+> `KnowledgeGraph(db_path=os.path.join(palace_path, "knowledge_graph.sqlite3"))`
+> directly and calls `.invalidate(...)`.
+
+### Reserved future tasks
+
 - `pattern` — frequent observations across sessions/diary → surface a rule.
 - `prune` — drop low-salience drawers.
 
@@ -41,6 +65,7 @@ same.
 ```jsonc
 {
   "version": 1,
+  "task": "merge",
   "scope": {"palace": "<path>", "wing": "<w>", "room": "<r|null>"},
   "params": {"tau": 0.9},
   "instructions": "<optional steering|null>",
@@ -60,19 +85,59 @@ same.
 }
 ```
 
+Contradiction worklist:
+
+```jsonc
+{
+  "version": 1,
+  "task": "contradiction",
+  "scope": {"palace": "<path>", "task": "contradiction"},
+  "params": {},
+  "instructions": "<optional steering|null>",
+  "items": [
+    {
+      "kind": "contradiction",
+      "cluster_id": 0,
+      "subject": "Alice",
+      "predicate": "lives_in",
+      "candidates": [
+        {"object": "Seattle", "valid_from": "2025-01-01", "extracted_at": "2025-01-02"},
+        {"object": "Portland", "valid_from": "2024-01-01", "extracted_at": "2024-01-02"}
+      ],
+      "evidence": {"size": 2, "newest_object": "Seattle"},
+      "decision": null
+    }
+  ]
+}
+```
+
 ### `decisions.json` (agent → adopt)
 
 Same document with each `item.decision` set to one of:
+
+Merge:
 
 ```jsonc
 {"action": "merge", "wing": "<w>", "room": "<r>",
  "text": "<synthesised drawer>", "supersedes": ["<physical id>", ...]}
 ```
+
+Contradiction:
+
+```jsonc
+{"action": "invalidate", "keep": "<object>", "invalidate": ["<stale object>", ...]}
+```
+If `invalidate` is omitted, adoption invalidates every candidate object except
+`keep`. Use this only after judging that the predicate is functional and the kept
+object is authoritative.
+
 ```jsonc
 {"action": "skip"}
 ```
 
 `wing`/`room`/`supersedes` default to the item's values if omitted.
+For contradiction items, `skip` means the group is legitimately multi-valued or
+not safe to adjudicate.
 
 ## Verified mempalace API facts (mempalace 3.5.0)
 
@@ -95,6 +160,12 @@ Same document with each `item.decision` set to one of:
 - **Palace targeting**: handlers resolve the palace via
   `MEMPALACE_PALACE_PATH`; set it before importing mempalace
   (`dream_palace.bind_palace(path)`).
+- **KG read/write**: the palace-local KG is
+  `<palace_path>/knowledge_graph.sqlite3`; active triples are rows where
+  `valid_to IS NULL`. For contradiction adoption, use
+  `KnowledgeGraph(db_path=<palace-local KG>)` directly instead of the MCP
+  `mempalace_kg_invalidate` handler because of the `_palace_flag_given` gate
+  described above.
 
 ## Invariants
 

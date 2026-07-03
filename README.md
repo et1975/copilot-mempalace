@@ -12,7 +12,8 @@ audit hook that nags when an external tool is about to run without a prior `memp
 - **[skills/mempalace/SKILL.md](skills/mempalace/SKILL.md)** — full skill: 30 MCP tools (read/write/tunnels/KG/diary),
   proactive vs reactive use, mining hygiene, HNSW drift recovery, auto-save hook notes.
 - **[skills/dreaming/SKILL.md](skills/dreaming/SKILL.md)** — offline consolidation ("dreaming"): a 5-phase
-  pipeline (harvest → adjudicate → review → adopt → verify) that merges near-duplicate drawers between sessions.
+  pipeline (harvest → adjudicate → review → adopt → verify) that merges near-duplicate drawers and resolves
+  adjudicated KG contradiction/staleness candidates between sessions.
   Cognition stays in the agent, mechanics in dependency-free Python scripts
   ([`skills/dreaming/scripts/`](skills/dreaming/scripts/)), storage in mempalace. Non-destructive (nothing writes
   the live palace until an approved `decisions.json` is adopted) with a fixpoint re-harvest as the verify oracle.
