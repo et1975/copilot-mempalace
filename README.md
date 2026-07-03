@@ -11,6 +11,12 @@ audit hook that nags when an external tool is about to run without a prior `memp
   checkup" workflow. Drop into your home or repo `copilot-instructions.md` (concatenate or replace).
 - **[skills/mempalace/SKILL.md](skills/mempalace/SKILL.md)** — full skill: 30 MCP tools (read/write/tunnels/KG/diary),
   proactive vs reactive use, mining hygiene, HNSW drift recovery, auto-save hook notes.
+- **[skills/dreaming/SKILL.md](skills/dreaming/SKILL.md)** — offline consolidation ("dreaming"): a 5-phase
+  pipeline (harvest → adjudicate → review → adopt → verify) that merges near-duplicate drawers between sessions.
+  Cognition stays in the agent, mechanics in dependency-free Python scripts
+  ([`skills/dreaming/scripts/`](skills/dreaming/scripts/)), storage in mempalace. Non-destructive (nothing writes
+  the live palace until an approved `decisions.json` is adopted) with a fixpoint re-harvest as the verify oracle.
+  See [`skills/dreaming/references/pipeline.md`](skills/dreaming/references/pipeline.md) for the contract.
 - **[hooks/palace-reflex.json](hooks/palace-reflex.json) + [hooks/palace-reflex.py](hooks/palace-reflex.py)** —
   `PreToolUse` audit hook. Maintains a per-session ring buffer of recent tool calls under `$TMPDIR`. Fires when
   a trigger tool runs without a recent `mempalace_search`, injecting a one-line reminder via
