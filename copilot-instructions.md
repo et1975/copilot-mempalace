@@ -47,11 +47,14 @@ Before composing the final reply, answer silently:
 3. **Recall and save both resolved?** Write a one-line `mempalace_diary_write` entry:
 
 ```
+SESSION_ID: <copilot-session-id>
 session: <brief topic>
 recalled: <query used> -> <N hits, useful? yes/no/partial>   (or "none — see lapse")
 saved: <wing/room, one-line drawer summary>   (or "none")
 notes: <one-sentence assessment>   (optional)
 ```
+
+The `SESSION_ID` line lets the dreaming `pattern` task count exact distinct-session support.
 
 Skip the diary for trivial turns where Rules 1 and 2 both legitimately did not fire.
 

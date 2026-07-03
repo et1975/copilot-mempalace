@@ -50,13 +50,54 @@ logical drawers in a wing/room and the palace-local temporal KG.
 > `KnowledgeGraph(db_path=os.path.join(palace_path, "knowledge_graph.sqlite3"))`
 > directly and calls `.invalidate(...)`.
 
+### Task: pattern / induce
+
+- This is the **net-new-knowledge** task. `merge` compresses existing memory;
+  `contradiction` retires stale beliefs; `pattern` induces a new lesson/rule
+  from repeated observations.
+- Adoption is **ADD-ONLY**: approved decisions add a surfaced lesson drawer and
+  never delete drawers or invalidate KG facts.
+- Detection is mechanical: a theme is a connected component of the `≥ τ`
+  similarity graph over observations (`τ` defaults to `0.75` for pattern).
+- Observation extraction and rule synthesis are cognitive: the agent reads the
+  theme members, extracts atomic observations, judges whether a generalizable
+  rule exists, and writes the final lesson.
+- Groundedness invariant: a surfaced rule must cite at least `min_support`
+  **distinct sessions** via `support_ids` (default `3`). `apply_pattern_decisions`
+  rejects `surface` decisions with empty `supported_by`.
+- `session_id` is the join key. Session identity is host-owned and orthogonal to
+  mempalace; it is stamped onto diary entries at write time because a diary entry
+  is a memory **about** a host session. `extract_session_id` parses a
+  `SESSION_ID:<guid>` token; legacy entries without that token contribute no
+  support.
+- Two substrates / two modes:
+  - **Diary-mode** (portable, mempalace-native, v1): `load_observation_entries`
+    reads diary drawers, groups chunks by `parent_entry_id` / `parent_drawer_id`,
+    and extracts stamped `session_id`s from text.
+  - **Session-mode** (host amplifier): `dream_sessions.py` is a read-only adapter
+    over `~/.copilot/session-store.db` (or `COPILOT_SESSION_STORE`) that loads
+    sessions, turns, and session-attributed observations. It imports only the
+    stdlib, not mempalace, isolating HOST coupling from mempalace coupling.
+- Two-tier substrate: because diary carries `session_id`, a diary theme can drill
+  down to raw host sessions; induced rules cite exact session ids.
+- Weaker fixpoint than merge/contradiction: pattern is add-only, so there is no
+  destructive convergence. Convergence comes from excluding already-adopted
+  lessons from mining plus a dedup gate during adjudication so high-support
+  themes become "covered."
+
+Harvest:
+
+```bash
+MPY=$(head -1 "$(command -v mempalace)" | sed 's/^#!//')
+"$MPY" dream_harvest.py --palace <palace> --task pattern --wing <wing> \
+  --rooms diary --min-support 3 --out worklist.json
+```
+
 ### Reserved future tasks
 
-- `pattern` — frequent observations across sessions/diary → surface a rule.
 - `prune` — drop low-salience drawers.
 
-These are additional worklist `kind`s; the harvest/adjudicate/adopt shape is the
-same.
+Additional worklist `kind`s should keep the same harvest/adjudicate/adopt shape.
 
 ## Artifacts (session workspace — never commit)
 
@@ -111,6 +152,35 @@ Contradiction worklist:
 }
 ```
 
+Pattern worklist:
+
+```jsonc
+{
+  "version": 1,
+  "task": "pattern",
+  "scope": {"palace": "<path>", "wing": "<w>", "rooms": ["diary"], "task": "pattern"},
+  "params": {"tau": 0.75, "min_support": 3},
+  "instructions": "<optional steering|null>",
+  "items": [
+    {
+      "kind": "pattern",
+      "cluster_id": 0,
+      "members": [
+        {"id": "<entry id>", "text": "<diary text>", "session_id": "<session id>",
+         "agent": "<agent|null>", "date": "<date|null>", "topic": "<topic|null>"}
+      ],
+      "evidence": {
+        "size": 3,
+        "support": 3,
+        "support_ids": ["<session id>", "..."],
+        "pair_sims": [{"a": "id", "b": "id", "sim": 0.82}]
+      },
+      "decision": null
+    }
+  ]
+}
+```
+
 ### `decisions.json` (agent → adopt)
 
 Same document with each `item.decision` set to one of:
@@ -131,6 +201,18 @@ If `invalidate` is omitted, adoption invalidates every candidate object except
 `keep`. Use this only after judging that the predicate is functional and the kept
 object is authoritative.
 
+Pattern:
+
+```jsonc
+{"action": "surface", "wing": "<w>", "room": "<r>",
+ "text": "<induced rule/lesson>",
+ "supported_by": ["<session id>", "..."]}
+```
+
+If `wing`/`room` are omitted, adoption falls back to the first member when that
+metadata is present, then to the worklist scope. If `supported_by` is omitted,
+adoption falls back to `evidence.support_ids`; empty support is rejected.
+
 ```jsonc
 {"action": "skip"}
 ```
@@ -138,6 +220,8 @@ object is authoritative.
 `wing`/`room`/`supersedes` default to the item's values if omitted.
 For contradiction items, `skip` means the group is legitimately multi-valued or
 not safe to adjudicate.
+For pattern items, `skip` means the rule is unsupported, not generalizable, or
+already covered by an existing filed lesson.
 
 ## Verified mempalace API facts (mempalace 3.5.0)
 
@@ -173,6 +257,7 @@ not safe to adjudicate.
 |-----------|-------------|
 | Non-destructiveness | harvest read-only; live writes only in adopt, only on approved decisions; failed add skips delete |
 | Provenance | `supersedes` on every merge |
+| Groundedness | pattern `support_ids` must cover ≥ `min_support` distinct sessions; empty `supported_by` is rejected |
 | Idempotence / fixpoint | Phase 5 re-harvest → 0 clusters |
 | Bounded cost | scope by wing/room; `tau` gates the pairwise graph |
 
