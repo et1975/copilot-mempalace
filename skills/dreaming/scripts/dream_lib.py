@@ -13,6 +13,7 @@ plain ``decisions``.
 from __future__ import annotations
 
 import math
+import re
 from typing import Any
 
 WORKLIST_VERSION = 1
@@ -131,6 +132,69 @@ def cluster_duplicates(drawers: list[dict[str, Any]], tau: float) -> list[dict[s
     return clusters
 
 
+def extract_session_id(text: str) -> str | None:
+    """Extract the first ``SESSION_ID:<uuid-like>`` token from diary text."""
+    match = re.search(r"SESSION_ID:\s*([0-9a-fA-F-]{8,})", text, re.IGNORECASE)
+    if match is None:
+        return None
+    return match.group(1)
+
+
+def group_observation_themes(
+    entries: list[dict[str, Any]],
+    tau: float,
+    min_support: int,
+    support_key: str = "session_id",
+) -> list[dict[str, Any]]:
+    """Cluster observations into cross-session topical themes.
+
+    Themes are connected components of the ``>= tau`` similarity graph. A theme is
+    retained only when it has at least ``min_support`` distinct non-None
+    provenance values from ``support_key``.
+    """
+    n = len(entries)
+    uf = _UnionFind(n)
+    sims: dict[tuple[int, int], float] = {}
+    for i in range(n):
+        for j in range(i + 1, n):
+            s = cosine_similarity(entries[i]["embedding"], entries[j]["embedding"])
+            if s >= tau:
+                uf.union(i, j)
+                sims[(i, j)] = s
+
+    comps: dict[int, list[int]] = {}
+    for i in range(n):
+        comps.setdefault(uf.find(i), []).append(i)
+
+    themes = []
+    for members in comps.values():
+        members.sort()
+        support_ids = sorted(
+            {entries[i].get(support_key) for i in members if entries[i].get(support_key) is not None}
+        )
+        support = len(support_ids)
+        if support < min_support:
+            continue
+        pair_sims = [
+            {"a": entries[i]["id"], "b": entries[j]["id"], "sim": round(sims[(i, j)], 4)}
+            for i in members
+            for j in members
+            if i < j and (i, j) in sims
+        ]
+        themes.append(
+            {
+                "members": [entries[k] for k in members],
+                "support": support,
+                "support_ids": support_ids,
+                "pair_sims": pair_sims,
+            }
+        )
+    return sorted(
+        themes,
+        key=lambda t: (-t["support"], min(m["id"] for m in t["members"])),
+    )
+
+
 def build_worklist(
     drawers: list[dict[str, Any]],
     tau: float,
@@ -171,6 +235,50 @@ def build_worklist(
         "task": "merge",
         "scope": scope,
         "params": {"tau": tau},
+        "instructions": instructions,
+        "items": items,
+    }
+
+
+def build_pattern_worklist(
+    themes: list[dict[str, Any]],
+    scope: dict[str, Any],
+    params: dict[str, Any],
+    instructions: str | None = None,
+) -> dict[str, Any]:
+    """Produce the deterministic worklist of cross-session pattern candidates."""
+    items = []
+    for idx, t in enumerate(themes):
+        members = t["members"]
+        items.append(
+            {
+                "kind": "pattern",
+                "cluster_id": idx,
+                "members": [
+                    {
+                        "id": m["id"],
+                        "text": m["text"],
+                        "session_id": m.get("session_id"),
+                        "agent": m.get("agent"),
+                        "date": m.get("date"),
+                        "topic": m.get("topic"),
+                    }
+                    for m in members
+                ],
+                "evidence": {
+                    "size": len(members),
+                    "support": t["support"],
+                    "support_ids": t["support_ids"],
+                    "pair_sims": t["pair_sims"],
+                },
+                "decision": None,
+            }
+        )
+    return {
+        "version": WORKLIST_VERSION,
+        "task": "pattern",
+        "scope": scope,
+        "params": params,
         "instructions": instructions,
         "items": items,
     }
@@ -283,6 +391,35 @@ def apply_merge_decisions(decisions: list[dict[str, Any]], writer: Any) -> dict[
             except Exception as exc:  # noqa: BLE001
                 report["errors"].append({"stage": "delete", "id": pid, "error": str(exc)})
         report["merged"] += 1
+    return report
+
+
+def apply_pattern_decisions(decisions: list[dict[str, Any]], writer: Any) -> dict[str, Any]:
+    """Execute approved pattern-surfacing decisions against ``writer``.
+
+    Pattern induction is add-only: approved ``{"action": "surface"}`` decisions
+    write a new drawer, but never delete or invalidate source evidence.
+    """
+    report: dict[str, Any] = {
+        "surfaced": 0,
+        "skipped": 0,
+        "added": [],
+        "errors": [],
+    }
+    for d in decisions:
+        if d.get("action") != "surface":
+            report["skipped"] += 1
+            continue
+        if not d.get("supported_by"):
+            report["errors"].append({"stage": "groundedness", "error": "unsupported rule", "decision": d})
+            continue
+        try:
+            res = writer.add_drawer(d["wing"], d["room"], d["text"])
+            report["added"].append(res)
+            report["surfaced"] += 1
+        except Exception as exc:  # noqa: BLE001 - record and continue, stay add-only
+            report["errors"].append({"stage": "add", "error": str(exc), "decision": d})
+            continue
     return report
 
 
