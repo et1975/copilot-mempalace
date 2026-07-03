@@ -14,12 +14,14 @@ audit hook that nags when an external tool is about to run without a prior `memp
 - **[skills/dreaming/SKILL.md](skills/dreaming/SKILL.md)** — offline consolidation ("dreaming"): a 5-phase
   pipeline (harvest → adjudicate → review → adopt → verify) that merges near-duplicate drawers and resolves
   adjudicated KG contradiction/staleness candidates between sessions, plus `pattern` / `induce` for surfacing
-  grounded cross-session lessons from stamped diary observations.
+  grounded cross-session lessons from stamped diary observations, and `prune` / `forget` for reversible
+  archive-before-delete cleanup of low-salience drawers.
   Cognition stays in the agent, mechanics in Python scripts
   ([`skills/dreaming/scripts/`](skills/dreaming/scripts/)), storage in mempalace. The optional read-only
   `dream_sessions.py` adapter uses Copilot's host session store as a richer pattern substrate. Non-destructive
-  (nothing writes the live palace until an approved `decisions.json` is adopted) with a fixpoint re-harvest as the
-  verify oracle.
+  (nothing writes the live palace until an approved `decisions.json` is adopted; prune writes a lossless JSONL
+  archive before sanctioned delete) with a fixpoint re-harvest as the verify oracle. Native drawer usage-frequency
+  is proposed upstream as MemPalace/mempalace#1921.
   See [`skills/dreaming/references/pipeline.md`](skills/dreaming/references/pipeline.md) for the contract.
 - **[hooks/palace-reflex.json](hooks/palace-reflex.json) + [hooks/palace-reflex.py](hooks/palace-reflex.py)** —
   `PreToolUse` audit hook. Maintains a per-session ring buffer of recent tool calls under `$TMPDIR`. Fires when

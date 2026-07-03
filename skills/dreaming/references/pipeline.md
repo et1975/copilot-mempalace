@@ -93,9 +93,54 @@ MPY=$(head -1 "$(command -v mempalace)" | sed 's/^#!//')
   --rooms diary --min-support 3 --out worklist.json
 ```
 
-### Reserved future tasks
+### Task: prune / forget
 
-- `prune` — drop low-salience drawers.
+- This is the **FORGETTING** task and the only destructive one. Its safety model
+  is therefore inverted: **remove carefully, reversibly**. `merge` preserves
+  source facts by add-then-delete, `contradiction` soft-invalidates KG facts,
+  and `pattern` is add-only; `prune` may delete drawers after approval.
+- Ideal salience is `v(d) = usage-freq × recency × KG-degree`. Because
+  mempalace v1 has no per-drawer usage counter and only `filed_at` (filing
+  time, not last-use time), the shipped score is a composite of observable
+  signals: age from `filed_at`, KG source-degree (`source_drawer_id` triple
+  count), redundancy (maximum cosine similarity to neighbours), and ephemeral
+  marker negatives (`for now`, `one-off`, `scratch`, etc.). True usage-frequency
+  is deferred to a session-store oracle or native upstream salience.
+- Candidate selection is the guardrail heart: **multi-gate AND**, never OR. A
+  drawer is proposed only when `v < v_min` AND `age_days >= age_floor_days` AND
+  `kg_degree == 0` AND it is not pinned. The `kg_degree == 0` gate also means the
+  pruned drawer sourced no KG triples, so deletion cannot orphan the graph.
+- Adoption is archive-not-delete: each pruned drawer is appended as a full record
+  (including `salience` and `pruned_at`) to an append-only JSONL cold store,
+  flushed and `fsync`ed, and only then deleted through the sanctioned
+  `mempalace_delete_drawer` handler, which purges the closet/AAAK index. A
+  failed archive deletes nothing; the archive is lossless and reversible.
+- Apply has a protected re-check: drawers with `kg_degree > 0` or `pinned` are
+  refused even if adjudication said `prune`.
+- Steering-sensitive: this is where steering `θ` bites hardest. "Focus on X"
+  reweights salience; "preserve X" pins a fixed point that should not be pruned.
+- Fixpoint is a maintenance loop, not one-shot convergence: re-harvest should
+  remove approved candidates from the current pass, but cold/redundant drawers
+  will appear over time as the palace evolves.
+
+Harvest:
+
+```bash
+MPY=$(head -1 "$(command -v mempalace)" | sed 's/^#!//')
+"$MPY" dream_harvest.py --palace <palace> --task prune --wing <wing> \
+  --room <room> --v-min 0.35 --age-floor-days 30 --out worklist.json
+```
+
+Adopt:
+
+```bash
+"$MPY" dream_adopt.py --palace <palace> --decisions decisions.json \
+  --archive-file archive.jsonl --dry-run
+"$MPY" dream_adopt.py --palace <palace> --decisions decisions.json \
+  --archive-file archive.jsonl
+```
+
+### Future task shape
 
 Additional worklist `kind`s should keep the same harvest/adjudicate/adopt shape.
 
@@ -181,6 +226,36 @@ Pattern worklist:
 }
 ```
 
+Prune worklist:
+
+```jsonc
+{
+  "version": 1,
+  "task": "prune",
+  "scope": {"palace": "<path>", "wing": "<w>", "room": "<r|null>", "task": "prune"},
+  "params": {"v_min": 0.35, "age_floor_days": 30},
+  "instructions": "<optional steering|null>",
+  "items": [
+    {
+      "kind": "prune",
+      "id": "<logical id>",
+      "member_ids": ["<physical id>", "..."],
+      "text": "<drawer text>",
+      "wing": "<w>",
+      "room": "<r>",
+      "salience": {
+        "age_days": 45,
+        "kg_degree": 0,
+        "redundancy": 0.94,
+        "negatives": true,
+        "v": 0.12
+      },
+      "decision": null
+    }
+  ]
+}
+```
+
 ### `decisions.json` (agent → adopt)
 
 Same document with each `item.decision` set to one of:
@@ -213,6 +288,20 @@ If `wing`/`room` are omitted, adoption falls back to the first member when that
 metadata is present, then to the worklist scope. If `supported_by` is omitted,
 adoption falls back to `evidence.support_ids`; empty support is rejected.
 
+Prune:
+
+```jsonc
+{"action": "prune"}
+```
+
+```jsonc
+{"action": "keep"}
+```
+
+If a prune decision is omitted, adoption defaults to `keep` (conservative). A
+`prune` decision may also repeat `id`, `member_ids`, `wing`, `room`, `text`, or
+`salience`; omitted values fall back to the worklist item.
+
 ```jsonc
 {"action": "skip"}
 ```
@@ -222,6 +311,8 @@ For contradiction items, `skip` means the group is legitimately multi-valued or
 not safe to adjudicate.
 For pattern items, `skip` means the rule is unsupported, not generalizable, or
 already covered by an existing filed lesson.
+For prune items, use `keep` rather than `skip`; missing or non-`prune` decisions
+are treated as keep.
 
 ## Verified mempalace API facts (mempalace 3.5.0)
 
@@ -255,10 +346,12 @@ already covered by an existing filed lesson.
 
 | Invariant | Enforced by |
 |-----------|-------------|
-| Non-destructiveness | harvest read-only; live writes only in adopt, only on approved decisions; failed add skips delete |
+| Non-destructiveness / reversibility | harvest read-only; live writes only in adopt, only on approved decisions; failed add skips delete; prune archives full records before delete and a failed archive deletes nothing |
 | Provenance | `supersedes` on every merge |
 | Groundedness | pattern `support_ids` must cover ≥ `min_support` distinct sessions; empty `supported_by` is rejected |
-| Idempotence / fixpoint | Phase 5 re-harvest → 0 clusters |
+| Salience-gated protected classes | prune requires `v < v_min` AND age floor AND `kg_degree == 0` AND not pinned; apply refuses KG-connected or pinned drawers |
+| Auditability | prune archive records include drawer text, member ids, salience components, and `pruned_at` |
+| Idempotence / fixpoint | Phase 5 re-harvest → 0 merge clusters / resolved functional contradictions; pattern and prune are maintenance loops rather than one-shot convergence |
 | Bounded cost | scope by wing/room; `tau` gates the pairwise graph |
 
 ## Upstream evolution (why harvest imports mempalace)
@@ -275,3 +368,9 @@ coupling), exact-cosine, and scalable. See
 [`upstream-find-duplicates-proposal.md`](upstream-find-duplicates-proposal.md)
 for the paste-ready proposal. Until that lands, the script-based harvest here is
 the working approach.
+
+For prune, the clean long-term fix is native per-drawer salience dynamics:
+MemPalace/mempalace#1921 would add drawer usage-frequency / last-activated
+signals so `usage-freq` becomes native instead of proxied by host session data or
+observable heuristics. See
+[`upstream-drawer-salience-proposal.md`](upstream-drawer-salience-proposal.md).
