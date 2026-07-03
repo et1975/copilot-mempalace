@@ -100,6 +100,76 @@ class TestBuildWorklist(unittest.TestCase):
         self.assertEqual(item["evidence"]["size"], 2)
 
 
+class TestGroupContradictions(unittest.TestCase):
+    def test_groups_same_subject_predicate_with_distinct_objects(self):
+        triples = [
+            {"subject": "Alice", "predicate": "lives_in", "object": "Portland",
+             "valid_from": "2024-01-01", "extracted_at": "2024-01-02"},
+            {"subject": "Alice", "predicate": "lives_in", "object": "Seattle",
+             "valid_from": "2025-01-01", "extracted_at": "2025-01-02"},
+            {"subject": "Alice", "predicate": "lives_in", "object": "Seattle",
+             "valid_from": "2025-01-01", "extracted_at": "2025-01-02"},
+            {"subject": "Bob", "predicate": "lives_in", "object": "Portland",
+             "valid_from": "2025-01-01", "extracted_at": "2025-01-02"},
+            {"subject": "Alice", "predicate": "works_at", "object": "Contoso",
+             "valid_from": "2025-01-01", "extracted_at": "2025-01-02"},
+        ]
+
+        clusters = dl.group_contradictions(triples)
+
+        self.assertEqual(len(clusters), 1)
+        self.assertEqual(clusters[0]["subject"], "Alice")
+        self.assertEqual(clusters[0]["predicate"], "lives_in")
+        self.assertEqual(clusters[0]["newest_object"], "Seattle")
+        self.assertEqual([c["object"] for c in clusters[0]["candidates"]], ["Seattle", "Portland"])
+
+    def test_distinct_groups_stay_separate_and_order_deterministically(self):
+        triples = [
+            {"subject": "Zoe", "predicate": "status_is", "object": "active",
+             "valid_from": None, "extracted_at": "2025-01-02"},
+            {"subject": "Zoe", "predicate": "status_is", "object": "paused",
+             "valid_from": None, "extracted_at": "2025-01-01"},
+            {"subject": "Alice", "predicate": "lives_in", "object": "Seattle",
+             "valid_from": "2025-01-01", "extracted_at": "2025-01-01"},
+            {"subject": "Alice", "predicate": "lives_in", "object": "Portland",
+             "valid_from": "2024-01-01", "extracted_at": "2024-01-01"},
+        ]
+
+        clusters = dl.group_contradictions(triples)
+
+        self.assertEqual([(c["subject"], c["predicate"]) for c in clusters],
+                         [("Alice", "lives_in"), ("Zoe", "status_is")])
+        self.assertEqual(clusters[1]["newest_object"], "active")
+
+
+class TestBuildContradictionWorklist(unittest.TestCase):
+    def test_shape_and_evidence(self):
+        triples = [
+            {"subject": "Alice", "predicate": "lives_in", "object": "Portland",
+             "valid_from": "2024-01-01", "extracted_at": "2024-01-02"},
+            {"subject": "Alice", "predicate": "lives_in", "object": "Seattle",
+             "valid_from": "2025-01-01", "extracted_at": "2025-01-02"},
+        ]
+
+        wl = dl.build_contradiction_worklist(
+            triples,
+            scope={"palace": "/p", "task": "contradiction"},
+            instructions="prefer sourced facts",
+        )
+
+        self.assertEqual(wl["version"], dl.WORKLIST_VERSION)
+        self.assertEqual(wl["task"], "contradiction")
+        self.assertEqual(wl["scope"], {"palace": "/p", "task": "contradiction"})
+        self.assertEqual(wl["params"], {})
+        self.assertEqual(wl["instructions"], "prefer sourced facts")
+        self.assertEqual(len(wl["items"]), 1)
+        item = wl["items"][0]
+        self.assertEqual(item["kind"], "contradiction")
+        self.assertIsNone(item["decision"])
+        self.assertEqual(item["evidence"]["size"], 2)
+        self.assertEqual(item["evidence"]["newest_object"], "Seattle")
+
+
 class _FakeWriter:
     def __init__(self, fail_add=False):
         self.calls = []
@@ -114,6 +184,18 @@ class _FakeWriter:
     def delete_drawer(self, drawer_id):
         self.calls.append(("delete", drawer_id))
         return {"success": True}
+
+
+class _FakeKgWriter:
+    def __init__(self, fail_objects=None):
+        self.calls = []
+        self.fail_objects = set(fail_objects or [])
+
+    def invalidate(self, subject, predicate, object, ended=None):
+        self.calls.append((subject, predicate, object, ended))
+        if object in self.fail_objects:
+            raise RuntimeError(f"cannot invalidate {object}")
+        return {"invalidated": 1}
 
 
 class TestApplyDecisions(unittest.TestCase):
@@ -142,6 +224,46 @@ class TestApplyDecisions(unittest.TestCase):
         self.assertEqual(report["merged"], 0)
         self.assertEqual(len(report["errors"]), 1)
         self.assertNotIn(("delete", "a"), w.calls)  # non-destructive on add failure
+
+
+class TestApplyContradictionDecisions(unittest.TestCase):
+    def test_invalidate_calls_writer_for_each_object_and_counts_skip(self):
+        w = _FakeKgWriter()
+        decisions = [
+            {"action": "invalidate", "subject": "Alice", "predicate": "lives_in",
+             "invalidate": ["Portland", "Seattle"]},
+            {"action": "skip"},
+        ]
+
+        report = dl.apply_contradiction_decisions(decisions, w)
+
+        self.assertEqual(report["invalidated"], 1)
+        self.assertEqual(report["skipped"], 1)
+        self.assertEqual(w.calls, [
+            ("Alice", "lives_in", "Portland", None),
+            ("Alice", "lives_in", "Seattle", None),
+        ])
+        self.assertEqual(report["invalidated_facts"], [
+            {"subject": "Alice", "predicate": "lives_in", "object": "Portland"},
+            {"subject": "Alice", "predicate": "lives_in", "object": "Seattle"},
+        ])
+
+    def test_writer_error_is_recorded_and_later_objects_still_process(self):
+        w = _FakeKgWriter(fail_objects={"Portland"})
+        decisions = [
+            {"action": "invalidate", "subject": "Alice", "predicate": "lives_in",
+             "invalidate": ["Portland", "Seattle"]},
+        ]
+
+        report = dl.apply_contradiction_decisions(decisions, w)
+
+        self.assertEqual(report["invalidated"], 1)
+        self.assertEqual(len(report["errors"]), 1)
+        self.assertEqual(report["errors"][0]["object"], "Portland")
+        self.assertIn("cannot invalidate Portland", report["errors"][0]["error"])
+        self.assertEqual(report["invalidated_facts"], [
+            {"subject": "Alice", "predicate": "lives_in", "object": "Seattle"},
+        ])
 
 
 if __name__ == "__main__":

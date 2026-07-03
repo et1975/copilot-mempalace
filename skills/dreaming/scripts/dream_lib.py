@@ -168,8 +168,83 @@ def build_worklist(
         )
     return {
         "version": WORKLIST_VERSION,
+        "task": "merge",
         "scope": scope,
         "params": {"tau": tau},
+        "instructions": instructions,
+        "items": items,
+    }
+
+
+def group_contradictions(triples: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Group active KG triples that disagree on object for a subject/predicate.
+
+    A group is only a structural candidate: predicates may be legitimately
+    multi-valued, so the agent decides whether to invalidate anything.
+    """
+    grouped: dict[tuple[str, str], dict[str, dict[str, Any]]] = {}
+    for t in triples:
+        key = (t["subject"], t["predicate"])
+        object_name = t["object"]
+        candidate = {
+            "object": object_name,
+            "valid_from": t.get("valid_from"),
+            "extracted_at": t.get("extracted_at"),
+        }
+        objects = grouped.setdefault(key, {})
+        current = objects.get(object_name)
+        if current is None or _contradiction_recency_key(candidate) > _contradiction_recency_key(current):
+            objects[object_name] = candidate
+
+    clusters = []
+    for (subject, predicate), objects in grouped.items():
+        if len(objects) < 2:
+            continue
+        candidates = sorted(objects.values(), key=lambda c: c["object"])
+        candidates.sort(key=_contradiction_recency_key, reverse=True)
+        clusters.append(
+            {
+                "subject": subject,
+                "predicate": predicate,
+                "candidates": candidates,
+                "newest_object": candidates[0]["object"],
+            }
+        )
+    return sorted(clusters, key=lambda c: (c["subject"], c["predicate"]))
+
+
+def _contradiction_recency_key(candidate: dict[str, Any]) -> tuple[str, str]:
+    return (candidate.get("valid_from") or "", candidate.get("extracted_at") or "")
+
+
+def build_contradiction_worklist(
+    triples: list[dict[str, Any]],
+    scope: dict[str, Any],
+    instructions: str | None = None,
+) -> dict[str, Any]:
+    """Produce the deterministic worklist of KG contradiction candidates."""
+    clusters = group_contradictions(triples)
+    items = []
+    for idx, c in enumerate(clusters):
+        items.append(
+            {
+                "kind": "contradiction",
+                "cluster_id": idx,
+                "subject": c["subject"],
+                "predicate": c["predicate"],
+                "candidates": c["candidates"],
+                "evidence": {
+                    "size": len(c["candidates"]),
+                    "newest_object": c["newest_object"],
+                },
+                "decision": None,
+            }
+        )
+    return {
+        "version": WORKLIST_VERSION,
+        "task": "contradiction",
+        "scope": scope,
+        "params": {},
         "instructions": instructions,
         "items": items,
     }
@@ -208,4 +283,37 @@ def apply_merge_decisions(decisions: list[dict[str, Any]], writer: Any) -> dict[
             except Exception as exc:  # noqa: BLE001
                 report["errors"].append({"stage": "delete", "id": pid, "error": str(exc)})
         report["merged"] += 1
+    return report
+
+
+def apply_contradiction_decisions(decisions: list[dict[str, Any]], writer: Any) -> dict[str, Any]:
+    """Execute approved KG invalidation decisions against ``writer``."""
+    report: dict[str, Any] = {
+        "invalidated": 0,
+        "skipped": 0,
+        "invalidated_facts": [],
+        "errors": [],
+    }
+    for d in decisions:
+        if d.get("action") != "invalidate":
+            report["skipped"] += 1
+            continue
+        subject = d["subject"]
+        predicate = d["predicate"]
+        for obj in d.get("invalidate", []):
+            try:
+                writer.invalidate(subject, predicate, obj)
+                report["invalidated_facts"].append(
+                    {"subject": subject, "predicate": predicate, "object": obj}
+                )
+            except Exception as exc:  # noqa: BLE001 - record and continue, stay soft
+                report["errors"].append(
+                    {
+                        "error": str(exc),
+                        "subject": subject,
+                        "predicate": predicate,
+                        "object": obj,
+                    }
+                )
+        report["invalidated"] += 1
     return report
