@@ -104,3 +104,18 @@ Same document with each `item.decision` set to one of:
 | Provenance | `supersedes` on every merge |
 | Idempotence / fixpoint | Phase 5 re-harvest → 0 clusters |
 | Bounded cost | scope by wing/room; `tau` gates the pairwise graph |
+
+## Upstream evolution (why harvest imports mempalace)
+
+Harvest reads the ChromaDB collection directly (via `mempalace.palace.get_collection`)
+because **no MCP tool exposes raw embeddings or a bulk near-duplicate scan** —
+`mempalace_search` is query-based top-N only, and `mempalace dedup` is
+destructive keep-longest, not a cluster finder. That direct read is the sole
+reason the scripts need a Python that can `import mempalace`.
+
+The clean long-term fix is a **read-only server-side cluster finder** upstream in
+MemPalace, which would make this pipeline fully MCP-native (no library/venv
+coupling), exact-cosine, and scalable. See
+[`upstream-find-duplicates-proposal.md`](upstream-find-duplicates-proposal.md)
+for the paste-ready proposal. Until that lands, the script-based harvest here is
+the working approach.
