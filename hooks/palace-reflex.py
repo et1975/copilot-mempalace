@@ -68,6 +68,32 @@ BROAD_PROBE_PATTERNS = (
 SATISFY_PATTERN = re.compile(r"mempalace_search")
 SATISFY_TOKEN = "satisfy"
 
+# Rule 2 (routing audit): store_memory persists to Copilot's built-in memory,
+# which is best for short always-on instincts. Project/code-scoped facts and
+# decisions usually belong in a MemPalace drawer instead. When a store_memory
+# call looks project-scoped and no MemPalace activity is in the window, nudge.
+STORE_MEMORY_PATTERN = re.compile(r"^(?:store_memory|manage_memory)$", _I)
+
+# Any recent buffer token mentioning mempalace (a drawer/kg/diary write, whose
+# raw name is e.g. mempalace-mempalace_add_drawer) indicates the palace is
+# already in use this window; combined with the search "satisfy" token it
+# suppresses the routing nudge.
+MEMPALACE_TOKEN = re.compile(r"mempalace")
+
+# High-precision signals that a fact is about a codebase (paths, file names with
+# a code extension, or a commit-ish hash) → drawer material, not an always-on
+# instinct. Kept conservative to avoid nagging on genuine universal preferences.
+PROJECT_SCOPE_PATTERNS = (
+    re.compile(r"(?<![\w-])[\w.-]+/[\w./-]*\w"),  # a slash-joined path
+    re.compile(
+        r"\.(?:py|fsx?|fsi|fsproj|tsx?|jsx?|go|rs|rb|json|ya?ml|md|sh|toml|cs|cpp|c|h|sql)\b",
+        _I,
+    ),  # a code/config file extension
+    re.compile(
+        r"(?<![\w])(?=[0-9a-f]*[a-f])(?=[0-9a-f]*[0-9])[0-9a-f]{7,40}(?![\w])"
+    ),  # commit-ish hash (mixed hex: needs a letter a-f AND a digit)
+)
+
 WINDOW = 6
 SAFE_SESSION = re.compile(r"[^A-Za-z0-9_.-]")
 
@@ -137,6 +163,32 @@ def is_trigger(tool_name: str, tool_input: dict, recent_caps: list[str]) -> bool
     return False
 
 
+def is_project_scoped_memory(tool_input: dict) -> bool:
+    """True if a store_memory fact reads as project/code-scoped (drawer material)."""
+    text = " ".join(
+        arg(tool_input, k) for k in ("fact", "citations", "reason", "subject")
+    )
+    return any(p.search(text) for p in PROJECT_SCOPE_PATTERNS)
+
+
+def reminder(tool_name: str) -> str:
+    return (
+        f"[palace-reflex] About to call '{tool_name}' without a recent "
+        "mempalace_search in this session. Consider calling mempalace_search "
+        "first; skip only for pure syntax Q&A, a single trivial edit, or if "
+        "the user said 'don't check memory'."
+    )
+
+
+ROUTING_REMINDER = (
+    "[palace-reflex] This store_memory looks project/code-scoped (paths, file "
+    "names, or a commit hash). Project decisions and code rationale usually "
+    "belong in a MemPalace drawer (mempalace_add_drawer) — store_memory is best "
+    "for short, always-on universal instincts. Consider filing a drawer too; "
+    "skip if this really is a brief universal preference."
+)
+
+
 def main() -> int:
     try:
         payload = json.load(sys.stdin)
@@ -145,6 +197,8 @@ def main() -> int:
 
     tool_name = str(payload.get("tool_name", ""))
     tool_input = payload.get("tool_input") or {}
+    if not isinstance(tool_input, dict):
+        tool_input = {}
     session_id = str(payload.get("session_id", ""))
     if not tool_name:
         return 0
@@ -152,19 +206,21 @@ def main() -> int:
     path = buffer_path(session_id)
     recent = load_recent(path)  # canonical tokens from earlier calls in window
     satisfied = SATISFY_TOKEN in recent
-    triggered = is_trigger(
-        tool_name, tool_input if isinstance(tool_input, dict) else {}, recent
-    )
+    palace_engaged = satisfied or any(MEMPALACE_TOKEN.search(t) for t in recent)
+
+    msg: str | None = None
+    if is_trigger(tool_name, tool_input, recent) and not satisfied:
+        msg = reminder(tool_name)
+    elif (
+        STORE_MEMORY_PATTERN.match(tool_name)
+        and is_project_scoped_memory(tool_input)
+        and not palace_engaged
+    ):
+        msg = ROUTING_REMINDER
 
     append(path, canonical_token(tool_name))
 
-    if triggered and not satisfied:
-        msg = (
-            f"[palace-reflex] About to call '{tool_name}' without a recent "
-            "mempalace_search in this session. Consider calling mempalace_search "
-            "first; skip only for pure syntax Q&A, a single trivial edit, or if "
-            "the user said 'don't check memory'."
-        )
+    if msg is not None:
         json.dump(
             {
                 "hookSpecificOutput": {
