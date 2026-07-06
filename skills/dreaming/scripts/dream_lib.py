@@ -217,18 +217,36 @@ def drawer_salience(
     now: datetime,
     half_life_days: float = 180.0,
     weights: dict[str, float] | None = None,
+    usage: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Score one drawer for pruning; lower ``v`` means weaker / more prunable."""
     age_days = _age_days(drawer.get("filed_at"), now)
     negatives = _detect_ephemeral(drawer.get("text", ""))
     recency = math.exp(-age_days / half_life_days) if half_life_days > 0.0 else 0.0
     deg = min(max(kg_degree, 0), DEG_CAP) / DEG_CAP
+    access_count = 0
+    strength = 0.0
+    if usage is not None:
+        try:
+            access_count = max(0, int(usage.get("access_count") or 0))
+        except (TypeError, ValueError):
+            access_count = 0
+        try:
+            strength = _clamp01(float(usage.get("strength") or 0.0))
+        except (TypeError, ValueError):
+            strength = 0.0
+    usage_known = access_count > 0
+    usage_signal = 0.0
+    if usage_known:
+        count_score = _clamp01(math.log1p(access_count) / math.log1p(50.0))
+        usage_signal = (count_score + strength) / 2.0
 
     w = {
         "recency": 0.4,
         "kg_degree": 0.4,
         "redundancy": 0.3,
         "negatives": 0.5,
+        "usage": 0.2,
     }
     if weights is not None:
         w.update(weights)
@@ -236,6 +254,7 @@ def drawer_salience(
     v = _clamp01(
         w["recency"] * recency
         + w["kg_degree"] * deg
+        + w["usage"] * usage_signal
         - w["redundancy"] * _clamp01(redundancy)
         - (w["negatives"] if negatives else 0.0)
     )
@@ -245,6 +264,8 @@ def drawer_salience(
         "kg_degree": kg_degree,
         "redundancy": round(redundancy, 4),
         "negatives": negatives,
+        "access_count": access_count,
+        "usage_known": usage_known,
         "v": round(v, 4),
     }
 
@@ -713,15 +734,57 @@ def apply_pattern_decisions(decisions: list[dict[str, Any]], writer: Any, min_su
 
 
 def apply_contradiction_decisions(decisions: list[dict[str, Any]], writer: Any) -> dict[str, Any]:
-    """Execute approved KG triple invalidation decisions against ``writer``."""
+    """Execute approved KG contradiction decisions against ``writer``.
+
+    ``{"action": "supersede", "subject", "predicate", "keep", "retire": [old]}``
+    calls ``writer.supersede``. Supersede decisions with multiple retired
+    objects are rejected; use ``action == "invalidate"`` for multi-retire cases.
+    """
     report: dict[str, Any] = {
         "invalidated": 0,
+        "superseded": 0,
         "skipped": 0,
         "invalidated_facts": [],
         "errors": [],
     }
     for d in decisions:
-        if d.get("action") != "invalidate":
+        action = d.get("action")
+        if action == "supersede":
+            retire = list(d.get("retire") or [])
+            keep = d.get("keep")
+            subject = d.get("subject")
+            predicate = d.get("predicate")
+            if len(retire) != 1:
+                report["errors"].append(
+                    {
+                        "stage": "groundedness",
+                        "error": "supersede requires exactly one retired object",
+                        "decision": d,
+                    }
+                )
+                continue
+            if keep is None or subject is None or predicate is None:
+                report["errors"].append(
+                    {
+                        "stage": "groundedness",
+                        "error": "supersede requires subject, predicate, and keep",
+                        "decision": d,
+                    }
+                )
+                continue
+            try:
+                writer.supersede(subject, predicate, retire[0], keep)
+                report["superseded"] += 1
+            except Exception as exc:  # noqa: BLE001 - record and continue, stay soft
+                report["errors"].append(
+                    {
+                        "stage": "supersede",
+                        "error": str(exc),
+                        "decision": d,
+                    }
+                )
+            continue
+        if action != "invalidate":
             report["skipped"] += 1
             continue
         triple_ids = list(d.get("invalidate") or [])
@@ -729,9 +792,18 @@ def apply_contradiction_decisions(decisions: list[dict[str, Any]], writer: Any) 
             report["errors"].append({"stage": "groundedness", "error": "no triples selected", "decision": d})
             continue
         try:
-            writer.invalidate_triples(triple_ids)
-            report["invalidated"] += len(triple_ids)
+            n = writer.invalidate_triples(triple_ids)
+            report["invalidated"] += n
             report["invalidated_facts"].extend({"triple_id": tid} for tid in triple_ids)
+            if n != len(triple_ids):
+                report["errors"].append(
+                    {
+                        "stage": "failed_adopt",
+                        "error": f"invalidated {n} of {len(triple_ids)}",
+                        "triple_ids": triple_ids,
+                        "decision": d,
+                    }
+                )
         except Exception as exc:  # noqa: BLE001 - record and continue, stay soft
             report["errors"].append(
                 {
