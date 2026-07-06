@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from typing import Any
 
@@ -46,16 +47,42 @@ def _resolve_decisions(worklist: dict[str, Any]) -> list[dict[str, Any]]:
             continue
         members = item.get("members", [])
         first = members[0] if members else {}
+        supersedes = decision.get("supersedes") or item.get("supersedes")
+        if not supersedes:
+            supersedes = [pid for member in members for pid in member.get("member_ids", [member["id"]])]
         resolved.append(
             {
                 "action": "merge",
                 "wing": decision.get("wing") or first.get("wing"),
                 "room": decision.get("room") or first.get("room"),
-                "text": decision["text"],
-                "supersedes": decision.get("supersedes") or item.get("supersedes", []),
+                "text": decision.get("text", ""),
+                "supersedes": supersedes,
+                "sources": [
+                    {
+                        "id": member["id"],
+                        "content_hash": member.get("content_hash") or (item.get("content_hashes") or {}).get(member["id"]),
+                    }
+                    for member in members
+                ],
             }
         )
     return resolved
+
+
+def _candidate_triple_ids(candidate: dict[str, Any]) -> list[Any]:
+    triple_ids = list(candidate.get("triple_ids") or [])
+    if candidate.get("triple_id") is not None and candidate["triple_id"] not in triple_ids:
+        triple_ids.append(candidate["triple_id"])
+    return triple_ids
+
+
+def _candidate_matches(candidate: dict[str, Any], selected: Any) -> bool:
+    return selected in {
+        candidate.get("object"),
+        candidate.get("object_id"),
+        candidate.get("triple_id"),
+        *list(candidate.get("triple_ids") or []),
+    }
 
 
 def _resolve_contradiction_decisions(worklist: dict[str, Any]) -> list[dict[str, Any]]:
@@ -66,13 +93,27 @@ def _resolve_contradiction_decisions(worklist: dict[str, Any]) -> list[dict[str,
         if not decision or decision.get("action") != "invalidate":
             resolved.append({"action": "skip"})
             continue
-        invalidate = decision.get("invalidate")
-        if invalidate is None:
+        candidates = item.get("candidates", [])
+        selected = decision.get("invalidate")
+        if selected is None:
             keep = decision.get("keep")
             invalidate = [
-                c["object"] for c in item.get("candidates", [])
-                if c.get("object") != keep
+                triple_id
+                for c in candidates
+                if not _candidate_matches(c, keep)
+                for triple_id in _candidate_triple_ids(c)
             ]
+        else:
+            invalidate = []
+            for value in selected:
+                matches = [c for c in candidates if _candidate_matches(c, value)]
+                if matches:
+                    invalidate.extend(
+                        triple_id for c in matches for triple_id in _candidate_triple_ids(c)
+                    )
+                else:
+                    invalidate.append(value)
+        invalidate = list(dict.fromkeys(invalidate))
         resolved.append(
             {
                 "action": "invalidate",
@@ -105,13 +146,15 @@ def _resolve_pattern_decisions(worklist: dict[str, Any]) -> list[dict[str, Any]]
         members = item.get("members", [])
         first = members[0] if members else {}
         evidence = item.get("evidence", {})
+        supported_by = list(decision.get("supported_by") or [])
         resolved.append(
             {
                 "action": "surface",
                 "wing": decision.get("wing") or first.get("wing") or scope.get("wing"),
                 "room": decision.get("room") or first.get("room") or _first_scope_room(scope),
                 "text": decision["text"],
-                "supported_by": decision.get("supported_by") or evidence.get("support_ids", []),
+                "supported_by": supported_by,
+                "allowed_support": list(evidence.get("support_ids", [])),
             }
         )
     return resolved
@@ -133,6 +176,9 @@ def _resolve_prune_decisions(worklist: dict[str, Any]) -> list[dict[str, Any]]:
                 "wing": decision.get("wing") or item.get("wing"),
                 "room": decision.get("room") or item.get("room"),
                 "text": decision.get("text") or item.get("text", ""),
+                "content_hash": decision.get("content_hash") or item.get("content_hash"),
+                "pinned": decision.get("pinned", item.get("pinned", False)),
+                "topic": decision.get("topic") or item.get("topic"),
                 "salience": decision.get("salience") or item.get("salience", {}),
             }
         )
@@ -143,7 +189,14 @@ class _DryRunWriter:
     def __init__(self) -> None:
         self.planned: list[str] = []
 
-    def add_drawer(self, wing: str, room: str, content: str) -> Any:
+    def add_drawer(
+        self,
+        wing: str,
+        room: str,
+        content: str,
+        added_by: str = "dreaming",
+        metadata: dict[str, Any] | None = None,
+    ) -> Any:
         preview = content.replace("\n", " ")[:60]
         self.planned.append(f"ADD  {wing}/{room}: {preview}...")
         return {"drawer_id": "dry-run"}
@@ -157,9 +210,9 @@ class _DryRunKgWriter:
     def __init__(self) -> None:
         self.planned: list[str] = []
 
-    def invalidate(self, subject: str, predicate: str, object: str, ended: str | None = None) -> Any:
-        self.planned.append(f"INVALIDATE {subject} {predicate}={object}")
-        return {"success": True}
+    def invalidate_triples(self, triple_ids: list[str], ended: str | None = None) -> int:
+        self.planned.append(f"INVALIDATE_TRIPLES {', '.join(str(tid) for tid in triple_ids)}")
+        return len(triple_ids)
 
 
 class _DryRunArchiver:
@@ -167,8 +220,141 @@ class _DryRunArchiver:
         self.planned: list[str] = []
 
     def archive_then_delete(self, record: dict[str, Any]) -> dict[str, Any]:
-        self.planned.append(f"PRUNE {record['id']} (archive+delete)")
+        member_ids = record.get("member_ids", [record["id"]])
+        if record.get("reason") == "merge":
+            self.planned.append(f"ARCHIVE+DELETE {member_ids}")
+        else:
+            self.planned.append(f"PRUNE {record['id']} (archive+delete)")
         return {"archived": record["id"], "deleted": record.get("member_ids", [record["id"]])}
+
+
+def _min_support(worklist: dict[str, Any]) -> int:
+    return int((worklist.get("params") or {}).get("min_support", 1))
+
+
+def _archive_writability_errors(archive_file: str) -> list[dict[str, Any]]:
+    parent = os.path.abspath(os.path.dirname(archive_file) or os.getcwd())
+    probe = parent
+    while probe and not os.path.exists(probe):
+        next_probe = os.path.dirname(probe)
+        if next_probe == probe:
+            break
+        probe = next_probe
+    if not os.path.isdir(probe) or not os.access(probe, os.W_OK | os.X_OK):
+        return [{"stage": "preflight", "error": f"archive path is not writable: {archive_file}"}]
+    return []
+
+
+def _same_text_drawer_exists(path: str, decision: dict[str, Any]) -> bool:
+    text = (decision.get("text") or "").strip()
+    if not text:
+        return False
+    try:
+        drawers = dream_palace.load_logical_drawers(path, wing=decision.get("wing"), room=decision.get("room"))
+    except Exception:  # noqa: BLE001 - dry-run duplicate checks are best effort
+        return False
+    return any((drawer.get("text") or "").strip() == text for drawer in drawers)
+
+
+def _filter_duplicate_adds(path: str, decisions: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    filtered = []
+    errors = []
+    for decision in decisions:
+        if decision.get("action") in {"merge", "surface"} and _same_text_drawer_exists(path, decision):
+            errors.append({"stage": "duplicate", "error": "drawer text already exists", "decision": decision})
+            filtered.append({"action": "skip"})
+        else:
+            filtered.append(decision)
+    return filtered, errors
+
+
+def _merge_drift_errors(path: str, decision: dict[str, Any]) -> list[dict[str, Any]]:
+    errors = []
+    for source in decision.get("sources", []):
+        expected = source.get("content_hash")
+        if not expected:
+            continue
+        drawer_id = source["id"]
+        try:
+            live = dream_palace.load_drawer_by_id(path, drawer_id)
+        except Exception as exc:  # noqa: BLE001
+            errors.append({"stage": "drift", "error": str(exc), "drawer_id": drawer_id, "decision": decision})
+            continue
+        if live is None:
+            errors.append({"stage": "drift", "error": "drawer missing", "drawer_id": drawer_id, "decision": decision})
+        elif live.get("content_hash") != expected:
+            errors.append({"stage": "drift", "error": "content hash changed", "drawer_id": drawer_id, "decision": decision})
+    return errors
+
+
+def _preflight_merge_decisions(path: str, decisions: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    filtered = []
+    errors = []
+    for decision in decisions:
+        if decision.get("action") != "merge":
+            filtered.append(decision)
+            continue
+        drift_errors = _merge_drift_errors(path, decision)
+        if drift_errors:
+            errors.extend(drift_errors)
+            filtered.append({"action": "skip"})
+        else:
+            filtered.append(decision)
+    return filtered, errors
+
+
+def _preflight_prune_decisions(path: str, decisions: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    try:
+        degrees = dream_palace.kg_source_degree(path)
+    except Exception as exc:  # noqa: BLE001
+        return (
+            [{"action": "keep"} if d.get("action") == "prune" else d for d in decisions],
+            [{"stage": "preflight", "error": str(exc), "decision": d} for d in decisions if d.get("action") == "prune"],
+        )
+
+    filtered = []
+    errors = []
+    for decision in decisions:
+        if decision.get("action") != "prune":
+            filtered.append(decision)
+            continue
+        drawer_id = decision["id"]
+        try:
+            live = dream_palace.load_drawer_by_id(path, drawer_id)
+        except Exception as exc:  # noqa: BLE001
+            errors.append({"stage": "drift", "error": str(exc), "drawer_id": drawer_id, "decision": decision})
+            filtered.append({"action": "keep"})
+            continue
+        if live is None:
+            errors.append({"stage": "drift", "error": "drawer missing", "drawer_id": drawer_id, "decision": decision})
+            filtered.append({"action": "keep"})
+            continue
+        expected = decision.get("content_hash")
+        if expected and live.get("content_hash") != expected:
+            errors.append({"stage": "drift", "error": "content hash changed", "drawer_id": drawer_id, "decision": decision})
+            filtered.append({"action": "keep"})
+            continue
+        live_pinned = bool((live.get("metadata") or {}).get("pinned", False))
+        live_degree = int(degrees.get(drawer_id, 0))
+        if live_pinned or live_degree > 0:
+            reason = "pinned" if live_pinned else "kg-connected"
+            errors.append({"stage": "protected", "error": reason, "drawer_id": drawer_id, "decision": decision})
+            filtered.append({"action": "keep"})
+            continue
+        salience = dict(decision.get("salience") or {})
+        salience["kg_degree"] = live_degree
+        filtered.append({**decision, "pinned": live_pinned, "salience": salience})
+    return filtered, errors
+
+
+def _add_preflight_errors(report: dict[str, Any], errors: list[dict[str, Any]]) -> dict[str, Any]:
+    report["errors"].extend(errors)
+    return report
+
+
+def _print_errors(report: dict[str, Any]) -> None:
+    for err in report["errors"]:
+        print(f"  ERROR {err}", file=sys.stderr)
 
 
 def _worklist_task(worklist: dict[str, Any]) -> str:
@@ -209,10 +395,15 @@ def main(argv: list[str] | None = None) -> int:
 
         if task == "pattern":
             decisions = _resolve_pattern_decisions(worklist)
+            decisions, duplicate_errors = _filter_duplicate_adds(path, decisions)
             writer = _DryRunWriter()
-            report = apply_pattern_decisions(decisions, writer)
+            report = _add_preflight_errors(
+                apply_pattern_decisions(decisions, writer, _min_support(worklist)),
+                duplicate_errors,
+            )
             for line in writer.planned:
                 print(line)
+            _print_errors(report)
             print(
                 f"[dry-run] would surface {report['surfaced']}, skip {report['skipped']}, "
                 f"errors {len(report['errors'])}",
@@ -222,22 +413,37 @@ def main(argv: list[str] | None = None) -> int:
 
         if task == "merge":
             decisions = _resolve_decisions(worklist)
+            decisions, preflight_errors = _preflight_merge_decisions(path, decisions)
+            decisions, duplicate_errors = _filter_duplicate_adds(path, decisions)
             writer: Any = _DryRunWriter()
-            report = apply_merge_decisions(decisions, writer)
+            archiver = _DryRunArchiver()
+            report = _add_preflight_errors(
+                apply_merge_decisions(decisions, writer, archiver),
+                preflight_errors + duplicate_errors + _archive_writability_errors(args.archive_file),
+            )
             for line in writer.planned:
                 print(line)
+            for line in archiver.planned:
+                print(line)
+            _print_errors(report)
             print(
-                f"[dry-run] would merge {report['merged']}, skip {report['skipped']}",
+                f"[dry-run] would merge {report['merged']}, skip {report['skipped']}, "
+                f"errors {len(report['errors'])}",
                 file=sys.stderr,
             )
-            return 0
+            return 1 if report["errors"] else 0
 
         if task == "prune":
             decisions = _resolve_prune_decisions(worklist)
+            decisions, preflight_errors = _preflight_prune_decisions(path, decisions)
             archiver = _DryRunArchiver()
-            report = apply_prune_decisions(decisions, archiver)
+            report = _add_preflight_errors(
+                apply_prune_decisions(decisions, archiver),
+                preflight_errors + _archive_writability_errors(args.archive_file),
+            )
             for line in archiver.planned:
                 print(line)
+            _print_errors(report)
             print(
                 f"[dry-run] would prune {report['pruned']}, keep {report['kept']}, "
                 f"errors {len(report['errors'])}",
@@ -262,7 +468,7 @@ def main(argv: list[str] | None = None) -> int:
         )
     elif task == "pattern":
         decisions = _resolve_pattern_decisions(worklist)
-        report = apply_pattern_decisions(decisions, dream_palace.MempalaceWriter())
+        report = apply_pattern_decisions(decisions, dream_palace.MempalaceWriter(), _min_support(worklist))
         print(
             f"adopted (pattern): surfaced {report['surfaced']}, skipped {report['skipped']}, "
             f"errors {len(report['errors'])}",
@@ -270,7 +476,13 @@ def main(argv: list[str] | None = None) -> int:
         )
     elif task == "merge":
         decisions = _resolve_decisions(worklist)
-        report = apply_merge_decisions(decisions, dream_palace.MempalaceWriter())
+        decisions, preflight_errors = _preflight_merge_decisions(path, decisions)
+        writer = dream_palace.MempalaceWriter()
+        archiver = dream_palace.Archiver(path, writer=writer)
+        report = _add_preflight_errors(
+            apply_merge_decisions(decisions, writer, archiver),
+            preflight_errors,
+        )
         print(
             f"adopted: merged {report['merged']}, skipped {report['skipped']}, "
             f"deleted {len(report['deleted'])}, errors {len(report['errors'])}",
@@ -278,7 +490,11 @@ def main(argv: list[str] | None = None) -> int:
         )
     elif task == "prune":
         decisions = _resolve_prune_decisions(worklist)
-        report = apply_prune_decisions(decisions, dream_palace.Archiver(args.archive_file))
+        decisions, preflight_errors = _preflight_prune_decisions(path, decisions)
+        report = _add_preflight_errors(
+            apply_prune_decisions(decisions, dream_palace.Archiver(path, archive_path=args.archive_file)),
+            preflight_errors,
+        )
         print(
             f"adopted (prune): pruned {report['pruned']}, kept {report['kept']}, "
             f"errors {len(report['errors'])}",
@@ -288,8 +504,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"unknown dreaming task: {task}", file=sys.stderr)
         return 2
 
-    for err in report["errors"]:
-        print(f"  ERROR {err}", file=sys.stderr)
+    _print_errors(report)
     return 1 if report["errors"] else 0
 
 
