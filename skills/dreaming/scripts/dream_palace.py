@@ -199,6 +199,100 @@ def load_drawer_by_id(palace_path: str, drawer_id: str) -> dict[str, Any] | None
     }
 
 
+def _drawer_record_text(record: Any) -> str:
+    for key in ("text", "content", "document"):
+        value = _field(record, key)
+        if value is not None:
+            return str(value)
+    return ""
+
+
+def find_duplicate_clusters(
+    palace_path: str,
+    wing: str | None = None,
+    room: str | None = None,
+    tau: float = 0.9,
+    max_clusters: int | None = None,
+) -> list[dict[str, Any]]:
+    """Read logical duplicate clusters from mempalace's native duplicate finder."""
+    bind_palace(palace_path)
+    from mempalace.mcp_server import TOOLS  # lazy
+
+    res = TOOLS["mempalace_find_duplicates"]["handler"](
+        wing=wing,
+        room=room,
+        threshold=1.0 - tau,
+        max_clusters=max_clusters,
+    )
+    get_drawer = TOOLS["mempalace_get_drawer"]["handler"]
+
+    clusters = []
+    for cluster in _field(res, "clusters") or []:
+        members = []
+        for drawer_id in list(_field(cluster, "drawer_ids") or []):
+            record = get_drawer(drawer_id=drawer_id)
+            metadata = _field(record, "metadata") or {}
+            # find_duplicates and get_drawer both operate at logical-drawer
+            # granularity in the custom build; delete_drawer accepts that same
+            # logical drawer_id, so member_ids intentionally contains it.
+            members.append(
+                {
+                    "id": _field(record, "id") or drawer_id,
+                    "member_ids": [drawer_id],
+                    "text": _drawer_record_text(record),
+                    "wing": _field(record, "wing") or metadata.get("wing"),
+                    "room": _field(record, "room") or metadata.get("room"),
+                }
+            )
+
+        pair_sims = []
+        for pair in _field(cluster, "pairs") or []:
+            distance = _field(pair, "distance")
+            pair_sims.append(
+                {
+                    "a": _field(pair, "a"),
+                    "b": _field(pair, "b"),
+                    "sim": None if distance is None else 1.0 - float(distance),
+                }
+            )
+
+        clusters.append(
+            {
+                "members": members,
+                "pair_sims": pair_sims,
+                "size": _field(cluster, "size") or len(members),
+            }
+        )
+    return clusters
+
+
+def load_drawer_usage(
+    palace_path: str,
+    wing: str | None = None,
+    room: str | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Return lazy-decayed drawer salience keyed by logical drawer id."""
+    bind_palace(palace_path)
+    from mempalace.mcp_server import TOOLS  # lazy
+
+    res = TOOLS["mempalace_drawer_salience"]["handler"](
+        wing=wing,
+        room=room,
+        limit=100000,
+    )
+    usage = {}
+    for drawer in _field(res, "drawers") or []:
+        drawer_id = _field(drawer, "id")
+        if not drawer_id:
+            continue
+        usage[drawer_id] = {
+            "strength": _field(drawer, "strength"),
+            "access_count": _field(drawer, "access_count"),
+            "last_activated": _field(drawer, "last_activated"),
+        }
+    return usage
+
+
 def load_observation_entries(
     palace_path: str,
     wing: str | None = None,
@@ -447,6 +541,41 @@ class KgWriter:
 
     def invalidate(self, subject: str, predicate: str, object: str, ended: str | None = None) -> Any:
         return self._kg.invalidate(subject, predicate, object, ended=ended)
+
+    def supersede(
+        self,
+        subject: str,
+        predicate: str,
+        old_object: str,
+        new_object: str,
+        at: str | None = None,
+    ) -> Any:
+        ended_at = at or datetime.now(timezone.utc).isoformat()
+        for method_name in ("supersede", "replace"):
+            method = getattr(self._kg, method_name, None)
+            if method is not None:
+                try:
+                    return method(subject, predicate, old_object, new_object, at=ended_at)
+                except TypeError:
+                    return method(subject, predicate, old_object, new_object)
+
+        self._kg.invalidate(subject, predicate, old_object, ended=ended_at)
+        add_triple = self._kg.add_triple
+        kwargs: dict[str, Any] = {}
+        try:
+            params = inspect.signature(add_triple).parameters
+        except (TypeError, ValueError):
+            params = {}
+        if "valid_from" in params:
+            kwargs["valid_from"] = ended_at
+        elif "at" in params:
+            kwargs["at"] = ended_at
+        if "extracted_at" in params:
+            kwargs["extracted_at"] = ended_at
+        try:
+            return add_triple(subject, predicate, new_object, **kwargs)
+        except TypeError:
+            return add_triple(subject, predicate, new_object)
 
     def invalidate_triples(self, triple_ids: list[str], ended: str | None = None) -> int:
         if not os.path.exists(self._db_path):

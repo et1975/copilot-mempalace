@@ -19,6 +19,153 @@ def _test_tmpdir():
     )
 
 
+class TestFindDuplicateClusters(unittest.TestCase):
+    def _with_fake_tools(self, find_handler, get_handler):
+        original_mempalace = sys.modules.get("mempalace")
+        original_mcp_module = sys.modules.get("mempalace.mcp_server")
+        mempalace_module = types.ModuleType("mempalace")
+        mcp_module = types.ModuleType("mempalace.mcp_server")
+        mcp_module.TOOLS = {
+            "mempalace_find_duplicates": {"handler": find_handler},
+            "mempalace_get_drawer": {"handler": get_handler},
+        }
+        sys.modules["mempalace"] = mempalace_module
+        sys.modules["mempalace.mcp_server"] = mcp_module
+        return original_mempalace, original_mcp_module
+
+    def _restore_fake_tools(self, original_mempalace, original_mcp_module):
+        if original_mempalace is None:
+            sys.modules.pop("mempalace", None)
+        else:
+            sys.modules["mempalace"] = original_mempalace
+        if original_mcp_module is None:
+            sys.modules.pop("mempalace.mcp_server", None)
+        else:
+            sys.modules["mempalace.mcp_server"] = original_mcp_module
+
+    def test_uses_find_duplicates_and_get_drawer_to_build_merge_worklist_clusters(self):
+        calls = []
+
+        def find_handler(**kwargs):
+            calls.append(("find", kwargs))
+            return {
+                "clusters": [
+                    {
+                        "drawer_ids": ["logical-a", "logical-b"],
+                        "size": 2,
+                        "pairs": [{"a": "logical-a", "b": "logical-b", "distance": 0.12}],
+                    }
+                ]
+            }
+
+        def get_handler(drawer_id):
+            calls.append(("get", drawer_id))
+            return {
+                "logical-a": {"id": "logical-a", "content": "alpha text", "wing": "wing-a", "room": "room-a"},
+                "logical-b": {"id": "logical-b", "document": "bravo text", "wing": "wing-b", "room": "room-b"},
+            }[drawer_id]
+
+        originals = self._with_fake_tools(find_handler, get_handler)
+        try:
+            clusters = dream_palace.find_duplicate_clusters(
+                "/palace", wing="wing-scope", room="room-scope", tau=0.82, max_clusters=5
+            )
+        finally:
+            self._restore_fake_tools(originals[0], originals[1])
+
+        self.assertEqual(calls[0][0], "find")
+        self.assertEqual(calls[0][1]["wing"], "wing-scope")
+        self.assertEqual(calls[0][1]["room"], "room-scope")
+        self.assertAlmostEqual(calls[0][1]["threshold"], 0.18)
+        self.assertEqual(calls[0][1]["max_clusters"], 5)
+        self.assertEqual(calls[1:], [("get", "logical-a"), ("get", "logical-b")])
+        self.assertEqual(clusters, [
+            {
+                "members": [
+                    {
+                        "id": "logical-a",
+                        "member_ids": ["logical-a"],
+                        "text": "alpha text",
+                        "wing": "wing-a",
+                        "room": "room-a",
+                    },
+                    {
+                        "id": "logical-b",
+                        "member_ids": ["logical-b"],
+                        "text": "bravo text",
+                        "wing": "wing-b",
+                        "room": "room-b",
+                    },
+                ],
+                "pair_sims": [{"a": "logical-a", "b": "logical-b", "sim": 0.88}],
+                "size": 2,
+            }
+        ])
+
+
+class TestLoadDrawerUsage(unittest.TestCase):
+    def _with_fake_tools(self, salience_handler):
+        original_mempalace = sys.modules.get("mempalace")
+        original_mcp_module = sys.modules.get("mempalace.mcp_server")
+        mempalace_module = types.ModuleType("mempalace")
+        mcp_module = types.ModuleType("mempalace.mcp_server")
+        mcp_module.TOOLS = {"mempalace_drawer_salience": {"handler": salience_handler}}
+        sys.modules["mempalace"] = mempalace_module
+        sys.modules["mempalace.mcp_server"] = mcp_module
+        return original_mempalace, original_mcp_module
+
+    def _restore_fake_tools(self, original_mempalace, original_mcp_module):
+        if original_mempalace is None:
+            sys.modules.pop("mempalace", None)
+        else:
+            sys.modules["mempalace"] = original_mempalace
+        if original_mcp_module is None:
+            sys.modules.pop("mempalace.mcp_server", None)
+        else:
+            sys.modules["mempalace.mcp_server"] = original_mcp_module
+
+    def test_maps_salience_rows_to_drawer_usage_by_id(self):
+        calls = []
+
+        def salience_handler(**kwargs):
+            calls.append(kwargs)
+            return {
+                "drawers": [
+                    {
+                        "id": "drawer-1",
+                        "wing": "wing",
+                        "room": "room",
+                        "strength": 0.75,
+                        "stability": 0.9,
+                        "last_activated": "2026-07-06T20:00:00+00:00",
+                        "access_count": 3,
+                    }
+                ]
+            }
+
+        originals = self._with_fake_tools(salience_handler)
+        try:
+            usage = dream_palace.load_drawer_usage("/palace", wing="wing", room="room")
+        finally:
+            self._restore_fake_tools(originals[0], originals[1])
+
+        self.assertEqual(calls, [{"wing": "wing", "room": "room", "limit": 100000}])
+        self.assertEqual(usage, {
+            "drawer-1": {
+                "strength": 0.75,
+                "access_count": 3,
+                "last_activated": "2026-07-06T20:00:00+00:00",
+            }
+        })
+
+    def test_returns_empty_usage_when_salience_has_no_drawers(self):
+        originals = self._with_fake_tools(lambda **kwargs: {"drawers": []})
+        try:
+            self.assertEqual(dream_palace.load_drawer_usage("/palace"), {})
+        finally:
+            self._restore_fake_tools(originals[0], originals[1])
+
+
 class TestLoadActiveTriples(unittest.TestCase):
     def test_missing_kg_returns_empty_list(self):
         with _test_tmpdir() as palace:
@@ -679,6 +826,148 @@ class TestKgWriter(unittest.TestCase):
                 self.assertEqual(rows["t1"], "2026-07-06T15:00:00+00:00")
                 self.assertIsNone(rows["t2"])
                 self.assertEqual(rows["t3"], "already-ended")
+        finally:
+            if original_mempalace is None:
+                sys.modules.pop("mempalace", None)
+            else:
+                sys.modules["mempalace"] = original_mempalace
+            if original_kg_module is None:
+                sys.modules.pop("mempalace.knowledge_graph", None)
+            else:
+                sys.modules["mempalace.knowledge_graph"] = original_kg_module
+
+    def test_supersede_closes_old_triple_and_opens_new_at_same_timestamp(self):
+        original_mempalace = sys.modules.get("mempalace")
+        original_kg_module = sys.modules.get("mempalace.knowledge_graph")
+
+        class FakeKnowledgeGraph:
+            def __init__(self, db_path):
+                self.db_path = db_path
+
+            def _entity_id(self, con, name):
+                row = con.execute("SELECT id FROM entities WHERE name=?", (name,)).fetchone()
+                if row:
+                    return row[0]
+                entity_id = f"entity-{name.lower()}"
+                con.execute("INSERT INTO entities (id, name) VALUES (?, ?)", (entity_id, name))
+                return entity_id
+
+            def invalidate(self, subject, predicate, object, ended=None):
+                con = sqlite3.connect(self.db_path)
+                try:
+                    subject_id = self._entity_id(con, subject)
+                    object_id = self._entity_id(con, object)
+                    cur = con.execute(
+                        """
+                        UPDATE triples
+                        SET valid_to=?
+                        WHERE subject=? AND predicate=? AND object=? AND valid_to IS NULL
+                        """,
+                        (ended, subject_id, predicate, object_id),
+                    )
+                    con.commit()
+                    return cur.rowcount
+                finally:
+                    con.close()
+
+            def add_triple(self, subject, predicate, object, valid_from=None, extracted_at=None):
+                con = sqlite3.connect(self.db_path)
+                try:
+                    subject_id = self._entity_id(con, subject)
+                    object_id = self._entity_id(con, object)
+                    con.execute(
+                        """
+                        INSERT INTO triples (
+                            id, subject, predicate, object, valid_from, valid_to, extracted_at
+                        ) VALUES (?, ?, ?, ?, ?, NULL, ?)
+                        """,
+                        ("new-triple", subject_id, predicate, object_id, valid_from, extracted_at),
+                    )
+                    con.commit()
+                    return {"id": "new-triple"}
+                finally:
+                    con.close()
+
+            def close(self):
+                pass
+
+        mempalace_module = types.ModuleType("mempalace")
+        kg_module = types.ModuleType("mempalace.knowledge_graph")
+        kg_module.KnowledgeGraph = FakeKnowledgeGraph
+        sys.modules["mempalace"] = mempalace_module
+        sys.modules["mempalace.knowledge_graph"] = kg_module
+        try:
+            with _test_tmpdir() as palace:
+                db_path = os.path.join(palace, "knowledge_graph.sqlite3")
+                con = sqlite3.connect(db_path)
+                con.executescript(
+                    """
+                    CREATE TABLE entities (id TEXT PRIMARY KEY, name TEXT NOT NULL);
+                    CREATE TABLE triples (
+                        id TEXT PRIMARY KEY,
+                        subject TEXT,
+                        predicate TEXT,
+                        object TEXT,
+                        valid_from TEXT,
+                        valid_to TEXT,
+                        extracted_at TEXT
+                    );
+                    INSERT INTO entities (id, name) VALUES
+                        ('e-alice', 'Alice'), ('e-portland', 'Portland');
+                    INSERT INTO triples (
+                        id, subject, predicate, object, valid_from, valid_to, extracted_at
+                    ) VALUES (
+                        'old-triple', 'e-alice', 'lives_in', 'e-portland',
+                        '2025-01-01T00:00:00+00:00', NULL, '2025-01-01T00:00:00+00:00'
+                    );
+                    """
+                )
+                con.commit()
+                con.close()
+
+                writer = dream_palace.KgWriter(palace)
+                result = writer.supersede(
+                    "Alice",
+                    "lives_in",
+                    "Portland",
+                    "Seattle",
+                    at="2026-07-06T20:22:29+00:00",
+                )
+                writer.close()
+
+                con = sqlite3.connect(db_path)
+                rows = con.execute(
+                    """
+                    SELECT t.id, s.name, t.predicate, o.name, t.valid_from, t.valid_to, t.extracted_at
+                    FROM triples t
+                    JOIN entities s ON t.subject = s.id
+                    JOIN entities o ON t.object = o.id
+                    ORDER BY t.id
+                    """
+                ).fetchall()
+                con.close()
+
+                self.assertEqual(result, {"id": "new-triple"})
+                self.assertEqual(rows, [
+                    (
+                        "new-triple",
+                        "Alice",
+                        "lives_in",
+                        "Seattle",
+                        "2026-07-06T20:22:29+00:00",
+                        None,
+                        "2026-07-06T20:22:29+00:00",
+                    ),
+                    (
+                        "old-triple",
+                        "Alice",
+                        "lives_in",
+                        "Portland",
+                        "2025-01-01T00:00:00+00:00",
+                        "2026-07-06T20:22:29+00:00",
+                        "2025-01-01T00:00:00+00:00",
+                    ),
+                ])
         finally:
             if original_mempalace is None:
                 sys.modules.pop("mempalace", None)
