@@ -24,10 +24,10 @@ import sys
 import dream_ontology
 import dream_palace
 from dream_lib import (
+    WORKLIST_VERSION,
     build_contradiction_worklist,
     build_pattern_worklist,
     build_prune_worklist,
-    build_worklist,
     compute_redundancy,
     deductive_closure,
     drawer_salience,
@@ -80,6 +80,62 @@ def _stamp_prune_hashes(worklist: dict) -> None:
         item["content_hash"] = _content_hash(item.get("text", ""))
 
 
+def _build_merge_worklist_from_clusters(
+    clusters: list[dict],
+    scope: dict,
+    params: dict,
+    instructions: str | None = None,
+) -> dict:
+    items = []
+    cluster_id = 0
+    for cluster in clusters:
+        partitions: dict[tuple[object, object], list[dict]] = {}
+        for member in cluster.get("members", []):
+            partitions.setdefault((member.get("wing"), member.get("room")), []).append(member)
+        mixed_room_split = len(partitions) > 1
+        for members in partitions.values():
+            if len(members) < 2:
+                continue
+            member_ids = {member["id"] for member in members}
+            pair_sims = [
+                pair for pair in cluster.get("pair_sims", [])
+                if pair.get("a") in member_ids and pair.get("b") in member_ids
+            ]
+            item = {
+                "kind": "merge",
+                "cluster_id": cluster_id,
+                "members": [
+                    {
+                        "id": member["id"],
+                        "member_ids": member.get("member_ids", [member["id"]]),
+                        "text": member.get("text", ""),
+                        "wing": member.get("wing"),
+                        "room": member.get("room"),
+                    }
+                    for member in members
+                ],
+                "supersedes": [
+                    member_id
+                    for member in members
+                    for member_id in member.get("member_ids", [member["id"]])
+                ],
+                "evidence": {"pair_sims": pair_sims, "size": len(members)},
+                "decision": None,
+            }
+            if mixed_room_split:
+                item["mixed_room_split"] = True
+            items.append(item)
+            cluster_id += 1
+    return {
+        "version": WORKLIST_VERSION,
+        "task": "merge",
+        "scope": scope,
+        "params": params,
+        "instructions": instructions,
+        "items": items,
+    }
+
+
 def _degree_for(drawer: dict, degrees: dict[str, int]) -> int:
     ids = {drawer["id"], *drawer.get("member_ids", [])}
     return sum(degrees.get(drawer_id, 0) for drawer_id in ids)
@@ -96,6 +152,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--room", help="Scope merge harvest to this room (ignored for contradiction)")
     ap.add_argument("--tau", type=float,
                     help="Cosine-similarity threshold; defaults to 0.9 for merge and 0.75 for pattern")
+    ap.add_argument("--max-clusters", type=int,
+                    help="Maximum duplicate clusters to harvest for merge")
     ap.add_argument("--min-support", type=int, default=None,
                     help="Minimum support for pattern themes (default 3) or induced ontology rules (default 2)")
     ap.add_argument("--v-min", type=float, default=0.35,
@@ -172,6 +230,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.task == "prune":
         drawers = dream_palace.load_logical_drawers(path, wing=args.wing, room=args.room)
+        usage_by_id = dream_palace.load_drawer_usage(path, wing=args.wing, room=args.room)
         degrees = dream_palace.kg_source_degree(path)
         redundancy = compute_redundancy(drawers)
         now = datetime.now()
@@ -187,6 +246,7 @@ def main(argv: list[str] | None = None) -> int:
                         redundancy[drawer["id"]],
                         _degree_for(drawer, degrees),
                         now=now,
+                        usage=usage_by_id.get(drawer["id"]),
                     ),
                     "pinned": metadata.get("pinned", False),
                 }
@@ -207,7 +267,7 @@ def main(argv: list[str] | None = None) -> int:
             json.dump(worklist, fh, indent=2, ensure_ascii=False)
         print(
             f"harvested {len(drawers)} drawers -> {len(worklist['items'])} prune candidate(s) "
-            f"(v<v_min, age>=floor, kg_degree=0) -> {args.out}",
+            f"(v<v_min, age>=floor, kg_degree=0) with usage incorporated -> {args.out}",
             file=sys.stderr,
         )
         return 0
@@ -279,11 +339,20 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     tau = args.tau if args.tau is not None else 0.9
-    drawers = dream_palace.load_logical_drawers(path, args.wing, args.room)
-    worklist = build_worklist(
-        drawers,
+    clusters = dream_palace.find_duplicate_clusters(
+        path,
+        wing=args.wing,
+        room=args.room,
         tau=tau,
+        max_clusters=args.max_clusters,
+    )
+    params = {"tau": tau}
+    if args.max_clusters is not None:
+        params["max_clusters"] = args.max_clusters
+    worklist = _build_merge_worklist_from_clusters(
+        clusters,
         scope={"palace": path, "wing": args.wing, "room": args.room},
+        params=params,
         instructions=args.instructions,
     )
     _stamp_merge_hashes(worklist)
@@ -294,7 +363,7 @@ def main(argv: list[str] | None = None) -> int:
     n_items = len(worklist["items"])
     n_drawers = sum(item["evidence"]["size"] for item in worklist["items"])
     print(
-        f"harvested {len(drawers)} logical drawers -> {n_items} merge cluster(s) "
+        f"harvested {len(clusters)} duplicate cluster(s) -> {n_items} merge cluster(s) "
         f"covering {n_drawers} drawers -> {args.out}",
         file=sys.stderr,
     )
