@@ -24,6 +24,10 @@ _EPHEMERAL_RE = re.compile(
     r"\b(?:for now|this session|temporarily|one-off|throwaway|scratch|just for this)\b",
     re.IGNORECASE,
 )
+_SESSION_ID_RE = re.compile(
+    r"SESSION_ID:\s*([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})",
+    re.IGNORECASE,
+)
 
 
 def cosine_similarity(a: list[float], b: list[float]) -> float:
@@ -156,6 +160,8 @@ def _detect_ephemeral(text: str) -> bool:
 
 
 def _parse_iso(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value
     if not isinstance(value, str) or not value.strip():
         return None
     text = value.strip()
@@ -167,15 +173,34 @@ def _parse_iso(value: Any) -> datetime | None:
         return None
 
 
+def _normalise_pair_for_compare(a: datetime, b: datetime) -> tuple[datetime, datetime]:
+    if a.tzinfo is not None and b.tzinfo is None:
+        a = a.replace(tzinfo=None)
+    elif a.tzinfo is None and b.tzinfo is not None:
+        b = b.replace(tzinfo=None)
+    return a, b
+
+
+def _coerce_now(now: str | datetime | None) -> datetime:
+    if now is None:
+        return datetime.now()
+    parsed = _parse_iso(now)
+    return parsed if parsed is not None else datetime.now()
+
+
+def _is_future_iso(value: Any, now: datetime) -> bool:
+    parsed = _parse_iso(value)
+    if parsed is None:
+        return False
+    parsed, comparison_now = _normalise_pair_for_compare(parsed, now)
+    return parsed > comparison_now
+
+
 def _age_days(filed_at: Any, now: datetime) -> int:
     filed = _parse_iso(filed_at)
     if filed is None:
         return 0
-    comparison_now = now
-    if filed.tzinfo is not None and comparison_now.tzinfo is None:
-        filed = filed.replace(tzinfo=None)
-    elif filed.tzinfo is None and comparison_now.tzinfo is not None:
-        comparison_now = comparison_now.replace(tzinfo=None)
+    filed, comparison_now = _normalise_pair_for_compare(filed, now)
     return max(0, (comparison_now - filed).days)
 
 
@@ -232,25 +257,47 @@ def select_prune_candidates(
     Expected shape: each element is the original logical drawer dict augmented
     with a ``salience`` sub-dict from ``drawer_salience`` and optional ``pinned``.
     """
+    topic_counts: dict[Any, int] = {}
+    for d in scored:
+        topic = _drawer_topic_key(d)
+        topic_counts[topic] = topic_counts.get(topic, 0) + 1
+
     candidates = []
     for d in scored:
         salience = d.get("salience", d)
+        pinned = bool(d.get("pinned", False) or (d.get("metadata") or {}).get("pinned", False))
+        topic = _drawer_topic_key(d)
         if (
             salience.get("v", 1.0) < v_min
             and salience.get("age_days", 0) >= age_floor_days
             and salience.get("kg_degree", 0) == 0
-            and not d.get("pinned", False)
+            and not pinned
+            and topic_counts.get(topic, 0) > 1
         ):
             candidates.append(d)
     return candidates
 
 
+def _drawer_topic_key(drawer: dict[str, Any]) -> Any:
+    return (drawer.get("metadata") or {}).get("topic") or drawer.get("topic") or drawer.get("room")
+
+
 def extract_session_id(text: str) -> str | None:
-    """Extract the first ``SESSION_ID:<uuid-like>`` token from diary text."""
-    match = re.search(r"SESSION_ID:\s*([0-9a-fA-F-]{8,})", text, re.IGNORECASE)
-    if match is None:
-        return None
-    return match.group(1)
+    """Extract the first canonical ``SESSION_ID:<uuid>`` token from diary text."""
+    ids = extract_all_session_ids(text)
+    return ids[0] if ids else None
+
+
+def extract_all_session_ids(text: str) -> list[str]:
+    """Extract all canonical session UUIDs, preserving first-seen order."""
+    ids: list[str] = []
+    seen: set[str] = set()
+    for match in _SESSION_ID_RE.finditer(text):
+        session_id = match.group(1)
+        if session_id not in seen:
+            ids.append(session_id)
+            seen.add(session_id)
+    return ids
 
 
 def group_observation_themes(
@@ -322,12 +369,23 @@ def build_worklist(
     """
     clusters = cluster_duplicates(drawers, tau)
     items = []
-    for idx, c in enumerate(clusters):
-        members = c["members"]
-        items.append(
-            {
+    cluster_id = 0
+    for c in clusters:
+        partitions: dict[tuple[Any, Any], list[dict[str, Any]]] = {}
+        for m in c["members"]:
+            partitions.setdefault((m.get("wing"), m.get("room")), []).append(m)
+        mixed_room_split = len(partitions) > 1
+        for members in partitions.values():
+            if len(members) < 2:
+                continue
+            member_ids = {m["id"] for m in members}
+            pair_sims = [
+                p for p in c["pair_sims"]
+                if p["a"] in member_ids and p["b"] in member_ids
+            ]
+            item = {
                 "kind": "merge",
-                "cluster_id": idx,
+                "cluster_id": cluster_id,
                 "members": [
                     {
                         "id": m["id"],
@@ -339,10 +397,13 @@ def build_worklist(
                     for m in members
                 ],
                 "supersedes": [pid for m in members for pid in m["member_ids"]],
-                "evidence": {"pair_sims": c["pair_sims"], "size": len(members)},
+                "evidence": {"pair_sims": pair_sims, "size": len(members)},
                 "decision": None,
             }
-        )
+            if mixed_room_split:
+                item["mixed_room_split"] = True
+            items.append(item)
+            cluster_id += 1
     return {
         "version": WORKLIST_VERSION,
         "task": "merge",
@@ -406,6 +467,7 @@ def build_prune_worklist(
     """Produce the deterministic worklist of prune candidates."""
     items = []
     for c in candidates:
+        metadata = c.get("metadata") or {}
         items.append(
             {
                 "kind": "prune",
@@ -414,6 +476,8 @@ def build_prune_worklist(
                 "text": c.get("text", ""),
                 "wing": c.get("wing"),
                 "room": c.get("room"),
+                "topic": metadata.get("topic") or c.get("topic") or c.get("room"),
+                "pinned": bool(metadata.get("pinned", c.get("pinned", False))),
                 "salience": c["salience"],
                 "decision": None,
             }
@@ -428,41 +492,69 @@ def build_prune_worklist(
     }
 
 
-def group_contradictions(triples: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def group_contradictions(
+    triples: list[dict[str, Any]],
+    now: str | datetime | None = None,
+) -> list[dict[str, Any]]:
     """Group active KG triples that disagree on object for a subject/predicate.
 
     A group is only a structural candidate: predicates may be legitimately
     multi-valued, so the agent decides whether to invalidate anything.
     """
-    grouped: dict[tuple[str, str], dict[str, dict[str, Any]]] = {}
+    now_dt = _coerce_now(now)
+    grouped: dict[tuple[Any, str], dict[str, Any]] = {}
     for t in triples:
-        key = (t["subject"], t["predicate"])
+        if _is_future_iso(t.get("valid_from"), now_dt):
+            continue
+        subject_id = t.get("subject_id") or t.get("subject")
+        key = (subject_id, t["predicate"])
         object_name = t["object"]
+        object_id = t.get("object_id")
+        object_key = object_id or object_name
+        triple_id = t.get("triple_id")
         candidate = {
             "object": object_name,
+            "object_id": object_id,
+            "triple_id": triple_id,
+            "triple_ids": [triple_id] if triple_id is not None else [],
             "valid_from": t.get("valid_from"),
             "extracted_at": t.get("extracted_at"),
         }
-        objects = grouped.setdefault(key, {})
-        current = objects.get(object_name)
+        group = grouped.setdefault(
+            key,
+            {
+                "subject": t.get("subject"),
+                "subject_id": subject_id,
+                "predicate": t["predicate"],
+                "objects": {},
+            },
+        )
+        objects = group["objects"]
+        current = objects.get(object_key)
+        if current is not None and triple_id is not None and triple_id not in current["triple_ids"]:
+            current["triple_ids"].append(triple_id)
         if current is None or _contradiction_recency_key(candidate) > _contradiction_recency_key(current):
-            objects[object_name] = candidate
+            if current is not None:
+                candidate["triple_ids"] = current["triple_ids"]
+            objects[object_key] = candidate
 
     clusters = []
-    for (subject, predicate), objects in grouped.items():
+    for group in grouped.values():
+        objects = group["objects"]
         if len(objects) < 2:
             continue
         candidates = sorted(objects.values(), key=lambda c: c["object"])
         candidates.sort(key=_contradiction_recency_key, reverse=True)
         clusters.append(
             {
-                "subject": subject,
-                "predicate": predicate,
+                "subject": group["subject"],
+                "subject_id": group["subject_id"],
+                "predicate": group["predicate"],
                 "candidates": candidates,
                 "newest_object": candidates[0]["object"],
             }
         )
-    return sorted(clusters, key=lambda c: (c["subject"], c["predicate"]))
+    return sorted(clusters, key=lambda c: (c["subject"] or "", c["predicate"], c["subject_id"] or ""))
 
 
 def _contradiction_recency_key(candidate: dict[str, Any]) -> tuple[str, str]:
@@ -473,9 +565,10 @@ def build_contradiction_worklist(
     triples: list[dict[str, Any]],
     scope: dict[str, Any],
     instructions: str | None = None,
+    now: str | datetime | None = None,
 ) -> dict[str, Any]:
     """Produce the deterministic worklist of KG contradiction candidates."""
-    clusters = group_contradictions(triples)
+    clusters = group_contradictions(triples, now=now)
     items = []
     for idx, c in enumerate(clusters):
         items.append(
@@ -483,6 +576,7 @@ def build_contradiction_worklist(
                 "kind": "contradiction",
                 "cluster_id": idx,
                 "subject": c["subject"],
+                "subject_id": c.get("subject_id"),
                 "predicate": c["predicate"],
                 "candidates": c["candidates"],
                 "evidence": {
@@ -502,14 +596,12 @@ def build_contradiction_worklist(
     }
 
 
-def apply_merge_decisions(decisions: list[dict[str, Any]], writer: Any) -> dict[str, Any]:
-    """Execute approved merge decisions against ``writer`` (no cognition here).
+def apply_merge_decisions(decisions: list[dict[str, Any]], writer: Any, archiver: Any) -> dict[str, Any]:
+    """Execute approved merge decisions against ``writer`` and ``archiver``.
 
-    ``writer`` exposes ``add_drawer(wing, room, content)`` and
-    ``delete_drawer(drawer_id)``. For each ``{"action": "merge"}`` decision the
-    merged drawer is added first; only on a successful add are the ``supersedes``
-    originals deleted (so a failed add is non-destructive). ``{"action": "skip"}``
-    items are ignored.
+    ``writer`` exposes ``add_drawer(wing, room, content, metadata=None)``.
+    ``archiver`` exposes ``archive_then_delete(record)`` and is called only after
+    the merged drawer is durably added.
     """
     report: dict[str, Any] = {
         "merged": 0,
@@ -522,23 +614,56 @@ def apply_merge_decisions(decisions: list[dict[str, Any]], writer: Any) -> dict[
         if d.get("action") != "merge":
             report["skipped"] += 1
             continue
+        text = d.get("text") or ""
+        supersedes = list(d.get("supersedes") or [])
+        if not text.strip() or not supersedes:
+            report["errors"].append({"stage": "soundness", "error": "merge requires text and supersedes", "decision": d})
+            continue
         try:
-            res = writer.add_drawer(d["wing"], d["room"], d["text"])
+            res = writer.add_drawer(
+                d["wing"],
+                d["room"],
+                text,
+                metadata={"supersedes": supersedes, "kind": "merged"},
+            )
             report["added"].append(res)
         except Exception as exc:  # noqa: BLE001 - record and continue, stay non-destructive
             report["errors"].append({"stage": "add", "error": str(exc), "decision": d})
             continue
-        for pid in d.get("supersedes", []):
-            try:
-                writer.delete_drawer(pid)
-                report["deleted"].append(pid)
-            except Exception as exc:  # noqa: BLE001
-                report["errors"].append({"stage": "delete", "id": pid, "error": str(exc)})
+        record = {
+            "id": _added_drawer_id(res, supersedes),
+            "member_ids": supersedes,
+            "wing": d["wing"],
+            "room": d["room"],
+            "reason": "merge",
+        }
+        try:
+            archive_result = archiver.archive_then_delete(record)
+            report["deleted"].extend(_archive_deleted_ids(archive_result, supersedes))
+        except Exception as exc:  # noqa: BLE001
+            report["errors"].append({"stage": "archive", "error": str(exc), "decision": d})
+            continue
         report["merged"] += 1
     return report
 
 
-def apply_pattern_decisions(decisions: list[dict[str, Any]], writer: Any) -> dict[str, Any]:
+def _added_drawer_id(add_result: Any, supersedes: list[str]) -> str:
+    if isinstance(add_result, dict):
+        drawer_id = add_result.get("drawer_id") or add_result.get("id")
+        if drawer_id:
+            return drawer_id
+    return supersedes[0]
+
+
+def _archive_deleted_ids(archive_result: Any, fallback: list[str]) -> list[str]:
+    if isinstance(archive_result, dict):
+        deleted = archive_result.get("deleted") or archive_result.get("deleted_ids")
+        if isinstance(deleted, list):
+            return list(deleted)
+    return list(fallback)
+
+
+def apply_pattern_decisions(decisions: list[dict[str, Any]], writer: Any, min_support: int) -> dict[str, Any]:
     """Execute approved pattern-surfacing decisions against ``writer``.
 
     Pattern induction is add-only: approved ``{"action": "surface"}`` decisions
@@ -554,11 +679,29 @@ def apply_pattern_decisions(decisions: list[dict[str, Any]], writer: Any) -> dic
         if d.get("action") != "surface":
             report["skipped"] += 1
             continue
-        if not d.get("supported_by"):
-            report["errors"].append({"stage": "groundedness", "error": "unsupported rule", "decision": d})
+        supported_by = list(d.get("supported_by") or [])
+        support_set = set(supported_by)
+        allowed_support = d.get("_support_pool", d.get("allowed_support", supported_by))
+        allowed_set = set(allowed_support or [])
+        error = None
+        if not supported_by:
+            error = "unsupported rule"
+        elif len(support_set) != len(supported_by):
+            error = "support ids must be distinct"
+        elif len(support_set) < min_support:
+            error = "insufficient support"
+        elif not support_set.issubset(allowed_set):
+            error = "support ids outside evidence"
+        if error is not None:
+            report["errors"].append({"stage": "groundedness", "error": error, "decision": d})
             continue
         try:
-            res = writer.add_drawer(d["wing"], d["room"], d["text"])
+            res = writer.add_drawer(
+                d["wing"],
+                d["room"],
+                d["text"],
+                metadata={"supported_by": supported_by, "kind": "lesson"},
+            )
             report["added"].append(res)
             report["surfaced"] += 1
         except Exception as exc:  # noqa: BLE001 - record and continue, stay add-only
@@ -568,7 +711,7 @@ def apply_pattern_decisions(decisions: list[dict[str, Any]], writer: Any) -> dic
 
 
 def apply_contradiction_decisions(decisions: list[dict[str, Any]], writer: Any) -> dict[str, Any]:
-    """Execute approved KG invalidation decisions against ``writer``."""
+    """Execute approved KG triple invalidation decisions against ``writer``."""
     report: dict[str, Any] = {
         "invalidated": 0,
         "skipped": 0,
@@ -579,24 +722,23 @@ def apply_contradiction_decisions(decisions: list[dict[str, Any]], writer: Any) 
         if d.get("action") != "invalidate":
             report["skipped"] += 1
             continue
-        subject = d["subject"]
-        predicate = d["predicate"]
-        for obj in d.get("invalidate", []):
-            try:
-                writer.invalidate(subject, predicate, obj)
-                report["invalidated_facts"].append(
-                    {"subject": subject, "predicate": predicate, "object": obj}
-                )
-            except Exception as exc:  # noqa: BLE001 - record and continue, stay soft
-                report["errors"].append(
-                    {
-                        "error": str(exc),
-                        "subject": subject,
-                        "predicate": predicate,
-                        "object": obj,
-                    }
-                )
-        report["invalidated"] += 1
+        triple_ids = list(d.get("invalidate") or [])
+        if not triple_ids:
+            report["errors"].append({"stage": "groundedness", "error": "no triples selected", "decision": d})
+            continue
+        try:
+            writer.invalidate_triples(triple_ids)
+            report["invalidated"] += len(triple_ids)
+            report["invalidated_facts"].extend({"triple_id": tid} for tid in triple_ids)
+        except Exception as exc:  # noqa: BLE001 - record and continue, stay soft
+            report["errors"].append(
+                {
+                    "stage": "invalidate",
+                    "error": str(exc),
+                    "triple_ids": triple_ids,
+                    "decision": d,
+                }
+            )
     return report
 
 

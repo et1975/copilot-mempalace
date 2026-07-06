@@ -65,13 +65,58 @@ class TestLoadActiveTriples(unittest.TestCase):
 
             self.assertEqual(triples, [
                 {
+                    "triple_id": "t1",
                     "subject": "Alice",
+                    "subject_id": "e1",
                     "predicate": "lives_in",
                     "object": "Portland",
+                    "object_id": "e2",
                     "valid_from": "2024-01-01",
+                    "valid_to": None,
                     "extracted_at": "2024-01-02",
+                    "source_drawer_id": None,
+                    "confidence": 1.0,
                 }
             ])
+
+    def test_returns_entity_ids_to_distinguish_homonyms(self):
+        with _test_tmpdir() as palace:
+            db_path = os.path.join(palace, "knowledge_graph.sqlite3")
+            con = sqlite3.connect(db_path)
+            con.executescript(
+                """
+                CREATE TABLE entities (id TEXT PRIMARY KEY, name TEXT NOT NULL);
+                CREATE TABLE triples (
+                    id TEXT PRIMARY KEY,
+                    subject TEXT,
+                    predicate TEXT,
+                    object TEXT,
+                    valid_from TEXT,
+                    valid_to TEXT,
+                    confidence REAL,
+                    source_drawer_id TEXT,
+                    extracted_at TEXT
+                );
+                INSERT INTO entities (id, name) VALUES
+                    ('person-1', 'Alex'), ('person-2', 'Alex'), ('city-1', 'Paris');
+                INSERT INTO triples (
+                    id, subject, predicate, object, valid_from, valid_to,
+                    confidence, source_drawer_id, extracted_at
+                ) VALUES
+                    ('t-person-1', 'person-1', 'visited', 'city-1', '2025-01-01', NULL,
+                     0.8, 'drawer-a', '2025-01-02'),
+                    ('t-person-2', 'person-2', 'visited', 'city-1', '2025-02-01', NULL,
+                     0.9, 'drawer-b', '2025-02-02');
+                """
+            )
+            con.commit()
+            con.close()
+
+            triples = dream_palace.load_active_triples(palace)
+
+            self.assertEqual([row["subject"] for row in triples], ["Alex", "Alex"])
+            self.assertEqual([row["subject_id"] for row in triples], ["person-1", "person-2"])
+            self.assertEqual([row["triple_id"] for row in triples], ["t-person-1", "t-person-2"])
 
 
 class TestKgSourceDegree(unittest.TestCase):
@@ -121,8 +166,18 @@ class TestArchiver(unittest.TestCase):
                 "room": "room",
                 "text": "forgettable",
                 "salience": {"v": 0.1, "kg_degree": 0},
-                "pruned_at": "2026-07-03T20:00:00",
+                "reason": "prune",
             }
+
+            class FakeCollection:
+                def get(self, **kwargs):
+                    self.last_get = kwargs
+                    return {
+                        "ids": ["chunk-1", "chunk-2"],
+                        "documents": ["first chunk", "second chunk"],
+                        "metadatas": [{"chunk_index": 0}, {"chunk_index": 1}],
+                        "embeddings": [[1.0, 2.0], [3.0, 4.0]],
+                    }
 
             class FakeWriter:
                 def __init__(self):
@@ -135,20 +190,54 @@ class TestArchiver(unittest.TestCase):
                     self.deleted.append(drawer_id)
                     return {"deleted": drawer_id}
 
+            collection = FakeCollection()
             writer = FakeWriter()
-            result = dream_palace.Archiver(archive_path, writer=writer).archive_then_delete(record)
+            result = dream_palace.Archiver(
+                td, archive_path=archive_path, writer=writer, collection=collection
+            ).archive_then_delete(record)
 
             with open(archive_path, encoding="utf-8") as fh:
                 lines = fh.readlines()
-            self.assertEqual([json.loads(line) for line in lines], [record])
+            archived = json.loads(lines[0])
+            self.assertEqual(archived["schema"], 1)
+            self.assertEqual(archived["id"], "logical-1")
+            self.assertEqual(archived["member_ids"], ["chunk-1", "chunk-2"])
+            self.assertEqual(archived["wing"], "wing")
+            self.assertEqual(archived["room"], "room")
+            self.assertEqual(archived["salience"], {"v": 0.1, "kg_degree": 0})
+            self.assertEqual(archived["reason"], "prune")
+            self.assertIn("archived_at", archived)
+            self.assertEqual(archived["rows"], [
+                {
+                    "id": "chunk-1",
+                    "document": "first chunk",
+                    "metadata": {"chunk_index": 0},
+                    "embedding": [1.0, 2.0],
+                },
+                {
+                    "id": "chunk-2",
+                    "document": "second chunk",
+                    "metadata": {"chunk_index": 1},
+                    "embedding": [3.0, 4.0],
+                },
+            ])
             self.assertEqual(writer.deleted, ["chunk-1", "chunk-2"])
-            self.assertEqual([json.loads(writer.archive_seen_at_delete[0])], [record])
+            self.assertEqual(json.loads(writer.archive_seen_at_delete[0])["rows"], archived["rows"])
             self.assertEqual(result, {"archived": "logical-1", "deleted": ["chunk-1", "chunk-2"]})
 
     def test_archive_failure_does_not_delete(self):
         with _test_tmpdir() as td:
             archive_path = os.path.join(td, "archive-dir")
             os.mkdir(archive_path)
+
+            class FakeCollection:
+                def get(self, **kwargs):
+                    return {
+                        "ids": ["d1"],
+                        "documents": ["doc"],
+                        "metadatas": [{}],
+                        "embeddings": [[]],
+                    }
 
             class FakeWriter:
                 def __init__(self):
@@ -158,11 +247,65 @@ class TestArchiver(unittest.TestCase):
                     self.deleted.append(drawer_id)
 
             writer = FakeWriter()
-            archiver = dream_palace.Archiver(archive_path, writer=writer)
+            archiver = dream_palace.Archiver(td, archive_path=archive_path, writer=writer, collection=FakeCollection())
 
             with self.assertRaises(IsADirectoryError):
                 archiver.archive_then_delete({"id": "d1", "member_ids": ["d1"]})
             self.assertEqual(writer.deleted, [])
+
+    def test_archive_defaults_to_palace_local_path(self):
+        with _test_tmpdir() as palace:
+            class FakeCollection:
+                def get(self, **kwargs):
+                    return {
+                        "ids": ["d1"],
+                        "documents": ["doc"],
+                        "metadatas": [{}],
+                        "embeddings": [[]],
+                    }
+
+            class FakeWriter:
+                def __init__(self):
+                    self.deleted = []
+
+                def delete_drawer(self, drawer_id):
+                    self.deleted.append(drawer_id)
+
+            writer = FakeWriter()
+            dream_palace.Archiver(palace, writer=writer, collection=FakeCollection()).archive_then_delete(
+                {"id": "d1", "member_ids": ["d1"]}
+            )
+            self.assertTrue(os.path.exists(os.path.join(palace, "dream-archive.jsonl")))
+
+    def test_missing_member_preflight_raises_without_archiving_or_deleting(self):
+        with _test_tmpdir() as palace:
+            archive_path = os.path.join(palace, "archive.jsonl")
+
+            class FakeCollection:
+                def get(self, **kwargs):
+                    return {
+                        "ids": ["chunk-1"],
+                        "documents": ["first chunk"],
+                        "metadatas": [{}],
+                        "embeddings": [[]],
+                    }
+
+            class FakeWriter:
+                def __init__(self):
+                    self.deleted = []
+
+                def delete_drawer(self, drawer_id):
+                    self.deleted.append(drawer_id)
+
+            writer = FakeWriter()
+            archiver = dream_palace.Archiver(
+                palace, archive_path=archive_path, writer=writer, collection=FakeCollection()
+            )
+
+            with self.assertRaises(ValueError):
+                archiver.archive_then_delete({"id": "logical-1", "member_ids": ["chunk-1", "chunk-2"]})
+            self.assertEqual(writer.deleted, [])
+            self.assertFalse(os.path.exists(archive_path))
 
 
 class TestLoadObservationEntries(unittest.TestCase):
@@ -200,7 +343,10 @@ class TestLoadObservationEntries(unittest.TestCase):
     def test_groups_diary_chunks_by_parent_entry_id(self):
         originals = self._with_fake_collection(
             ids=["chunk-2", "chunk-1"],
-            documents=["continued pattern", "SESSION_ID: 12345678-abcd first pattern"],
+            documents=[
+                "continued pattern",
+                "SESSION_ID: 12345678-abcd-1234-abcd-123456789abc first pattern",
+            ],
             metadatas=[
                 {
                     "parent_entry_id": "entry-1",
@@ -233,10 +379,10 @@ class TestLoadObservationEntries(unittest.TestCase):
         self.assertEqual(entries[0]["member_ids"], ["chunk-1", "chunk-2"])
         self.assertEqual(
             entries[0]["text"],
-            "SESSION_ID: 12345678-abcd first pattern\ncontinued pattern",
+            "SESSION_ID: 12345678-abcd-1234-abcd-123456789abc first pattern\ncontinued pattern",
         )
         self.assertEqual(entries[0]["embedding"], [2.0, 4.0])
-        self.assertEqual(entries[0]["session_id"], "12345678-abcd")
+        self.assertEqual(entries[0]["session_id"], "12345678-abcd-1234-abcd-123456789abc")
         self.assertEqual(entries[0]["agent"], "Copilot CLI")
         self.assertEqual(entries[0]["date"], "2026-07-03")
         self.assertEqual(entries[0]["topic"], "dreaming")
@@ -247,7 +393,7 @@ class TestLoadObservationEntries(unittest.TestCase):
     def test_single_chunk_row_passes_through(self):
         originals = self._with_fake_collection(
             ids=["drawer-1"],
-            documents=["SESSION_ID: abcdef12 one chunk"],
+            documents=["SESSION_ID: abcdef12-1111-2222-3333-abcdef123456 one chunk"],
             metadatas=[
                 {
                     "wing": "wing_copilot-cli",
@@ -268,9 +414,9 @@ class TestLoadObservationEntries(unittest.TestCase):
             {
                 "id": "drawer-1",
                 "member_ids": ["drawer-1"],
-                "text": "SESSION_ID: abcdef12 one chunk",
+                "text": "SESSION_ID: abcdef12-1111-2222-3333-abcdef123456 one chunk",
                 "embedding": [0.5, 0.25],
-                "session_id": "abcdef12",
+                "session_id": "abcdef12-1111-2222-3333-abcdef123456",
                 "agent": "Copilot CLI",
                 "date": "2026-07-03",
                 "topic": "single",
@@ -292,6 +438,27 @@ class TestLoadObservationEntries(unittest.TestCase):
             self._restore_fake_collection(originals[0], originals[1])
 
         self.assertIsNone(entries[0]["session_id"])
+
+    def test_ambiguous_when_logical_entry_contains_multiple_session_ids(self):
+        originals = self._with_fake_collection(
+            ids=["chunk-1", "chunk-2"],
+            documents=[
+                "SESSION_ID: 11111111-1111-1111-1111-111111111111 first",
+                "SESSION_ID: 22222222-2222-2222-2222-222222222222 second",
+            ],
+            metadatas=[
+                {"parent_entry_id": "entry-ambiguous", "chunk_index": 0, "wing": "wing_copilot-cli", "room": "diary"},
+                {"parent_entry_id": "entry-ambiguous", "chunk_index": 1, "wing": "wing_copilot-cli", "room": "diary"},
+            ],
+            embeddings=[[1.0], [3.0]],
+        )
+        try:
+            entries = dream_palace.load_observation_entries("/palace")
+        finally:
+            self._restore_fake_collection(originals[0], originals[1])
+
+        self.assertIsNone(entries[0]["session_id"])
+        self.assertTrue(entries[0]["ambiguous"])
 
 
 class TestKgWriter(unittest.TestCase):
@@ -337,6 +504,198 @@ class TestKgWriter(unittest.TestCase):
                 sys.modules.pop("mempalace.knowledge_graph", None)
             else:
                 sys.modules["mempalace.knowledge_graph"] = original_kg_module
+
+    def test_invalidate_triples_updates_only_requested_ids(self):
+        original_mempalace = sys.modules.get("mempalace")
+        original_kg_module = sys.modules.get("mempalace.knowledge_graph")
+
+        class FakeKnowledgeGraph:
+            def __init__(self, db_path):
+                self.db_path = db_path
+
+            def close(self):
+                pass
+
+        mempalace_module = types.ModuleType("mempalace")
+        kg_module = types.ModuleType("mempalace.knowledge_graph")
+        kg_module.KnowledgeGraph = FakeKnowledgeGraph
+        sys.modules["mempalace"] = mempalace_module
+        sys.modules["mempalace.knowledge_graph"] = kg_module
+        try:
+            with _test_tmpdir() as palace:
+                db_path = os.path.join(palace, "knowledge_graph.sqlite3")
+                con = sqlite3.connect(db_path)
+                con.executescript(
+                    """
+                    CREATE TABLE triples (
+                        id TEXT PRIMARY KEY,
+                        subject TEXT,
+                        predicate TEXT,
+                        object TEXT,
+                        valid_to TEXT
+                    );
+                    INSERT INTO triples (id, subject, predicate, object, valid_to) VALUES
+                        ('t1', 'e1', 'same', 'e2', NULL),
+                        ('t2', 'e1', 'same', 'e2', NULL),
+                        ('t3', 'e1', 'same', 'e2', 'already-ended');
+                    """
+                )
+                con.commit()
+                con.close()
+
+                writer = dream_palace.KgWriter(palace)
+                count = writer.invalidate_triples(["t1"], ended="2026-07-06T15:00:00+00:00")
+                writer.close()
+
+                con = sqlite3.connect(db_path)
+                rows = dict(con.execute("SELECT id, valid_to FROM triples").fetchall())
+                con.close()
+                self.assertEqual(count, 1)
+                self.assertEqual(rows["t1"], "2026-07-06T15:00:00+00:00")
+                self.assertIsNone(rows["t2"])
+                self.assertEqual(rows["t3"], "already-ended")
+        finally:
+            if original_mempalace is None:
+                sys.modules.pop("mempalace", None)
+            else:
+                sys.modules["mempalace"] = original_mempalace
+            if original_kg_module is None:
+                sys.modules.pop("mempalace.knowledge_graph", None)
+            else:
+                sys.modules["mempalace.knowledge_graph"] = original_kg_module
+
+
+class TestMempalaceWriter(unittest.TestCase):
+    def _with_fake_tools(self, handler):
+        original_mempalace = sys.modules.get("mempalace")
+        original_mcp_module = sys.modules.get("mempalace.mcp_server")
+        mempalace_module = types.ModuleType("mempalace")
+        mcp_module = types.ModuleType("mempalace.mcp_server")
+        mcp_module.TOOLS = {
+            "mempalace_add_drawer": {"handler": handler},
+            "mempalace_delete_drawer": {"handler": lambda drawer_id: {"deleted": drawer_id}},
+        }
+        sys.modules["mempalace"] = mempalace_module
+        sys.modules["mempalace.mcp_server"] = mcp_module
+        return original_mempalace, original_mcp_module
+
+    def _restore_fake_tools(self, original_mempalace, original_mcp_module):
+        if original_mempalace is None:
+            sys.modules.pop("mempalace", None)
+        else:
+            sys.modules["mempalace"] = original_mempalace
+        if original_mcp_module is None:
+            sys.modules.pop("mempalace.mcp_server", None)
+        else:
+            sys.modules["mempalace.mcp_server"] = original_mcp_module
+
+    def test_add_drawer_forwards_metadata_when_handler_accepts_it(self):
+        calls = []
+
+        def handler(wing, room, content, added_by="dreaming", metadata=None):
+            calls.append((wing, room, content, added_by, metadata))
+            return {"id": "new-drawer"}
+
+        originals = self._with_fake_tools(handler)
+        try:
+            result = dream_palace.MempalaceWriter().add_drawer(
+                "wing", "room", "content", metadata={"kind": "pattern"}
+            )
+        finally:
+            self._restore_fake_tools(originals[0], originals[1])
+
+        self.assertEqual(result, {"id": "new-drawer"})
+        self.assertEqual(calls, [("wing", "room", "content", "dreaming", {"kind": "pattern"})])
+
+    def test_add_drawer_embeds_metadata_trailer_when_handler_does_not_accept_it(self):
+        calls = []
+
+        def handler(wing, room, content, added_by="dreaming"):
+            calls.append((wing, room, content, added_by))
+            return {"id": "new-drawer"}
+
+        originals = self._with_fake_tools(handler)
+        try:
+            dream_palace.MempalaceWriter().add_drawer(
+                "wing", "room", "content", metadata={"supersedes": ["old"], "kind": "merge"}
+            )
+        finally:
+            self._restore_fake_tools(originals[0], originals[1])
+
+        self.assertEqual(calls[0][0:2], ("wing", "room"))
+        self.assertTrue(calls[0][2].startswith("content\n\n<!--dreaming-meta: "))
+        self.assertIn('"supersedes":["old"]', calls[0][2])
+
+
+class TestLoadDrawerById(unittest.TestCase):
+    def test_returns_reassembled_drawer_with_content_hash(self):
+        original_mempalace = sys.modules.get("mempalace")
+        original_palace_module = sys.modules.get("mempalace.palace")
+
+        class FakeCollection:
+            def get(self, **kwargs):
+                if kwargs.get("ids") == ["logical-1"]:
+                    return {"ids": [], "documents": [], "metadatas": [], "embeddings": []}
+                if kwargs.get("where") == {"parent_drawer_id": "logical-1"}:
+                    return {
+                        "ids": ["chunk-2", "chunk-1"],
+                        "documents": ["second", "first"],
+                        "metadatas": [
+                            {"parent_drawer_id": "logical-1", "chunk_index": 1, "wing": "wing", "room": "room"},
+                            {"parent_drawer_id": "logical-1", "chunk_index": 0, "wing": "wing", "room": "room"},
+                        ],
+                        "embeddings": [[3.0, 5.0], [1.0, 3.0]],
+                    }
+                return {"ids": [], "documents": [], "metadatas": [], "embeddings": []}
+
+        palace_module = types.ModuleType("mempalace.palace")
+        palace_module.get_collection = lambda palace_path: FakeCollection()
+        sys.modules["mempalace"] = types.ModuleType("mempalace")
+        sys.modules["mempalace.palace"] = palace_module
+        try:
+            drawer = dream_palace.load_drawer_by_id("/palace", "logical-1")
+        finally:
+            if original_mempalace is None:
+                sys.modules.pop("mempalace", None)
+            else:
+                sys.modules["mempalace"] = original_mempalace
+            if original_palace_module is None:
+                sys.modules.pop("mempalace.palace", None)
+            else:
+                sys.modules["mempalace.palace"] = original_palace_module
+
+        self.assertEqual(drawer["id"], "logical-1")
+        self.assertEqual(drawer["text"], "first\nsecond")
+        self.assertEqual(drawer["metadata"], {"parent_drawer_id": "logical-1", "chunk_index": 0, "wing": "wing", "room": "room"})
+        self.assertEqual(drawer["embedding"], [2.0, 4.0])
+        self.assertEqual(
+            drawer["content_hash"],
+            "4252f8d56b4bb236d0b1bc95a1202e392ca84ce0644bf628398fbb9517287da8",
+        )
+
+    def test_returns_none_for_unknown_drawer(self):
+        original_mempalace = sys.modules.get("mempalace")
+        original_palace_module = sys.modules.get("mempalace.palace")
+
+        class FakeCollection:
+            def get(self, **kwargs):
+                return {"ids": [], "documents": [], "metadatas": [], "embeddings": []}
+
+        palace_module = types.ModuleType("mempalace.palace")
+        palace_module.get_collection = lambda palace_path: FakeCollection()
+        sys.modules["mempalace"] = types.ModuleType("mempalace")
+        sys.modules["mempalace.palace"] = palace_module
+        try:
+            self.assertIsNone(dream_palace.load_drawer_by_id("/palace", "missing"))
+        finally:
+            if original_mempalace is None:
+                sys.modules.pop("mempalace", None)
+            else:
+                sys.modules["mempalace"] = original_mempalace
+            if original_palace_module is None:
+                sys.modules.pop("mempalace.palace", None)
+            else:
+                sys.modules["mempalace.palace"] = original_palace_module
 
 
 if __name__ == "__main__":

@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime
+import hashlib
 import json
+import re
 import sys
 
 import dream_palace
@@ -28,6 +30,35 @@ from dream_lib import (
     group_observation_themes,
     select_prune_candidates,
 )
+
+_LESSON_TRAILER_RE = re.compile(
+    r"<!--dreaming-meta:\s*\{[^}]*[\"']kind[\"']\s*:\s*[\"']lesson[\"'][^}]*\}\s*-->",
+    re.IGNORECASE,
+)
+
+
+def _content_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _is_surfaced_lesson(entry: dict) -> bool:
+    metadata = entry.get("metadata") or {}
+    return metadata.get("kind") == "lesson" or _LESSON_TRAILER_RE.search(entry.get("text", "")) is not None
+
+
+def _stamp_merge_hashes(worklist: dict) -> None:
+    for item in worklist.get("items", []):
+        hashes = {}
+        for member in item.get("members", []):
+            digest = _content_hash(member.get("text", ""))
+            member["content_hash"] = digest
+            hashes[member["id"]] = digest
+        item["content_hashes"] = hashes
+
+
+def _stamp_prune_hashes(worklist: dict) -> None:
+    for item in worklist.get("items", []):
+        item["content_hash"] = _content_hash(item.get("text", ""))
 
 
 def _degree_for(drawer: dict, degrees: dict[str, int]) -> int:
@@ -51,7 +82,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--age-floor-days", type=int, default=30,
                     help="Minimum drawer age for prune candidates (default 30)")
     ap.add_argument("--rooms", default="diary",
-                    help="Comma-separated rooms for pattern observation harvest (default diary)")
+                    help=(
+                        "Comma-separated rooms for pattern observation harvest (default diary). "
+                        "Put surfaced lessons in a non-mined room so future pattern harvests ignore them."
+                    ))
     ap.add_argument("--instructions", help="Optional steering note recorded in the worklist")
     ap.add_argument("--out", default="worklist.json", help="Output worklist path (default worklist.json)")
     args = ap.parse_args(argv)
@@ -76,7 +110,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.task == "pattern":
         tau = args.tau if args.tau is not None else 0.75
         rooms = tuple(room.strip() for room in args.rooms.split(",") if room.strip())
-        entries = dream_palace.load_observation_entries(path, wing=args.wing, rooms=rooms)
+        entries = [
+            entry for entry in dream_palace.load_observation_entries(path, wing=args.wing, rooms=rooms)
+            if not _is_surfaced_lesson(entry)
+        ]
         themes = group_observation_themes(entries, tau=tau, min_support=args.min_support)
         worklist = build_pattern_worklist(
             themes,
@@ -125,6 +162,7 @@ def main(argv: list[str] | None = None) -> int:
             params={"v_min": args.v_min, "age_floor_days": args.age_floor_days},
             instructions=args.instructions,
         )
+        _stamp_prune_hashes(worklist)
         with open(args.out, "w", encoding="utf-8") as fh:
             json.dump(worklist, fh, indent=2, ensure_ascii=False)
         print(
@@ -142,6 +180,7 @@ def main(argv: list[str] | None = None) -> int:
         scope={"palace": path, "wing": args.wing, "room": args.room},
         instructions=args.instructions,
     )
+    _stamp_merge_hashes(worklist)
 
     with open(args.out, "w", encoding="utf-8") as fh:
         json.dump(worklist, fh, indent=2, ensure_ascii=False)

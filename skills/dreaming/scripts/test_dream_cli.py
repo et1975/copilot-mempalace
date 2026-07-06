@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -109,6 +110,54 @@ class TestHarvestPatternTask(unittest.TestCase):
                 stderr.getvalue(),
             )
 
+    def test_pattern_task_excludes_already_surfaced_lessons(self):
+        entries = [
+            {
+                "id": "entry-1",
+                "text": "SESSION_ID: s1 repeated observation",
+                "embedding": [1.0, 0.0],
+                "session_id": "s1",
+            },
+            {
+                "id": "entry-2",
+                "text": "SESSION_ID: s2 repeated observation again",
+                "embedding": [1.0, 0.0],
+                "session_id": "s2",
+            },
+            {
+                "id": "lesson-meta",
+                "text": "SESSION_ID: s3 surfaced lesson",
+                "embedding": [1.0, 0.0],
+                "session_id": "s3",
+                "metadata": {"kind": "lesson"},
+            },
+            {
+                "id": "lesson-trailer",
+                "text": 'SESSION_ID: s4 surfaced lesson\n<!--dreaming-meta: {"kind":"lesson"}-->',
+                "embedding": [1.0, 0.0],
+                "session_id": "s4",
+            },
+        ]
+        with _test_tmpdir() as td:
+            out = os.path.join(td, "worklist.json")
+            stderr = io.StringIO()
+            with mock.patch.object(dream_harvest.dream_palace, "bind_palace", return_value="/bound"), \
+                 mock.patch.object(dream_harvest.dream_palace, "load_observation_entries", return_value=entries), \
+                 contextlib.redirect_stderr(stderr):
+                rc = dream_harvest.main([
+                    "--palace", "/palace",
+                    "--task", "pattern",
+                    "--wing", "wing_copilot-cli",
+                    "--min-support", "2",
+                    "--out", out,
+                ])
+
+            self.assertEqual(rc, 0)
+            with open(out, encoding="utf-8") as fh:
+                worklist = json.load(fh)
+            self.assertEqual(worklist["items"][0]["evidence"]["support_ids"], ["s1", "s2"])
+            self.assertIn("harvested 2 observation entries -> 1 pattern theme(s)", stderr.getvalue())
+
 
 class TestHarvestPruneTask(unittest.TestCase):
     def test_prune_task_writes_prune_worklist(self):
@@ -162,6 +211,10 @@ class TestHarvestPruneTask(unittest.TestCase):
             self.assertEqual([item["id"] for item in worklist["items"]], ["drawer-1"])
             self.assertEqual(worklist["items"][0]["kind"], "prune")
             self.assertEqual(worklist["items"][0]["salience"]["kg_degree"], 0)
+            self.assertEqual(
+                worklist["items"][0]["content_hash"],
+                hashlib.sha256("temporary note for now".encode("utf-8")).hexdigest(),
+            )
             self.assertIn(
                 "harvested 2 drawers -> 1 prune candidate(s) (v<v_min, age>=floor, kg_degree=0)",
                 stderr.getvalue(),
@@ -178,8 +231,8 @@ class TestAdoptContradictionTask(unittest.TestCase):
                     "subject": "Alice",
                     "predicate": "lives_in",
                     "candidates": [
-                        {"object": "Seattle"},
-                        {"object": "Portland"},
+                        {"object": "Seattle", "object_id": "city-sea", "triple_id": "t-sea", "triple_ids": ["t-sea"]},
+                        {"object": "Portland", "object_id": "city-pdx", "triple_id": "t-pdx", "triple_ids": ["t-pdx"]},
                     ],
                     "decision": {"action": "invalidate", "keep": "Seattle"},
                 },
@@ -200,7 +253,7 @@ class TestAdoptContradictionTask(unittest.TestCase):
 
         self.assertEqual(decisions, [
             {"action": "invalidate", "subject": "Alice", "predicate": "lives_in",
-             "invalidate": ["Portland"]},
+             "invalidate": ["t-pdx"]},
             {"action": "skip"},
         ])
 
@@ -212,11 +265,14 @@ class TestAdoptContradictionTask(unittest.TestCase):
                     "kind": "contradiction",
                     "subject": "Alice",
                     "predicate": "lives_in",
-                    "candidates": [{"object": "Portland"}, {"object": "Seattle"}],
+                    "candidates": [
+                        {"object": "Portland", "object_id": "city-pdx", "triple_id": "t-pdx", "triple_ids": ["t-pdx"]},
+                        {"object": "Seattle", "object_id": "city-sea", "triple_id": "t-sea", "triple_ids": ["t-sea"]},
+                    ],
                     "decision": {
                         "action": "invalidate",
                         "keep": "Seattle",
-                        "invalidate": ["Portland"],
+                        "invalidate": ["t-pdx"],
                     },
                 }
             ],
@@ -238,14 +294,15 @@ class TestAdoptContradictionTask(unittest.TestCase):
                 ])
 
             self.assertEqual(rc, 0)
-            self.assertIn("INVALIDATE Alice lives_in=Portland", stdout.getvalue())
+            self.assertIn("INVALIDATE_TRIPLES t-pdx", stdout.getvalue())
             self.assertIn("[dry-run] would invalidate 1, skip 0", stderr.getvalue())
 
 
 class TestAdoptPatternTask(unittest.TestCase):
-    def test_resolve_pattern_decisions_defaults_surface_and_skip(self):
+    def test_pattern_support_subset_rejects_laundering_and_surfaces_valid_subset(self):
         worklist = {
             "task": "pattern",
+            "params": {"min_support": 2},
             "items": [
                 {
                     "kind": "pattern",
@@ -258,8 +315,30 @@ class TestAdoptPatternTask(unittest.TestCase):
                             "room": "diary",
                         }
                     ],
-                    "evidence": {"support_ids": ["abcdef12", "abcdef13"]},
-                    "decision": {"action": "surface", "text": "Recurring pattern worth surfacing."},
+                    "evidence": {"support_ids": ["abcdef12", "abcdef13", "abcdef14"]},
+                    "decision": {
+                        "action": "surface",
+                        "text": "Undersupported pattern must be rejected.",
+                        "supported_by": ["abcdef12"],
+                    },
+                },
+                {
+                    "kind": "pattern",
+                    "members": [
+                        {
+                            "id": "entry-2",
+                            "text": "SESSION_ID: abcdef13 repeated observation",
+                            "session_id": "abcdef13",
+                            "wing": "wing_copilot-cli",
+                            "room": "diary",
+                        }
+                    ],
+                    "evidence": {"support_ids": ["abcdef12", "abcdef13", "abcdef14"]},
+                    "decision": {
+                        "action": "surface",
+                        "text": "Recurring pattern worth surfacing.",
+                        "supported_by": ["abcdef12", "abcdef14"],
+                    },
                 },
                 {
                     "kind": "pattern",
@@ -272,20 +351,25 @@ class TestAdoptPatternTask(unittest.TestCase):
 
         decisions = dream_adopt._resolve_pattern_decisions(worklist)
 
-        self.assertEqual(decisions, [
-            {
-                "action": "surface",
-                "wing": "wing_copilot-cli",
-                "room": "diary",
-                "text": "Recurring pattern worth surfacing.",
-                "supported_by": ["abcdef12", "abcdef13"],
-            },
-            {"action": "skip"},
-        ])
+        self.assertEqual(decisions[0]["supported_by"], ["abcdef12"])
+        self.assertEqual(decisions[0]["allowed_support"], ["abcdef12", "abcdef13", "abcdef14"])
+        self.assertEqual(decisions[1]["supported_by"], ["abcdef12", "abcdef14"])
+        writer = mock.Mock()
+        writer.add_drawer.return_value = {"drawer_id": "lesson-1"}
+        report = dream_adopt.apply_pattern_decisions(decisions, writer, min_support=2)
+        self.assertEqual(report["surfaced"], 1)
+        self.assertEqual(len(report["errors"]), 1)
+        writer.add_drawer.assert_called_once_with(
+            "wing_copilot-cli",
+            "diary",
+            "Recurring pattern worth surfacing.",
+            metadata={"supported_by": ["abcdef12", "abcdef14"], "kind": "lesson"},
+        )
 
     def test_dry_run_pattern_adds_only_and_never_deletes(self):
         worklist = {
             "task": "pattern",
+            "params": {"min_support": 2},
             "items": [
                 {
                     "kind": "pattern",
@@ -302,6 +386,7 @@ class TestAdoptPatternTask(unittest.TestCase):
                     "decision": {
                         "action": "surface",
                         "text": "Recurring pattern worth surfacing.",
+                        "supported_by": ["abcdef12", "abcdef13"],
                     },
                 }
             ],
@@ -328,6 +413,48 @@ class TestAdoptPatternTask(unittest.TestCase):
             self.assertIn("[dry-run] would surface 1, skip 0, errors 0", stderr.getvalue())
 
 
+class TestAdoptMergeTask(unittest.TestCase):
+    def test_dry_run_merge_archives_without_real_writes_or_deletes(self):
+        worklist = {
+            "task": "merge",
+            "items": [
+                {
+                    "kind": "merge",
+                    "members": [
+                        {"id": "drawer-1", "member_ids": ["chunk-1"], "wing": "wing", "room": "room", "text": "old A"},
+                        {"id": "drawer-2", "member_ids": ["chunk-2"], "wing": "wing", "room": "room", "text": "old B"},
+                    ],
+                    "supersedes": ["chunk-1", "chunk-2"],
+                    "decision": {"action": "merge", "text": "merged fact"},
+                }
+            ],
+        }
+        with _test_tmpdir() as td:
+            decisions_path = os.path.join(td, "decisions.json")
+            with open(decisions_path, "w", encoding="utf-8") as fh:
+                json.dump(worklist, fh)
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            with mock.patch.object(dream_adopt.dream_palace, "bind_palace", return_value="/bound"), \
+                 mock.patch.object(dream_adopt.dream_palace, "MempalaceWriter", side_effect=AssertionError("real writer used")), \
+                 mock.patch.object(dream_adopt.dream_palace, "Archiver", side_effect=AssertionError("real archiver used")), \
+                 contextlib.redirect_stdout(stdout), \
+                 contextlib.redirect_stderr(stderr):
+                rc = dream_adopt.main([
+                    "--palace", "/palace",
+                    "--decisions", decisions_path,
+                    "--archive-file", os.path.join(td, "archive.jsonl"),
+                    "--dry-run",
+                ])
+
+            self.assertEqual(rc, 0)
+            self.assertIn("ADD  wing/room: merged fact...", stdout.getvalue())
+            self.assertIn("ARCHIVE+DELETE ['chunk-1', 'chunk-2']", stdout.getvalue())
+            self.assertNotIn("DEL  ", stdout.getvalue())
+            self.assertIn("[dry-run] would merge 1, skip 0, errors 0", stderr.getvalue())
+
+
 class TestAdoptPruneTask(unittest.TestCase):
     def test_resolve_prune_decisions_defaults_to_item_fields_and_keeps_by_default(self):
         salience = {"v": 0.12, "age_days": 400, "kg_degree": 0}
@@ -341,6 +468,8 @@ class TestAdoptPruneTask(unittest.TestCase):
                     "wing": "wing",
                     "room": "room",
                     "text": "forgettable",
+                    "content_hash": "hash-1",
+                    "pinned": False,
                     "salience": salience,
                     "decision": {"action": "prune"},
                 },
@@ -377,6 +506,9 @@ class TestAdoptPruneTask(unittest.TestCase):
                 "wing": "wing",
                 "room": "room",
                 "text": "forgettable",
+                "content_hash": "hash-1",
+                "pinned": False,
+                "topic": None,
                 "salience": salience,
             },
             {"action": "keep"},
@@ -394,6 +526,8 @@ class TestAdoptPruneTask(unittest.TestCase):
                     "wing": "wing",
                     "room": "room",
                     "text": "forgettable",
+                    "content_hash": "expected-hash",
+                    "pinned": False,
                     "salience": {"v": 0.12, "age_days": 400, "kg_degree": 0},
                     "decision": {"action": "prune"},
                 }
@@ -407,6 +541,13 @@ class TestAdoptPruneTask(unittest.TestCase):
             stderr = io.StringIO()
 
             with mock.patch.object(dream_adopt.dream_palace, "bind_palace", return_value="/bound"), \
+                 mock.patch.object(dream_adopt.dream_palace, "load_drawer_by_id", return_value={
+                     "id": "drawer-1",
+                     "text": "forgettable",
+                     "metadata": {"pinned": False},
+                     "content_hash": "expected-hash",
+                 }), \
+                 mock.patch.object(dream_adopt.dream_palace, "kg_source_degree", return_value={}), \
                  mock.patch.object(dream_adopt.dream_palace, "Archiver", side_effect=AssertionError("real archiver used")), \
                  contextlib.redirect_stdout(stdout), \
                  contextlib.redirect_stderr(stderr):
@@ -420,6 +561,114 @@ class TestAdoptPruneTask(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertIn("PRUNE drawer-1 (archive+delete)", stdout.getvalue())
             self.assertIn("[dry-run] would prune 1, keep 0, errors 0", stderr.getvalue())
+
+    def test_dry_run_prune_skips_drifted_drawer(self):
+        worklist = {
+            "task": "prune",
+            "items": [
+                {
+                    "kind": "prune",
+                    "id": "drawer-1",
+                    "member_ids": ["chunk-1"],
+                    "wing": "wing",
+                    "room": "room",
+                    "text": "old text",
+                    "content_hash": "old-hash",
+                    "pinned": False,
+                    "salience": {"v": 0.12, "age_days": 400, "kg_degree": 0},
+                    "decision": {"action": "prune"},
+                }
+            ],
+        }
+        with _test_tmpdir() as td:
+            decisions_path = os.path.join(td, "decisions.json")
+            with open(decisions_path, "w", encoding="utf-8") as fh:
+                json.dump(worklist, fh)
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            with mock.patch.object(dream_adopt.dream_palace, "bind_palace", return_value="/bound"), \
+                 mock.patch.object(dream_adopt.dream_palace, "load_drawer_by_id", return_value={
+                     "id": "drawer-1",
+                     "text": "new text",
+                     "metadata": {"pinned": False},
+                     "content_hash": "new-hash",
+                 }), \
+                 mock.patch.object(dream_adopt.dream_palace, "kg_source_degree", return_value={}), \
+                 contextlib.redirect_stdout(stdout), \
+                 contextlib.redirect_stderr(stderr):
+                rc = dream_adopt.main([
+                    "--palace", "/palace",
+                    "--decisions", decisions_path,
+                    "--archive-file", os.path.join(td, "archive.jsonl"),
+                    "--dry-run",
+                ])
+
+            self.assertEqual(rc, 1)
+            self.assertNotIn("PRUNE drawer-1", stdout.getvalue())
+            self.assertIn("drift", stderr.getvalue())
+
+    def test_dry_run_prune_aborts_now_pinned_or_kg_connected_drawers(self):
+        worklist = {
+            "task": "prune",
+            "items": [
+                {
+                    "kind": "prune",
+                    "id": "pinned",
+                    "member_ids": ["pinned"],
+                    "wing": "wing",
+                    "room": "room",
+                    "text": "still important",
+                    "content_hash": "hash-pinned",
+                    "pinned": False,
+                    "salience": {"v": 0.12, "age_days": 400, "kg_degree": 0},
+                    "decision": {"action": "prune"},
+                },
+                {
+                    "kind": "prune",
+                    "id": "connected",
+                    "member_ids": ["connected"],
+                    "wing": "wing",
+                    "room": "room",
+                    "text": "kg source",
+                    "content_hash": "hash-connected",
+                    "pinned": False,
+                    "salience": {"v": 0.12, "age_days": 400, "kg_degree": 0},
+                    "decision": {"action": "prune"},
+                },
+            ],
+        }
+
+        def load_live(_palace, drawer_id):
+            return {
+                "id": drawer_id,
+                "text": drawer_id,
+                "metadata": {"pinned": drawer_id == "pinned"},
+                "content_hash": f"hash-{drawer_id}",
+            }
+
+        with _test_tmpdir() as td:
+            decisions_path = os.path.join(td, "decisions.json")
+            with open(decisions_path, "w", encoding="utf-8") as fh:
+                json.dump(worklist, fh)
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            with mock.patch.object(dream_adopt.dream_palace, "bind_palace", return_value="/bound"), \
+                 mock.patch.object(dream_adopt.dream_palace, "load_drawer_by_id", side_effect=load_live), \
+                 mock.patch.object(dream_adopt.dream_palace, "kg_source_degree", return_value={"connected": 1}), \
+                 contextlib.redirect_stdout(stdout), \
+                 contextlib.redirect_stderr(stderr):
+                rc = dream_adopt.main([
+                    "--palace", "/palace",
+                    "--decisions", decisions_path,
+                    "--archive-file", os.path.join(td, "archive.jsonl"),
+                    "--dry-run",
+                ])
+
+            self.assertEqual(rc, 1)
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertIn("protected", stderr.getvalue())
 
 
 if __name__ == "__main__":

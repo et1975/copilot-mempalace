@@ -13,10 +13,17 @@ from __future__ import annotations
 
 import json
 import os
+import hashlib
+import inspect
+import re
 import sqlite3
+from datetime import datetime, timezone
 from typing import Any
 
-from dream_lib import extract_session_id
+SESSION_ID_RE = re.compile(
+    r"SESSION_ID:\s*([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})",
+    re.IGNORECASE,
+)
 
 
 def bind_palace(palace_path: str) -> str:
@@ -106,6 +113,15 @@ def _group_by_parent(rows: list[dict[str, Any]], key_fields: tuple[str, ...]) ->
     return logical
 
 
+def _session_id_state(text: str) -> tuple[str | None, bool]:
+    ids = list(dict.fromkeys(match.lower() for match in SESSION_ID_RE.findall(text)))
+    if len(ids) == 1:
+        return ids[0], False
+    if len(ids) > 1:
+        return None, True
+    return None, False
+
+
 def load_logical_drawers(
     palace_path: str, wing: str | None = None, room: str | None = None
 ) -> list[dict[str, Any]]:
@@ -119,6 +135,44 @@ def load_logical_drawers(
         kwargs["where"] = where
     res = col.get(**kwargs)
     return _group_by_parent(_rows_from_collection_result(res), ("parent_drawer_id",))
+
+
+def load_drawer_by_id(palace_path: str, drawer_id: str) -> dict[str, Any] | None:
+    """Read a current logical drawer by id, reassembling chunks and hashing text."""
+    from mempalace.palace import get_collection  # lazy: heavy import
+
+    col = get_collection(palace_path)
+    include = ["documents", "metadatas", "embeddings"]
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    for kwargs in (
+        {"where": {"parent_drawer_id": drawer_id}, "include": include},
+        {"ids": [drawer_id], "include": include},
+    ):
+        for row in _rows_from_collection_result(col.get(**kwargs)):
+            if row["id"] not in seen:
+                rows.append(row)
+                seen.add(row["id"])
+
+    if not rows:
+        return None
+
+    logicals = _group_by_parent(rows, ("parent_drawer_id",))
+    logical = next((item for item in logicals if item["id"] == drawer_id), None)
+    if logical is None:
+        if len(logicals) != 1:
+            return None
+        logical = logicals[0]
+
+    text = logical["text"]
+    return {
+        "id": logical["id"],
+        "text": text,
+        "metadata": logical["metadata"],
+        "embedding": logical["embedding"],
+        "content_hash": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+    }
 
 
 def load_observation_entries(
@@ -143,20 +197,22 @@ def load_observation_entries(
     for logical in _group_by_parent(rows, ("parent_entry_id", "parent_drawer_id")):
         meta = logical.get("metadata") or {}
         text = logical["text"]
-        entries.append(
-            {
-                "id": logical["id"],
-                "member_ids": logical["member_ids"],
-                "text": text,
-                "embedding": logical["embedding"],
-                "session_id": extract_session_id(text),
-                "agent": meta.get("agent"),
-                "date": meta.get("date"),
-                "topic": meta.get("topic"),
-                "wing": meta.get("wing"),
-                "room": meta.get("room"),
-            }
-        )
+        session_id, ambiguous = _session_id_state(text)
+        entry = {
+            "id": logical["id"],
+            "member_ids": logical["member_ids"],
+            "text": text,
+            "embedding": logical["embedding"],
+            "session_id": session_id,
+            "agent": meta.get("agent"),
+            "date": meta.get("date"),
+            "topic": meta.get("topic"),
+            "wing": meta.get("wing"),
+            "room": meta.get("room"),
+        }
+        if ambiguous:
+            entry["ambiguous"] = True
+        entries.append(entry)
     return entries
 
 
@@ -176,15 +232,22 @@ def load_active_triples(palace_path: str) -> list[dict[str, Any]]:
         rows = con.execute(
             """
             SELECT
+                t.id AS triple_id,
                 s.name AS subject,
+                t.subject AS subject_id,
                 t.predicate AS predicate,
                 o.name AS object,
+                t.object AS object_id,
                 t.valid_from AS valid_from,
-                t.extracted_at AS extracted_at
+                t.valid_to AS valid_to,
+                t.extracted_at AS extracted_at,
+                t.source_drawer_id AS source_drawer_id,
+                t.confidence AS confidence
             FROM triples t
             JOIN entities s ON t.subject = s.id
             JOIN entities o ON t.object = o.id
             WHERE t.valid_to IS NULL
+            ORDER BY t.id
             """
         ).fetchall()
         return [dict(row) for row in rows]
@@ -226,9 +289,33 @@ class MempalaceWriter:
 
         self._tools = TOOLS
 
-    def add_drawer(self, wing: str, room: str, content: str) -> Any:
+    def add_drawer(
+        self,
+        wing: str,
+        room: str,
+        content: str,
+        added_by: str = "dreaming",
+        metadata: dict[str, Any] | None = None,
+    ) -> Any:
+        handler = self._tools["mempalace_add_drawer"]["handler"]
+        kwargs: dict[str, Any] = {"wing": wing, "room": room, "content": content, "added_by": added_by}
+        if metadata:
+            try:
+                sig = inspect.signature(handler)
+                accepts_metadata = "metadata" in sig.parameters or any(
+                    param.kind is inspect.Parameter.VAR_KEYWORD for param in sig.parameters.values()
+                )
+            except (TypeError, ValueError):
+                accepts_metadata = False
+            if accepts_metadata:
+                kwargs["metadata"] = metadata
+            else:
+                # The shipped MCP add_drawer schema has no metadata field, so keep
+                # provenance reversible by appending a machine-readable trailer.
+                meta_json = json.dumps(metadata, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                kwargs["content"] = f"{content}\n\n<!--dreaming-meta: {meta_json}-->"
         return self._tools["mempalace_add_drawer"]["handler"](
-            wing=wing, room=room, content=content, added_by="dreaming"
+            **kwargs
         )
 
     def delete_drawer(self, drawer_id: str) -> Any:
@@ -241,25 +328,81 @@ class Archiver:
     Deletes go through the sanctioned handler so the closet/AAAK index is purged.
     """
 
-    def __init__(self, archive_path: str, writer: Any | None = None) -> None:
+    def __init__(
+        self,
+        palace_path: str,
+        archive_path: str | None = None,
+        writer: Any | None = None,
+        collection: Any | None = None,
+    ) -> None:
+        self.palace_path = os.path.abspath(os.path.expanduser(palace_path))
+        if archive_path is None:
+            archive_path = os.path.join(self.palace_path, "dream-archive.jsonl")
         self.archive_path = os.path.abspath(os.path.expanduser(archive_path))
         self._writer = writer if writer is not None else MempalaceWriter()
+        self._collection = collection
+
+    def _get_collection(self) -> Any:
+        if self._collection is None:
+            from mempalace.palace import get_collection  # lazy: heavy import
+
+            self._collection = get_collection(self.palace_path)
+        return self._collection
+
+    def _reload_rows(self, member_ids: list[str]) -> list[dict[str, Any]]:
+        res = self._get_collection().get(
+            ids=member_ids,
+            include=["documents", "metadatas", "embeddings"],
+        )
+        rows = _rows_from_collection_result(res)
+        by_id = {row["id"]: row for row in rows}
+        missing = [drawer_id for drawer_id in member_ids if drawer_id not in by_id]
+        if missing:
+            raise ValueError(f"archive preflight failed; missing drawer ids: {missing}")
+        return [by_id[drawer_id] for drawer_id in member_ids]
 
     def archive_then_delete(self, record: dict[str, Any]) -> dict[str, Any]:
+        member_ids = list(record.get("member_ids") or [record["id"]])
+        rows = self._reload_rows(member_ids)
+        archive_record = {
+            "schema": 1,
+            "id": record["id"],
+            "member_ids": member_ids,
+            "wing": record.get("wing"),
+            "room": record.get("room"),
+            "salience": record.get("salience"),
+            "reason": record.get("reason", "prune"),
+            "archived_at": datetime.now(timezone.utc).isoformat(),
+            "rows": [
+                {
+                    "id": row["id"],
+                    "document": row.get("text", ""),
+                    "metadata": row.get("metadata") or {},
+                    "embedding": row.get("embedding") or [],
+                }
+                for row in rows
+            ],
+        }
+
         parent = os.path.dirname(self.archive_path)
         if parent:
             os.makedirs(parent, exist_ok=True)
 
         with open(self.archive_path, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, ensure_ascii=False))
+            fh.write(json.dumps(archive_record, ensure_ascii=False))
             fh.write("\n")
             fh.flush()
             os.fsync(fh.fileno())
 
         deleted = []
-        for drawer_id in record.get("member_ids", [record["id"]]):
-            self._writer.delete_drawer(drawer_id)
-            deleted.append(drawer_id)
+        for drawer_id in member_ids:
+            try:
+                self._writer.delete_drawer(drawer_id)
+            except Exception as ex:
+                ex.args = (*ex.args, {"deleted": deleted.copy(), "failed": drawer_id})
+                raise
+            else:
+                deleted.append(drawer_id)
         return {"archived": record["id"], "deleted": deleted}
 
 
@@ -275,10 +418,29 @@ class KgWriter:
     def __init__(self, palace_path: str) -> None:
         from mempalace.knowledge_graph import KnowledgeGraph  # lazy
 
-        self._kg = KnowledgeGraph(db_path=os.path.join(palace_path, "knowledge_graph.sqlite3"))
+        self._db_path = os.path.join(palace_path, "knowledge_graph.sqlite3")
+        self._kg = KnowledgeGraph(db_path=self._db_path)
 
     def invalidate(self, subject: str, predicate: str, object: str, ended: str | None = None) -> Any:
         return self._kg.invalidate(subject, predicate, object, ended=ended)
+
+    def invalidate_triples(self, triple_ids: list[str], ended: str | None = None) -> int:
+        if not os.path.exists(self._db_path):
+            return 0
+        ended_at = ended or datetime.now(timezone.utc).isoformat()
+        con = sqlite3.connect(self._db_path)
+        try:
+            count = 0
+            for triple_id in triple_ids:
+                cur = con.execute(
+                    "UPDATE triples SET valid_to=? WHERE id=? AND valid_to IS NULL",
+                    (ended_at, triple_id),
+                )
+                count += cur.rowcount
+            con.commit()
+            return count
+        finally:
+            con.close()
 
     def close(self) -> None:
         self._kg.close()
