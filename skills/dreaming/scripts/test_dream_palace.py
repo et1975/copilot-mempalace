@@ -68,14 +68,14 @@ class TestFindDuplicateClusters(unittest.TestCase):
         originals = self._with_fake_tools(find_handler, get_handler)
         try:
             clusters = dream_palace.find_duplicate_clusters(
-                "/palace", wing="wing-scope", room="room-scope", tau=0.82, max_clusters=5
+                "/palace", wing="wing-scope", tau=0.82, max_clusters=5
             )
         finally:
             self._restore_fake_tools(originals[0], originals[1])
 
         self.assertEqual(calls[0][0], "find")
         self.assertEqual(calls[0][1]["wing"], "wing-scope")
-        self.assertEqual(calls[0][1]["room"], "room-scope")
+        self.assertIsNone(calls[0][1]["room"])
         self.assertAlmostEqual(calls[0][1]["threshold"], 0.18)
         self.assertEqual(calls[0][1]["max_clusters"], 5)
         self.assertEqual(calls[1:], [("get", "logical-a"), ("get", "logical-b")])
@@ -101,6 +101,52 @@ class TestFindDuplicateClusters(unittest.TestCase):
                 "size": 2,
             }
         ])
+
+    def test_avoids_two_key_where_filter_and_filters_room_client_side(self):
+        # Custom mempalace find_duplicates errors on a two-key (wing+room) where
+        # filter, so the adapter must pass a single scope to the handler and
+        # filter the other scope client-side.
+        calls = []
+
+        def find_handler(**kwargs):
+            calls.append(kwargs)
+            # Simulate the mempalace bug: reject a two-key where filter.
+            if kwargs.get("wing") and kwargs.get("room"):
+                raise AssertionError("handler must not receive both wing and room")
+            return {
+                "clusters": [
+                    {
+                        "drawer_ids": ["keep-1", "keep-2", "other-room"],
+                        "size": 3,
+                        "pairs": [
+                            {"a": "keep-1", "b": "keep-2", "distance": 0.1},
+                            {"a": "keep-1", "b": "other-room", "distance": 0.2},
+                        ],
+                    }
+                ]
+            }
+
+        def get_handler(drawer_id):
+            return {
+                "keep-1": {"id": "keep-1", "content": "x", "wing": "w", "room": "n"},
+                "keep-2": {"id": "keep-2", "content": "y", "wing": "w", "room": "n"},
+                "other-room": {"id": "other-room", "content": "z", "wing": "w", "room": "misc"},
+            }[drawer_id]
+
+        originals = self._with_fake_tools(find_handler, get_handler)
+        try:
+            clusters = dream_palace.find_duplicate_clusters("/palace", wing="w", room="n")
+        finally:
+            self._restore_fake_tools(originals[0], originals[1])
+
+        # Handler received wing only (room withheld to avoid the two-key bug).
+        self.assertEqual(calls[0]["wing"], "w")
+        self.assertIsNone(calls[0]["room"])
+        # The out-of-room member is filtered out; only the in-room pair survives.
+        self.assertEqual(len(clusters), 1)
+        self.assertEqual([m["id"] for m in clusters[0]["members"]], ["keep-1", "keep-2"])
+        self.assertEqual(clusters[0]["size"], 2)
+        self.assertEqual(clusters[0]["pair_sims"], [{"a": "keep-1", "b": "keep-2", "sim": 0.9}])
 
 
 class TestLoadDrawerUsage(unittest.TestCase):

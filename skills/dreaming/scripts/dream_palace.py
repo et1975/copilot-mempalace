@@ -218,9 +218,14 @@ def find_duplicate_clusters(
     bind_palace(palace_path)
     from mempalace.mcp_server import TOOLS  # lazy
 
+    # The custom mempalace find_duplicates builds a raw multi-key ChromaDB where
+    # filter, which Chroma rejects when both wing AND room are set ("Expected
+    # where to have exactly one operator"). Pass a single scope key to the
+    # handler and apply the remaining scope client-side below.
+    handler_room = None if (wing and room) else room
     res = TOOLS["mempalace_find_duplicates"]["handler"](
         wing=wing,
-        room=room,
+        room=handler_room,
         threshold=1.0 - tau,
         max_clusters=max_clusters,
     )
@@ -245,13 +250,23 @@ def find_duplicate_clusters(
                 }
             )
 
+        # Client-side scope filter for the key we could not pass to the handler.
+        if wing and room:
+            members = [m for m in members if m["wing"] == wing and m["room"] == room]
+        if len(members) < 2:
+            continue  # a cluster needs >=2 members to be a merge candidate
+        surviving = {m["id"] for m in members} | {mid for m in members for mid in m["member_ids"]}
+
         pair_sims = []
         for pair in _field(cluster, "pairs") or []:
+            a, b = _field(pair, "a"), _field(pair, "b")
+            if a not in surviving or b not in surviving:
+                continue
             distance = _field(pair, "distance")
             pair_sims.append(
                 {
-                    "a": _field(pair, "a"),
-                    "b": _field(pair, "b"),
+                    "a": a,
+                    "b": b,
                     "sim": None if distance is None else 1.0 - float(distance),
                 }
             )
@@ -260,7 +275,7 @@ def find_duplicate_clusters(
             {
                 "members": members,
                 "pair_sims": pair_sims,
-                "size": _field(cluster, "size") or len(members),
+                "size": len(members),
             }
         )
     return clusters
