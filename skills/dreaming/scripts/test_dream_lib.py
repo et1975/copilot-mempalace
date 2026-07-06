@@ -83,9 +83,9 @@ class TestCluster(unittest.TestCase):
 
 
 class TestBuildWorklist(unittest.TestCase):
-    def _d(self, _id, emb):
+    def _d(self, _id, emb, room="r"):
         return {"id": _id, "member_ids": [_id], "text": _id, "embedding": emb,
-                "wing": "w", "room": "r"}
+                "wing": "w", "room": room}
 
     def test_shape_and_null_decision(self):
         drawers = [self._d("a", [1.0, 0.0]), self._d("b", [1.0, 0.0])]
@@ -99,6 +99,29 @@ class TestBuildWorklist(unittest.TestCase):
         self.assertEqual(item["kind"], "merge")
         self.assertIsNone(item["decision"])
         self.assertEqual(item["evidence"]["size"], 2)
+
+    def test_cross_room_cluster_is_partitioned_and_singletons_dropped(self):
+        drawers = [
+            self._d("a", [1.0, 0.0], room="a"),
+            self._d("b", [1.0, 0.0], room="b"),
+        ]
+
+        wl = dl.build_worklist(drawers, tau=0.9, scope={"wing": "w"})
+
+        self.assertEqual(wl["items"], [])
+
+    def test_mixed_room_split_keeps_same_room_subcluster(self):
+        drawers = [
+            self._d("a", [1.0, 0.0], room="a"),
+            self._d("b", [1.0, 0.0], room="a"),
+            self._d("c", [1.0, 0.0], room="b"),
+        ]
+
+        wl = dl.build_worklist(drawers, tau=0.9, scope={"wing": "w"})
+
+        self.assertEqual(len(wl["items"]), 1)
+        self.assertEqual([m["id"] for m in wl["items"][0]["members"]], ["a", "b"])
+        self.assertTrue(wl["items"][0]["mixed_room_split"])
 
 
 class TestGroupContradictions(unittest.TestCase):
@@ -141,6 +164,43 @@ class TestGroupContradictions(unittest.TestCase):
         self.assertEqual([(c["subject"], c["predicate"]) for c in clusters],
                          [("Alice", "lives_in"), ("Zoe", "status_is")])
         self.assertEqual(clusters[1]["newest_object"], "active")
+
+    def test_groups_by_subject_id_not_display_name(self):
+        triples = [
+            {"triple_id": "t1", "subject": "Alice", "subject_id": "entity-1",
+             "predicate": "lives_in", "object": "Portland", "object_id": "city-portland",
+             "valid_from": "2024-01-01", "extracted_at": "2024-01-02"},
+            {"triple_id": "t2", "subject": "Alice", "subject_id": "entity-2",
+             "predicate": "lives_in", "object": "Seattle", "object_id": "city-seattle",
+             "valid_from": "2024-01-01", "extracted_at": "2024-01-02"},
+            {"triple_id": "t3", "subject": "Alice", "subject_id": "entity-1",
+             "predicate": "lives_in", "object": "Vancouver", "object_id": "city-vancouver",
+             "valid_from": "2025-01-01", "extracted_at": "2025-01-02"},
+        ]
+
+        clusters = dl.group_contradictions(triples)
+
+        self.assertEqual(len(clusters), 1)
+        self.assertEqual(clusters[0]["subject"], "Alice")
+        self.assertEqual(clusters[0]["subject_id"], "entity-1")
+        self.assertEqual([c["object_id"] for c in clusters[0]["candidates"]],
+                         ["city-vancouver", "city-portland"])
+        self.assertEqual([c["triple_id"] for c in clusters[0]["candidates"]], ["t3", "t1"])
+        self.assertEqual([c["triple_ids"] for c in clusters[0]["candidates"]], [["t3"], ["t1"]])
+
+    def test_future_valid_from_is_excluded(self):
+        triples = [
+            {"triple_id": "t1", "subject": "Alice", "subject_id": "entity-1",
+             "predicate": "lives_in", "object": "Portland", "object_id": "city-portland",
+             "valid_from": "2026-01-01", "extracted_at": "2025-01-01"},
+            {"triple_id": "t2", "subject": "Alice", "subject_id": "entity-1",
+             "predicate": "lives_in", "object": "Seattle", "object_id": "city-seattle",
+             "valid_from": "2026-07-01", "extracted_at": "2025-01-02"},
+        ]
+
+        clusters = dl.group_contradictions(triples, now="2026-02-01T00:00:00")
+
+        self.assertEqual(clusters, [])
 
 
 class TestBuildContradictionWorklist(unittest.TestCase):
@@ -185,9 +245,34 @@ class TestExtractSessionId(unittest.TestCase):
             "SESSION_ID: 22222222-2222-2222-2222-222222222222"
         )
         self.assertEqual(dl.extract_session_id(text), "11111111-1111-1111-1111-111111111111")
+        self.assertEqual(
+            dl.extract_all_session_ids(text),
+            [
+                "11111111-1111-1111-1111-111111111111",
+                "22222222-2222-2222-2222-222222222222",
+            ],
+        )
 
-    def test_label_is_case_insensitive(self):
-        self.assertEqual(dl.extract_session_id("session_id: ABCDEF12-3456"), "ABCDEF12-3456")
+    def test_label_is_case_insensitive_and_uuid_is_canonical(self):
+        self.assertIsNone(dl.extract_session_id("session_id: deadbeef"))
+        self.assertEqual(
+            dl.extract_session_id("session_id: ABCDEF12-3456-7890-abcd-EF1234567890"),
+            "ABCDEF12-3456-7890-abcd-EF1234567890",
+        )
+
+    def test_extract_all_session_ids_dedupes_preserving_order(self):
+        text = (
+            "SESSION_ID: 11111111-1111-1111-1111-111111111111 "
+            "SESSION_ID: 22222222-2222-2222-2222-222222222222 "
+            "SESSION_ID: 11111111-1111-1111-1111-111111111111"
+        )
+        self.assertEqual(
+            dl.extract_all_session_ids(text),
+            [
+                "11111111-1111-1111-1111-111111111111",
+                "22222222-2222-2222-2222-222222222222",
+            ],
+        )
 
 
 class TestGroupObservationThemes(unittest.TestCase):
@@ -426,14 +511,15 @@ class TestDrawerSalience(unittest.TestCase):
 
 
 class TestSelectPruneCandidates(unittest.TestCase):
-    def _drawer(self, _id, v, age_days, kg_degree=0, pinned=False):
+    def _drawer(self, _id, v, age_days, kg_degree=0, pinned=False, topic=None, room="r"):
         return {
             "id": _id,
             "text": _id,
             "member_ids": [_id],
             "wing": "w",
-            "room": "r",
+            "room": room,
             "pinned": pinned,
+            "metadata": {"topic": topic} if topic is not None else {},
             "salience": {
                 "id": _id,
                 "age_days": age_days,
@@ -459,6 +545,19 @@ class TestSelectPruneCandidates(unittest.TestCase):
 
         self.assertEqual([d["id"] for d in selected], ["qualifies"])
 
+    def test_last_drawer_on_topic_is_protected(self):
+        selected = dl.select_prune_candidates(
+            [
+                self._drawer("shared-a", v=0.1, age_days=365, topic="shared"),
+                self._drawer("shared-b", v=0.1, age_days=365, topic="shared"),
+                self._drawer("unique", v=0.1, age_days=365, topic="unique"),
+            ],
+            v_min=0.2,
+            age_floor_days=180,
+        )
+
+        self.assertEqual([d["id"] for d in selected], ["shared-a", "shared-b"])
+
 
 class TestBuildPruneWorklist(unittest.TestCase):
     def test_shape_and_salience(self):
@@ -468,6 +567,7 @@ class TestBuildPruneWorklist(unittest.TestCase):
             "text": "old scratch",
             "wing": "w",
             "room": "r",
+            "metadata": {"topic": "dreaming", "pinned": True},
             "salience": {"id": "d1", "age_days": 365, "kg_degree": 0, "redundancy": 1.0, "negatives": True, "v": 0.0},
         }
 
@@ -491,6 +591,8 @@ class TestBuildPruneWorklist(unittest.TestCase):
         self.assertEqual(item["text"], "old scratch")
         self.assertEqual(item["wing"], "w")
         self.assertEqual(item["room"], "r")
+        self.assertEqual(item["topic"], "dreaming")
+        self.assertTrue(item["pinned"])
         self.assertEqual(item["salience"], candidate["salience"])
         self.assertIsNone(item["decision"])
 
@@ -593,8 +695,8 @@ class _FakeWriter:
         self.calls = []
         self.fail_add = fail_add
 
-    def add_drawer(self, wing, room, content):
-        self.calls.append(("add", wing, room, content))
+    def add_drawer(self, wing, room, content, metadata=None):
+        self.calls.append(("add", wing, room, content, metadata))
         if self.fail_add:
             raise RuntimeError("boom")
         return {"drawer_id": "new1"}
@@ -605,15 +707,16 @@ class _FakeWriter:
 
 
 class _FakeKgWriter:
-    def __init__(self, fail_objects=None):
+    def __init__(self, fail_triple_ids=None):
         self.calls = []
-        self.fail_objects = set(fail_objects or [])
+        self.fail_triple_ids = set(fail_triple_ids or [])
 
-    def invalidate(self, subject, predicate, object, ended=None):
-        self.calls.append((subject, predicate, object, ended))
-        if object in self.fail_objects:
-            raise RuntimeError(f"cannot invalidate {object}")
-        return {"invalidated": 1}
+    def invalidate_triples(self, triple_ids):
+        self.calls.append(list(triple_ids))
+        failed = self.fail_triple_ids.intersection(triple_ids)
+        if failed:
+            raise RuntimeError(f"cannot invalidate {sorted(failed)[0]}")
+        return {"invalidated": len(triple_ids)}
 
 
 class _FakePatternWriter:
@@ -622,8 +725,8 @@ class _FakePatternWriter:
         self.fail_texts = set(fail_texts or [])
         self.delete_called = False
 
-    def add_drawer(self, wing, room, content):
-        self.calls.append(("add", wing, room, content))
+    def add_drawer(self, wing, room, content, metadata=None):
+        self.calls.append(("add", wing, room, content, metadata))
         if content in self.fail_texts:
             raise RuntimeError("boom")
         return {"drawer_id": f"new{len(self.calls)}"}
@@ -635,31 +738,56 @@ class _FakePatternWriter:
 
 
 class TestApplyDecisions(unittest.TestCase):
-    def test_add_then_delete_order(self):
+    def test_add_then_archive_order(self):
         w = _FakeWriter()
+        archiver = _FakeArchiver()
         decisions = [{"action": "merge", "wing": "w", "room": "r", "text": "merged",
                       "supersedes": ["a", "b"]}]
-        report = dl.apply_merge_decisions(decisions, w)
+        report = dl.apply_merge_decisions(decisions, w, archiver)
         self.assertEqual(report["merged"], 1)
         self.assertEqual(w.calls[0][0], "add")
-        self.assertEqual([c for c in w.calls if c[0] == "delete"],
-                         [("delete", "a"), ("delete", "b")])
+        self.assertEqual(w.calls[0][4], {"supersedes": ["a", "b"], "kind": "merged"})
+        self.assertEqual([c for c in w.calls if c[0] == "delete"], [])
+        self.assertEqual(len(archiver.calls), 1)
+        self.assertEqual(archiver.calls[0]["member_ids"], ["a", "b"])
+        self.assertEqual(archiver.calls[0]["reason"], "merge")
         self.assertEqual(report["deleted"], ["a", "b"])
 
     def test_skip_ignored(self):
         w = _FakeWriter()
-        report = dl.apply_merge_decisions([{"action": "skip"}], w)
+        archiver = _FakeArchiver()
+        report = dl.apply_merge_decisions([{"action": "skip"}], w, archiver)
         self.assertEqual(report["skipped"], 1)
         self.assertEqual(w.calls, [])
+        self.assertEqual(archiver.calls, [])
 
-    def test_add_failure_skips_delete(self):
+    def test_add_failure_skips_archive(self):
         w = _FakeWriter(fail_add=True)
+        archiver = _FakeArchiver()
         decisions = [{"action": "merge", "wing": "w", "room": "r", "text": "m",
                       "supersedes": ["a"]}]
-        report = dl.apply_merge_decisions(decisions, w)
+        report = dl.apply_merge_decisions(decisions, w, archiver)
         self.assertEqual(report["merged"], 0)
         self.assertEqual(len(report["errors"]), 1)
-        self.assertNotIn(("delete", "a"), w.calls)  # non-destructive on add failure
+        self.assertEqual(archiver.calls, [])  # non-destructive on add failure
+
+    def test_empty_text_or_supersedes_records_soundness_error_without_writes(self):
+        w = _FakeWriter()
+        archiver = _FakeArchiver()
+
+        report = dl.apply_merge_decisions(
+            [
+                {"action": "merge", "wing": "w", "room": "r", "text": "", "supersedes": ["a"]},
+                {"action": "merge", "wing": "w", "room": "r", "text": "merged", "supersedes": []},
+            ],
+            w,
+            archiver,
+        )
+
+        self.assertEqual(report["merged"], 0)
+        self.assertEqual([e["stage"] for e in report["errors"]], ["soundness", "soundness"])
+        self.assertEqual(w.calls, [])
+        self.assertEqual(archiver.calls, [])
 
 
 class TestApplyPatternDecisions(unittest.TestCase):
@@ -671,11 +799,12 @@ class TestApplyPatternDecisions(unittest.TestCase):
             {"action": "skip"},
         ]
 
-        report = dl.apply_pattern_decisions(decisions, w)
+        report = dl.apply_pattern_decisions(decisions, w, min_support=2)
 
         self.assertEqual(report["surfaced"], 1)
         self.assertEqual(report["skipped"], 1)
-        self.assertEqual(w.calls, [("add", "w", "r", "rule")])
+        self.assertEqual(w.calls, [("add", "w", "r", "rule",
+                                    {"supported_by": ["s1", "s2"], "kind": "lesson"})])
         self.assertEqual(report["added"], [{"drawer_id": "new1"}])
         self.assertFalse(w.delete_called)
 
@@ -684,7 +813,7 @@ class TestApplyPatternDecisions(unittest.TestCase):
         decisions = [{"action": "surface", "wing": "w", "room": "r", "text": "rule",
                       "supported_by": []}]
 
-        report = dl.apply_pattern_decisions(decisions, w)
+        report = dl.apply_pattern_decisions(decisions, w, min_support=2)
 
         self.assertEqual(report["surfaced"], 0)
         self.assertEqual(report["skipped"], 0)
@@ -693,62 +822,80 @@ class TestApplyPatternDecisions(unittest.TestCase):
         self.assertEqual(report["errors"][0]["error"], "unsupported rule")
         self.assertFalse(w.delete_called)
 
+    def test_surface_with_too_few_distinct_support_ids_is_rejected(self):
+        w = _FakePatternWriter()
+        decisions = [{"action": "surface", "wing": "w", "room": "r", "text": "rule",
+                      "supported_by": ["s1", "s1"], "allowed_support": ["s1", "s2"]}]
+
+        report = dl.apply_pattern_decisions(decisions, w, min_support=2)
+
+        self.assertEqual(report["surfaced"], 0)
+        self.assertEqual(w.calls, [])
+        self.assertEqual(report["errors"][0]["stage"], "groundedness")
+
+    def test_surface_support_must_be_subset_of_allowed_support(self):
+        w = _FakePatternWriter()
+        decisions = [{"action": "surface", "wing": "w", "room": "r", "text": "rule",
+                      "supported_by": ["s1", "s3"], "allowed_support": ["s1", "s2"]}]
+
+        report = dl.apply_pattern_decisions(decisions, w, min_support=2)
+
+        self.assertEqual(report["surfaced"], 0)
+        self.assertEqual(w.calls, [])
+        self.assertEqual(report["errors"][0]["stage"], "groundedness")
+
     def test_add_error_is_recorded_and_later_decisions_continue(self):
         w = _FakePatternWriter(fail_texts={"bad"})
         decisions = [
             {"action": "surface", "wing": "w", "room": "r", "text": "bad",
-             "supported_by": ["s1"]},
+             "supported_by": ["s1", "s2"]},
             {"action": "surface", "wing": "w", "room": "r", "text": "good",
-             "supported_by": ["s2"]},
+             "supported_by": ["s2", "s3"]},
         ]
 
-        report = dl.apply_pattern_decisions(decisions, w)
+        report = dl.apply_pattern_decisions(decisions, w, min_support=2)
 
         self.assertEqual(report["surfaced"], 1)
         self.assertEqual(len(report["errors"]), 1)
         self.assertEqual(report["errors"][0]["stage"], "add")
         self.assertIn("boom", report["errors"][0]["error"])
-        self.assertEqual(w.calls, [("add", "w", "r", "bad"), ("add", "w", "r", "good")])
+        self.assertEqual([c[:4] for c in w.calls], [("add", "w", "r", "bad"), ("add", "w", "r", "good")])
         self.assertFalse(w.delete_called)
 
 
 class TestApplyContradictionDecisions(unittest.TestCase):
-    def test_invalidate_calls_writer_for_each_object_and_counts_skip(self):
+    def test_invalidate_calls_writer_for_exact_triple_ids_and_counts_skip(self):
         w = _FakeKgWriter()
         decisions = [
-            {"action": "invalidate", "subject": "Alice", "predicate": "lives_in",
-             "invalidate": ["Portland", "Seattle"]},
+            {"action": "invalidate", "invalidate": ["triple-1", "triple-2"]},
             {"action": "skip"},
         ]
 
         report = dl.apply_contradiction_decisions(decisions, w)
 
-        self.assertEqual(report["invalidated"], 1)
+        self.assertEqual(report["invalidated"], 2)
         self.assertEqual(report["skipped"], 1)
-        self.assertEqual(w.calls, [
-            ("Alice", "lives_in", "Portland", None),
-            ("Alice", "lives_in", "Seattle", None),
-        ])
+        self.assertEqual(w.calls, [["triple-1", "triple-2"]])
         self.assertEqual(report["invalidated_facts"], [
-            {"subject": "Alice", "predicate": "lives_in", "object": "Portland"},
-            {"subject": "Alice", "predicate": "lives_in", "object": "Seattle"},
+            {"triple_id": "triple-1"},
+            {"triple_id": "triple-2"},
         ])
 
-    def test_writer_error_is_recorded_and_later_objects_still_process(self):
-        w = _FakeKgWriter(fail_objects={"Portland"})
+    def test_writer_error_is_recorded_and_later_decisions_still_process(self):
+        w = _FakeKgWriter(fail_triple_ids={"triple-1"})
         decisions = [
-            {"action": "invalidate", "subject": "Alice", "predicate": "lives_in",
-             "invalidate": ["Portland", "Seattle"]},
+            {"action": "invalidate", "invalidate": ["triple-1", "triple-2"]},
+            {"action": "invalidate", "invalidate": ["triple-3"]},
         ]
 
         report = dl.apply_contradiction_decisions(decisions, w)
 
         self.assertEqual(report["invalidated"], 1)
         self.assertEqual(len(report["errors"]), 1)
-        self.assertEqual(report["errors"][0]["object"], "Portland")
-        self.assertIn("cannot invalidate Portland", report["errors"][0]["error"])
+        self.assertEqual(report["errors"][0]["triple_ids"], ["triple-1", "triple-2"])
+        self.assertIn("cannot invalidate triple-1", report["errors"][0]["error"])
         self.assertEqual(report["invalidated_facts"], [
-            {"subject": "Alice", "predicate": "lives_in", "object": "Seattle"},
+            {"triple_id": "triple-3"},
         ])
 
 
