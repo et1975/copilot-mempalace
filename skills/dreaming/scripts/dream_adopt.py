@@ -371,11 +371,14 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--palace", required=True, help="Path to the mempalace palace directory")
     ap.add_argument("--decisions", required=True, help="Path to the adjudicated decisions.json")
-    ap.add_argument("--archive-file", default="archive.jsonl", help="Append-only prune archive JSONL path")
+    ap.add_argument("--archive-file", default=None,
+                    help="Append-only prune archive JSONL path (default: <palace>/dream-archive.jsonl)")
     ap.add_argument("--dry-run", action="store_true", help="Print planned changes; write nothing")
     args = ap.parse_args(argv)
 
     path = dream_palace.bind_palace(args.palace)
+    if args.archive_file is None:
+        args.archive_file = os.path.join(path, "dream-archive.jsonl")
     with open(args.decisions, encoding="utf-8") as fh:
         worklist = json.load(fh)
     task = _worklist_task(worklist)
