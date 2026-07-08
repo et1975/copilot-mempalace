@@ -937,3 +937,27 @@ class OntologyConfigTests(unittest.TestCase):
         self.assertEqual(dream_lib.derived_predicate_for(rule), "depends_on_closure")
         rule2 = dict(rule, derived_predicate="reaches")
         self.assertEqual(dream_lib.derived_predicate_for(rule2), "reaches")
+
+
+# ---------------------------------------------------------------------------
+# Task 2: Canonical triple keys + stable candidate id
+# ---------------------------------------------------------------------------
+
+class DeriveKeyTests(unittest.TestCase):
+    def test_triple_id_key_uses_entity_ids_not_names(self):
+        t = {"subject_id": 7, "predicate": "Depends On", "object_id": 9,
+             "subject": "A", "object": "B"}
+        self.assertEqual(dream_lib.triple_id_key(t), (7, "depends_on", 9))
+
+    def test_candidate_id_is_stable_and_order_independent_on_premises(self):
+        concl = {"subject_id": 1, "predicate": "depends_on_closure", "object_id": 3}
+        c1 = dream_lib.derive_candidate_id(concl, "transitive:depends_on", [101, 102], "onto:x")
+        c2 = dream_lib.derive_candidate_id(concl, "transitive:depends_on", [102, 101], "onto:x")
+        self.assertEqual(c1, c2)
+        self.assertTrue(c1.startswith("derive:"))
+
+    def test_candidate_id_changes_with_ontology_version(self):
+        concl = {"subject_id": 1, "predicate": "depends_on_closure", "object_id": 3}
+        a = dream_lib.derive_candidate_id(concl, "r", [1], "onto:x")
+        b = dream_lib.derive_candidate_id(concl, "r", [1], "onto:y")
+        self.assertNotEqual(a, b)

@@ -825,3 +825,20 @@ def ontology_version(rules: list[dict[str, Any]]) -> str:
     )
     blob = json.dumps(canon, sort_keys=True, separators=(",", ":"))
     return "onto:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+
+def triple_id_key(triple: dict[str, Any]) -> tuple[Any, str, Any]:
+    return (triple["subject_id"], normalize_predicate(triple["predicate"]), triple["object_id"])
+
+
+def derive_candidate_id(conclusion: dict[str, Any], rule_id: str,
+                        premise_triple_ids: list[Any], onto_version: str) -> str:
+    payload = {
+        "c": [conclusion["subject_id"], normalize_predicate(conclusion["predicate"]),
+              conclusion["object_id"]],
+        "r": rule_id,
+        "p": sorted(str(x) for x in premise_triple_ids),
+        "o": onto_version,
+    }
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return "derive:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()
