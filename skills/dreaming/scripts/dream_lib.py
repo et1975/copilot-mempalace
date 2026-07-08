@@ -871,3 +871,122 @@ def premise_interval(premises: list[dict[str, Any]]) -> tuple[str, str | None] |
         max_start.isoformat() if max_start is not None else None,
         min_end.isoformat() if min_end is not None else None,
     )
+
+
+def _entity_name_map(triples: list[dict[str, Any]]) -> dict[Any, str]:
+    names: dict[Any, str] = {}
+    for t in triples:
+        names.setdefault(t["subject_id"], t.get("subject"))
+        names.setdefault(t["object_id"], t.get("object"))
+    return names
+
+
+def _mk_candidate(subj_id, pred, obj_id, names, rule, premises, onto_version, depth):
+    interval = premise_interval(premises)
+    if interval is None:
+        return None
+    premise_ids = [p["triple_id"] for p in premises]
+    conclusion = {
+        "subject_id": subj_id, "predicate": pred, "object_id": obj_id,
+        "subject": names.get(subj_id), "object": names.get(obj_id),
+    }
+    conf = min((float(p.get("confidence", 1.0)) for p in premises), default=1.0)
+    return {
+        "kind": "derive",
+        "candidate_id": derive_candidate_id(conclusion, rule["id"], premise_ids, onto_version),
+        "conclusion": conclusion,
+        "rule": {"id": rule["id"], "family": rule["family"],
+                 "predicate": normalize_predicate(rule["predicate"])},
+        "proof": {"depth": depth,
+                  "premise_ids": premise_ids,
+                  "premise_drawer_ids": [p.get("source_drawer_id") for p in premises]},
+        "evidence": {"already_active": False, "confidence": conf,
+                     "valid_from": interval[0], "valid_to": interval[1]},
+        "decision": None,
+    }
+
+
+def deductive_closure(triples, rules, *, max_depth, max_iterations, max_candidates):
+    active_rules = enabled_rules(rules)
+    if not active_rules:
+        return []
+    onto_version = ontology_version(rules)
+    names = _entity_name_map(triples)
+    # active-key set for exclude-active (by canonical id-key)
+    active_keys = {triple_id_key(t) for t in triples}
+    out: dict[str, dict[str, Any]] = {}
+    truncated = False
+
+    def emit(cand):
+        nonlocal truncated
+        if cand is None:
+            return
+        key = triple_id_key(cand["conclusion"])
+        if key[0] == key[2]:            # anti-reflexive (unconditional in v1)
+            return
+        if key in active_keys:          # exclude already-active facts (incl. pre-existing _closure)
+            return
+        cid = cand["candidate_id"]
+        if cid in out:
+            return
+        if len(out) >= max_candidates:
+            truncated = True
+            return
+        out[cid] = cand
+
+    # --- non-transitive families: single pass, depth 1 ---
+    for rule in active_rules:
+        pred = normalize_predicate(rule["predicate"])
+        if rule["family"] == "inverse":
+            inv = normalize_predicate(rule["inverse_predicate"])
+            for t in triples:
+                if normalize_predicate(t["predicate"]) != pred:
+                    continue
+                emit(_mk_candidate(t["object_id"], inv, t["subject_id"], names, rule, [t], onto_version, 1))
+        elif rule["family"] == "symmetric":
+            for t in triples:
+                if normalize_predicate(t["predicate"]) != pred:
+                    continue
+                emit(_mk_candidate(t["object_id"], pred, t["subject_id"], names, rule, [t], onto_version, 1))
+
+    # --- transitivity: semi-naive LEFT-recursive closure T = base U (T o base) ---
+    # Right operand is the FIXED base edge set {P U P_closure}; frontier is the delta of
+    # newly-reached tuples. Any path a->..->d decomposes as (a->..->c) o (c->d) with the last
+    # hop a base edge, so this is provably complete. depth = number of base hops.
+    trans_rules = [r for r in active_rules if r["family"] == "transitive"]
+    for rule in trans_rules:
+        base = normalize_predicate(rule["predicate"])
+        closure_pred = derived_predicate_for(rule)
+        depth_cap = int(rule.get("max_depth", max_depth) or max_depth)
+        base_edges: dict[tuple[Any, Any], dict[str, Any]] = {}
+        for t in triples:
+            p = normalize_predicate(t["predicate"])
+            if p == base or p == closure_pred:
+                base_edges.setdefault((t["subject_id"], t["object_id"]), {"premises": [t], "depth": 1})
+        reached = dict(base_edges)
+        frontier = dict(base_edges)
+        for _ in range(min(max_iterations, depth_cap)):
+            new_edges: dict[tuple[Any, Any], dict[str, Any]] = {}
+            for (a, b), ea in frontier.items():
+                for (c, d), eb in base_edges.items():  # RIGHT operand = fixed base (depth 1)
+                    if b != c or a == d:
+                        continue
+                    depth = ea["depth"] + 1
+                    if depth > depth_cap:
+                        continue
+                    k = (a, d)
+                    if k in reached or k in new_edges:
+                        continue
+                    new_edges[k] = {"premises": ea["premises"] + eb["premises"], "depth": depth}
+            if not new_edges:
+                break
+            for (a, d), e in new_edges.items():
+                emit(_mk_candidate(a, closure_pred, d, names, rule, e["premises"], onto_version, e["depth"]))
+            reached.update(new_edges)
+            frontier = new_edges
+
+    result = list(out.values())
+    if truncated:
+        for c in result:
+            c["truncated"] = True
+    return result

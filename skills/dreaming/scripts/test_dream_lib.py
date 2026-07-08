@@ -1003,3 +1003,108 @@ class IntervalOverlapTests(unittest.TestCase):
             {"valid_from": "2026-02-01", "valid_to": None},
         ])
         self.assertEqual(got, ("2026-02-01T00:00:00", None))
+
+
+# ---------------------------------------------------------------------------
+# Task 4: deductive_closure — bounded semi-naive forward chaining
+# ---------------------------------------------------------------------------
+
+def _t(tid, s, p, o, sid=None, oid=None, vf=None, vt=None, conf=1.0):
+    return {"triple_id": tid, "subject": s, "predicate": p, "object": o,
+            "subject_id": sid if sid is not None else s, "object_id": oid if oid is not None else o,
+            "valid_from": vf, "valid_to": vt, "confidence": conf, "source_drawer_id": f"d{tid}"}
+
+TRANS_RULES = [{"id": "transitive:depends_on", "family": "transitive",
+                "predicate": "depends_on", "enabled": True, "max_depth": 3}]
+
+class DeductiveClosureTests(unittest.TestCase):
+    def test_transitive_chain_emits_closure_predicate(self):
+        triples = [_t(1, "A", "depends_on", "B"), _t(2, "B", "depends_on", "C")]
+        cands = dream_lib.deductive_closure(triples, TRANS_RULES,
+                                            max_depth=3, max_iterations=10, max_candidates=500)
+        self.assertEqual(len(cands), 1)
+        c = cands[0]
+        self.assertEqual(c["conclusion"]["predicate"], "depends_on_closure")
+        self.assertEqual((c["conclusion"]["subject"], c["conclusion"]["object"]), ("A", "C"))
+        self.assertEqual(sorted(c["proof"]["premise_ids"]), [1, 2])
+        self.assertEqual(c["proof"]["depth"], 2)
+        self.assertEqual(c["rule"]["id"], "transitive:depends_on")
+
+    def test_proof_depth_reflects_chain_length(self):
+        triples = [_t(1, "A", "depends_on", "B"), _t(2, "B", "depends_on", "C"),
+                   _t(3, "C", "depends_on", "D")]
+        cands = dream_lib.deductive_closure(triples, TRANS_RULES,
+                                            max_depth=3, max_iterations=10, max_candidates=500)
+        depth_by_pair = {(c["conclusion"]["subject"], c["conclusion"]["object"]): c["proof"]["depth"]
+                         for c in cands}
+        self.assertEqual(depth_by_pair[("A", "D")], 3)
+        self.assertEqual(depth_by_pair[("A", "C")], 2)
+
+    def test_longer_chain_reaches_full_closure_via_closure_edges(self):
+        triples = [_t(1, "A", "depends_on", "B"), _t(2, "B", "depends_on", "C"),
+                   _t(3, "C", "depends_on", "D")]
+        cands = dream_lib.deductive_closure(triples, TRANS_RULES,
+                                            max_depth=3, max_iterations=10, max_candidates=500)
+        pairs = {(c["conclusion"]["subject"], c["conclusion"]["object"]) for c in cands}
+        self.assertEqual(pairs, {("A", "C"), ("A", "D"), ("B", "D")})
+
+    def test_reflexive_conclusions_suppressed_by_default(self):
+        triples = [_t(1, "A", "depends_on", "B"), _t(2, "B", "depends_on", "A")]
+        cands = dream_lib.deductive_closure(triples, TRANS_RULES,
+                                            max_depth=3, max_iterations=10, max_candidates=500)
+        for c in cands:
+            self.assertNotEqual(c["conclusion"]["subject_id"], c["conclusion"]["object_id"])
+
+    def test_excludes_already_active_closure_fact(self):
+        triples = [_t(1, "A", "depends_on", "B"), _t(2, "B", "depends_on", "C"),
+                   _t(9, "A", "depends_on_closure", "C")]
+        cands = dream_lib.deductive_closure(triples, TRANS_RULES,
+                                            max_depth=3, max_iterations=10, max_candidates=500)
+        self.assertEqual(cands, [])
+
+    def test_inverse_rule_emits_inverse_predicate(self):
+        rules = [{"id": "inverse:depends_on:dependency_of", "family": "inverse",
+                  "predicate": "depends_on", "inverse_predicate": "dependency_of", "enabled": True}]
+        triples = [_t(1, "A", "depends_on", "B")]
+        cands = dream_lib.deductive_closure(triples, rules, max_depth=1,
+                                            max_iterations=10, max_candidates=500)
+        self.assertEqual(len(cands), 1)
+        c = cands[0]["conclusion"]
+        self.assertEqual((c["subject"], c["predicate"], c["object"]), ("B", "dependency_of", "A"))
+
+    def test_symmetric_rule_emits_swapped_pair(self):
+        rules = [{"id": "symmetric:collaborates_with", "family": "symmetric",
+                  "predicate": "collaborates_with", "enabled": True}]
+        triples = [_t(1, "A", "collaborates_with", "B")]
+        cands = dream_lib.deductive_closure(triples, rules, max_depth=1,
+                                            max_iterations=10, max_candidates=500)
+        self.assertEqual(len(cands), 1)
+        c = cands[0]["conclusion"]
+        self.assertEqual((c["subject"], c["object"]), ("B", "A"))
+
+    def test_disabled_and_empty_config_yield_nothing(self):
+        triples = [_t(1, "A", "depends_on", "B"), _t(2, "B", "depends_on", "C")]
+        self.assertEqual(dream_lib.deductive_closure(triples, [], max_depth=3,
+                          max_iterations=10, max_candidates=500), [])
+
+    def test_disjoint_temporal_premises_produce_no_candidate(self):
+        triples = [_t(1, "A", "depends_on", "B", vf="2026-01-01", vt="2026-02-01"),
+                   _t(2, "B", "depends_on", "C", vf="2026-03-01", vt=None)]
+        cands = dream_lib.deductive_closure(triples, TRANS_RULES, max_depth=3,
+                                            max_iterations=10, max_candidates=500)
+        self.assertEqual(cands, [])
+
+    def test_confidence_is_min_of_premises(self):
+        triples = [_t(1, "A", "depends_on", "B", conf=0.9), _t(2, "B", "depends_on", "C", conf=0.6)]
+        cands = dream_lib.deductive_closure(triples, TRANS_RULES, max_depth=3,
+                                            max_iterations=10, max_candidates=500)
+        self.assertAlmostEqual(cands[0]["evidence"]["confidence"], 0.6)
+
+    def test_candidate_cap_truncates_and_marks_all(self):
+        # 8-node path A..H -> 21 non-adjacent closure pairs; cap far below that
+        nodes = [chr(65 + i) for i in range(8)]  # A..H
+        triples = [_t(i + 1, nodes[i], "depends_on", nodes[i + 1]) for i in range(7)]
+        cands = dream_lib.deductive_closure(triples, TRANS_RULES, max_depth=8,
+                                            max_iterations=20, max_candidates=3)
+        self.assertEqual(len(cands), 3)
+        self.assertTrue(all(c.get("truncated") for c in cands))
