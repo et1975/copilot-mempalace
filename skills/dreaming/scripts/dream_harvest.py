@@ -16,6 +16,7 @@ import argparse
 from datetime import datetime
 import hashlib
 import json
+import os
 import re
 import sys
 
@@ -26,8 +27,12 @@ from dream_lib import (
     build_prune_worklist,
     build_worklist,
     compute_redundancy,
+    deductive_closure,
     drawer_salience,
+    filter_skipped,
+    build_contemplate_worklist,
     group_observation_themes,
+    ontology_version,
     select_prune_candidates,
 )
 
@@ -69,7 +74,7 @@ def _degree_for(drawer: dict, degrees: dict[str, int]) -> int:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--palace", required=True, help="Path to the mempalace palace directory")
-    ap.add_argument("--task", choices=["merge", "contradiction", "pattern", "prune"], default="merge",
+    ap.add_argument("--task", choices=["merge", "contradiction", "pattern", "prune", "derive"], default="merge",
                     help="Dreaming task to harvest (default merge)")
     ap.add_argument("--wing", help="Scope merge harvest to this wing (ignored for contradiction)")
     ap.add_argument("--room", help="Scope merge harvest to this room (ignored for contradiction)")
@@ -87,6 +92,16 @@ def main(argv: list[str] | None = None) -> int:
                         "Put surfaced lessons in a non-mined room so future pattern harvests ignore them."
                     ))
     ap.add_argument("--instructions", help="Optional steering note recorded in the worklist")
+    ap.add_argument("--rules", default=None,
+                    help="Path to ontology config (default: <palace>/ontology.json)")
+    ap.add_argument("--skips", default=None,
+                    help="Path to skip-markers file (default: <palace>/dream-derive-skips.jsonl)")
+    ap.add_argument("--max-depth", type=int, default=3,
+                    help="Maximum derivation depth for derive (default 3)")
+    ap.add_argument("--max-iterations", type=int, default=10,
+                    help="Maximum closure iterations for derive (default 10)")
+    ap.add_argument("--max-candidates", type=int, default=500,
+                    help="Maximum candidates for derive (default 500)")
     ap.add_argument("--out", default="worklist.json", help="Output worklist path (default worklist.json)")
     args = ap.parse_args(argv)
 
@@ -170,6 +185,28 @@ def main(argv: list[str] | None = None) -> int:
             f"(v<v_min, age>=floor, kg_degree=0) -> {args.out}",
             file=sys.stderr,
         )
+        return 0
+
+    if args.task == "derive":
+        rules_path = args.rules or os.path.join(path, "ontology.json")
+        skips_path = args.skips or os.path.join(path, "dream-derive-skips.jsonl")
+        rules = dream_palace.load_ontology_config(rules_path)
+        onto_ver = ontology_version(rules)
+        triples = dream_palace.load_active_triples_with_ids(path)
+        candidates = deductive_closure(
+            triples, rules, max_depth=args.max_depth,
+            max_iterations=args.max_iterations, max_candidates=args.max_candidates)
+        skips = dream_palace.load_skip_markers(skips_path)
+        candidates = filter_skipped(candidates, skips, onto_ver)
+        for c in candidates:
+            c["ontology_version"] = onto_ver
+        worklist = build_contemplate_worklist(
+            candidates, scope={"palace": path}, rules=rules, onto_version=onto_ver,
+            params={"max_depth": args.max_depth, "max_iterations": args.max_iterations,
+                    "max_candidates": args.max_candidates})
+        with open(args.out, "w", encoding="utf-8") as fh:
+            json.dump(worklist, fh, indent=2, ensure_ascii=False)
+        print(f"derive: {len(candidates)} candidate(s) ({onto_ver}) -> {args.out}", file=sys.stderr)
         return 0
 
     tau = args.tau if args.tau is not None else 0.9

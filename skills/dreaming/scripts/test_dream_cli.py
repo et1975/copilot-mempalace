@@ -13,6 +13,12 @@ from unittest import mock
 import dream_adopt
 import dream_harvest
 
+try:
+    from mempalace.knowledge_graph import KnowledgeGraph as _RealKG
+    _HAS_MEMPALACE = True
+except Exception:
+    _HAS_MEMPALACE = False
+
 
 def _test_tmpdir():
     return tempfile.TemporaryDirectory(
@@ -669,6 +675,40 @@ class TestAdoptPruneTask(unittest.TestCase):
             self.assertEqual(rc, 1)
             self.assertEqual(stdout.getvalue(), "")
             self.assertIn("protected", stderr.getvalue())
+
+
+@unittest.skipUnless(_HAS_MEMPALACE, "requires mempalace interpreter")
+class DeriveHarvestCliTests(unittest.TestCase):
+    def _palace(self, td):
+        palace = os.path.join(td, "palace"); os.makedirs(palace)
+        kg = _RealKG(db_path=os.path.join(palace, "knowledge_graph.sqlite3"))
+        kg.add_triple("A", "depends_on", "B", valid_from="2026-01-01")
+        kg.add_triple("B", "depends_on", "C", valid_from="2026-01-01")
+        kg.close()
+        with open(os.path.join(palace, "ontology.json"), "w") as f:
+            json.dump({"version": 1, "rules": [{"id": "transitive:depends_on",
+                "family": "transitive", "predicate": "depends_on", "enabled": True,
+                "max_depth": 3}]}, f)
+        return palace
+
+    def test_harvest_derive_emits_one_closure_candidate(self):
+        with _test_tmpdir() as td:
+            palace = self._palace(td); out = os.path.join(td, "wl.json")
+            rc = dream_harvest.main(["--task", "derive", "--palace", palace, "--out", out])
+            self.assertEqual(rc, 0)
+            wl = json.load(open(out))
+            self.assertEqual(wl["task"], "contemplate")
+            self.assertEqual(len(wl["items"]), 1)
+            self.assertEqual(wl["items"][0]["conclusion"]["predicate"], "depends_on_closure")
+
+    def test_harvest_derive_empty_config_yields_zero(self):
+        with _test_tmpdir() as td:
+            palace = os.path.join(td, "palace"); os.makedirs(palace)
+            _RealKG(db_path=os.path.join(palace, "knowledge_graph.sqlite3")).close()
+            out = os.path.join(td, "wl.json")
+            rc = dream_harvest.main(["--task", "derive", "--palace", palace, "--out", out])
+            self.assertEqual(rc, 0)
+            self.assertEqual(len(json.load(open(out))["items"]), 0)
 
 
 if __name__ == "__main__":
