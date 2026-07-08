@@ -1009,3 +1009,71 @@ def build_contemplate_worklist(candidates, *, scope, params, rules, onto_version
         "instructions": instructions,
         "items": list(candidates),
     }
+
+
+def apply_derive_decisions(decisions, writer):
+    report = {"materialized": 0, "skipped": 0, "ignored": 0,
+              "rejected_rules": [], "materialized_facts": [], "errors": []}
+    skip_markers = []
+    for d in decisions:
+        action = d.get("action")
+        if action == "materialize":
+            concl = d.get("conclusion") or {}
+            rule = d.get("rule") or {}
+            proof = d.get("proof") or {}
+            ev = d.get("evidence") or {}
+            missing = [k for k in ("subject_id", "predicate", "object_id") if concl.get(k) is None]
+            if missing or not rule.get("id"):
+                report["errors"].append({"stage": "groundedness",
+                    "error": f"incomplete materialize ({missing or 'rule.id'})", "decision": d})
+                continue
+            try:
+                writer.add_derived(
+                    concl, rule["id"], list(proof.get("premise_ids") or []),
+                    list(proof.get("premise_drawer_ids") or []),
+                    d.get("ontology_version"), ev.get("confidence", 1.0),
+                    ev.get("valid_from"), ev.get("valid_to"))
+                report["materialized"] += 1
+                report["materialized_facts"].append(
+                    {"candidate_id": d.get("candidate_id"),
+                     "conclusion": [concl["subject_id"], normalize_predicate(concl["predicate"]),
+                                    concl["object_id"]]})
+            except Exception as exc:  # noqa: BLE001
+                report["errors"].append({"stage": "materialize", "error": str(exc), "decision": d})
+        elif action == "skip":
+            cid = d.get("candidate_id")
+            if not cid:
+                report["errors"].append({"stage": "groundedness",
+                    "error": "skip requires candidate_id", "decision": d})
+                continue
+            marker = {"candidate_id": cid, "ontology_version": d.get("ontology_version")}
+            if d.get("reason"):
+                marker["reason"] = d["reason"]
+            skip_markers.append(marker)
+            report["skipped"] += 1
+        elif action == "reject_rule":
+            rid = (d.get("rule") or {}).get("id")
+            if rid:
+                report["rejected_rules"].append(rid)
+            else:
+                report["errors"].append({"stage": "groundedness",
+                    "error": "reject_rule requires rule.id", "decision": d})
+        else:
+            report["ignored"] += 1
+    return report, skip_markers
+
+
+def skip_markers_for_rejected_rules(worklist_items, rejected_rule_ids, onto_version):
+    """Expand reject_rule decisions into skip-markers for every current-worklist candidate of
+    those rules, so a re-harvest reaches an OPERATIONAL fixpoint under this ontology_version.
+    (Persistent fix = disable the rule in ontology.json, which changes onto_version and re-surfaces.)
+    """
+    rejected = set(rejected_rule_ids or [])
+    markers = []
+    for item in worklist_items or []:
+        rid = (item.get("rule") or {}).get("id")
+        cid = item.get("candidate_id")
+        if rid in rejected and cid:
+            markers.append({"candidate_id": cid, "ontology_version": onto_version,
+                            "reason": "reject_rule"})
+    return markers

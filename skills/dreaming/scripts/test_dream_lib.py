@@ -1135,3 +1135,86 @@ class ContemplateWorklistTests(unittest.TestCase):
         skips = [{"candidate_id": "derive:a", "ontology_version": "onto:OLD"}]
         got = dream_lib.filter_skipped(cands, skips, "onto:v")
         self.assertEqual([c["candidate_id"] for c in got], ["derive:a"])
+
+
+# ---------------------------------------------------------------------------
+# Task 6: apply_derive_decisions (pure)
+# ---------------------------------------------------------------------------
+
+class FakeDeriveWriter:
+    def __init__(self): self.added = []
+    def add_derived(self, conclusion, rule_id, premise_ids, premise_drawer_ids,
+                    onto_version, confidence, valid_from, valid_to):
+        self.added.append((conclusion["subject_id"], conclusion["predicate"],
+                           conclusion["object_id"], rule_id, tuple(premise_ids), valid_from, valid_to))
+        return {"ok": True}
+
+class ApplyDeriveTests(unittest.TestCase):
+    def test_materialize_calls_writer_and_counts(self):
+        w = FakeDeriveWriter()
+        decisions = [{"action": "materialize", "candidate_id": "derive:a",
+            "conclusion": {"subject_id": 1, "predicate": "depends_on_closure", "object_id": 3},
+            "rule": {"id": "transitive:depends_on"},
+            "proof": {"premise_ids": [1, 2], "premise_drawer_ids": ["d1", "d2"]},
+            "evidence": {"confidence": 0.7, "valid_from": "2026-01-01", "valid_to": None},
+            "ontology_version": "onto:v"}]
+        report, skips = dream_lib.apply_derive_decisions(decisions, w)
+        self.assertEqual(report["materialized"], 1)
+        self.assertEqual(len(w.added), 1)
+        self.assertEqual(skips, [])
+
+    def test_materialize_propagates_valid_to(self):
+        w = FakeDeriveWriter()
+        decisions = [{"action": "materialize", "candidate_id": "derive:a",
+            "conclusion": {"subject_id": 1, "predicate": "p", "object_id": 3},
+            "rule": {"id": "r"}, "proof": {"premise_ids": [1], "premise_drawer_ids": ["d1"]},
+            "evidence": {"confidence": 1.0, "valid_from": "2026-01-01", "valid_to": "2026-05-01"},
+            "ontology_version": "onto:v"}]
+        dream_lib.apply_derive_decisions(decisions, w)
+        self.assertEqual(w.added[0][-1], "2026-05-01")
+
+    def test_skip_emits_marker_no_write(self):
+        w = FakeDeriveWriter()
+        decisions = [{"action": "skip", "candidate_id": "derive:a", "ontology_version": "onto:v",
+                      "reason": "cheaply re-derivable"}]
+        report, skips = dream_lib.apply_derive_decisions(decisions, w)
+        self.assertEqual(report["skipped"], 1)
+        self.assertEqual(w.added, [])
+        self.assertEqual(skips, [{"candidate_id": "derive:a", "ontology_version": "onto:v",
+                                  "reason": "cheaply re-derivable"}])
+
+    def test_reject_rule_recorded_no_write(self):
+        w = FakeDeriveWriter()
+        decisions = [{"action": "reject_rule", "rule": {"id": "transitive:depends_on"},
+                      "reason": "not transitive here"}]
+        report, skips = dream_lib.apply_derive_decisions(decisions, w)
+        self.assertEqual(report["rejected_rules"], ["transitive:depends_on"])
+        self.assertEqual(w.added, [])
+
+    def test_materialize_writer_error_recorded_soft(self):
+        class Boom(FakeDeriveWriter):
+            def add_derived(self, *a, **k): raise RuntimeError("db locked")
+        decisions = [{"action": "materialize", "candidate_id": "derive:a",
+            "conclusion": {"subject_id": 1, "predicate": "p", "object_id": 3},
+            "rule": {"id": "r"}, "proof": {"premise_ids": [1], "premise_drawer_ids": ["d1"]},
+            "evidence": {"confidence": 1.0, "valid_from": None, "valid_to": None},
+            "ontology_version": "onto:v"}]
+        report, skips = dream_lib.apply_derive_decisions(decisions, Boom())
+        self.assertEqual(report["materialized"], 0)
+        self.assertEqual(report["errors"][0]["stage"], "materialize")
+
+    def test_unknown_action_skips_softly(self):
+        report, skips = dream_lib.apply_derive_decisions([{"action": "frobnicate"}], FakeDeriveWriter())
+        self.assertEqual(report["ignored"], 1)
+
+    def test_skip_markers_for_rejected_rules_covers_all_matching_items(self):
+        items = [
+            {"candidate_id": "derive:a", "rule": {"id": "transitive:depends_on"}},
+            {"candidate_id": "derive:b", "rule": {"id": "transitive:depends_on"}},
+            {"candidate_id": "derive:c", "rule": {"id": "symmetric:x"}},
+        ]
+        markers = dream_lib.skip_markers_for_rejected_rules(
+            items, ["transitive:depends_on"], "onto:v")
+        self.assertEqual({m["candidate_id"] for m in markers}, {"derive:a", "derive:b"})
+        self.assertTrue(all(m["ontology_version"] == "onto:v" for m in markers))
+        self.assertTrue(all(m.get("reason") == "reject_rule" for m in markers))
