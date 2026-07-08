@@ -977,7 +977,10 @@ def deductive_closure(triples, rules, *, max_depth, max_iterations, max_candidat
                     k = (a, d)
                     if k in reached or k in new_edges:
                         continue
-                    new_edges[k] = {"premises": ea["premises"] + eb["premises"], "depth": depth}
+                    combined = ea["premises"] + eb["premises"]
+                    if premise_interval(combined) is None:
+                        continue
+                    new_edges[k] = {"premises": combined, "depth": depth}
             if not new_edges:
                 break
             for (a, d), e in new_edges.items():

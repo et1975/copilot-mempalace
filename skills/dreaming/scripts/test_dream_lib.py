@@ -1109,6 +1109,22 @@ class DeductiveClosureTests(unittest.TestCase):
         self.assertEqual(len(cands), 3)
         self.assertTrue(all(c.get("truncated") for c in cands))
 
+    def test_disjoint_short_path_does_not_block_valid_longer_path(self):
+        # A->B disjoint with B->D (depth-2 path has empty interval);
+        # A->X->Y->D is all open (valid depth-3 path).
+        # The closure MUST emit A depends_on_closure D via the valid path.
+        triples = [
+            _t(1, "A", "depends_on", "B", vf="2026-01-01", vt="2026-02-01"),   # ends Feb
+            _t(2, "B", "depends_on", "D", vf="2026-03-01", vt=None),            # starts Mar → disjoint
+            _t(3, "A", "depends_on", "X", vf=None, vt=None),
+            _t(4, "X", "depends_on", "Y", vf=None, vt=None),
+            _t(5, "Y", "depends_on", "D", vf=None, vt=None),
+        ]
+        cands = dream_lib.deductive_closure(triples, TRANS_RULES,
+                                            max_depth=5, max_iterations=10, max_candidates=500)
+        pairs = {(c["conclusion"]["subject"], c["conclusion"]["object"]) for c in cands}
+        self.assertIn(("A", "D"), pairs)
+
 
 # ---------------------------------------------------------------------------
 # Task 5: build_contemplate_worklist + skip-marker filtering
