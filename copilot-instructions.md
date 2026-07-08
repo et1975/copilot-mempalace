@@ -86,3 +86,8 @@ When the user asks for a "memory checkup" / "palace checkup":
 3. Report concisely: growth deltas, top recall gaps, suggested consolidations. Offer to act on each.
 
 For deeper workflow docs (init, mine, full search/status walkthrough), invoke the `mempalace` skill.
+
+## Reasoning vs consolidation
+
+- Use `contemplate` when the user asks to derive, infer, reason, contemplate, or asks "what follows from this?" / "what can we conclude?" It runs on-demand/inline over the active KG with explicit rules and approved materialization.
+- Use `dreaming` for unattended offline consolidation: merge duplicates, resolve contradiction/staleness candidates, induce repeated patterns, or prune low-salience drawers. It should run in a fresh/off-hours session, not inline during feature work.

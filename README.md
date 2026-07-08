@@ -23,6 +23,11 @@ audit hook that nags when an external tool is about to run without a prior `memp
   archive before sanctioned delete) with a fixpoint re-harvest as the verify oracle. Native drawer usage-frequency
   is proposed upstream as MemPalace/mempalace#1921.
   See [`skills/dreaming/references/pipeline.md`](skills/dreaming/references/pipeline.md) for the contract.
+- **[skills/contemplate/SKILL.md](skills/contemplate/SKILL.md)** — on-demand deductive reasoning over the
+  MemPalace KG: run `derive` inline when the user asks what follows, then adjudicate
+  `materialize` / `skip` / `reject_rule` candidates. It shares the same Python mechanics in
+  [`skills/dreaming/scripts/`](skills/dreaming/scripts/) and documents the derive contract in
+  [`skills/contemplate/references/derive.md`](skills/contemplate/references/derive.md).
 - **[hooks/palace-reflex.json](hooks/palace-reflex.json) + [hooks/palace-reflex.py](hooks/palace-reflex.py)** —
   `PreToolUse` audit hook. Maintains a per-session ring buffer of recent tool calls under `$TMPDIR`. Fires when
   a trigger tool runs without a recent `mempalace_search`, injecting a one-line reminder via
