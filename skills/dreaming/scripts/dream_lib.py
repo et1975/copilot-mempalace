@@ -915,6 +915,7 @@ def deductive_closure(triples, rules, *, max_depth, max_iterations, max_candidat
     # active-key set for exclude-active (by canonical id-key)
     active_keys = {triple_id_key(t) for t in triples}
     out: dict[str, dict[str, Any]] = {}
+    emitted_conclusion_keys: set[tuple[Any, str, Any]] = set()
     truncated = False
 
     def emit(cand):
@@ -926,6 +927,8 @@ def deductive_closure(triples, rules, *, max_depth, max_iterations, max_candidat
             return
         if key in active_keys:          # exclude already-active facts (incl. pre-existing _closure)
             return
+        if key in emitted_conclusion_keys:  # deduplicate by conclusion identity across all families
+            return
         cid = cand["candidate_id"]
         if cid in out:
             return
@@ -933,6 +936,7 @@ def deductive_closure(triples, rules, *, max_depth, max_iterations, max_candidat
             truncated = True
             return
         out[cid] = cand
+        emitted_conclusion_keys.add(key)
 
     # --- non-transitive families: single pass, depth 1 ---
     for rule in active_rules:

@@ -1135,6 +1135,29 @@ class DeductiveClosureTests(unittest.TestCase):
         self.assertEqual(len(cands), 1)
         self.assertAlmostEqual(cands[0]["evidence"]["confidence"], 0.8)
 
+    def test_duplicate_base_triples_yield_one_inverse_candidate(self):
+        # Two triples with same subject/object but different triple_ids under inverse rule
+        rules = [{"id": "inverse:depends_on:dependency_of", "family": "inverse",
+                  "predicate": "depends_on", "inverse_predicate": "dependency_of", "enabled": True}]
+        triples = [
+            _t(10, "A", "depends_on", "B"),
+            _t(11, "A", "depends_on", "B"),  # duplicate conclusion but different triple_id
+        ]
+        cands = dream_lib.deductive_closure(triples, rules, max_depth=1,
+                                            max_iterations=10, max_candidates=500)
+        self.assertEqual(len(cands), 1)
+
+    def test_duplicate_base_triples_yield_one_symmetric_candidate(self):
+        rules = [{"id": "symmetric:collaborates_with", "family": "symmetric",
+                  "predicate": "collaborates_with", "enabled": True}]
+        triples = [
+            _t(20, "A", "collaborates_with", "B"),
+            _t(21, "A", "collaborates_with", "B"),
+        ]
+        cands = dream_lib.deductive_closure(triples, rules, max_depth=1,
+                                            max_iterations=10, max_candidates=500)
+        self.assertEqual(len(cands), 1)
+
 
 # ---------------------------------------------------------------------------
 # Task 5: build_contemplate_worklist + skip-marker filtering
