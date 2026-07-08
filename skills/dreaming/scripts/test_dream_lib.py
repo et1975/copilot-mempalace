@@ -961,3 +961,45 @@ class DeriveKeyTests(unittest.TestCase):
         a = dream_lib.derive_candidate_id(concl, "r", [1], "onto:x")
         b = dream_lib.derive_candidate_id(concl, "r", [1], "onto:y")
         self.assertNotEqual(a, b)
+
+
+# ---------------------------------------------------------------------------
+# Task 3: Interval-overlap temporal validity
+# ---------------------------------------------------------------------------
+
+class IntervalOverlapTests(unittest.TestCase):
+    def test_overlap_of_open_intervals_is_max_start_none_end(self):
+        got = dream_lib.premise_interval([
+            {"valid_from": "2026-01-01", "valid_to": None},
+            {"valid_from": "2026-03-01", "valid_to": None},
+        ])
+        self.assertEqual(got, ("2026-03-01T00:00:00", None))
+
+    def test_overlap_with_bounded_end_takes_min_end(self):
+        got = dream_lib.premise_interval([
+            {"valid_from": "2026-01-01", "valid_to": "2026-06-01"},
+            {"valid_from": "2026-02-01", "valid_to": "2026-05-01"},
+        ])
+        self.assertEqual(got, ("2026-02-01T00:00:00", "2026-05-01T00:00:00"))
+
+    def test_disjoint_intervals_return_none(self):
+        got = dream_lib.premise_interval([
+            {"valid_from": "2026-01-01", "valid_to": "2026-02-01"},
+            {"valid_from": "2026-03-01", "valid_to": None},
+        ])
+        self.assertIsNone(got)  # max_start (2026-03) >= min_end (2026-02) => empty
+
+    def test_touching_intervals_are_empty(self):
+        # max_start == min_end is a zero-width (empty) intersection
+        got = dream_lib.premise_interval([
+            {"valid_from": "2026-01-01", "valid_to": "2026-03-01"},
+            {"valid_from": "2026-03-01", "valid_to": None},
+        ])
+        self.assertIsNone(got)
+
+    def test_mixed_aware_and_naive_timestamps_do_not_crash(self):
+        got = dream_lib.premise_interval([
+            {"valid_from": "2026-01-01T00:00:00+00:00", "valid_to": None},
+            {"valid_from": "2026-02-01", "valid_to": None},
+        ])
+        self.assertEqual(got, ("2026-02-01T00:00:00", None))

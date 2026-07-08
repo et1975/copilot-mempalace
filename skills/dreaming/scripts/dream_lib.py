@@ -842,3 +842,32 @@ def derive_candidate_id(conclusion: dict[str, Any], rule_id: str,
     }
     blob = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return "derive:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _naive(dt: datetime) -> datetime:
+    return dt.replace(tzinfo=None) if dt.tzinfo is not None else dt
+
+
+def premise_interval(premises: list[dict[str, Any]]) -> tuple[str, str | None] | None:
+    """Return (valid_from, valid_to) of the intersection, or None if empty.
+
+    valid_from = max(starts); valid_to = min(ends, treating None as +inf).
+    Empty (max_start >= min_end) => None: premises never simultaneously true.
+    Timestamps are normalized to naive before comparison (module convention).
+    """
+    starts, ends = [], []
+    for p in premises:
+        vf = _parse_iso(p.get("valid_from"))
+        if vf is not None:
+            starts.append(_naive(vf))
+        vt = _parse_iso(p.get("valid_to"))
+        if vt is not None:
+            ends.append(_naive(vt))
+    max_start = max(starts) if starts else None
+    min_end = min(ends) if ends else None
+    if max_start is not None and min_end is not None and max_start >= min_end:
+        return None
+    return (
+        max_start.isoformat() if max_start is not None else None,
+        min_end.isoformat() if min_end is not None else None,
+    )
