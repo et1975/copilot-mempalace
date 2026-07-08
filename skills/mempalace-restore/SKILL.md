@@ -169,8 +169,48 @@ python3 -c "import sqlite3;print(sqlite3.connect('DB').execute('PRAGMA integrity
 
 `locks/` was excluded from backup and is ephemeral; do not try to restore it.
 
+## Import a wing bundle
+
+Whole-palace restic restore has a logical counterpart: importing a **single
+wing** from a JSONL bundle produced by the `mempalace-backup` skill's
+[`palace_wing.py`](../mempalace-backup/scripts/palace_wing.py) exporter. Use it to
+restore, migrate, or clone one wing without touching the rest of the palace.
+
+```bash
+# Import needs mempalace importable — run under the interpreter where mempalace
+# is installed (e.g. the uv-tool venv), not necessarily system python3.
+./scripts/palace_wing.py import wing-<wing>.jsonl --palace ~/.mempalace
+
+# Preview without writing anything:
+./scripts/palace_wing.py import wing-<wing>.jsonl --dry-run
+
+# Clone the bundle into a different wing name (implies no dedup):
+./scripts/palace_wing.py import wing-<wing>.jsonl --into-wing <new-wing>
+```
+
+Behavior and caveats:
+
+- **Replay, not byte restore.** Drawers are re-added (new IDs, re-embedded).
+  Metadata `add_drawer` cannot set (topic/hall/type/date) is preserved via a
+  content trailer.
+- **Idempotent merge.** Re-importing into the same wing skips near-duplicates via
+  `check_duplicate` (`--dup-threshold`). `--into-wing`/`--force-add` bypass dedup
+  (palace-wide dedup would otherwise skip a clone).
+- **KG is best-effort.** Only triples whose `source_drawer_id` resolved to the
+  wing were exported; on import `source_drawer_id` is dropped (old IDs are
+  invalid). KG triples are written directly to the palace KG.
+- **Tunnels import last** and only if both endpoint rooms exist; the handler
+  validates rooms and skipped tunnels are reported (dangling tunnels are
+  impossible).
+- **Stop the daemon / reopen after.** Import writes through a live ChromaDB
+  client. Stop `mempalace daemon`, then reopen with MCP `mempalace_reconnect`
+  (or restart the MCP server). Freshly added drawers materialize on flush, so
+  don't expect them in `embedding_metadata` the instant import returns.
+
 ## See also
 
+- [`../mempalace-backup/scripts/palace_wing.py`](../mempalace-backup/scripts/palace_wing.py)
+  — wing bundle export/import (this skill covers `import`).
 - [`../mempalace-backup/scripts/palace_backup.py`](../mempalace-backup/scripts/palace_backup.py)
   — the same helper also restores: `palace_backup.py restore <snapshot> --in-place`.
 - [Disaster recovery](references/disaster-recovery.md) — scenario-based restore,

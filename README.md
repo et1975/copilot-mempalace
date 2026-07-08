@@ -29,6 +29,9 @@ audit hook that nags when an external tool is about to run without a prior `memp
   only, on demand. Ships a tested Python helper
   ([`scripts/palace_backup.py`](skills/mempalace-backup/scripts/palace_backup.py) + `test_palace_backup.py`) that
   needs no `sqlite3` CLI, plus a [restic cheatsheet](skills/mempalace-backup/references/restic-cheatsheet.md).
+  For **per-wing** archival/migration/cloning (which restic cannot do, since wings share physical storage), it also
+  ships [`scripts/palace_wing.py`](skills/mempalace-backup/scripts/palace_wing.py) — a logical wing export/import that
+  reads the palace SQLite directly into a portable JSONL bundle and replays it back.
 - **[skills/mempalace-restore/SKILL.md](skills/mempalace-restore/SKILL.md)** — restore / disaster-recovery
   counterpart: reversible staged restore (move the current palace aside first), restic's absolute-path-stripping
   subpath syntax so files land directly, then `mempalace repair` / `repair-status` and MCP `mempalace_reconnect`.

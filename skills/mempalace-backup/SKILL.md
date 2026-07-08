@@ -167,6 +167,31 @@ chmod 600 "$RESTIC_PASSWORD_FILE"
 restic init
 ```
 
+## Wing-scoped logical export
+
+`restic` backup is **physical and whole-palace only** — wings share the same
+ChromaDB collections, HNSW index, and SQLite databases, so a file snapshot cannot
+isolate one wing. When you need *one wing* (to archive, move, or clone it), use
+the **logical** exporter [`scripts/palace_wing.py`](scripts/palace_wing.py), which
+reads a wing's contents straight from the palace SQLite and writes a portable
+JSONL bundle.
+
+```bash
+# Export needs NO restic and NO mempalace import — it reads the palace SQLite directly.
+./scripts/palace_wing.py export <wing> --out wing-<wing>.jsonl
+./scripts/palace_wing.py export copilot-mempalace --palace ~/.mempalace
+```
+
+A bundle contains: **drawers** (multi-chunk drawers reassembled), **best-effort
+KG triples** (only those whose `source_drawer_id` resolves to the wing — others
+are counted and skipped in the manifest `kg_note`), and **tunnels** that touch the
+wing. Closets are **not** exported — they regenerate from drawers on import.
+
+**This is a logical bundle, not a byte snapshot.** It is complementary to restic:
+use restic for whole-palace disaster recovery, and the wing bundle for
+per-wing archival, migration, or cloning. Import is documented in the
+`mempalace-restore` skill.
+
 ## Helper script
 
 For a deterministic, idempotent version of the whole flow, use the bundled
@@ -193,6 +218,7 @@ Restore lives in the same script (see the `mempalace-restore` skill):
 ## See also
 
 - [`scripts/palace_backup.py`](scripts/palace_backup.py) — tested Python backup/restore helper.
+- [`scripts/palace_wing.py`](scripts/palace_wing.py) — wing-scoped logical export/import.
 - [`references/restic-cheatsheet.md`](references/restic-cheatsheet.md) — compact restic command reference.
 - `mempalace-restore` — recovery workflow, including restore-side `mempalace repair` / `repair-status`.
 - `skills/mempalace/references/hnsw-recovery.md` — HNSW drift/index recovery background.
