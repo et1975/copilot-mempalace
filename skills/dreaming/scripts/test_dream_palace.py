@@ -698,5 +698,43 @@ class TestLoadDrawerById(unittest.TestCase):
                 sys.modules["mempalace.palace"] = original_palace_module
 
 
+class OntologyLoaderTests(unittest.TestCase):
+    def test_missing_config_returns_empty(self):
+        with _test_tmpdir() as d:
+            self.assertEqual(dream_palace.load_ontology_config(os.path.join(d, "none.json")), [])
+
+    def test_loads_wrapped_rules(self):
+        with _test_tmpdir() as d:
+            p = os.path.join(d, "ontology.json")
+            with open(p, "w") as f:
+                json.dump({"version": 1, "rules": [{"id": "a", "family": "transitive",
+                           "predicate": "depends_on", "enabled": True}]}, f)
+            self.assertEqual(dream_palace.load_ontology_config(p)[0]["id"], "a")
+
+    def test_loads_bare_array(self):
+        with _test_tmpdir() as d:
+            p = os.path.join(d, "ontology.json")
+            with open(p, "w") as f:
+                json.dump([{"id": "b", "family": "symmetric", "predicate": "x", "enabled": True}], f)
+            self.assertEqual(dream_palace.load_ontology_config(p)[0]["id"], "b")
+
+class SkipMarkerIOTests(unittest.TestCase):
+    def test_append_then_load_roundtrip(self):
+        with _test_tmpdir() as d:
+            path = os.path.join(d, "skips.jsonl")
+            dream_palace.append_skip_markers(path, [{"candidate_id": "derive:a", "ontology_version": "v"}])
+            dream_palace.append_skip_markers(path, [{"candidate_id": "derive:b", "ontology_version": "v"}])
+            got = dream_palace.load_skip_markers(path)
+            self.assertEqual([m["candidate_id"] for m in got], ["derive:a", "derive:b"])
+
+    def test_load_missing_returns_empty(self):
+        with _test_tmpdir() as d:
+            self.assertEqual(dream_palace.load_skip_markers(os.path.join(d, "no.jsonl")), [])
+
+class LoaderAliasTests(unittest.TestCase):
+    def test_with_ids_alias_is_the_loader(self):
+        self.assertIs(dream_palace.load_active_triples_with_ids, dream_palace.load_active_triples)
+
+
 if __name__ == "__main__":
     unittest.main()

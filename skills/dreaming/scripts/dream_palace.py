@@ -446,6 +446,39 @@ class KgWriter:
         self._kg.close()
 
 
+load_active_triples_with_ids = load_active_triples  # alias: proofs need t.id (already returned)
+
+def load_ontology_config(path):
+    if not path or not os.path.exists(path):
+        return []
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if isinstance(data, dict):
+        return list(data.get("rules") or [])
+    if isinstance(data, list):
+        return list(data)
+    return []
+
+def load_skip_markers(path):
+    if not path or not os.path.exists(path):
+        return []
+    out = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                out.append(json.loads(line))
+    return out
+
+def append_skip_markers(path, markers):
+    if not markers:
+        return
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        for m in markers:
+            f.write(json.dumps(m, separators=(",", ":")) + "\n")
+
+
 if __name__ == "__main__":  # tiny manual smoke: print drawer count for a scope
     import argparse
 
