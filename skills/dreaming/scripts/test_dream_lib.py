@@ -1125,6 +1125,16 @@ class DeductiveClosureTests(unittest.TestCase):
         pairs = {(c["conclusion"]["subject"], c["conclusion"]["object"]) for c in cands}
         self.assertIn(("A", "D"), pairs)
 
+    def test_null_confidence_treated_as_1_not_crash(self):
+        # confidence=None can come from sqlite REAL DEFAULT 1.0 (nullable); must not crash
+        triples = [_t(1, "A", "depends_on", "B", conf=None),
+                   _t(2, "B", "depends_on", "C", conf=0.8)]
+        triples[0]["confidence"] = None  # ensure key present with None value
+        cands = dream_lib.deductive_closure(triples, TRANS_RULES, max_depth=3,
+                                            max_iterations=10, max_candidates=500)
+        self.assertEqual(len(cands), 1)
+        self.assertAlmostEqual(cands[0]["evidence"]["confidence"], 0.8)
+
 
 # ---------------------------------------------------------------------------
 # Task 5: build_contemplate_worklist + skip-marker filtering

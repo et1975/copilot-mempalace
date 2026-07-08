@@ -890,7 +890,7 @@ def _mk_candidate(subj_id, pred, obj_id, names, rule, premises, onto_version, de
         "subject_id": subj_id, "predicate": pred, "object_id": obj_id,
         "subject": names.get(subj_id), "object": names.get(obj_id),
     }
-    conf = min((float(p.get("confidence", 1.0)) for p in premises), default=1.0)
+    conf = min((float(c) if (c := p.get("confidence")) is not None else 1.0 for p in premises), default=1.0)
     return {
         "kind": "derive",
         "candidate_id": derive_candidate_id(conclusion, rule["id"], premise_ids, onto_version),
