@@ -238,6 +238,14 @@ class _DryRunKgWriter:
         self.planned.append(f"INVALIDATE_TRIPLES {', '.join(str(tid) for tid in triple_ids)}")
         return len(triple_ids)
 
+    def add_derived(self, conclusion, rule_id, premise_ids, premise_drawer_ids,
+                    ontology_version, confidence, valid_from, valid_to) -> dict[str, Any]:
+        pred = conclusion.get("predicate", "?")
+        subj = conclusion.get("subject") or conclusion.get("subject_id", "?")
+        obj = conclusion.get("object") or conclusion.get("object_id", "?")
+        self.planned.append(f"DERIVE  {subj} -{pred}-> {obj}  (rule={rule_id})")
+        return {"ok": True, "triple_id": "dry-run", "dry_run": True}
+
 
 class _DryRunArchiver:
     def __init__(self) -> None:

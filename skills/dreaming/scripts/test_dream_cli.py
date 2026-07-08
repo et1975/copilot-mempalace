@@ -735,6 +735,19 @@ class DeriveCliTests(unittest.TestCase):
             dream_harvest.main(["--task", "derive", "--palace", palace, "--out", out])
             self.assertEqual(len(json.load(open(out))["items"]), 0)  # operational fixpoint
 
+    def test_dry_run_materialize_previews_without_writing(self):
+        with _test_tmpdir() as td:
+            palace = self._palace(td); out = os.path.join(td, "wl.json")
+            dream_harvest.main(["--task", "derive", "--palace", palace, "--out", out])
+            wl = json.load(open(out)); wl["items"][0]["action"] = "materialize"
+            dec = os.path.join(td, "dec.json"); json.dump(wl, open(dec, "w"))
+            rc = dream_adopt.main(["--task", "derive", "--palace", palace,
+                                   "--decisions", dec, "--dry-run"])
+            self.assertEqual(rc, 0)
+            # palace must be unmutated: re-harvest still yields 1 candidate
+            dream_harvest.main(["--task", "derive", "--palace", palace, "--out", out])
+            self.assertEqual(len(json.load(open(out))["items"]), 1)
+
 
 @unittest.skipUnless(_HAS_MEMPALACE, "requires mempalace interpreter")
 class DeriveHarvestCliTests(unittest.TestCase):
