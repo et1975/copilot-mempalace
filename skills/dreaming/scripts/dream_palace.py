@@ -479,6 +479,84 @@ def append_skip_markers(path, markers):
             f.write(json.dumps(m, separators=(",", ":")) + "\n")
 
 
+class KgDeriveWriter:
+    """Writes derived triples + a kg_derivations lineage row to the palace-local KG.
+
+    Direct KnowledgeGraph use (not the mempalace_kg_add MCP handler) for the same
+    _palace_flag_given reason the contradiction KgWriter documents. add_triple RETURNS the
+    triple id (existing on dedupe, new otherwise) so no post-write re-query is needed.
+    """
+
+    _DDL = (
+        "CREATE TABLE IF NOT EXISTS kg_derivations("
+        " id INTEGER PRIMARY KEY,"
+        " candidate_id TEXT UNIQUE,"
+        " conclusion_triple_id TEXT,"
+        " rule_id TEXT,"
+        " ontology_version TEXT,"
+        " premise_triple_ids TEXT,"
+        " premise_drawer_ids TEXT,"
+        " confidence REAL,"
+        " created_at TEXT)"
+    )
+
+    def __init__(self, palace_path):
+        from mempalace.knowledge_graph import KnowledgeGraph  # lazy
+        self._db_path = os.path.join(palace_path, "knowledge_graph.sqlite3")
+        self._kg = KnowledgeGraph(db_path=self._db_path)
+        con = sqlite3.connect(self._db_path)
+        try:
+            con.execute(self._DDL)
+            con.commit()
+        finally:
+            con.close()
+
+    def _resolve_name(self, con, entity_id):
+        row = con.execute("SELECT name FROM entities WHERE id=?", (entity_id,)).fetchone()
+        if row is None:
+            raise ValueError(f"derive references unknown entity id {entity_id!r}; "
+                             "premises must come from the live KG loader")
+        return row[0]
+
+    def add_derived(self, conclusion, rule_id, premise_ids, premise_drawer_ids,
+                    ontology_version, confidence, valid_from, valid_to):
+        from dream_lib import derive_candidate_id, normalize_predicate
+        candidate_id = derive_candidate_id(conclusion, rule_id, premise_ids, ontology_version)
+        con = sqlite3.connect(self._db_path)
+        try:
+            if con.execute("SELECT 1 FROM kg_derivations WHERE candidate_id=?",
+                           (candidate_id,)).fetchone():
+                return {"ok": True, "idempotent": True}
+            subj = self._resolve_name(con, conclusion["subject_id"])
+            obj = self._resolve_name(con, conclusion["object_id"])
+        finally:
+            con.close()
+        pred = normalize_predicate(conclusion["predicate"])
+        # add_triple resolves entities by NAME (mempalace is name-keyed) and RETURNS the id.
+        triple_id = self._kg.add_triple(
+            subj, pred, obj,
+            valid_from=valid_from, valid_to=valid_to,
+            confidence=confidence if confidence is not None else 1.0,
+            source_drawer_id="derive:" + rule_id,
+            adapter_name="contemplate:derive")
+        con = sqlite3.connect(self._db_path)
+        try:
+            con.execute(
+                "INSERT OR IGNORE INTO kg_derivations(candidate_id, conclusion_triple_id,"
+                " rule_id, ontology_version, premise_triple_ids, premise_drawer_ids,"
+                " confidence, created_at) VALUES (?,?,?,?,?,?,?,?)",
+                (candidate_id, str(triple_id), rule_id, ontology_version,
+                 json.dumps(premise_ids), json.dumps(premise_drawer_ids),
+                 confidence, datetime.now(timezone.utc).isoformat()))
+            con.commit()
+        finally:
+            con.close()
+        return {"ok": True, "triple_id": triple_id}
+
+    def close(self):
+        self._kg.close()
+
+
 if __name__ == "__main__":  # tiny manual smoke: print drawer count for a scope
     import argparse
 

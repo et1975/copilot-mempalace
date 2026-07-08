@@ -736,5 +736,83 @@ class LoaderAliasTests(unittest.TestCase):
         self.assertIs(dream_palace.load_active_triples_with_ids, dream_palace.load_active_triples)
 
 
+try:
+    from mempalace.knowledge_graph import KnowledgeGraph as _RealKG
+    _HAS_MEMPALACE = True
+except Exception:
+    _HAS_MEMPALACE = False
+
+@unittest.skipUnless(_HAS_MEMPALACE, "requires mempalace interpreter")
+class KgDeriveWriterTests(unittest.TestCase):
+    def _seed(self, palace):
+        # create entities A, B, C via real add_triple; return their ids
+        kg = _RealKG(db_path=os.path.join(palace, "knowledge_graph.sqlite3"))
+        kg.add_triple("A", "depends_on", "B", valid_from="2026-01-01")
+        kg.add_triple("B", "depends_on", "C", valid_from="2026-01-01")
+        kg.close()
+        con = sqlite3.connect(os.path.join(palace, "knowledge_graph.sqlite3"))
+        ids = {r[1]: r[0] for r in con.execute("SELECT id,name FROM entities").fetchall()}
+        con.close()
+        return ids
+
+    def test_add_derived_creates_derivation_row_and_triple(self):
+        with _test_tmpdir() as palace:
+            ids = self._seed(palace)
+            w = dream_palace.KgDeriveWriter(palace)
+            try:
+                res = w.add_derived(
+                    {"subject_id": ids["A"], "predicate": "depends_on_closure", "object_id": ids["C"]},
+                    "transitive:depends_on", ["t1", "t2"], ["d1", "d2"], "onto:v", 0.7,
+                    "2026-01-01", None)
+            finally:
+                w.close()
+            self.assertIsNotNone(res["triple_id"])
+            con = sqlite3.connect(os.path.join(palace, "knowledge_graph.sqlite3"))
+            nd = con.execute("SELECT COUNT(*) FROM kg_derivations").fetchone()[0]
+            nt = con.execute(
+                "SELECT COUNT(*) FROM triples WHERE predicate='depends_on_closure' AND valid_to IS NULL"
+            ).fetchone()[0]
+            link = con.execute(
+                "SELECT conclusion_triple_id FROM kg_derivations").fetchone()[0]
+            con.close()
+            self.assertEqual((nd, nt), (1, 1))
+            self.assertEqual(link, res["triple_id"])  # lineage points at the written triple
+
+    def test_add_derived_is_idempotent_on_same_candidate(self):
+        with _test_tmpdir() as palace:
+            ids = self._seed(palace)
+            w = dream_palace.KgDeriveWriter(palace)
+            args = ({"subject_id": ids["A"], "predicate": "depends_on_closure", "object_id": ids["C"]},
+                    "r", ["t1", "t2"], ["d1", "d2"], "onto:v", 0.7, "2026-01-01", None)
+            try:
+                w.add_derived(*args)
+                second = w.add_derived(*args)
+            finally:
+                w.close()
+            self.assertTrue(second.get("idempotent"))
+            con = sqlite3.connect(os.path.join(palace, "knowledge_graph.sqlite3"))
+            nt = con.execute(
+                "SELECT COUNT(*) FROM triples WHERE predicate='depends_on_closure'").fetchone()[0]
+            nd = con.execute("SELECT COUNT(*) FROM kg_derivations").fetchone()[0]
+            con.close()
+            self.assertEqual((nt, nd), (1, 1))
+
+    def test_valid_to_is_persisted(self):
+        with _test_tmpdir() as palace:
+            ids = self._seed(palace)
+            w = dream_palace.KgDeriveWriter(palace)
+            try:
+                w.add_derived(
+                    {"subject_id": ids["A"], "predicate": "depends_on_closure", "object_id": ids["C"]},
+                    "r", ["t1"], ["d1"], "onto:v", 1.0, "2026-01-01", "2026-05-01")
+            finally:
+                w.close()
+            con = sqlite3.connect(os.path.join(palace, "knowledge_graph.sqlite3"))
+            vt = con.execute(
+                "SELECT valid_to FROM triples WHERE predicate='depends_on_closure'").fetchone()[0]
+            con.close()
+            self.assertEqual(vt, "2026-05-01")
+
+
 if __name__ == "__main__":
     unittest.main()
