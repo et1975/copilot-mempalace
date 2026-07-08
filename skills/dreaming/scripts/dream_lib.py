@@ -990,3 +990,22 @@ def deductive_closure(triples, rules, *, max_depth, max_iterations, max_candidat
         for c in result:
             c["truncated"] = True
     return result
+
+
+def filter_skipped(candidates, skip_markers, onto_version):
+    skipped = {m["candidate_id"] for m in (skip_markers or [])
+               if m.get("ontology_version") == onto_version}
+    return [c for c in candidates if c.get("candidate_id") not in skipped]
+
+
+def build_contemplate_worklist(candidates, *, scope, params, rules, onto_version, instructions=None):
+    return {
+        "version": WORKLIST_VERSION,
+        "task": "contemplate",
+        "scope": scope,
+        "params": params,
+        "ontology_version": onto_version,
+        "rules": rules,
+        "instructions": instructions,
+        "items": list(candidates),
+    }

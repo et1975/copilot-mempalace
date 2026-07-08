@@ -1108,3 +1108,30 @@ class DeductiveClosureTests(unittest.TestCase):
                                             max_iterations=20, max_candidates=3)
         self.assertEqual(len(cands), 3)
         self.assertTrue(all(c.get("truncated") for c in cands))
+
+
+# ---------------------------------------------------------------------------
+# Task 5: build_contemplate_worklist + skip-marker filtering
+# ---------------------------------------------------------------------------
+
+class ContemplateWorklistTests(unittest.TestCase):
+    def test_worklist_shape_and_version(self):
+        cands = [{"kind": "derive", "candidate_id": "derive:x", "conclusion": {}, "decision": None}]
+        wl = dream_lib.build_contemplate_worklist(cands, scope={"palace": "/p"},
+                  params={"max_depth": 3}, rules=[], onto_version="onto:v")
+        self.assertEqual(wl["task"], "contemplate")
+        self.assertEqual(wl["version"], dream_lib.WORKLIST_VERSION)
+        self.assertEqual(wl["ontology_version"], "onto:v")
+        self.assertEqual(len(wl["items"]), 1)
+
+    def test_filter_skipped_candidates_removes_by_id(self):
+        cands = [{"candidate_id": "derive:a"}, {"candidate_id": "derive:b"}]
+        skips = [{"candidate_id": "derive:a", "ontology_version": "onto:v"}]
+        got = dream_lib.filter_skipped(cands, skips, "onto:v")
+        self.assertEqual([c["candidate_id"] for c in got], ["derive:b"])
+
+    def test_filter_skipped_ignores_markers_from_other_ontology_version(self):
+        cands = [{"candidate_id": "derive:a"}]
+        skips = [{"candidate_id": "derive:a", "ontology_version": "onto:OLD"}]
+        got = dream_lib.filter_skipped(cands, skips, "onto:v")
+        self.assertEqual([c["candidate_id"] for c in got], ["derive:a"])
