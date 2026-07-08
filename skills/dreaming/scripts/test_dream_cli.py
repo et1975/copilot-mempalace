@@ -678,6 +678,65 @@ class TestAdoptPruneTask(unittest.TestCase):
 
 
 @unittest.skipUnless(_HAS_MEMPALACE, "requires mempalace interpreter")
+class DeriveCliTests(unittest.TestCase):
+    def _palace(self, td):
+        palace = os.path.join(td, "palace"); os.makedirs(palace)
+        kg = _RealKG(db_path=os.path.join(palace, "knowledge_graph.sqlite3"))
+        kg.add_triple("A", "depends_on", "B", valid_from="2026-01-01")
+        kg.add_triple("B", "depends_on", "C", valid_from="2026-01-01")
+        kg.close()
+        with open(os.path.join(palace, "ontology.json"), "w") as f:
+            json.dump({"version": 1, "rules": [{"id": "transitive:depends_on",
+                "family": "transitive", "predicate": "depends_on", "enabled": True,
+                "max_depth": 3}]}, f)
+        return palace
+
+    def test_harvest_derive_emits_one_closure_candidate(self):
+        with _test_tmpdir() as td:
+            palace = self._palace(td); out = os.path.join(td, "wl.json")
+            dream_harvest.main(["--task", "derive", "--palace", palace, "--out", out])
+            wl = json.load(open(out))
+            self.assertEqual(wl["task"], "contemplate")
+            self.assertEqual(len(wl["items"]), 1)
+            self.assertEqual(wl["items"][0]["conclusion"]["predicate"], "depends_on_closure")
+
+    def test_adopt_materialize_then_verify_reaches_fixpoint(self):
+        with _test_tmpdir() as td:
+            palace = self._palace(td); out = os.path.join(td, "wl.json")
+            dream_harvest.main(["--task", "derive", "--palace", palace, "--out", out])
+            wl = json.load(open(out))
+            wl["items"][0]["action"] = "materialize"
+            dec = os.path.join(td, "dec.json"); json.dump(wl, open(dec, "w"))
+            rc = dream_adopt.main(["--task", "derive", "--palace", palace,
+                                   "--decisions", dec, "--verify", "--strict"])
+            self.assertEqual(rc, 0)
+            # re-harvest: candidate now active => 0 residual
+            dream_harvest.main(["--task", "derive", "--palace", palace, "--out", out])
+            self.assertEqual(len(json.load(open(out))["items"]), 0)
+
+    def test_adopt_skip_then_reharvest_is_empty_via_skip_marker(self):
+        with _test_tmpdir() as td:
+            palace = self._palace(td); out = os.path.join(td, "wl.json")
+            dream_harvest.main(["--task", "derive", "--palace", palace, "--out", out])
+            wl = json.load(open(out)); wl["items"][0]["action"] = "skip"
+            wl["items"][0]["reason"] = "noise"
+            dec = os.path.join(td, "dec.json"); json.dump(wl, open(dec, "w"))
+            dream_adopt.main(["--task", "derive", "--palace", palace, "--decisions", dec])
+            dream_harvest.main(["--task", "derive", "--palace", palace, "--out", out])
+            self.assertEqual(len(json.load(open(out))["items"]), 0)  # skip-marker suppresses
+
+    def test_adopt_reject_rule_suppresses_via_skip_markers(self):
+        with _test_tmpdir() as td:
+            palace = self._palace(td); out = os.path.join(td, "wl.json")
+            dream_harvest.main(["--task", "derive", "--palace", palace, "--out", out])
+            wl = json.load(open(out)); wl["items"][0]["action"] = "reject_rule"
+            dec = os.path.join(td, "dec.json"); json.dump(wl, open(dec, "w"))
+            dream_adopt.main(["--task", "derive", "--palace", palace, "--decisions", dec])
+            dream_harvest.main(["--task", "derive", "--palace", palace, "--out", out])
+            self.assertEqual(len(json.load(open(out))["items"]), 0)  # operational fixpoint
+
+
+@unittest.skipUnless(_HAS_MEMPALACE, "requires mempalace interpreter")
 class DeriveHarvestCliTests(unittest.TestCase):
     def _palace(self, td):
         palace = os.path.join(td, "palace"); os.makedirs(palace)

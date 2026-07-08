@@ -26,11 +26,14 @@ import sys
 from typing import Any
 
 import dream_palace
+import dream_lib as _dream_lib
 from dream_lib import (
     apply_contradiction_decisions,
+    apply_derive_decisions,
     apply_merge_decisions,
     apply_pattern_decisions,
     apply_prune_decisions,
+    skip_markers_for_rejected_rules,
 )
 
 
@@ -183,6 +186,27 @@ def _resolve_prune_decisions(worklist: dict[str, Any]) -> list[dict[str, Any]]:
             }
         )
     return resolved
+
+
+def _resolve_derive_decisions(worklist: dict[str, Any]) -> list[dict[str, Any]]:
+    """Items already carry action + conclusion/rule/proof/evidence/ontology_version from harvest."""
+    return [dict(item) for item in worklist.get("items", []) if item.get("action")]
+
+
+def _task_from_worklist(worklist: dict[str, Any]) -> str:
+    """Derive the task key used for dispatch from the worklist.
+
+    The harvest labels contemplate worklists ``task:"contemplate"``; adopt must
+    look at item kind to determine the sub-task (e.g. ``"derive"``).
+    """
+    task = worklist.get("task")
+    if task in ("merge", "contradiction", "pattern", "prune"):
+        return task
+    # "contemplate" and unknown labels: infer from item kind
+    items = worklist.get("items", [])
+    if items:
+        return items[0].get("kind", "derive")
+    return task or "merge"
 
 
 class _DryRunWriter:
@@ -371,9 +395,26 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--palace", required=True, help="Path to the mempalace palace directory")
     ap.add_argument("--decisions", required=True, help="Path to the adjudicated decisions.json")
+    ap.add_argument("--task", default=None,
+                    choices=["merge", "contradiction", "pattern", "prune", "derive"],
+                    help="Override task (default: derived from worklist)")
     ap.add_argument("--archive-file", default=None,
                     help="Append-only prune archive JSONL path (default: <palace>/dream-archive.jsonl)")
     ap.add_argument("--dry-run", action="store_true", help="Print planned changes; write nothing")
+    ap.add_argument("--rules", default=None,
+                    help="Path to ontology config (default: <palace>/ontology.json)")
+    ap.add_argument("--skips", default=None,
+                    help="Path to skip-markers file (default: <palace>/dream-derive-skips.jsonl)")
+    ap.add_argument("--max-depth", type=int, default=3,
+                    help="Maximum derivation depth for derive (default 3)")
+    ap.add_argument("--max-iterations", type=int, default=10,
+                    help="Maximum closure iterations for derive (default 10)")
+    ap.add_argument("--max-candidates", type=int, default=500,
+                    help="Maximum candidates for derive (default 500)")
+    ap.add_argument("--verify", action="store_true",
+                    help="After adopt, re-harvest and print residual count")
+    ap.add_argument("--strict", action="store_true",
+                    help="With --verify, return exit code 1 if any residual candidates remain")
     args = ap.parse_args(argv)
 
     path = dream_palace.bind_palace(args.palace)
@@ -381,7 +422,7 @@ def main(argv: list[str] | None = None) -> int:
         args.archive_file = os.path.join(path, "dream-archive.jsonl")
     with open(args.decisions, encoding="utf-8") as fh:
         worklist = json.load(fh)
-    task = _worklist_task(worklist)
+    task = args.task or _task_from_worklist(worklist)
 
     if args.dry_run:
         if task == "contradiction":
@@ -454,6 +495,17 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 1 if report["errors"] else 0
 
+        if task == "derive":
+            decisions = _resolve_derive_decisions(worklist)
+            report, _markers = apply_derive_decisions(decisions, _DryRunKgWriter())
+            print(json.dumps(report, indent=2))
+            print(
+                f"[dry-run] would materialize {report['materialized']}, skip {report['skipped']}, "
+                f"errors {len(report['errors'])}",
+                file=sys.stderr,
+            )
+            return 1 if report["errors"] else 0
+
         print(f"unknown dreaming task: {task}", file=sys.stderr)
         return 2
 
@@ -503,6 +555,33 @@ def main(argv: list[str] | None = None) -> int:
             f"errors {len(report['errors'])}",
             file=sys.stderr,
         )
+    elif task == "derive":
+        decisions = _resolve_derive_decisions(worklist)
+        writer = dream_palace.KgDeriveWriter(args.palace)
+        try:
+            report, skip_markers = apply_derive_decisions(decisions, writer)
+        finally:
+            writer.close()
+        onto_ver = worklist.get("ontology_version") or _dream_lib.ontology_version(
+            dream_palace.load_ontology_config(args.rules or os.path.join(path, "ontology.json")))
+        rejected = [(d.get("rule") or {}).get("id") for d in decisions if d.get("action") == "reject_rule"]
+        skip_markers += skip_markers_for_rejected_rules(
+            worklist.get("items", []), [r for r in rejected if r], onto_ver)
+        skips_path = args.skips or os.path.join(path, "dream-derive-skips.jsonl")
+        dream_palace.append_skip_markers(skips_path, skip_markers)
+        print(json.dumps(report, indent=2))
+        if args.verify:
+            rules = dream_palace.load_ontology_config(args.rules or os.path.join(path, "ontology.json"))
+            triples = dream_palace.load_active_triples_with_ids(path)
+            residual = _dream_lib.deductive_closure(
+                triples, rules, max_depth=args.max_depth,
+                max_iterations=args.max_iterations, max_candidates=args.max_candidates)
+            residual = _dream_lib.filter_skipped(
+                residual, dream_palace.load_skip_markers(skips_path), _dream_lib.ontology_version(rules))
+            print(f"verify: {len(residual)} residual candidate(s)", file=sys.stderr)
+            if args.strict and residual:
+                return 1
+        return 0
     else:
         print(f"unknown dreaming task: {task}", file=sys.stderr)
         return 2

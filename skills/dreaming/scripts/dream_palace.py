@@ -479,6 +479,23 @@ def append_skip_markers(path, markers):
             f.write(json.dumps(m, separators=(",", ":")) + "\n")
 
 
+def _normalize_dt_for_kg(value):
+    """Normalize a date/datetime string to what mempalace add_triple accepts.
+
+    premise_interval() returns isoformat() which for midnight datetimes gives
+    'YYYY-MM-DDTHH:MM:SS' (no Z).  add_triple expects either 'YYYY-MM-DD' or
+    'YYYY-MM-DDTHH:MM:SSZ'.  Convert accordingly.
+    """
+    if not value or not isinstance(value, str) or "T" not in value:
+        return value
+    if value.endswith("Z"):
+        return value
+    # naive datetime string: if midnight, return date-only; otherwise append Z (assume UTC)
+    if value.endswith("T00:00:00"):
+        return value[:10]
+    return value + "Z"
+
+
 class KgDeriveWriter:
     """Writes derived triples + a kg_derivations lineage row to the palace-local KG.
 
@@ -535,7 +552,7 @@ class KgDeriveWriter:
         # add_triple resolves entities by NAME (mempalace is name-keyed) and RETURNS the id.
         triple_id = self._kg.add_triple(
             subj, pred, obj,
-            valid_from=valid_from, valid_to=valid_to,
+            valid_from=_normalize_dt_for_kg(valid_from), valid_to=_normalize_dt_for_kg(valid_to),
             confidence=confidence if confidence is not None else 1.0,
             source_drawer_id="derive:" + rule_id,
             adapter_name="contemplate:derive")
