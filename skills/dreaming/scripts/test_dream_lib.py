@@ -901,3 +901,39 @@ class TestApplyContradictionDecisions(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# Task 1: Ontology rule model + config normalization
+# ---------------------------------------------------------------------------
+
+import dream_lib as dream_lib  # noqa: E402 (alias for plan-compatible access)
+
+
+class OntologyConfigTests(unittest.TestCase):
+    def test_normalize_predicate_lowercases_and_underscores(self):
+        self.assertEqual(dream_lib.normalize_predicate("Depends On"), "depends_on")
+        self.assertEqual(dream_lib.normalize_predicate("depends-on"), "depends_on")
+
+    def test_ontology_version_is_stable_content_hash(self):
+        rules = [{"id": "transitive:depends_on", "family": "transitive",
+                  "predicate": "depends_on", "enabled": True}]
+        v1 = dream_lib.ontology_version(rules)
+        v2 = dream_lib.ontology_version(list(rules))
+        self.assertEqual(v1, v2)
+        self.assertNotEqual(v1, dream_lib.ontology_version([]))
+
+    def test_enabled_rules_filters_disabled_and_unknown_family(self):
+        rules = [
+            {"id": "a", "family": "transitive", "predicate": "p", "enabled": True},
+            {"id": "b", "family": "transitive", "predicate": "q", "enabled": False},
+            {"id": "c", "family": "bogus", "predicate": "r", "enabled": True},
+        ]
+        got = [r["id"] for r in dream_lib.enabled_rules(rules)]
+        self.assertEqual(got, ["a"])
+
+    def test_derived_predicate_defaults_to_closure_suffix(self):
+        rule = {"id": "a", "family": "transitive", "predicate": "depends_on", "enabled": True}
+        self.assertEqual(dream_lib.derived_predicate_for(rule), "depends_on_closure")
+        rule2 = dict(rule, derived_predicate="reaches")
+        self.assertEqual(dream_lib.derived_predicate_for(rule2), "reaches")

@@ -13,6 +13,8 @@ plain ``decisions``.
 from __future__ import annotations
 
 from datetime import datetime
+import hashlib
+import json
 import math
 import re
 from typing import Any
@@ -775,3 +777,51 @@ def apply_prune_decisions(decisions: list[dict[str, Any]], archiver: Any) -> dic
             report["errors"].append({"stage": "archive", "error": str(exc), "decision": d})
             continue
     return report
+
+
+# ---------------------------------------------------------------------------
+# Derive: deductive KG closure (Tasks 1–6)
+# ---------------------------------------------------------------------------
+
+DERIVE_FAMILIES = ("transitive", "inverse", "symmetric")
+
+
+def normalize_predicate(predicate: str) -> str:
+    """Canonicalize a predicate the way mempalace's KG does: lowercase, non-alnum -> underscore."""
+    s = re.sub(r"[^0-9a-z]+", "_", str(predicate).strip().lower())
+    return s.strip("_")
+
+
+def enabled_rules(rules: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out = []
+    for r in rules or []:
+        if not r.get("enabled"):
+            continue
+        if r.get("family") not in DERIVE_FAMILIES:
+            continue
+        out.append(r)
+    return out
+
+
+def derived_predicate_for(rule: dict[str, Any]) -> str:
+    explicit = rule.get("derived_predicate")
+    if explicit:
+        return normalize_predicate(explicit)
+    return normalize_predicate(rule["predicate"]) + "_closure"
+
+
+def ontology_version(rules: list[dict[str, Any]]) -> str:
+    """Stable content hash over the (order-insensitive) enabled-rule semantics."""
+    canon = sorted(
+        (
+            normalize_predicate(r.get("predicate", "")),
+            r.get("family", ""),
+            normalize_predicate(r.get("inverse_predicate", "")) if r.get("inverse_predicate") else "",
+            derived_predicate_for(r) if r.get("family") == "transitive" else "",
+            bool(r.get("enabled")),
+            int(r.get("max_depth", 0) or 0),
+        )
+        for r in (rules or [])
+    )
+    blob = json.dumps(canon, sort_keys=True, separators=(",", ":"))
+    return "onto:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
