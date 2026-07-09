@@ -39,6 +39,7 @@ import argparse
 import inspect
 import json
 import os
+import re
 import sqlite3
 import sys
 from datetime import datetime, timezone
@@ -56,17 +57,61 @@ _VENV_HINT = "~/.local/share/uv/tools/mempalace/bin/python"
 
 
 # --------------------------------------------------------------------------- #
+# Palace layout resolution.
+#
+# ``--palace`` always means the mempalace HOME dir (default ``~/.mempalace``).
+# Under HOME live two separate stores whose paths resolve by DIFFERENT rules —
+# the running MCP server (launched without ``--palace``) reads:
+#   * Chroma vectors at ``<palace_path>/chroma.sqlite3`` where ``palace_path`` is
+#     ``config.json``'s ``palace_path`` (default ``<home>/palace``), and
+#   * the KnowledgeGraph at the HOME-level ``<home>/knowledge_graph.sqlite3``.
+# Conflating the two (e.g. pointing ``MEMPALACE_PALACE_PATH`` at HOME) silently
+# creates a stray second Chroma DB at ``<home>/chroma.sqlite3`` that the server
+# never reads. ``resolve_palace_layout`` centralizes both rules so export and
+# import agree with the server.
+# --------------------------------------------------------------------------- #
+def resolve_palace_layout(home: str | Path) -> tuple[Path, Path]:
+    """Map a mempalace HOME dir to ``(chroma_palace_dir, kg_db_path)``.
+
+    ``chroma_palace_dir`` is ``config.json``'s ``palace_path`` when present, else
+    ``<home>/palace``. ``kg_db_path`` is the server's HOME-level default
+    ``<home>/knowledge_graph.sqlite3``. Mirrors the mempalace MCP server's own
+    resolution so drawers and KG triples land where the server reads them.
+    """
+    home = Path(home).expanduser()
+    palace_dir = home / "palace"
+    cfg = home / "config.json"
+    if cfg.exists():
+        try:
+            configured = json.loads(cfg.read_text(encoding="utf-8")).get("palace_path")
+        except (OSError, ValueError):
+            configured = None
+        if configured:
+            palace_dir = Path(configured).expanduser()
+    return palace_dir, home / "knowledge_graph.sqlite3"
+
+
+# --------------------------------------------------------------------------- #
 # mempalace / palace I/O seams.
 #
 # Every mempalace or palace-SQLite touch point is a module-level function with a
 # lazy import inside its body. Importing this module therefore never imports
 # mempalace, and tests replace these seams with in-memory fakes.
 # --------------------------------------------------------------------------- #
-def bind_palace(palace_path: str) -> str:
-    """Point mempalace at ``palace_path`` for this process. Call before imports."""
-    abspath = os.path.abspath(os.path.expanduser(palace_path))
-    os.environ["MEMPALACE_PALACE_PATH"] = abspath
-    return abspath
+def bind_palace(home: str) -> str:
+    """Point mempalace at the palace under mempalace HOME for this process.
+
+    ``home`` is the mempalace HOME dir (default ``~/.mempalace``). Sets
+    ``MEMPALACE_PALACE_PATH`` to the RESOLVED Chroma dir (``<home>/palace`` or
+    ``config.json``'s ``palace_path``) — never HOME itself — so writes land in
+    the same Chroma DB the running server reads, not a stray ``<home>/chroma``.
+    Returns the HOME abspath (readers below join their own subpaths from it).
+    Call before importing mempalace.
+    """
+    home_abs = os.path.abspath(os.path.expanduser(home))
+    palace_dir, _ = resolve_palace_layout(home_abs)
+    os.environ["MEMPALACE_PALACE_PATH"] = os.path.abspath(str(palace_dir))
+    return home_abs
 
 
 def require_mempalace() -> None:
@@ -100,14 +145,17 @@ def mempalace_version() -> str:
 def read_wing_drawer_rows(palace: str, wing: str) -> list[dict[str, Any]]:
     """Read a wing's drawer chunk rows directly from ``palace/chroma.sqlite3``.
 
-    ``get_collection(...).get(...)`` returns nothing in a standalone process
-    (the ChromaDB API view is only populated inside the running server), so
-    export reads the persisted ``embedding_metadata`` EAV table directly. Each
+    ``palace`` is the mempalace HOME dir. The Chroma dir is resolved via
+    ``resolve_palace_layout`` so a non-default ``config.json`` ``palace_path`` is
+    honored. ``get_collection(...).get(...)`` returns nothing in a standalone
+    process (the ChromaDB API view is only populated inside the running server),
+    so export reads the persisted ``embedding_metadata`` EAV table directly. Each
     chunk ``id`` gathers its keys into a metadata dict; the drawer text is the
     value of the ``chroma:document`` key. The returned rows share the shape
     (``{"id", "text", "metadata"}``) consumed by ``_group_logical_drawers``.
     """
-    db_path = os.path.join(palace, "palace", "chroma.sqlite3")
+    palace_dir, _ = resolve_palace_layout(palace)
+    db_path = os.path.join(str(palace_dir), "chroma.sqlite3")
     if not os.path.exists(db_path):
         return []
     try:
@@ -140,6 +188,58 @@ def read_wing_drawer_rows(palace: str, wing: str) -> list[dict[str, Any]]:
             text = meta.pop("chroma:document", "") or ""
             rows.append({"id": chunk_id, "text": text, "metadata": meta})
         return rows
+    finally:
+        con.close()
+
+
+def palace_drawer_count(palace: str, wing: str | None = None) -> int | None:
+    """Count distinct logical drawers in the resolved Chroma DB (read-only).
+
+    Returns the drawer count (optionally filtered to ``wing``), or ``None`` when
+    the Chroma DB does not exist yet — the signal used by the import preflight to
+    refuse writing into a would-be-new/stray palace. Counts distinct
+    ``parent_drawer_id`` (falling back to chunk ``id`` for single-chunk drawers).
+    """
+    palace_dir, _ = resolve_palace_layout(palace)
+    db_path = os.path.join(str(palace_dir), "chroma.sqlite3")
+    if not os.path.exists(db_path):
+        return None
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except sqlite3.OperationalError:
+        con = sqlite3.connect(db_path)
+    try:
+        if wing is not None:
+            ids = [
+                row[0]
+                for row in con.execute(
+                    "SELECT id FROM embedding_metadata "
+                    "WHERE key = 'wing' AND string_value = ?",
+                    (wing,),
+                ).fetchall()
+            ]
+        else:
+            ids = [
+                row[0]
+                for row in con.execute(
+                    "SELECT DISTINCT id FROM embedding_metadata"
+                ).fetchall()
+            ]
+        if not ids:
+            return 0
+        placeholders = ",".join("?" * len(ids))
+        parents: set[str] = set()
+        rows = con.execute(
+            "SELECT id, string_value FROM embedding_metadata "
+            f"WHERE key = 'parent_drawer_id' AND id IN ({placeholders})",
+            ids,
+        ).fetchall()
+        have_parent = {row[0] for row in rows}
+        parents.update(row[1] for row in rows if row[1])
+        parents.update(cid for cid in ids if cid not in have_parent)
+        return len(parents)
+    except sqlite3.OperationalError:
+        return 0
     finally:
         con.close()
 
@@ -188,10 +288,16 @@ def create_tunnel(
 
 
 def open_kg(palace: str) -> Any:
-    """Open the palace-local KnowledgeGraph for direct triple writes."""
+    """Open the KnowledgeGraph the running server reads for direct triple writes.
+
+    ``palace`` is the mempalace HOME dir; the KG resolves to the HOME-level
+    ``<home>/knowledge_graph.sqlite3`` via ``resolve_palace_layout`` — matching
+    the server's default — so triples are visible after reconnect.
+    """
     from mempalace.knowledge_graph import KnowledgeGraph  # lazy
 
-    return KnowledgeGraph(db_path=os.path.join(palace, "knowledge_graph.sqlite3"))
+    _, kg_path = resolve_palace_layout(palace)
+    return KnowledgeGraph(db_path=str(kg_path))
 
 
 def add_triple(
@@ -394,11 +500,251 @@ def cmd_export(args: argparse.Namespace) -> int:
         exported_at=datetime.now(timezone.utc).isoformat(),
     )
 
+    all_records = [manifest, *records]
+    if getattr(args, "format", "jsonl") == "md":
+        out_dir = args.out or f"wing-{wing}-{datetime.now():%Y%m%d-%H%M%S}"
+        wing_dir = write_md_dir(all_records, out_dir)
+        print(wing_dir)
+        return 0
+
     out_path = args.out or f"wing-{wing}-{datetime.now():%Y%m%d-%H%M%S}.jsonl"
     with open(out_path, "w", encoding="utf-8") as fh:
-        fh.write(lib.dump_jsonl([manifest, *records]))
+        fh.write(lib.dump_jsonl(all_records))
     print(out_path)
     return 0
+
+
+# --------------------------------------------------------------------------- #
+# Markdown-directory (de)serialization — file I/O over lib's pure transforms.
+# --------------------------------------------------------------------------- #
+def write_md_dir(records: list[dict[str, Any]], out_dir: str) -> str:
+    """Write a bundle's records as a human-readable markdown directory.
+
+    Layout: ``<out_dir>/<wing>/`` with one ``.md`` per drawer, ``kg.jsonl`` and
+    ``tunnels.jsonl`` (structured), and ``manifest.json`` (index + counts).
+    Returns the wing directory path.
+    """
+    manifest = records[0]
+    wing = manifest["wing"]
+    drawers = [r for r in records[1:] if r.get("type") == "drawer"]
+    triples = [r for r in records[1:] if r.get("type") == "kg_triple"]
+    tunnels = [r for r in records[1:] if r.get("type") == "tunnel"]
+
+    wing_dir = os.path.join(os.path.expanduser(out_dir), wing)
+    os.makedirs(wing_dir, exist_ok=True)
+
+    index = []
+    for i, drawer in enumerate(drawers):
+        fname = lib.md_drawer_filename(drawer, i)
+        with open(os.path.join(wing_dir, fname), "w", encoding="utf-8") as fh:
+            fh.write(lib.encode_drawer_md(drawer))
+        index.append({
+            "drawer_id": drawer.get("orig_drawer_id"),
+            "room": drawer.get("room"),
+            "added_by": drawer.get("added_by"),
+            "source_file": drawer.get("source_file"),
+            "extra": drawer.get("extra") or {},
+            "content_file": fname,
+        })
+
+    kg_file = "kg.jsonl" if triples else None
+    if triples:
+        with open(os.path.join(wing_dir, kg_file), "w", encoding="utf-8") as fh:
+            fh.write(lib.dump_jsonl(triples))
+    tunnels_file = "tunnels.jsonl" if tunnels else None
+    if tunnels:
+        with open(os.path.join(wing_dir, tunnels_file), "w", encoding="utf-8") as fh:
+            fh.write(lib.dump_jsonl(tunnels))
+
+    out_manifest = dict(manifest)
+    out_manifest["format"] = "md-dir"
+    out_manifest["drawers"] = index
+    out_manifest["kg_file"] = kg_file
+    out_manifest["tunnels_file"] = tunnels_file
+    with open(os.path.join(wing_dir, "manifest.json"), "w", encoding="utf-8") as fh:
+        json.dump(out_manifest, fh, ensure_ascii=False, indent=2, sort_keys=True)
+        fh.write("\n")
+    return wing_dir
+
+
+def read_md_dir(path: str) -> list[dict[str, Any]]:
+    """Read a markdown directory back into bundle records (manifest first).
+
+    Accepts the wing directory (containing ``manifest.json``) or the
+    ``manifest.json`` path itself. Auto-detects and delegates to the legacy
+    one-file-per-room reader when the drawer files are not the new
+    per-drawer format.
+    """
+    p = Path(os.path.expanduser(path))
+    wing_dir = p.parent if p.name == "manifest.json" else p
+    manifest_path = wing_dir / "manifest.json"
+    if not manifest_path.exists():
+        sys.exit(f"No manifest.json under {wing_dir}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    entries = manifest.get("drawers") or []
+    # Detect legacy (one file per room, merged drawers) vs new (per-drawer).
+    if entries:
+        first = wing_dir / (entries[0].get("content_file") or "")
+        if first.exists():
+            head = first.read_text(encoding="utf-8")
+            if not head.startswith(lib._MD_OPEN):
+                return read_legacy_md_dir(wing_dir, manifest)
+
+    records: list[dict[str, Any]] = [manifest]
+    seen_files: set[str] = set()
+    for entry in entries:
+        cf = entry.get("content_file")
+        if not cf or cf in seen_files:
+            continue
+        seen_files.add(cf)
+        text = (wing_dir / cf).read_text(encoding="utf-8")
+        records.append(lib.decode_drawer_md(text))
+
+    kg_file = manifest.get("kg_file")
+    if kg_file and (wing_dir / kg_file).exists():
+        records.extend(lib.parse_jsonl((wing_dir / kg_file).read_text(encoding="utf-8")))
+    tunnels_file = manifest.get("tunnels_file")
+    if tunnels_file and (wing_dir / tunnels_file).exists():
+        records.extend(
+            lib.parse_jsonl((wing_dir / tunnels_file).read_text(encoding="utf-8")))
+    return records
+
+
+def read_legacy_md_dir(
+    wing_dir: Path, manifest: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Best-effort reader for the legacy one-file-per-room markdown export.
+
+    The legacy "copilot-cli-fleet" format wrote one markdown file per ROOM (its
+    ``content_file`` shared by several drawers) under a ``<!-- MemPalace wing
+    export ... -->`` header, with KG triples as prose under a
+    ``## Knowledge-Graph Triples`` heading. Drawers are recovered by splitting a
+    shared file at level-2 (``## ``) headers; a lone drawer takes the whole body.
+    Marked best-effort: boundaries are heuristic, not authoritative.
+    """
+    print(
+        "  NOTE: legacy one-file-per-room export detected; reconstructing drawers "
+        "best-effort by splitting on '## ' headers.",
+        file=sys.stderr,
+    )
+    wing = manifest["wing"]
+    entries = manifest.get("drawers") or []
+    groups: dict[str, list[dict[str, Any]]] = {}
+    order: list[str] = []
+    for entry in entries:
+        cf = entry.get("content_file")
+        if cf not in groups:
+            groups[cf] = []
+            order.append(cf)
+        groups[cf].append(entry)
+
+    body: list[dict[str, Any]] = []
+    bodies: dict[str, str] = {}
+    for cf in order:
+        group = groups[cf]
+        text = _strip_legacy_comment((wing_dir / cf).read_text(encoding="utf-8"))
+        bodies[cf] = text
+        contents = [text] if len(group) == 1 else _split_h2_slices(text, len(group))
+        for entry, content in zip(group, contents):
+            body.append(
+                lib.drawer_record(
+                    wing=wing,
+                    room=entry.get("room") or "general",
+                    content=content,
+                    source_file=(entry.get("source_file") or None),
+                    added_by=entry.get("added_by"),
+                    orig_drawer_id=entry.get("drawer_id"),
+                    extra=entry.get("extra") or {},
+                )
+            )
+    n_drawers = len(body)
+    for text in bodies.values():
+        for subject, predicate, obj in _parse_legacy_kg_triples(text):
+            body.append(
+                lib.kg_triple_record(subject, predicate, obj, None, None, None, None))
+    n_triples = len(body) - n_drawers
+
+    bundle_manifest = lib.build_manifest(
+        wing=wing,
+        mempalace_version="legacy",
+        counts={"drawers": n_drawers, "kg_triples": n_triples, "tunnels": 0},
+        kg_note="legacy import: KG triples parsed best-effort from prose",
+        exported_at=str(manifest.get("exported_at") or ""),
+    )
+    return [bundle_manifest, *body]
+
+
+_LEGACY_ARROW = "\u2192"
+
+
+def _strip_legacy_comment(text: str) -> str:
+    s = text.lstrip("\ufeff")
+    if s.lstrip().startswith("<!--"):
+        end = s.find("-->")
+        if end != -1:
+            s = s[end + 3:]
+    return s.lstrip("\n")
+
+
+def _split_h2_slices(body: str, n: int) -> list[str]:
+    starts = [m.start() for m in re.finditer(r"^## ", body, re.MULTILINE)]
+    if len(starts) < n:
+        raise ValueError(
+            f"legacy split needs >= {n} '## ' headers, found {len(starts)}")
+    cuts = [0] + starts[1:n] + [len(body)]
+    return [body[cuts[i]:cuts[i + 1]] for i in range(n)]
+
+
+def _parse_legacy_kg_triples(body: str) -> list[tuple[str, str, str]]:
+    m = re.search(r"^##\s+Knowledge-Graph Triples\s*$", body, re.MULTILINE)
+    if not m:
+        return []
+    section = body[m.end():]
+    nxt = re.search(r"^## ", section, re.MULTILINE)
+    if nxt:
+        section = section[:nxt.start()]
+    out: list[tuple[str, str, str]] = []
+    for line in section.splitlines():
+        line = line.strip()
+        if not line.startswith("- ") or _LEGACY_ARROW not in line:
+            continue
+        parts = [p.strip() for p in line[2:].split(_LEGACY_ARROW)]
+        if len(parts) == 3 and all(parts):
+            out.append((parts[0], parts[1], parts[2]))
+    return out
+
+
+def preflight_import_target(
+    home: str, target_wing: str, create_new_palace: bool
+) -> None:
+    """Stray-palace guard: report resolved paths/counts and refuse a bad target.
+
+    Prints the resolved Chroma dir, KG path, and existing drawer counts, then
+    aborts when the Chroma DB does not exist yet (unless ``create_new_palace``) —
+    the classic ``--palace ~/.mempalace/palace`` (DB dir) vs ``~/.mempalace``
+    (HOME) mistake that silently created a second palace.
+    """
+    palace_dir, kg_path = resolve_palace_layout(home)
+    chroma = os.path.join(str(palace_dir), "chroma.sqlite3")
+    total = palace_drawer_count(home)
+    existing = palace_drawer_count(home, target_wing)
+    print(
+        f"  target palace  : {palace_dir}\n"
+        f"  chroma db      : {chroma} "
+        f"({'exists' if total is not None else 'MISSING'})\n"
+        f"  knowledge graph: {kg_path}\n"
+        f"  drawers        : total={total if total is not None else 0}, "
+        f"wing {target_wing!r}={existing if existing is not None else 0}",
+        file=sys.stderr,
+    )
+    if total is None and not create_new_palace:
+        sys.exit(
+            f"Refusing to import: no Chroma DB at {chroma}.\n"
+            "--palace must be the mempalace HOME dir (e.g. ~/.mempalace), NOT the "
+            "nested ~/.mempalace/palace DB dir. If you really mean to initialize a "
+            "brand-new palace here, pass --create-new-palace."
+        )
 
 
 def cmd_import(args: argparse.Namespace) -> int:
@@ -408,8 +754,12 @@ def cmd_import(args: argparse.Namespace) -> int:
     palace = bind_palace(str(args.palace))
     require_mempalace()
 
-    with open(args.bundle, encoding="utf-8") as fh:
-        records = lib.parse_jsonl(fh.read())
+    bundle_path = Path(os.path.expanduser(args.bundle))
+    if bundle_path.is_dir() or bundle_path.name == "manifest.json":
+        records = read_md_dir(str(bundle_path))
+    else:
+        with open(args.bundle, encoding="utf-8") as fh:
+            records = lib.parse_jsonl(fh.read())
     if not records:
         sys.exit(f"Bundle is empty: {args.bundle}")
     manifest = records[0]
@@ -436,6 +786,8 @@ def cmd_import(args: argparse.Namespace) -> int:
         f"{prefix}Importing bundle {args.bundle} -> wing {target_wing!r} in {palace}",
         file=sys.stderr,
     )
+    if not dry:
+        preflight_import_target(palace, target_wing, args.create_new_palace)
 
     drawers_added = 0
     drawers_skipped = 0
@@ -559,6 +911,26 @@ def cmd_import(args: argparse.Namespace) -> int:
         print(f"  tunnel skip reason: {reason}", file=sys.stderr)
     if failed:
         print(f"{prefix}{failed} record(s) failed.", file=sys.stderr)
+    if not dry and (drawers_added or triples_added or tunnels_created):
+        after = palace_drawer_count(palace, target_wing)
+        if after is None:
+            palace_dir, _ = resolve_palace_layout(palace)
+            print(
+                "  WARNING: no Chroma DB at "
+                f"{os.path.join(str(palace_dir), 'chroma.sqlite3')} after import. "
+                "mempalace creates a brand-new palace at the HOME level, not "
+                "HOME/palace, so a freshly-created palace may be misplaced. Import "
+                "into a palace initialized through mempalace, or verify the "
+                "resulting location before relying on it.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"  verify: wing {target_wing!r} now holds {after} drawer(s). Run "
+                "MCP mempalace_reconnect (or restart the server) to refresh live "
+                "search.",
+                file=sys.stderr,
+            )
     return 1 if failed else 0
 
 
@@ -572,26 +944,34 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = p.add_subparsers(dest="command", required=True)
 
-    se = sub.add_parser("export", help="Export one wing to a JSONL bundle.")
+    se = sub.add_parser("export", help="Export one wing to a JSONL bundle or md dir.")
     se.add_argument("wing", help="Wing name to export.")
-    se.add_argument("--out", help="Output bundle path (default: wing-<wing>-<ts>.jsonl).")
+    se.add_argument("--out", help="Output path: bundle file (jsonl) or parent dir "
+                                  "(md). Default: wing-<wing>-<ts>[.jsonl].")
+    se.add_argument("--format", choices=("jsonl", "md"), default="jsonl",
+                    help="jsonl bundle (default) or human-readable markdown dir "
+                         "(one file per drawer + kg.jsonl/tunnels.jsonl).")
     se.add_argument(
         "--palace",
         type=lambda s: Path(s).expanduser(),
         default=DEFAULT_PALACE,
-        help="Palace root (default: ~/.mempalace).",
+        help="mempalace HOME dir (default: ~/.mempalace), NOT the nested "
+             "palace/ DB dir.",
     )
     se.set_defaults(func=cmd_export)
 
-    si = sub.add_parser("import", help="Replay a wing bundle into a palace.")
-    si.add_argument("bundle", help="Bundle JSONL path to import.")
+    si = sub.add_parser("import", help="Replay a wing bundle (jsonl) or md dir "
+                                       "into a palace.")
+    si.add_argument("bundle", help="Bundle .jsonl path, or a markdown export dir "
+                                   "(or its manifest.json) to import.")
     si.add_argument("--into-wing", help="Import into this wing (clone) instead of the "
                                         "bundle's wing; implies --force-add.")
     si.add_argument(
         "--palace",
         type=lambda s: Path(s).expanduser(),
         default=DEFAULT_PALACE,
-        help="Palace root (default: ~/.mempalace).",
+        help="mempalace HOME dir (default: ~/.mempalace), NOT the nested "
+             "palace/ DB dir.",
     )
     si.add_argument("--dry-run", action="store_true",
                     help="Report actions without performing any writes.")
@@ -599,6 +979,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Bypass near-duplicate detection and add every drawer.")
     si.add_argument("--dup-threshold", type=float, default=0.9,
                     help="Similarity threshold for near-duplicate skip (default: 0.9).")
+    si.add_argument("--create-new-palace", action="store_true",
+                    help="Allow importing into a HOME with no existing Chroma DB "
+                         "(initialize a brand-new palace); otherwise the import "
+                         "aborts to avoid creating a stray second palace.")
     si.set_defaults(func=cmd_import)
     return p
 

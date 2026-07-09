@@ -173,19 +173,31 @@ restic init
 ChromaDB collections, HNSW index, and SQLite databases, so a file snapshot cannot
 isolate one wing. When you need *one wing* (to archive, move, or clone it), use
 the **logical** exporter [`scripts/palace_wing.py`](scripts/palace_wing.py), which
-reads a wing's contents straight from the palace SQLite and writes a portable
-JSONL bundle.
+reads a wing's contents straight from the palace SQLite and writes either a
+portable JSONL bundle or a human-readable markdown directory.
 
 ```bash
 # Export needs NO restic and NO mempalace import — it reads the palace SQLite directly.
+# --palace is the mempalace HOME dir (~/.mempalace), NOT the nested palace/ dir.
 ./scripts/palace_wing.py export <wing> --out wing-<wing>.jsonl
 ./scripts/palace_wing.py export copilot-mempalace --palace ~/.mempalace
+
+# Human-readable, git/OneDrive-friendly markdown directory (lossless round-trip):
+./scripts/palace_wing.py export <wing> --format md --out backups/mempalace-wings
 ```
 
 A bundle contains: **drawers** (multi-chunk drawers reassembled), **best-effort
 KG triples** (only those whose `source_drawer_id` resolves to the wing — others
 are counted and skipped in the manifest `kg_note`), and **tunnels** that touch the
 wing. Closets are **not** exported — they regenerate from drawers on import.
+
+`--format md` writes `<out>/<wing>/` with **one markdown file per drawer**
+(verbatim content under an HTML metadata header), structured `kg.jsonl` /
+`tunnels.jsonl`, and a `manifest.json` index. One-file-per-drawer keeps drawer
+boundaries unambiguous — unlike the legacy one-file-per-room OneDrive export,
+which merged drawers and forced heuristic re-splitting on import. Both formats
+import via the same `palace_wing.py import` (auto-detected); see
+`mempalace-restore`.
 
 **This is a logical bundle, not a byte snapshot.** It is complementary to restic:
 use restic for whole-palace disaster recovery, and the wing bundle for
@@ -219,6 +231,7 @@ Restore lives in the same script (see the `mempalace-restore` skill):
 
 - [`scripts/palace_backup.py`](scripts/palace_backup.py) — tested Python backup/restore helper.
 - [`scripts/palace_wing.py`](scripts/palace_wing.py) — wing-scoped logical export/import.
+- [`references/palace-layout.md`](references/palace-layout.md) — HOME vs `palace/` layout and the Chroma-vs-KG path footgun (read before touching `--palace`).
 - [`references/restic-cheatsheet.md`](references/restic-cheatsheet.md) — compact restic command reference.
 - `mempalace-restore` — recovery workflow, including restore-side `mempalace repair` / `repair-status`.
 - `skills/mempalace/references/hnsw-recovery.md` — HNSW drift/index recovery background.

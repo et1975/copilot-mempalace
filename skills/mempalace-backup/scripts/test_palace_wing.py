@@ -130,6 +130,125 @@ def test_export_produces_manifest_and_records_with_counts():
 
 
 # --------------------------------------------------------------------------- #
+# Markdown directory: write -> read round-trip and import.
+# --------------------------------------------------------------------------- #
+def _sample_records():
+    return [
+        lib.build_manifest("avs", "3.5.0",
+                           {"drawers": 2, "kg_triples": 1, "tunnels": 1}, "n", "t"),
+        lib.drawer_record("avs", "scripting", "body one\nwith --> arrow", "a.md",
+                          "copilot-cli", "drawer_avs_scripting_1", {"topic": "t"}),
+        lib.drawer_record("avs", "general", "solo body", None, None, None, {}),
+        lib.kg_triple_record("A", "rel", "B", 1.0, None, None, "drawer_avs_scripting_1"),
+        lib.tunnel_record("avs", "scripting", "conveyor", "general", "why"),
+    ]
+
+
+def test_md_dir_write_read_round_trip(tmp_path):
+    records = _sample_records()
+    wing_dir = pw.write_md_dir(records, str(tmp_path))
+    assert (Path(wing_dir) / "manifest.json").exists()
+    assert (Path(wing_dir) / "drawer_avs_scripting_1.md").exists()
+    assert (Path(wing_dir) / "general__0001.md").exists()
+    assert (Path(wing_dir) / "kg.jsonl").exists()
+    assert (Path(wing_dir) / "tunnels.jsonl").exists()
+
+    back = pw.read_md_dir(wing_dir)
+    assert back[0]["type"] == "manifest" and back[0]["wing"] == "avs"
+    drawers = [r for r in back if r.get("type") == "drawer"]
+    triples = [r for r in back if r.get("type") == "kg_triple"]
+    tunnels = [r for r in back if r.get("type") == "tunnel"]
+    assert len(drawers) == 2 and len(triples) == 1 and len(tunnels) == 1
+    d0 = next(d for d in drawers if d["orig_drawer_id"] == "drawer_avs_scripting_1")
+    assert d0["content"] == "body one\nwith --> arrow"   # verbatim, arrow survives
+    assert d0["room"] == "scripting" and d0["extra"] == {"topic": "t"}
+    assert triples[0]["subject"] == "A"
+    assert tunnels[0]["target"]["wing"] == "conveyor"
+
+
+def test_import_from_md_dir_invokes_writes(tmp_path):
+    wing_dir = pw.write_md_dir(_sample_records(), str(tmp_path))
+    added, kg = [], FakeKG()
+    tunnels = []
+    try:
+        with patched(
+            require_mempalace=lambda: None,
+            check_duplicate=lambda content, threshold: {"is_duplicate": False},
+            add_drawer=lambda **kw: added.append(kw),
+            open_kg=lambda palace: kg,
+            create_tunnel=lambda **kw: tunnels.append(kw) or {"tunnel_id": "x"},
+            preflight_import_target=lambda *a, **k: None,
+            palace_drawer_count=lambda *a, **k: 2,
+        ):
+            rc = pw.main(["import", wing_dir, "--palace", str(tmp_path)])
+        assert rc == 0
+        assert len(added) == 2
+        assert {a["room"] for a in added} == {"scripting", "general"}
+        assert len(kg.triples) == 1
+        assert len(tunnels) == 1
+    finally:
+        pass
+
+
+def test_import_from_manifest_json_path(tmp_path):
+    wing_dir = pw.write_md_dir(_sample_records(), str(tmp_path))
+    added = []
+    with patched(
+        require_mempalace=lambda: None,
+        check_duplicate=lambda content, threshold: {"is_duplicate": False},
+        add_drawer=lambda **kw: added.append(kw),
+        open_kg=lambda palace: FakeKG(),
+        create_tunnel=lambda **kw: {"tunnel_id": "x"},
+        preflight_import_target=lambda *a, **k: None,
+        palace_drawer_count=lambda *a, **k: 2,
+    ):
+        rc = pw.main(["import", str(Path(wing_dir) / "manifest.json"),
+                      "--palace", str(tmp_path)])
+    assert rc == 0
+    assert len(added) == 2
+
+
+def test_read_legacy_md_dir_splits_and_parses_kg(tmp_path):
+    # Legacy: one file per room; 'insights.md' holds two drawers; prose KG.
+    wing_dir = tmp_path / "agentic"
+    wing_dir.mkdir()
+    (wing_dir / "insights.md").write_text(
+        "<!--\nMemPalace wing export\nwing: agentic\n-->\n"
+        "# Insights\n\n## INSIGHT I1\nfirst\n\n## INSIGHT I2\nsecond\n",
+        encoding="utf-8")
+    (wing_dir / "researchers.md").write_text(
+        "<!--\nMemPalace wing export\n-->\n"
+        "# Researchers\n\n## Knowledge-Graph Triples\n\n"
+        "- Ida \u2192 works_on \u2192 memory\n- Ken \u2192 authored \u2192 SORT\n",
+        encoding="utf-8")
+    manifest = {
+        "type": "manifest", "bundle_version": 1, "wing": "agentic",
+        "counts": {"drawers": 3}, "exported_by": "copilot-cli-fleet",
+        "drawers": [
+            {"drawer_id": "d1", "room": "insights", "added_by": "mcp",
+             "source_file": "", "content_file": "insights.md"},
+            {"drawer_id": "d2", "room": "insights", "added_by": "mcp",
+             "source_file": "", "content_file": "insights.md"},
+            {"drawer_id": "d3", "room": "researchers", "added_by": "mcp",
+             "source_file": "", "content_file": "researchers.md"},
+        ],
+    }
+    (wing_dir / "manifest.json").write_text(
+        __import__("json").dumps(manifest), encoding="utf-8")
+
+    records = pw.read_md_dir(str(wing_dir))
+    drawers = [r for r in records if r.get("type") == "drawer"]
+    triples = [r for r in records if r.get("type") == "kg_triple"]
+    assert len(drawers) == 3
+    ins = [d for d in drawers if d["room"] == "insights"]
+    assert ins[0]["content"].startswith("# Insights")     # preamble folded into 1st
+    assert "## INSIGHT I1" in ins[0]["content"]
+    assert ins[1]["content"].startswith("## INSIGHT I2")
+    assert len(triples) == 2
+    assert (triples[0]["subject"], triples[0]["predicate"]) == ("Ida", "works_on")
+
+
+# --------------------------------------------------------------------------- #
 # Import: dedup merge.
 # --------------------------------------------------------------------------- #
 def test_import_binds_palace_before_requiring_mempalace():
@@ -144,6 +263,7 @@ def test_import_binds_palace_before_requiring_mempalace():
         with patched(
             bind_palace=lambda p: (order.append("bind"), real_bind(p))[1],
             require_mempalace=lambda: order.append("require"),
+            preflight_import_target=lambda *a, **k: None,
         ):
             rc = pw.main(["import", str(bundle), "--palace", "/nope"])
         assert rc == 0
@@ -164,6 +284,8 @@ def test_import_skips_near_duplicate():
             require_mempalace=lambda: None,
             check_duplicate=lambda content, threshold: {"is_duplicate": True},
             add_drawer=lambda **kw: added.append(kw),
+            preflight_import_target=lambda *a, **k: None,
+            palace_drawer_count=lambda *a, **k: 1,
         ):
             rc = pw.main(["import", str(bundle), "--palace", "/nope"])
         assert rc == 0
@@ -184,6 +306,8 @@ def test_import_adds_with_target_wing_and_trailer_content():
             require_mempalace=lambda: None,
             check_duplicate=lambda content, threshold: {"is_duplicate": False},
             add_drawer=lambda **kw: added.append(kw),
+            preflight_import_target=lambda *a, **k: None,
+            palace_drawer_count=lambda *a, **k: 1,
         ):
             rc = pw.main(["import", str(bundle), "--palace", "/nope"])
         assert rc == 0
@@ -214,6 +338,8 @@ def test_import_into_wing_bypasses_dedup():
             require_mempalace=lambda: None,
             check_duplicate=_dup,
             add_drawer=lambda **kw: added.append(kw),
+            preflight_import_target=lambda *a, **k: None,
+            palace_drawer_count=lambda *a, **k: 1,
         ):
             rc = pw.main(["import", str(bundle), "--into-wing", "avs_clone",
                           "--palace", "/nope"])
@@ -272,6 +398,8 @@ def test_import_kg_uses_knowledge_graph_add_triple():
         with patched(
             require_mempalace=lambda: None,
             open_kg=lambda palace: kg,
+            preflight_import_target=lambda *a, **k: None,
+            palace_drawer_count=lambda *a, **k: 1,
         ):
             rc = pw.main(["import", str(bundle), "--palace", "/nope"])
         assert rc == 0
@@ -306,6 +434,8 @@ def test_import_tunnel_error_is_skipped_success_counted():
         with patched(
             require_mempalace=lambda: None,
             create_tunnel=_create_tunnel,
+            preflight_import_target=lambda *a, **k: None,
+            palace_drawer_count=lambda *a, **k: 1,
         ):
             rc = pw.main(["import", str(bundle), "--palace", "/nope"])
         assert rc == 0            # tunnel error is a skip, not a hard failure
@@ -324,6 +454,8 @@ def test_import_tunnel_endpoint_remapped_under_into_wing():
         with patched(
             require_mempalace=lambda: None,
             create_tunnel=lambda **kw: calls.append(kw) or {"tunnel_id": "x"},
+            preflight_import_target=lambda *a, **k: None,
+            palace_drawer_count=lambda *a, **k: 1,
         ):
             rc = pw.main(["import", str(bundle), "--into-wing", "avs_clone",
                           "--palace", "/nope"])
@@ -356,6 +488,84 @@ def test_import_rejects_unknown_bundle_version():
 
 
 # --------------------------------------------------------------------------- #
+# Palace layout resolution + stray-palace guard.
+# --------------------------------------------------------------------------- #
+def test_resolve_palace_layout_default(tmp_path):
+    home = tmp_path / ".mempalace"
+    home.mkdir()
+    palace_dir, kg = pw.resolve_palace_layout(home)
+    assert palace_dir == home / "palace"
+    assert kg == home / "knowledge_graph.sqlite3"
+
+
+def test_resolve_palace_layout_honors_config_palace_path(tmp_path):
+    home = tmp_path / ".mempalace"
+    home.mkdir()
+    custom = tmp_path / "elsewhere" / "db"
+    (home / "config.json").write_text(
+        f'{{"palace_path": "{custom.as_posix()}"}}', encoding="utf-8")
+    palace_dir, kg = pw.resolve_palace_layout(home)
+    assert palace_dir == custom                       # chroma follows config
+    assert kg == home / "knowledge_graph.sqlite3"     # KG stays home-level
+
+
+def test_bind_palace_sets_resolved_chroma_dir_not_home(tmp_path):
+    home = tmp_path / ".mempalace"
+    home.mkdir()
+    returned = pw.bind_palace(str(home))
+    import os
+    # Returns HOME (readers join their own subpaths), but the env points at the
+    # nested palace/ dir so writes never create a stray <home>/chroma.sqlite3.
+    assert returned == str(home)
+    assert os.environ["MEMPALACE_PALACE_PATH"] == str(home / "palace")
+
+
+def test_import_aborts_on_missing_palace(tmp_path):
+    # Real preflight + palace_drawer_count returning None (no chroma) must abort.
+    bundle = _write_bundle([
+        lib.build_manifest("avs", "3.5.0", {"drawers": 1}, "n", "t"),
+        lib.drawer_record("avs", "scripting", "hello", None, None, "d1", {}),
+    ])
+    added = []
+    try:
+        with patched(
+            require_mempalace=lambda: None,
+            palace_drawer_count=lambda *a, **k: None,   # chroma missing
+            add_drawer=lambda **kw: added.append(kw),
+        ):
+            try:
+                pw.main(["import", str(bundle), "--palace", str(tmp_path)])
+                raised = False
+            except SystemExit:
+                raised = True
+        assert raised            # guard fired
+        assert added == []       # no writes attempted
+    finally:
+        bundle.unlink(missing_ok=True)
+
+
+def test_import_create_new_palace_allows_missing(tmp_path):
+    bundle = _write_bundle([
+        lib.build_manifest("avs", "3.5.0", {"drawers": 1}, "n", "t"),
+        lib.drawer_record("avs", "scripting", "hello", None, None, "d1", {}),
+    ])
+    added = []
+    try:
+        with patched(
+            require_mempalace=lambda: None,
+            check_duplicate=lambda content, threshold: {"is_duplicate": False},
+            palace_drawer_count=lambda *a, **k: None,   # chroma missing
+            add_drawer=lambda **kw: added.append(kw),
+        ):
+            rc = pw.main(["import", str(bundle), "--palace", str(tmp_path),
+                          "--create-new-palace"])
+        assert rc == 0
+        assert len(added) == 1   # write proceeds when explicitly opted in
+    finally:
+        bundle.unlink(missing_ok=True)
+
+
+# --------------------------------------------------------------------------- #
 # Argument parsing.
 # --------------------------------------------------------------------------- #
 def test_parser_export_defaults():
@@ -374,6 +584,7 @@ def test_parser_import_defaults_and_required():
     assert args.dry_run is False
     assert args.force_add is False
     assert args.dup_threshold == 0.9
+    assert args.create_new_palace is False
     assert args.func is pw.cmd_import
 
 

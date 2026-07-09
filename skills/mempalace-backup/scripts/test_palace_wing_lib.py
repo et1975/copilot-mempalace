@@ -240,6 +240,54 @@ def test_validate_manifest_rejects_negative_counts():
 
 
 # --------------------------------------------------------------------------- #
+# Markdown drawer (de)serialization.
+# --------------------------------------------------------------------------- #
+def test_encode_decode_drawer_md_round_trip():
+    rec = lib.drawer_record(
+        wing="avs", room="scripting", content="line1\nline2\n",
+        source_file="a.md", added_by="copilot-cli", orig_drawer_id="drawer_avs_x_1",
+        extra={"topic": "t", "hall": "ops"})
+    text = lib.encode_drawer_md(rec)
+    assert text.startswith("<!--mempalace-drawer\n")
+    back = lib.decode_drawer_md(text)
+    assert back["type"] == "drawer"
+    assert back["wing"] == "avs"
+    assert back["room"] == "scripting"
+    assert back["content"] == "line1\nline2\n"      # body verbatim
+    assert back["source_file"] == "a.md"
+    assert back["added_by"] == "copilot-cli"
+    assert back["orig_drawer_id"] == "drawer_avs_x_1"
+    assert back["extra"] == {"topic": "t", "hall": "ops"}
+
+
+def test_decode_drawer_md_preserves_body_with_comment_and_headers():
+    # Body containing '-->' and '## ' headers must survive verbatim.
+    body = "## INSIGHT I1\n\ntext with --> arrow and <!-- comment --> inside\n"
+    rec = lib.drawer_record("w", "r", body, None, None, None, {})
+    back = lib.decode_drawer_md(lib.encode_drawer_md(rec))
+    assert back["content"] == body
+    assert back["source_file"] is None
+    assert back["added_by"] is None
+    assert back["orig_drawer_id"] is None
+    assert back["extra"] == {}
+
+
+def test_decode_drawer_md_rejects_non_drawer():
+    try:
+        lib.decode_drawer_md("# just markdown\n")
+        assert False, "expected ValueError"
+    except ValueError:
+        pass
+
+
+def test_md_drawer_filename():
+    with_id = lib.drawer_record("w", "r", "c", None, None, "drawer_w_r_abc", {})
+    assert lib.md_drawer_filename(with_id, 0) == "drawer_w_r_abc.md"
+    no_id = lib.drawer_record("w", "general", "c", None, None, None, {})
+    assert lib.md_drawer_filename(no_id, 3) == "general__0003.md"
+
+
+# --------------------------------------------------------------------------- #
 # Minimal runner when pytest is unavailable.
 # --------------------------------------------------------------------------- #
 def _run_without_pytest() -> int:

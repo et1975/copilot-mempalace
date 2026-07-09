@@ -172,21 +172,39 @@ python3 -c "import sqlite3;print(sqlite3.connect('DB').execute('PRAGMA integrity
 ## Import a wing bundle
 
 Whole-palace restic restore has a logical counterpart: importing a **single
-wing** from a JSONL bundle produced by the `mempalace-backup` skill's
+wing** produced by the `mempalace-backup` skill's
 [`palace_wing.py`](../mempalace-backup/scripts/palace_wing.py) exporter. Use it to
-restore, migrate, or clone one wing without touching the rest of the palace.
+restore, migrate, or clone one wing without touching the rest of the palace. Two
+input formats are auto-detected:
+
+- a **JSONL bundle** (`export`, or `export --format jsonl`), and
+- a **markdown directory** (`export --format md`) — pass the wing dir or its
+  `manifest.json`. The legacy one-file-per-room OneDrive export is also read
+  (best-effort: drawers split at `## ` headers, prose KG parsed).
 
 ```bash
 # Import needs mempalace importable — run under the interpreter where mempalace
 # is installed (e.g. the uv-tool venv), not necessarily system python3.
+# --palace is the mempalace HOME dir (~/.mempalace), NOT the nested palace/ dir.
 ./scripts/palace_wing.py import wing-<wing>.jsonl --palace ~/.mempalace
+
+# Markdown directory (or its manifest.json), incl. legacy OneDrive exports:
+./scripts/palace_wing.py import backups/mempalace-wings/<wing> --palace ~/.mempalace
 
 # Preview without writing anything:
 ./scripts/palace_wing.py import wing-<wing>.jsonl --dry-run
 
-# Clone the bundle into a different wing name (implies no dedup):
+# Clone into a different wing name (implies no dedup):
 ./scripts/palace_wing.py import wing-<wing>.jsonl --into-wing <new-wing>
 ```
+
+> **`--palace` = HOME, and the stray-palace guard.** `--palace` must be the
+> mempalace HOME (`~/.mempalace`), never the nested `~/.mempalace/palace` DB dir.
+> Chroma resolves under `palace_path` while the KG is HOME-level; pointing
+> `--palace` at the DB dir used to silently create a second, invisible palace.
+> Import now **aborts** if the target has no existing Chroma DB (pass
+> `--create-new-palace` to intentionally initialize a fresh one) and prints the
+> resolved Chroma/KG paths + drawer counts before writing.
 
 Behavior and caveats:
 
