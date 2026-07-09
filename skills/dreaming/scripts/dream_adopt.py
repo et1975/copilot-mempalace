@@ -206,6 +206,9 @@ def _task_from_worklist(worklist: dict[str, Any]) -> str:
     items = worklist.get("items", [])
     if items:
         return items[0].get("kind", "derive")
+    # empty contemplate worklist — resolve to derive so the branch runs as a no-op
+    if task == "contemplate":
+        return "derive"
     return task or "merge"
 
 
@@ -389,16 +392,6 @@ def _print_errors(report: dict[str, Any]) -> None:
         print(f"  ERROR {err}", file=sys.stderr)
 
 
-def _worklist_task(worklist: dict[str, Any]) -> str:
-    task = worklist.get("task")
-    if task:
-        return task
-    items = worklist.get("items", [])
-    if items:
-        return items[0].get("kind", "merge")
-    return "merge"
-
-
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--palace", required=True, help="Path to the mempalace palace directory")
@@ -578,6 +571,7 @@ def main(argv: list[str] | None = None) -> int:
         skips_path = args.skips or os.path.join(path, "dream-derive-skips.jsonl")
         dream_palace.append_skip_markers(skips_path, skip_markers)
         print(json.dumps(report, indent=2))
+        _print_errors(report)
         if args.verify:
             rules = dream_palace.load_ontology_config(args.rules or os.path.join(path, "ontology.json"))
             triples = dream_palace.load_active_triples_with_ids(path)
@@ -589,7 +583,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"verify: {len(residual)} residual candidate(s)", file=sys.stderr)
             if args.strict and residual:
                 return 1
-        return 0
+        return 1 if report["errors"] else 0
     else:
         print(f"unknown dreaming task: {task}", file=sys.stderr)
         return 2

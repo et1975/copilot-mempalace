@@ -493,6 +493,8 @@ def _normalize_dt_for_kg(value):
     # naive datetime string: if midnight, return date-only; otherwise append Z (assume UTC)
     if value.endswith("T00:00:00"):
         return value[:10]
+    if value.endswith("+00:00"):
+        return value[:-6] + "Z"
     return value + "Z"
 
 

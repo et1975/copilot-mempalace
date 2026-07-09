@@ -748,6 +748,31 @@ class DeriveCliTests(unittest.TestCase):
             dream_harvest.main(["--task", "derive", "--palace", palace, "--out", out])
             self.assertEqual(len(json.load(open(out))["items"]), 1)
 
+    def test_live_adopt_materialize_error_returns_nonzero(self):
+        # Corrupt object_id so KgDeriveWriter raises; errors should surface in exit code
+        with _test_tmpdir() as td:
+            palace = self._palace(td); out = os.path.join(td, "wl.json")
+            dream_harvest.main(["--task", "derive", "--palace", palace, "--out", out])
+            wl = json.load(open(out))
+            wl["items"][0]["action"] = "materialize"
+            wl["items"][0]["conclusion"]["object_id"] = 999999  # bogus entity id
+            dec = os.path.join(td, "dec.json"); json.dump(wl, open(dec, "w"))
+            rc = dream_adopt.main(["--task", "derive", "--palace", palace, "--decisions", dec])
+            self.assertEqual(rc, 1)
+
+    def test_empty_contemplate_worklist_dispatches_without_task_flag(self):
+        # Zero-item contemplate worklist should adopt as a clean no-op (rc 0) without --task
+        with _test_tmpdir() as td:
+            palace = os.path.join(td, "palace"); os.makedirs(palace)
+            _RealKG(db_path=os.path.join(palace, "knowledge_graph.sqlite3")).close()
+            out = os.path.join(td, "wl.json")
+            dream_harvest.main(["--task", "derive", "--palace", palace, "--out", out])
+            wl = json.load(open(out))
+            self.assertEqual(len(wl["items"]), 0)
+            dec = os.path.join(td, "dec.json"); json.dump(wl, open(dec, "w"))
+            rc = dream_adopt.main(["--palace", palace, "--decisions", dec])
+            self.assertEqual(rc, 0)
+
 
 @unittest.skipUnless(_HAS_MEMPALACE, "requires mempalace interpreter")
 class DeriveHarvestCliTests(unittest.TestCase):
