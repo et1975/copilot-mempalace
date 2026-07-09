@@ -267,3 +267,94 @@ def decode_trailer(content: str) -> tuple[str, dict[str, Any]]:
     if not isinstance(extra, dict):
         return content, {}
     return content[:idx], extra
+
+
+# --------------------------------------------------------------------------- #
+# Markdown-directory serialization (human-readable, lossless round-trip).
+#
+# An alternative to the single JSONL bundle: a directory holding one markdown
+# file PER DRAWER (verbatim content under an HTML metadata header), plus
+# ``kg.jsonl`` / ``tunnels.jsonl`` (structured) and a ``manifest.json`` index.
+# One-file-per-drawer keeps drawer boundaries unambiguous (the legacy
+# one-file-per-room export merged drawers and lost them). These helpers are pure
+# text transforms; file I/O lives in ``palace_wing.py``.
+# --------------------------------------------------------------------------- #
+MD_DRAWER_MARKER = "mempalace-drawer"
+_MD_OPEN = f"<!--{MD_DRAWER_MARKER}\n"
+_MD_CLOSE = "\n-->\n"
+
+
+def encode_drawer_md(record: dict[str, Any]) -> str:
+    """Serialize a ``drawer`` record to markdown: metadata header + verbatim body.
+
+    Metadata (single-line) lives in a leading ``<!--mempalace-drawer ... -->``
+    comment; the drawer content follows verbatim (may contain anything, including
+    ``-->``). ``encode``/``decode`` are exact inverses.
+    """
+    extra = record.get("extra") or {}
+    meta_lines = [
+        f"wing: {record.get('wing') or ''}",
+        f"room: {record.get('room') or ''}",
+        f"drawer_id: {record.get('orig_drawer_id') or ''}",
+        f"added_by: {record.get('added_by') or ''}",
+        f"source_file: {_oneline(record.get('source_file'))}",
+        "extra: " + json.dumps(extra, ensure_ascii=False, sort_keys=True,
+                               separators=(",", ":")),
+    ]
+    return _MD_OPEN + "\n".join(meta_lines) + _MD_CLOSE + (record.get("content") or "")
+
+
+def decode_drawer_md(text: str) -> dict[str, Any]:
+    """Parse a drawer markdown file back into a ``drawer`` bundle record.
+
+    Inverse of ``encode_drawer_md``. Raises ``ValueError`` if ``text`` is not a
+    mempalace drawer markdown file.
+    """
+    if not text.startswith(_MD_OPEN):
+        raise ValueError("not a mempalace drawer markdown file")
+    end = text.find(_MD_CLOSE, len(_MD_OPEN) - 1)
+    if end == -1:
+        raise ValueError("drawer markdown header is not terminated")
+    header = text[len(_MD_OPEN):end]
+    content = text[end + len(_MD_CLOSE):]
+    meta: dict[str, str] = {}
+    for line in header.split("\n"):
+        if not line.strip():
+            continue
+        key, sep, value = line.partition(":")
+        if sep:
+            meta[key.strip()] = value.strip()
+    try:
+        extra = json.loads(meta.get("extra") or "{}")
+    except json.JSONDecodeError:
+        extra = {}
+    if not isinstance(extra, dict):
+        extra = {}
+    return {
+        "type": "drawer",
+        "wing": meta.get("wing") or "",
+        "room": meta.get("room") or "general",
+        "content": content,
+        "source_file": meta.get("source_file") or None,
+        "added_by": meta.get("added_by") or None,
+        "orig_drawer_id": meta.get("drawer_id") or None,
+        "extra": extra,
+    }
+
+
+def md_drawer_filename(record: dict[str, Any], index: int) -> str:
+    """Deterministic, filesystem-safe markdown filename for a drawer record."""
+    did = record.get("orig_drawer_id")
+    if did:
+        safe = "".join(c if (c.isalnum() or c in "-_.") else "_" for c in str(did))
+        return f"{safe}.md"
+    room = "".join(c if (c.isalnum() or c in "-_.") else "_"
+                   for c in str(record.get("room") or "general"))
+    return f"{room}__{index:04d}.md"
+
+
+def _oneline(value: Any) -> str:
+    """Collapse a metadata value to a single line (metadata is never multi-line)."""
+    if value is None:
+        return ""
+    return str(value).replace("\r", " ").replace("\n", " ")

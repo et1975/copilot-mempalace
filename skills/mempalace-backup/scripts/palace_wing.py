@@ -39,6 +39,7 @@ import argparse
 import inspect
 import json
 import os
+import re
 import sqlite3
 import sys
 from datetime import datetime, timezone
@@ -499,11 +500,219 @@ def cmd_export(args: argparse.Namespace) -> int:
         exported_at=datetime.now(timezone.utc).isoformat(),
     )
 
+    all_records = [manifest, *records]
+    if getattr(args, "format", "jsonl") == "md":
+        out_dir = args.out or f"wing-{wing}-{datetime.now():%Y%m%d-%H%M%S}"
+        wing_dir = write_md_dir(all_records, out_dir)
+        print(wing_dir)
+        return 0
+
     out_path = args.out or f"wing-{wing}-{datetime.now():%Y%m%d-%H%M%S}.jsonl"
     with open(out_path, "w", encoding="utf-8") as fh:
-        fh.write(lib.dump_jsonl([manifest, *records]))
+        fh.write(lib.dump_jsonl(all_records))
     print(out_path)
     return 0
+
+
+# --------------------------------------------------------------------------- #
+# Markdown-directory (de)serialization — file I/O over lib's pure transforms.
+# --------------------------------------------------------------------------- #
+def write_md_dir(records: list[dict[str, Any]], out_dir: str) -> str:
+    """Write a bundle's records as a human-readable markdown directory.
+
+    Layout: ``<out_dir>/<wing>/`` with one ``.md`` per drawer, ``kg.jsonl`` and
+    ``tunnels.jsonl`` (structured), and ``manifest.json`` (index + counts).
+    Returns the wing directory path.
+    """
+    manifest = records[0]
+    wing = manifest["wing"]
+    drawers = [r for r in records[1:] if r.get("type") == "drawer"]
+    triples = [r for r in records[1:] if r.get("type") == "kg_triple"]
+    tunnels = [r for r in records[1:] if r.get("type") == "tunnel"]
+
+    wing_dir = os.path.join(os.path.expanduser(out_dir), wing)
+    os.makedirs(wing_dir, exist_ok=True)
+
+    index = []
+    for i, drawer in enumerate(drawers):
+        fname = lib.md_drawer_filename(drawer, i)
+        with open(os.path.join(wing_dir, fname), "w", encoding="utf-8") as fh:
+            fh.write(lib.encode_drawer_md(drawer))
+        index.append({
+            "drawer_id": drawer.get("orig_drawer_id"),
+            "room": drawer.get("room"),
+            "added_by": drawer.get("added_by"),
+            "source_file": drawer.get("source_file"),
+            "extra": drawer.get("extra") or {},
+            "content_file": fname,
+        })
+
+    kg_file = "kg.jsonl" if triples else None
+    if triples:
+        with open(os.path.join(wing_dir, kg_file), "w", encoding="utf-8") as fh:
+            fh.write(lib.dump_jsonl(triples))
+    tunnels_file = "tunnels.jsonl" if tunnels else None
+    if tunnels:
+        with open(os.path.join(wing_dir, tunnels_file), "w", encoding="utf-8") as fh:
+            fh.write(lib.dump_jsonl(tunnels))
+
+    out_manifest = dict(manifest)
+    out_manifest["format"] = "md-dir"
+    out_manifest["drawers"] = index
+    out_manifest["kg_file"] = kg_file
+    out_manifest["tunnels_file"] = tunnels_file
+    with open(os.path.join(wing_dir, "manifest.json"), "w", encoding="utf-8") as fh:
+        json.dump(out_manifest, fh, ensure_ascii=False, indent=2, sort_keys=True)
+        fh.write("\n")
+    return wing_dir
+
+
+def read_md_dir(path: str) -> list[dict[str, Any]]:
+    """Read a markdown directory back into bundle records (manifest first).
+
+    Accepts the wing directory (containing ``manifest.json``) or the
+    ``manifest.json`` path itself. Auto-detects and delegates to the legacy
+    one-file-per-room reader when the drawer files are not the new
+    per-drawer format.
+    """
+    p = Path(os.path.expanduser(path))
+    wing_dir = p.parent if p.name == "manifest.json" else p
+    manifest_path = wing_dir / "manifest.json"
+    if not manifest_path.exists():
+        sys.exit(f"No manifest.json under {wing_dir}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    entries = manifest.get("drawers") or []
+    # Detect legacy (one file per room, merged drawers) vs new (per-drawer).
+    if entries:
+        first = wing_dir / (entries[0].get("content_file") or "")
+        if first.exists():
+            head = first.read_text(encoding="utf-8")
+            if not head.startswith(lib._MD_OPEN):
+                return read_legacy_md_dir(wing_dir, manifest)
+
+    records: list[dict[str, Any]] = [manifest]
+    seen_files: set[str] = set()
+    for entry in entries:
+        cf = entry.get("content_file")
+        if not cf or cf in seen_files:
+            continue
+        seen_files.add(cf)
+        text = (wing_dir / cf).read_text(encoding="utf-8")
+        records.append(lib.decode_drawer_md(text))
+
+    kg_file = manifest.get("kg_file")
+    if kg_file and (wing_dir / kg_file).exists():
+        records.extend(lib.parse_jsonl((wing_dir / kg_file).read_text(encoding="utf-8")))
+    tunnels_file = manifest.get("tunnels_file")
+    if tunnels_file and (wing_dir / tunnels_file).exists():
+        records.extend(
+            lib.parse_jsonl((wing_dir / tunnels_file).read_text(encoding="utf-8")))
+    return records
+
+
+def read_legacy_md_dir(
+    wing_dir: Path, manifest: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Best-effort reader for the legacy one-file-per-room markdown export.
+
+    The legacy "copilot-cli-fleet" format wrote one markdown file per ROOM (its
+    ``content_file`` shared by several drawers) under a ``<!-- MemPalace wing
+    export ... -->`` header, with KG triples as prose under a
+    ``## Knowledge-Graph Triples`` heading. Drawers are recovered by splitting a
+    shared file at level-2 (``## ``) headers; a lone drawer takes the whole body.
+    Marked best-effort: boundaries are heuristic, not authoritative.
+    """
+    print(
+        "  NOTE: legacy one-file-per-room export detected; reconstructing drawers "
+        "best-effort by splitting on '## ' headers.",
+        file=sys.stderr,
+    )
+    wing = manifest["wing"]
+    entries = manifest.get("drawers") or []
+    groups: dict[str, list[dict[str, Any]]] = {}
+    order: list[str] = []
+    for entry in entries:
+        cf = entry.get("content_file")
+        if cf not in groups:
+            groups[cf] = []
+            order.append(cf)
+        groups[cf].append(entry)
+
+    body: list[dict[str, Any]] = []
+    bodies: dict[str, str] = {}
+    for cf in order:
+        group = groups[cf]
+        text = _strip_legacy_comment((wing_dir / cf).read_text(encoding="utf-8"))
+        bodies[cf] = text
+        contents = [text] if len(group) == 1 else _split_h2_slices(text, len(group))
+        for entry, content in zip(group, contents):
+            body.append(
+                lib.drawer_record(
+                    wing=wing,
+                    room=entry.get("room") or "general",
+                    content=content,
+                    source_file=(entry.get("source_file") or None),
+                    added_by=entry.get("added_by"),
+                    orig_drawer_id=entry.get("drawer_id"),
+                    extra=entry.get("extra") or {},
+                )
+            )
+    n_drawers = len(body)
+    for text in bodies.values():
+        for subject, predicate, obj in _parse_legacy_kg_triples(text):
+            body.append(
+                lib.kg_triple_record(subject, predicate, obj, None, None, None, None))
+    n_triples = len(body) - n_drawers
+
+    bundle_manifest = lib.build_manifest(
+        wing=wing,
+        mempalace_version="legacy",
+        counts={"drawers": n_drawers, "kg_triples": n_triples, "tunnels": 0},
+        kg_note="legacy import: KG triples parsed best-effort from prose",
+        exported_at=str(manifest.get("exported_at") or ""),
+    )
+    return [bundle_manifest, *body]
+
+
+_LEGACY_ARROW = "\u2192"
+
+
+def _strip_legacy_comment(text: str) -> str:
+    s = text.lstrip("\ufeff")
+    if s.lstrip().startswith("<!--"):
+        end = s.find("-->")
+        if end != -1:
+            s = s[end + 3:]
+    return s.lstrip("\n")
+
+
+def _split_h2_slices(body: str, n: int) -> list[str]:
+    starts = [m.start() for m in re.finditer(r"^## ", body, re.MULTILINE)]
+    if len(starts) < n:
+        raise ValueError(
+            f"legacy split needs >= {n} '## ' headers, found {len(starts)}")
+    cuts = [0] + starts[1:n] + [len(body)]
+    return [body[cuts[i]:cuts[i + 1]] for i in range(n)]
+
+
+def _parse_legacy_kg_triples(body: str) -> list[tuple[str, str, str]]:
+    m = re.search(r"^##\s+Knowledge-Graph Triples\s*$", body, re.MULTILINE)
+    if not m:
+        return []
+    section = body[m.end():]
+    nxt = re.search(r"^## ", section, re.MULTILINE)
+    if nxt:
+        section = section[:nxt.start()]
+    out: list[tuple[str, str, str]] = []
+    for line in section.splitlines():
+        line = line.strip()
+        if not line.startswith("- ") or _LEGACY_ARROW not in line:
+            continue
+        parts = [p.strip() for p in line[2:].split(_LEGACY_ARROW)]
+        if len(parts) == 3 and all(parts):
+            out.append((parts[0], parts[1], parts[2]))
+    return out
 
 
 def preflight_import_target(
@@ -545,8 +754,12 @@ def cmd_import(args: argparse.Namespace) -> int:
     palace = bind_palace(str(args.palace))
     require_mempalace()
 
-    with open(args.bundle, encoding="utf-8") as fh:
-        records = lib.parse_jsonl(fh.read())
+    bundle_path = Path(os.path.expanduser(args.bundle))
+    if bundle_path.is_dir() or bundle_path.name == "manifest.json":
+        records = read_md_dir(str(bundle_path))
+    else:
+        with open(args.bundle, encoding="utf-8") as fh:
+            records = lib.parse_jsonl(fh.read())
     if not records:
         sys.exit(f"Bundle is empty: {args.bundle}")
     manifest = records[0]
@@ -700,12 +913,24 @@ def cmd_import(args: argparse.Namespace) -> int:
         print(f"{prefix}{failed} record(s) failed.", file=sys.stderr)
     if not dry and (drawers_added or triples_added or tunnels_created):
         after = palace_drawer_count(palace, target_wing)
-        print(
-            f"  verify: wing {target_wing!r} now holds "
-            f"{after if after is not None else '?'} drawer(s). Run MCP "
-            "mempalace_reconnect (or restart the server) to refresh live search.",
-            file=sys.stderr,
-        )
+        if after is None:
+            palace_dir, _ = resolve_palace_layout(palace)
+            print(
+                "  WARNING: no Chroma DB at "
+                f"{os.path.join(str(palace_dir), 'chroma.sqlite3')} after import. "
+                "mempalace creates a brand-new palace at the HOME level, not "
+                "HOME/palace, so a freshly-created palace may be misplaced. Import "
+                "into a palace initialized through mempalace, or verify the "
+                "resulting location before relying on it.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"  verify: wing {target_wing!r} now holds {after} drawer(s). Run "
+                "MCP mempalace_reconnect (or restart the server) to refresh live "
+                "search.",
+                file=sys.stderr,
+            )
     return 1 if failed else 0
 
 
@@ -719,9 +944,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = p.add_subparsers(dest="command", required=True)
 
-    se = sub.add_parser("export", help="Export one wing to a JSONL bundle.")
+    se = sub.add_parser("export", help="Export one wing to a JSONL bundle or md dir.")
     se.add_argument("wing", help="Wing name to export.")
-    se.add_argument("--out", help="Output bundle path (default: wing-<wing>-<ts>.jsonl).")
+    se.add_argument("--out", help="Output path: bundle file (jsonl) or parent dir "
+                                  "(md). Default: wing-<wing>-<ts>[.jsonl].")
+    se.add_argument("--format", choices=("jsonl", "md"), default="jsonl",
+                    help="jsonl bundle (default) or human-readable markdown dir "
+                         "(one file per drawer + kg.jsonl/tunnels.jsonl).")
     se.add_argument(
         "--palace",
         type=lambda s: Path(s).expanduser(),
@@ -731,8 +960,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     se.set_defaults(func=cmd_export)
 
-    si = sub.add_parser("import", help="Replay a wing bundle into a palace.")
-    si.add_argument("bundle", help="Bundle JSONL path to import.")
+    si = sub.add_parser("import", help="Replay a wing bundle (jsonl) or md dir "
+                                       "into a palace.")
+    si.add_argument("bundle", help="Bundle .jsonl path, or a markdown export dir "
+                                   "(or its manifest.json) to import.")
     si.add_argument("--into-wing", help="Import into this wing (clone) instead of the "
                                         "bundle's wing; implies --force-add.")
     si.add_argument(
