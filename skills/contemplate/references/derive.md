@@ -34,6 +34,11 @@ MPY=$(head -1 "$(command -v mempalace)" | sed 's/^#!//')
   --palace <p> --decisions decisions.json --verify
 ```
 
+`--verify`/`--strict` apply to **live adoption only**: they re-harvest after the writes and check for
+an operational fixpoint. Under `--dry-run` nothing is written, so the residual/`--strict` check is
+skipped; a dry run still exits non-zero if any decision produced an error (the preview surfaces
+materialize failures).
+
 ## `ontology.json`
 
 The ontology config is explicit. Empty or missing config ⇒ no enabled rules ⇒
