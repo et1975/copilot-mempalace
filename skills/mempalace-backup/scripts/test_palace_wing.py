@@ -144,6 +144,7 @@ def test_import_binds_palace_before_requiring_mempalace():
         with patched(
             bind_palace=lambda p: (order.append("bind"), real_bind(p))[1],
             require_mempalace=lambda: order.append("require"),
+            preflight_import_target=lambda *a, **k: None,
         ):
             rc = pw.main(["import", str(bundle), "--palace", "/nope"])
         assert rc == 0
@@ -164,6 +165,8 @@ def test_import_skips_near_duplicate():
             require_mempalace=lambda: None,
             check_duplicate=lambda content, threshold: {"is_duplicate": True},
             add_drawer=lambda **kw: added.append(kw),
+            preflight_import_target=lambda *a, **k: None,
+            palace_drawer_count=lambda *a, **k: 1,
         ):
             rc = pw.main(["import", str(bundle), "--palace", "/nope"])
         assert rc == 0
@@ -184,6 +187,8 @@ def test_import_adds_with_target_wing_and_trailer_content():
             require_mempalace=lambda: None,
             check_duplicate=lambda content, threshold: {"is_duplicate": False},
             add_drawer=lambda **kw: added.append(kw),
+            preflight_import_target=lambda *a, **k: None,
+            palace_drawer_count=lambda *a, **k: 1,
         ):
             rc = pw.main(["import", str(bundle), "--palace", "/nope"])
         assert rc == 0
@@ -214,6 +219,8 @@ def test_import_into_wing_bypasses_dedup():
             require_mempalace=lambda: None,
             check_duplicate=_dup,
             add_drawer=lambda **kw: added.append(kw),
+            preflight_import_target=lambda *a, **k: None,
+            palace_drawer_count=lambda *a, **k: 1,
         ):
             rc = pw.main(["import", str(bundle), "--into-wing", "avs_clone",
                           "--palace", "/nope"])
@@ -272,6 +279,8 @@ def test_import_kg_uses_knowledge_graph_add_triple():
         with patched(
             require_mempalace=lambda: None,
             open_kg=lambda palace: kg,
+            preflight_import_target=lambda *a, **k: None,
+            palace_drawer_count=lambda *a, **k: 1,
         ):
             rc = pw.main(["import", str(bundle), "--palace", "/nope"])
         assert rc == 0
@@ -306,6 +315,8 @@ def test_import_tunnel_error_is_skipped_success_counted():
         with patched(
             require_mempalace=lambda: None,
             create_tunnel=_create_tunnel,
+            preflight_import_target=lambda *a, **k: None,
+            palace_drawer_count=lambda *a, **k: 1,
         ):
             rc = pw.main(["import", str(bundle), "--palace", "/nope"])
         assert rc == 0            # tunnel error is a skip, not a hard failure
@@ -324,6 +335,8 @@ def test_import_tunnel_endpoint_remapped_under_into_wing():
         with patched(
             require_mempalace=lambda: None,
             create_tunnel=lambda **kw: calls.append(kw) or {"tunnel_id": "x"},
+            preflight_import_target=lambda *a, **k: None,
+            palace_drawer_count=lambda *a, **k: 1,
         ):
             rc = pw.main(["import", str(bundle), "--into-wing", "avs_clone",
                           "--palace", "/nope"])
@@ -356,6 +369,84 @@ def test_import_rejects_unknown_bundle_version():
 
 
 # --------------------------------------------------------------------------- #
+# Palace layout resolution + stray-palace guard.
+# --------------------------------------------------------------------------- #
+def test_resolve_palace_layout_default(tmp_path):
+    home = tmp_path / ".mempalace"
+    home.mkdir()
+    palace_dir, kg = pw.resolve_palace_layout(home)
+    assert palace_dir == home / "palace"
+    assert kg == home / "knowledge_graph.sqlite3"
+
+
+def test_resolve_palace_layout_honors_config_palace_path(tmp_path):
+    home = tmp_path / ".mempalace"
+    home.mkdir()
+    custom = tmp_path / "elsewhere" / "db"
+    (home / "config.json").write_text(
+        f'{{"palace_path": "{custom.as_posix()}"}}', encoding="utf-8")
+    palace_dir, kg = pw.resolve_palace_layout(home)
+    assert palace_dir == custom                       # chroma follows config
+    assert kg == home / "knowledge_graph.sqlite3"     # KG stays home-level
+
+
+def test_bind_palace_sets_resolved_chroma_dir_not_home(tmp_path):
+    home = tmp_path / ".mempalace"
+    home.mkdir()
+    returned = pw.bind_palace(str(home))
+    import os
+    # Returns HOME (readers join their own subpaths), but the env points at the
+    # nested palace/ dir so writes never create a stray <home>/chroma.sqlite3.
+    assert returned == str(home)
+    assert os.environ["MEMPALACE_PALACE_PATH"] == str(home / "palace")
+
+
+def test_import_aborts_on_missing_palace(tmp_path):
+    # Real preflight + palace_drawer_count returning None (no chroma) must abort.
+    bundle = _write_bundle([
+        lib.build_manifest("avs", "3.5.0", {"drawers": 1}, "n", "t"),
+        lib.drawer_record("avs", "scripting", "hello", None, None, "d1", {}),
+    ])
+    added = []
+    try:
+        with patched(
+            require_mempalace=lambda: None,
+            palace_drawer_count=lambda *a, **k: None,   # chroma missing
+            add_drawer=lambda **kw: added.append(kw),
+        ):
+            try:
+                pw.main(["import", str(bundle), "--palace", str(tmp_path)])
+                raised = False
+            except SystemExit:
+                raised = True
+        assert raised            # guard fired
+        assert added == []       # no writes attempted
+    finally:
+        bundle.unlink(missing_ok=True)
+
+
+def test_import_create_new_palace_allows_missing(tmp_path):
+    bundle = _write_bundle([
+        lib.build_manifest("avs", "3.5.0", {"drawers": 1}, "n", "t"),
+        lib.drawer_record("avs", "scripting", "hello", None, None, "d1", {}),
+    ])
+    added = []
+    try:
+        with patched(
+            require_mempalace=lambda: None,
+            check_duplicate=lambda content, threshold: {"is_duplicate": False},
+            palace_drawer_count=lambda *a, **k: None,   # chroma missing
+            add_drawer=lambda **kw: added.append(kw),
+        ):
+            rc = pw.main(["import", str(bundle), "--palace", str(tmp_path),
+                          "--create-new-palace"])
+        assert rc == 0
+        assert len(added) == 1   # write proceeds when explicitly opted in
+    finally:
+        bundle.unlink(missing_ok=True)
+
+
+# --------------------------------------------------------------------------- #
 # Argument parsing.
 # --------------------------------------------------------------------------- #
 def test_parser_export_defaults():
@@ -374,6 +465,7 @@ def test_parser_import_defaults_and_required():
     assert args.dry_run is False
     assert args.force_add is False
     assert args.dup_threshold == 0.9
+    assert args.create_new_palace is False
     assert args.func is pw.cmd_import
 
 

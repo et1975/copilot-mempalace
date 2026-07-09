@@ -56,17 +56,61 @@ _VENV_HINT = "~/.local/share/uv/tools/mempalace/bin/python"
 
 
 # --------------------------------------------------------------------------- #
+# Palace layout resolution.
+#
+# ``--palace`` always means the mempalace HOME dir (default ``~/.mempalace``).
+# Under HOME live two separate stores whose paths resolve by DIFFERENT rules —
+# the running MCP server (launched without ``--palace``) reads:
+#   * Chroma vectors at ``<palace_path>/chroma.sqlite3`` where ``palace_path`` is
+#     ``config.json``'s ``palace_path`` (default ``<home>/palace``), and
+#   * the KnowledgeGraph at the HOME-level ``<home>/knowledge_graph.sqlite3``.
+# Conflating the two (e.g. pointing ``MEMPALACE_PALACE_PATH`` at HOME) silently
+# creates a stray second Chroma DB at ``<home>/chroma.sqlite3`` that the server
+# never reads. ``resolve_palace_layout`` centralizes both rules so export and
+# import agree with the server.
+# --------------------------------------------------------------------------- #
+def resolve_palace_layout(home: str | Path) -> tuple[Path, Path]:
+    """Map a mempalace HOME dir to ``(chroma_palace_dir, kg_db_path)``.
+
+    ``chroma_palace_dir`` is ``config.json``'s ``palace_path`` when present, else
+    ``<home>/palace``. ``kg_db_path`` is the server's HOME-level default
+    ``<home>/knowledge_graph.sqlite3``. Mirrors the mempalace MCP server's own
+    resolution so drawers and KG triples land where the server reads them.
+    """
+    home = Path(home).expanduser()
+    palace_dir = home / "palace"
+    cfg = home / "config.json"
+    if cfg.exists():
+        try:
+            configured = json.loads(cfg.read_text(encoding="utf-8")).get("palace_path")
+        except (OSError, ValueError):
+            configured = None
+        if configured:
+            palace_dir = Path(configured).expanduser()
+    return palace_dir, home / "knowledge_graph.sqlite3"
+
+
+# --------------------------------------------------------------------------- #
 # mempalace / palace I/O seams.
 #
 # Every mempalace or palace-SQLite touch point is a module-level function with a
 # lazy import inside its body. Importing this module therefore never imports
 # mempalace, and tests replace these seams with in-memory fakes.
 # --------------------------------------------------------------------------- #
-def bind_palace(palace_path: str) -> str:
-    """Point mempalace at ``palace_path`` for this process. Call before imports."""
-    abspath = os.path.abspath(os.path.expanduser(palace_path))
-    os.environ["MEMPALACE_PALACE_PATH"] = abspath
-    return abspath
+def bind_palace(home: str) -> str:
+    """Point mempalace at the palace under mempalace HOME for this process.
+
+    ``home`` is the mempalace HOME dir (default ``~/.mempalace``). Sets
+    ``MEMPALACE_PALACE_PATH`` to the RESOLVED Chroma dir (``<home>/palace`` or
+    ``config.json``'s ``palace_path``) — never HOME itself — so writes land in
+    the same Chroma DB the running server reads, not a stray ``<home>/chroma``.
+    Returns the HOME abspath (readers below join their own subpaths from it).
+    Call before importing mempalace.
+    """
+    home_abs = os.path.abspath(os.path.expanduser(home))
+    palace_dir, _ = resolve_palace_layout(home_abs)
+    os.environ["MEMPALACE_PALACE_PATH"] = os.path.abspath(str(palace_dir))
+    return home_abs
 
 
 def require_mempalace() -> None:
@@ -100,14 +144,17 @@ def mempalace_version() -> str:
 def read_wing_drawer_rows(palace: str, wing: str) -> list[dict[str, Any]]:
     """Read a wing's drawer chunk rows directly from ``palace/chroma.sqlite3``.
 
-    ``get_collection(...).get(...)`` returns nothing in a standalone process
-    (the ChromaDB API view is only populated inside the running server), so
-    export reads the persisted ``embedding_metadata`` EAV table directly. Each
+    ``palace`` is the mempalace HOME dir. The Chroma dir is resolved via
+    ``resolve_palace_layout`` so a non-default ``config.json`` ``palace_path`` is
+    honored. ``get_collection(...).get(...)`` returns nothing in a standalone
+    process (the ChromaDB API view is only populated inside the running server),
+    so export reads the persisted ``embedding_metadata`` EAV table directly. Each
     chunk ``id`` gathers its keys into a metadata dict; the drawer text is the
     value of the ``chroma:document`` key. The returned rows share the shape
     (``{"id", "text", "metadata"}``) consumed by ``_group_logical_drawers``.
     """
-    db_path = os.path.join(palace, "palace", "chroma.sqlite3")
+    palace_dir, _ = resolve_palace_layout(palace)
+    db_path = os.path.join(str(palace_dir), "chroma.sqlite3")
     if not os.path.exists(db_path):
         return []
     try:
@@ -140,6 +187,58 @@ def read_wing_drawer_rows(palace: str, wing: str) -> list[dict[str, Any]]:
             text = meta.pop("chroma:document", "") or ""
             rows.append({"id": chunk_id, "text": text, "metadata": meta})
         return rows
+    finally:
+        con.close()
+
+
+def palace_drawer_count(palace: str, wing: str | None = None) -> int | None:
+    """Count distinct logical drawers in the resolved Chroma DB (read-only).
+
+    Returns the drawer count (optionally filtered to ``wing``), or ``None`` when
+    the Chroma DB does not exist yet — the signal used by the import preflight to
+    refuse writing into a would-be-new/stray palace. Counts distinct
+    ``parent_drawer_id`` (falling back to chunk ``id`` for single-chunk drawers).
+    """
+    palace_dir, _ = resolve_palace_layout(palace)
+    db_path = os.path.join(str(palace_dir), "chroma.sqlite3")
+    if not os.path.exists(db_path):
+        return None
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except sqlite3.OperationalError:
+        con = sqlite3.connect(db_path)
+    try:
+        if wing is not None:
+            ids = [
+                row[0]
+                for row in con.execute(
+                    "SELECT id FROM embedding_metadata "
+                    "WHERE key = 'wing' AND string_value = ?",
+                    (wing,),
+                ).fetchall()
+            ]
+        else:
+            ids = [
+                row[0]
+                for row in con.execute(
+                    "SELECT DISTINCT id FROM embedding_metadata"
+                ).fetchall()
+            ]
+        if not ids:
+            return 0
+        placeholders = ",".join("?" * len(ids))
+        parents: set[str] = set()
+        rows = con.execute(
+            "SELECT id, string_value FROM embedding_metadata "
+            f"WHERE key = 'parent_drawer_id' AND id IN ({placeholders})",
+            ids,
+        ).fetchall()
+        have_parent = {row[0] for row in rows}
+        parents.update(row[1] for row in rows if row[1])
+        parents.update(cid for cid in ids if cid not in have_parent)
+        return len(parents)
+    except sqlite3.OperationalError:
+        return 0
     finally:
         con.close()
 
@@ -188,10 +287,16 @@ def create_tunnel(
 
 
 def open_kg(palace: str) -> Any:
-    """Open the palace-local KnowledgeGraph for direct triple writes."""
+    """Open the KnowledgeGraph the running server reads for direct triple writes.
+
+    ``palace`` is the mempalace HOME dir; the KG resolves to the HOME-level
+    ``<home>/knowledge_graph.sqlite3`` via ``resolve_palace_layout`` — matching
+    the server's default — so triples are visible after reconnect.
+    """
     from mempalace.knowledge_graph import KnowledgeGraph  # lazy
 
-    return KnowledgeGraph(db_path=os.path.join(palace, "knowledge_graph.sqlite3"))
+    _, kg_path = resolve_palace_layout(palace)
+    return KnowledgeGraph(db_path=str(kg_path))
 
 
 def add_triple(
@@ -401,6 +506,38 @@ def cmd_export(args: argparse.Namespace) -> int:
     return 0
 
 
+def preflight_import_target(
+    home: str, target_wing: str, create_new_palace: bool
+) -> None:
+    """Stray-palace guard: report resolved paths/counts and refuse a bad target.
+
+    Prints the resolved Chroma dir, KG path, and existing drawer counts, then
+    aborts when the Chroma DB does not exist yet (unless ``create_new_palace``) —
+    the classic ``--palace ~/.mempalace/palace`` (DB dir) vs ``~/.mempalace``
+    (HOME) mistake that silently created a second palace.
+    """
+    palace_dir, kg_path = resolve_palace_layout(home)
+    chroma = os.path.join(str(palace_dir), "chroma.sqlite3")
+    total = palace_drawer_count(home)
+    existing = palace_drawer_count(home, target_wing)
+    print(
+        f"  target palace  : {palace_dir}\n"
+        f"  chroma db      : {chroma} "
+        f"({'exists' if total is not None else 'MISSING'})\n"
+        f"  knowledge graph: {kg_path}\n"
+        f"  drawers        : total={total if total is not None else 0}, "
+        f"wing {target_wing!r}={existing if existing is not None else 0}",
+        file=sys.stderr,
+    )
+    if total is None and not create_new_palace:
+        sys.exit(
+            f"Refusing to import: no Chroma DB at {chroma}.\n"
+            "--palace must be the mempalace HOME dir (e.g. ~/.mempalace), NOT the "
+            "nested ~/.mempalace/palace DB dir. If you really mean to initialize a "
+            "brand-new palace here, pass --create-new-palace."
+        )
+
+
 def cmd_import(args: argparse.Namespace) -> int:
     # Bind the palace BEFORE importing mempalace: the config layer reads
     # MEMPALACE_PALACE_PATH at import time, so binding after would let --palace
@@ -436,6 +573,8 @@ def cmd_import(args: argparse.Namespace) -> int:
         f"{prefix}Importing bundle {args.bundle} -> wing {target_wing!r} in {palace}",
         file=sys.stderr,
     )
+    if not dry:
+        preflight_import_target(palace, target_wing, args.create_new_palace)
 
     drawers_added = 0
     drawers_skipped = 0
@@ -559,6 +698,14 @@ def cmd_import(args: argparse.Namespace) -> int:
         print(f"  tunnel skip reason: {reason}", file=sys.stderr)
     if failed:
         print(f"{prefix}{failed} record(s) failed.", file=sys.stderr)
+    if not dry and (drawers_added or triples_added or tunnels_created):
+        after = palace_drawer_count(palace, target_wing)
+        print(
+            f"  verify: wing {target_wing!r} now holds "
+            f"{after if after is not None else '?'} drawer(s). Run MCP "
+            "mempalace_reconnect (or restart the server) to refresh live search.",
+            file=sys.stderr,
+        )
     return 1 if failed else 0
 
 
@@ -579,7 +726,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--palace",
         type=lambda s: Path(s).expanduser(),
         default=DEFAULT_PALACE,
-        help="Palace root (default: ~/.mempalace).",
+        help="mempalace HOME dir (default: ~/.mempalace), NOT the nested "
+             "palace/ DB dir.",
     )
     se.set_defaults(func=cmd_export)
 
@@ -591,7 +739,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--palace",
         type=lambda s: Path(s).expanduser(),
         default=DEFAULT_PALACE,
-        help="Palace root (default: ~/.mempalace).",
+        help="mempalace HOME dir (default: ~/.mempalace), NOT the nested "
+             "palace/ DB dir.",
     )
     si.add_argument("--dry-run", action="store_true",
                     help="Report actions without performing any writes.")
@@ -599,6 +748,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Bypass near-duplicate detection and add every drawer.")
     si.add_argument("--dup-threshold", type=float, default=0.9,
                     help="Similarity threshold for near-duplicate skip (default: 0.9).")
+    si.add_argument("--create-new-palace", action="store_true",
+                    help="Allow importing into a HOME with no existing Chroma DB "
+                         "(initialize a brand-new palace); otherwise the import "
+                         "aborts to avoid creating a stray second palace.")
     si.set_defaults(func=cmd_import)
     return p
 
