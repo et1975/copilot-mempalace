@@ -28,6 +28,19 @@ audit hook that nags when an external tool is about to run without a prior `memp
   `materialize` / `skip` / `reject_rule` candidates. It shares the same Python mechanics in
   [`skills/dreaming/scripts/`](skills/dreaming/scripts/) and documents the derive contract in
   [`skills/contemplate/references/derive.md`](skills/contemplate/references/derive.md).
+- **[skills/mempalace-backup/SKILL.md](skills/mempalace-backup/SKILL.md)** — safely back up the local palace with
+  [`restic`](https://restic.net/): quiesce writers, checkpoint both SQLite WALs, snapshot `~/.mempalace/`
+  (excluding ephemeral `locks/`, always keeping `palace/.mempalace/origin.json`), verify, and prune. Local repos
+  only, on demand. Ships a tested Python helper
+  ([`scripts/palace_backup.py`](skills/mempalace-backup/scripts/palace_backup.py) + `test_palace_backup.py`) that
+  needs no `sqlite3` CLI, plus a [restic cheatsheet](skills/mempalace-backup/references/restic-cheatsheet.md).
+  For **per-wing** archival/migration/cloning (which restic cannot do, since wings share physical storage), it also
+  ships [`scripts/palace_wing.py`](skills/mempalace-backup/scripts/palace_wing.py) — a logical wing export/import that
+  reads the palace SQLite directly into a portable JSONL bundle and replays it back.
+- **[skills/mempalace-restore/SKILL.md](skills/mempalace-restore/SKILL.md)** — restore / disaster-recovery
+  counterpart: reversible staged restore (move the current palace aside first), restic's absolute-path-stripping
+  subpath syntax so files land directly, then `mempalace repair` / `repair-status` and MCP `mempalace_reconnect`.
+  Scenario runbook in [references/disaster-recovery.md](skills/mempalace-restore/references/disaster-recovery.md).
 - **[hooks/palace-reflex.json](hooks/palace-reflex.json) + [hooks/palace-reflex.py](hooks/palace-reflex.py)** —
   `PreToolUse` audit hook. Maintains a per-session ring buffer of recent tool calls under `$TMPDIR`. Fires when
   a trigger tool runs without a recent `mempalace_search`, injecting a one-line reminder via
@@ -46,6 +59,8 @@ audit hook that nags when an external tool is about to run without a prior `memp
   Verify with `mempalace status`.
 - MemPalace exposed as an MCP server in your harness — see [Step 0](#step-0--register-mempalace-as-an-mcp-server) below.
 - Python 3 on `PATH` (for the hook). The hook fails silently if Python is missing.
+- For the backup/restore skills only: [`restic`](https://restic.net/) on `PATH`
+  (`zypper in restic`, `apt install restic`, `brew install restic`, …).
 
 ## Install
 
