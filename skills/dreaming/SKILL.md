@@ -32,6 +32,24 @@ Scripts live in `skills/dreaming/scripts/`. Run them with a Python that can
 import `mempalace` (e.g. the interpreter from `uv tool install mempalace`).
 Artifacts go in the session workspace — never commit them.
 
+> **Fast reconnaissance first.** Before hand-running per-task/per-wing
+> harvests, get a whole-palace picture in one call with the read-only survey
+> driver — it runs every read-only task across every wing in a single process
+> and prints one aggregated report (no adopt, ever):
+>
+> ```bash
+> MPY=$(head -1 "$(command -v mempalace)" | sed 's/^#!//')
+> "$MPY" dream_survey.py --palace <p>                 # summary of all tasks/wings
+> "$MPY" dream_survey.py --palace <p> --format json --out survey.json
+> "$MPY" dream_survey.py --palace <p> --tasks merge,prune --wings avs,icm_automation \
+>     --worklists-dir ./wl   # also dump non-empty worklists for adjudication
+> ```
+>
+> Use it to decide *which* task/wing is worth the full 5-phase pipeline below.
+> `dream_survey.py` is read-only: `induce-rules` candidates go to a throwaway
+> ontology, and it never adopts. Adjudication/adopt still use the per-task
+> `dream_harvest.py` + `dream_adopt.py` flow.
+
 | # | Phase | Who | Command / action |
 |---|-------|-----|------------------|
 | 0 | Scope | you | pick task: merge (`--wing`, optional `--room`, `--tau`), contradiction (`--task contradiction`), pattern (`--task pattern`, `--wing`, `--rooms`, `--min-support`), rule induction (`--task induce-rules`, `--min-support`, `--ontology-out`), or prune (`--task prune`, `--wing`, optional `--room`, `--v-min`, `--age-floor-days`) + optional `--instructions` |

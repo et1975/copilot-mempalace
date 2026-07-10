@@ -150,6 +150,17 @@ def load_logical_drawers(
     return _group_by_parent(_rows_from_collection_result(res), ("parent_drawer_id",))
 
 
+def list_wings(palace_path: str) -> list[str]:
+    """Return the sorted distinct wing names present in the palace collection."""
+    from mempalace.palace import get_collection  # lazy: heavy import
+
+    col = get_collection(palace_path)
+    res = col.get(include=["metadatas"])
+    metas = _field(res, "metadatas") or []
+    wings = {meta.get("wing") for meta in metas if meta and meta.get("wing")}
+    return sorted(wings)
+
+
 def load_drawer_by_id(palace_path: str, drawer_id: str) -> dict[str, Any] | None:
     """Read a current logical drawer by id, reassembling chunks and hashing text."""
     from mempalace.palace import get_collection  # lazy: heavy import
