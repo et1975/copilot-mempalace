@@ -17,6 +17,7 @@ import hashlib
 import inspect
 import re
 import sqlite3
+import sys
 from datetime import datetime, timezone
 from typing import Any
 
@@ -31,6 +32,18 @@ def bind_palace(palace_path: str) -> str:
     abspath = os.path.abspath(os.path.expanduser(palace_path))
     os.environ["MEMPALACE_PALACE_PATH"] = abspath
     return abspath
+
+
+def _resolve_kg_path(palace_path: str) -> str | None:
+    """Resolve the KG SQLite path for palace-local and home-level layouts."""
+    palace_dir = os.path.abspath(os.path.expanduser(palace_path))
+    palace_local = os.path.join(palace_dir, "knowledge_graph.sqlite3")
+    home_level = os.path.abspath(os.path.join(palace_dir, os.pardir, "knowledge_graph.sqlite3"))
+    for db_path in (palace_local, home_level):
+        if os.path.exists(db_path):
+            print(f"dream_palace: KG resolved to {db_path}", file=sys.stderr)
+            return db_path
+    return palace_local
 
 
 def _where(wing: str | None, room: str | None) -> dict[str, Any] | None:
@@ -217,8 +230,8 @@ def load_observation_entries(
 
 
 def load_active_triples(palace_path: str) -> list[dict[str, Any]]:
-    """Read currently-active KG triples from the palace-local SQLite store."""
-    db_path = os.path.join(palace_path, "knowledge_graph.sqlite3")
+    """Read currently-active KG triples from the resolved KG SQLite store."""
+    db_path = _resolve_kg_path(palace_path)
     if not os.path.exists(db_path):
         return []
 
@@ -257,7 +270,7 @@ def load_active_triples(palace_path: str) -> list[dict[str, Any]]:
 
 def kg_source_degree(palace_path: str) -> dict[str, int]:
     """Return per-drawer counts of KG triples sourced from each drawer id."""
-    db_path = os.path.join(palace_path, "knowledge_graph.sqlite3")
+    db_path = _resolve_kg_path(palace_path)
     if not os.path.exists(db_path):
         return {}
 
@@ -407,7 +420,7 @@ class Archiver:
 
 
 class KgWriter:
-    """Writes KG invalidations to the palace-local KG, bypassing MCP handlers.
+    """Writes KG invalidations to the resolved KG, bypassing MCP handlers.
 
     The MCP ``mempalace_kg_invalidate`` handler resolves the KG path through a
     CLI-only ``_palace_flag_given`` gate; library imports without ``--palace``
@@ -418,7 +431,7 @@ class KgWriter:
     def __init__(self, palace_path: str) -> None:
         from mempalace.knowledge_graph import KnowledgeGraph  # lazy
 
-        self._db_path = os.path.join(palace_path, "knowledge_graph.sqlite3")
+        self._db_path = _resolve_kg_path(palace_path)
         self._kg = KnowledgeGraph(db_path=self._db_path)
 
     def invalidate(self, subject: str, predicate: str, object: str, ended: str | None = None) -> Any:
@@ -499,7 +512,7 @@ def _normalize_dt_for_kg(value):
 
 
 class KgDeriveWriter:
-    """Writes derived triples + a kg_derivations lineage row to the palace-local KG.
+    """Writes derived triples + a kg_derivations lineage row to the resolved KG.
 
     Direct KnowledgeGraph use (not the mempalace_kg_add MCP handler) for the same
     _palace_flag_given reason the contradiction KgWriter documents. add_triple RETURNS the
@@ -521,7 +534,7 @@ class KgDeriveWriter:
 
     def __init__(self, palace_path):
         from mempalace.knowledge_graph import KnowledgeGraph  # lazy
-        self._db_path = os.path.join(palace_path, "knowledge_graph.sqlite3")
+        self._db_path = _resolve_kg_path(palace_path)
         self._kg = KnowledgeGraph(db_path=self._db_path)
         con = sqlite3.connect(self._db_path)
         try:

@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import os
+import sqlite3
 import tempfile
 import unittest
 from unittest import mock
@@ -25,6 +26,16 @@ def _test_tmpdir():
         prefix="dream-cli-",
         dir=os.environ.get("DREAMING_TEST_TMPDIR", os.getcwd()),
     )
+
+
+def _load_json(path):
+    with open(path, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def _dump_json(path, value):
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(value, fh)
 
 
 class TestHarvestContradictionTask(unittest.TestCase):
@@ -225,6 +236,156 @@ class TestHarvestPruneTask(unittest.TestCase):
                 "harvested 2 drawers -> 1 prune candidate(s) (v<v_min, age>=floor, kg_degree=0)",
                 stderr.getvalue(),
             )
+
+
+class TestHarvestOntologyTasks(unittest.TestCase):
+    def _palace_with_kg(self, td):
+        palace = os.path.join(td, "palace")
+        os.makedirs(palace)
+        con = sqlite3.connect(os.path.join(palace, "knowledge_graph.sqlite3"))
+        con.executescript(
+            """
+            CREATE TABLE entities (id TEXT PRIMARY KEY, name TEXT NOT NULL);
+            CREATE TABLE triples (
+                id TEXT PRIMARY KEY,
+                subject TEXT,
+                predicate TEXT,
+                object TEXT,
+                valid_from TEXT,
+                valid_to TEXT,
+                confidence REAL,
+                source_closet TEXT,
+                source_file TEXT,
+                source_drawer_id TEXT,
+                adapter_name TEXT,
+                extracted_at TEXT
+            );
+            INSERT INTO entities (id, name) VALUES
+                ('a', 'Author'), ('x', 'Post'), ('b', 'ModuleB'), ('c', 'ModuleC'),
+                ('friend1', 'FriendOne'), ('friend2', 'FriendTwo');
+            INSERT INTO triples (
+                id, subject, predicate, object, valid_from, valid_to,
+                confidence, source_closet, source_file, source_drawer_id,
+                adapter_name, extracted_at
+            ) VALUES
+                ('t1', 'a', 'authored', 'x', '2026-01-01', NULL, 1.0, NULL, NULL, NULL, NULL, '2026-01-01'),
+                ('t2', 'x', 'authored_by', 'a', '2026-01-01', NULL, 1.0, NULL, NULL, NULL, NULL, '2026-01-01'),
+                ('t3', 'a', 'depends_on', 'b', '2026-01-01', NULL, 1.0, NULL, NULL, NULL, NULL, '2026-01-01'),
+                ('t4', 'b', 'depends_on', 'c', '2026-01-01', NULL, 1.0, NULL, NULL, NULL, NULL, '2026-01-01'),
+                ('t5', 'friend1', 'collaborates_with', 'friend2', '2026-01-01', NULL, 1.0, NULL, NULL, NULL, NULL, '2026-01-01'),
+                ('t6', 'friend2', 'collaborates_with', 'friend1', '2026-01-01', NULL, 1.0, NULL, NULL, NULL, NULL, '2026-01-01');
+            """
+        )
+        con.commit()
+        con.close()
+        return palace
+
+    def _run_harvest(self, argv):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            rc = dream_harvest.main(argv)
+        return rc, stderr.getvalue()
+
+    def _read_rules(self, path):
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)["rules"]
+
+    def test_suggest_rules_writes_disabled_heuristic_candidates(self):
+        with _test_tmpdir() as td:
+            palace = self._palace_with_kg(td)
+            ontology = os.path.join(td, "ontology.json")
+
+            rc, stderr = self._run_harvest([
+                "--task", "suggest-rules",
+                "--palace", palace,
+                "--ontology-out", ontology,
+            ])
+
+            self.assertEqual(rc, 0)
+            rules = self._read_rules(ontology)
+            self.assertTrue(rules)
+            self.assertTrue(all(rule["enabled"] is False for rule in rules))
+            self.assertIn("transitive:depends_on", {rule["id"] for rule in rules})
+            self.assertIn("inverse:authored:authored_by", {rule["id"] for rule in rules})
+            self.assertIn("symmetric:collaborates_with", {rule["id"] for rule in rules})
+            self.assertIn("suggest-rules: proposed", stderr)
+            self.assertIn("all candidates written DISABLED", stderr)
+
+    def test_induce_rules_writes_disabled_evidence_candidates(self):
+        with _test_tmpdir() as td:
+            palace = self._palace_with_kg(td)
+            ontology = os.path.join(td, "ontology.json")
+
+            rc, stderr = self._run_harvest([
+                "--task", "induce-rules",
+                "--palace", palace,
+                "--min-support", "1",
+                "--ontology-out", ontology,
+            ])
+
+            self.assertEqual(rc, 0)
+            rules = self._read_rules(ontology)
+            self.assertTrue(rules)
+            self.assertTrue(all(rule["enabled"] is False for rule in rules))
+            ids = {rule["id"] for rule in rules}
+            self.assertIn("inverse:authored:authored_by", ids)
+            self.assertIn("symmetric:collaborates_with", ids)
+            self.assertIn("transitive:depends_on", ids)
+            self.assertIn("induce-rules: min_support=1 proposed", stderr)
+            self.assertIn("all candidates written DISABLED", stderr)
+
+    def test_suggest_rules_is_idempotent_and_reports_existing_skips(self):
+        with _test_tmpdir() as td:
+            palace = self._palace_with_kg(td)
+            ontology = os.path.join(td, "ontology.json")
+
+            rc, stderr = self._run_harvest([
+                "--task", "suggest-rules",
+                "--palace", palace,
+                "--ontology-out", ontology,
+            ])
+            self.assertEqual(rc, 0)
+            with open(ontology, encoding="utf-8") as fh:
+                first_doc = json.load(fh)
+            first_count = len(first_doc["rules"])
+
+            rc, stderr = self._run_harvest([
+                "--task", "suggest-rules",
+                "--palace", palace,
+                "--ontology-out", ontology,
+            ])
+
+            self.assertEqual(rc, 0)
+            with open(ontology, encoding="utf-8") as fh:
+                second_doc = json.load(fh)
+            self.assertEqual(second_doc, first_doc)
+            self.assertIn(f"added 0 (skipped {first_count} existing)", stderr)
+
+    def test_suggest_rules_preserves_preexisting_enabled_colliding_rule(self):
+        with _test_tmpdir() as td:
+            palace = self._palace_with_kg(td)
+            ontology = os.path.join(td, "ontology.json")
+            existing_rule = {
+                "id": "transitive:depends_on",
+                "family": "transitive",
+                "predicate": "depends_on",
+                "derived_predicate": "depends_on_closure",
+                "enabled": True,
+                "rationale": "human approved",
+            }
+            with open(ontology, "w", encoding="utf-8") as fh:
+                json.dump({"version": 1, "rules": [existing_rule]}, fh)
+
+            rc, _stderr = self._run_harvest([
+                "--task", "suggest-rules",
+                "--palace", palace,
+                "--ontology-out", ontology,
+            ])
+
+            self.assertEqual(rc, 0)
+            rules = self._read_rules(ontology)
+            self.assertEqual(rules[0], existing_rule)
+            self.assertTrue(rules[0]["enabled"])
 
 
 class TestAdoptContradictionTask(unittest.TestCase):
@@ -695,7 +856,7 @@ class DeriveCliTests(unittest.TestCase):
         with _test_tmpdir() as td:
             palace = self._palace(td); out = os.path.join(td, "wl.json")
             dream_harvest.main(["--task", "derive", "--palace", palace, "--out", out])
-            wl = json.load(open(out))
+            wl = _load_json(out)
             self.assertEqual(wl["task"], "contemplate")
             self.assertEqual(len(wl["items"]), 1)
             self.assertEqual(wl["items"][0]["conclusion"]["predicate"], "depends_on_closure")
@@ -704,59 +865,59 @@ class DeriveCliTests(unittest.TestCase):
         with _test_tmpdir() as td:
             palace = self._palace(td); out = os.path.join(td, "wl.json")
             dream_harvest.main(["--task", "derive", "--palace", palace, "--out", out])
-            wl = json.load(open(out))
+            wl = _load_json(out)
             wl["items"][0]["action"] = "materialize"
-            dec = os.path.join(td, "dec.json"); json.dump(wl, open(dec, "w"))
+            dec = os.path.join(td, "dec.json"); _dump_json(dec, wl)
             rc = dream_adopt.main(["--task", "derive", "--palace", palace,
                                    "--decisions", dec, "--verify", "--strict"])
             self.assertEqual(rc, 0)
             # re-harvest: candidate now active => 0 residual
             dream_harvest.main(["--task", "derive", "--palace", palace, "--out", out])
-            self.assertEqual(len(json.load(open(out))["items"]), 0)
+            self.assertEqual(len(_load_json(out)["items"]), 0)
 
     def test_adopt_skip_then_reharvest_is_empty_via_skip_marker(self):
         with _test_tmpdir() as td:
             palace = self._palace(td); out = os.path.join(td, "wl.json")
             dream_harvest.main(["--task", "derive", "--palace", palace, "--out", out])
-            wl = json.load(open(out)); wl["items"][0]["action"] = "skip"
+            wl = _load_json(out); wl["items"][0]["action"] = "skip"
             wl["items"][0]["reason"] = "noise"
-            dec = os.path.join(td, "dec.json"); json.dump(wl, open(dec, "w"))
+            dec = os.path.join(td, "dec.json"); _dump_json(dec, wl)
             dream_adopt.main(["--task", "derive", "--palace", palace, "--decisions", dec])
             dream_harvest.main(["--task", "derive", "--palace", palace, "--out", out])
-            self.assertEqual(len(json.load(open(out))["items"]), 0)  # skip-marker suppresses
+            self.assertEqual(len(_load_json(out)["items"]), 0)  # skip-marker suppresses
 
     def test_adopt_reject_rule_suppresses_via_skip_markers(self):
         with _test_tmpdir() as td:
             palace = self._palace(td); out = os.path.join(td, "wl.json")
             dream_harvest.main(["--task", "derive", "--palace", palace, "--out", out])
-            wl = json.load(open(out)); wl["items"][0]["action"] = "reject_rule"
-            dec = os.path.join(td, "dec.json"); json.dump(wl, open(dec, "w"))
+            wl = _load_json(out); wl["items"][0]["action"] = "reject_rule"
+            dec = os.path.join(td, "dec.json"); _dump_json(dec, wl)
             dream_adopt.main(["--task", "derive", "--palace", palace, "--decisions", dec])
             dream_harvest.main(["--task", "derive", "--palace", palace, "--out", out])
-            self.assertEqual(len(json.load(open(out))["items"]), 0)  # operational fixpoint
+            self.assertEqual(len(_load_json(out)["items"]), 0)  # operational fixpoint
 
     def test_dry_run_materialize_previews_without_writing(self):
         with _test_tmpdir() as td:
             palace = self._palace(td); out = os.path.join(td, "wl.json")
             dream_harvest.main(["--task", "derive", "--palace", palace, "--out", out])
-            wl = json.load(open(out)); wl["items"][0]["action"] = "materialize"
-            dec = os.path.join(td, "dec.json"); json.dump(wl, open(dec, "w"))
+            wl = _load_json(out); wl["items"][0]["action"] = "materialize"
+            dec = os.path.join(td, "dec.json"); _dump_json(dec, wl)
             rc = dream_adopt.main(["--task", "derive", "--palace", palace,
                                    "--decisions", dec, "--dry-run"])
             self.assertEqual(rc, 0)
             # palace must be unmutated: re-harvest still yields 1 candidate
             dream_harvest.main(["--task", "derive", "--palace", palace, "--out", out])
-            self.assertEqual(len(json.load(open(out))["items"]), 1)
+            self.assertEqual(len(_load_json(out)["items"]), 1)
 
     def test_live_adopt_materialize_error_returns_nonzero(self):
         # Corrupt object_id so KgDeriveWriter raises; errors should surface in exit code
         with _test_tmpdir() as td:
             palace = self._palace(td); out = os.path.join(td, "wl.json")
             dream_harvest.main(["--task", "derive", "--palace", palace, "--out", out])
-            wl = json.load(open(out))
+            wl = _load_json(out)
             wl["items"][0]["action"] = "materialize"
             wl["items"][0]["conclusion"]["object_id"] = 999999  # bogus entity id
-            dec = os.path.join(td, "dec.json"); json.dump(wl, open(dec, "w"))
+            dec = os.path.join(td, "dec.json"); _dump_json(dec, wl)
             rc = dream_adopt.main(["--task", "derive", "--palace", palace, "--decisions", dec])
             self.assertEqual(rc, 1)
 
@@ -767,9 +928,9 @@ class DeriveCliTests(unittest.TestCase):
             _RealKG(db_path=os.path.join(palace, "knowledge_graph.sqlite3")).close()
             out = os.path.join(td, "wl.json")
             dream_harvest.main(["--task", "derive", "--palace", palace, "--out", out])
-            wl = json.load(open(out))
+            wl = _load_json(out)
             self.assertEqual(len(wl["items"]), 0)
-            dec = os.path.join(td, "dec.json"); json.dump(wl, open(dec, "w"))
+            dec = os.path.join(td, "dec.json"); _dump_json(dec, wl)
             rc = dream_adopt.main(["--palace", palace, "--decisions", dec])
             self.assertEqual(rc, 0)
 
@@ -793,7 +954,7 @@ class DeriveHarvestCliTests(unittest.TestCase):
             palace = self._palace(td); out = os.path.join(td, "wl.json")
             rc = dream_harvest.main(["--task", "derive", "--palace", palace, "--out", out])
             self.assertEqual(rc, 0)
-            wl = json.load(open(out))
+            wl = _load_json(out)
             self.assertEqual(wl["task"], "contemplate")
             self.assertEqual(len(wl["items"]), 1)
             self.assertEqual(wl["items"][0]["conclusion"]["predicate"], "depends_on_closure")
@@ -805,7 +966,7 @@ class DeriveHarvestCliTests(unittest.TestCase):
             out = os.path.join(td, "wl.json")
             rc = dream_harvest.main(["--task", "derive", "--palace", palace, "--out", out])
             self.assertEqual(rc, 0)
-            self.assertEqual(len(json.load(open(out))["items"]), 0)
+            self.assertEqual(len(_load_json(out)["items"]), 0)
 
 
 if __name__ == "__main__":

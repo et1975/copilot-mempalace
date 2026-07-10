@@ -91,6 +91,41 @@ semantics.
   are sound only relative to approved rules and MemPalace's name-keyed entity
   identity.
 
+## Bootstrapping the ontology
+
+The ontology starts empty on purpose: predicate names are not semantics. An
+empty ontology yields zero deductive candidates rather than guessing that a name
+like `depends_on` is transitive, inverse-bearing, or symmetric in this palace.
+
+Two generator tasks can populate review candidates in `<palace>/ontology.json`:
+
+- `suggest-rules` — day-1 name-heuristic bootstrap. It scans distinct KG
+  predicate names and proposes candidate transitive, inverse, and symmetric
+  rules from naming patterns. It works immediately but has lower precision.
+- `induce-rules` — evidence-based dreaming induction. It scans observed base
+  triples for inverse, symmetric, and transitive co-occurrence with a
+  `--min-support` threshold. It is higher precision only after enough data has
+  accumulated.
+
+Both generators write disabled candidates only: `enabled: false` plus a
+`rationale` explaining the heuristic or evidence. The workflow is always
+generate → human review → edit approved rules to `enabled: true` → run
+`derive`. Never auto-enable generated rules; a wrong rule pollutes the KG and
+closure amplifies the mistake.
+
+Generator guardrails:
+
+- **Never auto-enable** — enabling a rule is a deliberate human edit.
+- **Base-triples only** — induction reads observed facts and excludes derived
+  `*_closure` triples / derivation lineage, avoiding self-reinforcing loops.
+- **Support threshold** — induction requires `--min-support` co-occurrences;
+  sparse KGs legitimately produce few or no candidates.
+
+An eval gate for induced rules is deferred: future work should measure whether
+enabling candidates improves multi-session task success more than it adds drift,
+using LongMemEval/LoCoMo-style methodology. This change only proposes rules for
+human review.
+
 ## Invariants to preserve
 
 - **Entity identity** — closure keys on entity IDs, not display names. Current

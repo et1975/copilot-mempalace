@@ -34,8 +34,8 @@ Artifacts go in the session workspace — never commit them.
 
 | # | Phase | Who | Command / action |
 |---|-------|-----|------------------|
-| 0 | Scope | you | pick task: merge (`--wing`, optional `--room`, `--tau`), contradiction (`--task contradiction`), pattern (`--task pattern`, `--wing`, `--rooms`, `--min-support`), or prune (`--task prune`, `--wing`, optional `--room`, `--v-min`, `--age-floor-days`) + optional `--instructions` |
-| 1 | Harvest | script | merge: `dream_harvest.py --palace <p> --wing <w> --tau 0.9 --out worklist.json`; contradiction: `dream_harvest.py --palace <p> --task contradiction --out worklist.json`; pattern: `dream_harvest.py --palace <p> --task pattern --wing <w> --rooms diary --min-support 3 --out worklist.json`; prune: `dream_harvest.py --palace <p> --task prune --wing <w> --room <r> --v-min 0.35 --age-floor-days 30 --out worklist.json` (READ-ONLY) |
+| 0 | Scope | you | pick task: merge (`--wing`, optional `--room`, `--tau`), contradiction (`--task contradiction`), pattern (`--task pattern`, `--wing`, `--rooms`, `--min-support`), rule induction (`--task induce-rules`, `--min-support`, `--ontology-out`), or prune (`--task prune`, `--wing`, optional `--room`, `--v-min`, `--age-floor-days`) + optional `--instructions` |
+| 1 | Harvest | script | merge: `dream_harvest.py --palace <p> --wing <w> --tau 0.9 --out worklist.json`; contradiction: `dream_harvest.py --palace <p> --task contradiction --out worklist.json`; pattern: `dream_harvest.py --palace <p> --task pattern --wing <w> --rooms diary --min-support 3 --out worklist.json`; rule induction: `dream_harvest.py --palace <p> --task induce-rules --min-support 2 --ontology-out <p>/ontology.json`; prune: `dream_harvest.py --palace <p> --task prune --wing <w> --room <r> --v-min 0.35 --age-floor-days 30 --out worklist.json` (READ-ONLY except ontology candidate writes for `induce-rules`) |
 | 2 | Adjudicate | **you** | fill each `worklist.json` item's `decision`; save as `decisions.json` |
 | 3 | Review | human/auto | diff proposed merge text vs the originals; approve a subset |
 | 4 | Adopt | script | `dream_adopt.py --palace <p> --decisions decisions.json` (merge: add merged/delete originals; contradiction: soft-invalidate stale KG facts; pattern: add surfaced lessons only; prune: archive to JSONL then delete) |
@@ -129,6 +129,24 @@ Anti-proliferation discipline: never surface an unsupported generalization, and
 never re-surface a lesson that already exists. Pattern is the only net-new
 knowledge task; keep it high-signal.
 
+For `--task induce-rules`, the pattern-family induction target is
+`ontology.json`, not drawer text. It scans observed base KG triples for
+inverse, symmetric, and transitive co-occurrence at `--min-support`, then writes
+candidate ontology rules through the same `dream_harvest.py` /
+`dream_ontology.py` rails.
+
+- **Never auto-enable** — candidates are always written with `enabled: false`.
+  A human must review the rationale/evidence and flip only approved rules to
+  `enabled: true`.
+- **Base-triples only** — induction excludes derived `*_closure` triples and
+  derivation lineage so generated rules do not feed on their own closure.
+- **Support threshold** — sparse KGs legitimately yield few or no candidates
+  until enough observed co-occurrences accumulate.
+
+This is rule induction for human approval, not proof of sound semantics. An
+eval gate that measures task-success improvement versus drift using
+LongMemEval/LoCoMo-style methodology is deferred.
+
 For each `"kind": "prune"` item, read the drawer text and salience components
 (`age_days`, `kg_degree`, `redundancy`, `negatives`, `v`). Default to **KEEP**:
 omitted decisions are treated as keep, and pruning should be deliberate even
@@ -198,6 +216,9 @@ Implemented tasks:
 - `pattern`: cross-session diary observations grouped into themes, requiring
   `--min-support` distinct stamped sessions before the agent may surface a
   general lesson.
+- `induce-rules`: pattern-family ontology induction over observed base KG
+  triples. It writes disabled transitive/inverse/symmetric rule candidates to
+  `--ontology-out` and never auto-enables them.
 - `prune` / `forget`: low-salience drawer candidates selected by a conservative
   multi-gate AND (`v < v_min`, age floor, `kg_degree == 0`, not pinned). Adoption
   archives to JSONL before deleting through the sanctioned handler.

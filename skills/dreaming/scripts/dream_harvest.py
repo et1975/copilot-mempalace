@@ -20,6 +20,7 @@ import os
 import re
 import sys
 
+import dream_ontology
 import dream_palace
 from dream_lib import (
     build_contradiction_worklist,
@@ -74,14 +75,16 @@ def _degree_for(drawer: dict, degrees: dict[str, int]) -> int:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--palace", required=True, help="Path to the mempalace palace directory")
-    ap.add_argument("--task", choices=["merge", "contradiction", "pattern", "prune", "derive"], default="merge",
+    ap.add_argument("--task", choices=[
+        "merge", "contradiction", "pattern", "prune", "derive", "suggest-rules", "induce-rules"
+    ], default="merge",
                     help="Dreaming task to harvest (default merge)")
     ap.add_argument("--wing", help="Scope merge harvest to this wing (ignored for contradiction)")
     ap.add_argument("--room", help="Scope merge harvest to this room (ignored for contradiction)")
     ap.add_argument("--tau", type=float,
                     help="Cosine-similarity threshold; defaults to 0.9 for merge and 0.75 for pattern")
-    ap.add_argument("--min-support", type=int, default=3,
-                    help="Minimum distinct sessions for pattern themes (default 3)")
+    ap.add_argument("--min-support", type=int, default=None,
+                    help="Minimum support for pattern themes (default 3) or induced ontology rules (default 2)")
     ap.add_argument("--v-min", type=float, default=0.35,
                     help="Maximum salience value for prune candidates (default 0.35)")
     ap.add_argument("--age-floor-days", type=int, default=30,
@@ -94,6 +97,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--instructions", help="Optional steering note recorded in the worklist")
     ap.add_argument("--rules", default=None,
                     help="Path to ontology config (default: <palace>/ontology.json)")
+    ap.add_argument("--ontology-out", default=None,
+                    help="Path to ontology output for rule suggestion/induction (default: <palace>/ontology.json)")
     ap.add_argument("--skips", default=None,
                     help="Path to skip-markers file (default: <palace>/dream-derive-skips.jsonl)")
     ap.add_argument("--max-depth", type=int, default=3,
@@ -129,18 +134,19 @@ def main(argv: list[str] | None = None) -> int:
             entry for entry in dream_palace.load_observation_entries(path, wing=args.wing, rooms=rooms)
             if not _is_surfaced_lesson(entry)
         ]
-        themes = group_observation_themes(entries, tau=tau, min_support=args.min_support)
+        min_support = args.min_support if args.min_support is not None else 3
+        themes = group_observation_themes(entries, tau=tau, min_support=min_support)
         worklist = build_pattern_worklist(
             themes,
             scope={"palace": path, "wing": args.wing, "rooms": list(rooms), "task": "pattern"},
-            params={"tau": tau, "min_support": args.min_support},
+            params={"tau": tau, "min_support": min_support},
             instructions=args.instructions,
         )
         with open(args.out, "w", encoding="utf-8") as fh:
             json.dump(worklist, fh, indent=2, ensure_ascii=False)
         print(
             f"harvested {len(entries)} observation entries -> {len(worklist['items'])} "
-            f"pattern theme(s) spanning >= {args.min_support} sessions -> {args.out}",
+            f"pattern theme(s) spanning >= {min_support} sessions -> {args.out}",
             file=sys.stderr,
         )
         return 0
@@ -183,6 +189,50 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"harvested {len(drawers)} drawers -> {len(worklist['items'])} prune candidate(s) "
             f"(v<v_min, age>=floor, kg_degree=0) -> {args.out}",
+            file=sys.stderr,
+        )
+        return 0
+
+    if args.task == "suggest-rules":
+        ontology_out = args.ontology_out or os.path.join(path, "ontology.json")
+        triples = dream_palace.load_active_triples_with_ids(path)
+        predicates = sorted({
+            triple.get("predicate") for triple in triples
+            if isinstance(triple.get("predicate"), str) and triple.get("predicate")
+        })
+        cands = dream_ontology.suggest_rules_from_predicates(predicates)
+        existing = dream_ontology.read_ontology_doc(ontology_out)
+        merged, stats = dream_ontology.merge_ontology_candidates(existing.get("rules", []), cands)
+        doc = dream_ontology.build_ontology_doc(merged, existing.get("version", 1))
+        dream_ontology.write_ontology_doc(ontology_out, doc)
+        print(
+            f"suggest-rules: proposed {len(cands)} candidate(s), added {stats['added']} "
+            f"(skipped {stats['skipped_existing']} existing) -> {ontology_out}",
+            file=sys.stderr,
+        )
+        print(
+            "all candidates written DISABLED — review and set enabled:true on approved rules before contemplate can use them",
+            file=sys.stderr,
+        )
+        return 0
+
+    if args.task == "induce-rules":
+        ontology_out = args.ontology_out or os.path.join(path, "ontology.json")
+        triples = dream_palace.load_active_triples_with_ids(path)
+        existing = dream_ontology.read_ontology_doc(ontology_out)
+        base = dream_ontology.filter_base_triples(triples, existing.get("rules", []))
+        min_support = args.min_support if args.min_support is not None else 2
+        cands = dream_ontology.induce_rules_from_triples(base, min_support=min_support)
+        merged, stats = dream_ontology.merge_ontology_candidates(existing.get("rules", []), cands)
+        doc = dream_ontology.build_ontology_doc(merged, existing.get("version", 1))
+        dream_ontology.write_ontology_doc(ontology_out, doc)
+        print(
+            f"induce-rules: min_support={min_support} proposed {len(cands)} candidate(s), "
+            f"added {stats['added']} (skipped {stats['skipped_existing']} existing) -> {ontology_out}",
+            file=sys.stderr,
+        )
+        print(
+            "all candidates written DISABLED — review and set enabled:true on approved rules before contemplate can use them",
             file=sys.stderr,
         )
         return 0

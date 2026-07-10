@@ -90,6 +90,48 @@ Fields:
 
 There is no `allow_reflexive`: v1 closure is unconditionally anti-reflexive.
 
+## Bootstrapping ontology rules
+
+`ontology.json` may start empty. That is deliberate: predicate names are not
+semantics, and empty or missing config must emit zero deductive candidates
+instead of guessing. Two generator tasks can populate disabled candidate rules
+for review:
+
+```bash
+MPY=$(head -1 "$(command -v mempalace)" | sed 's/^#!//')
+# name-heuristic bootstrap
+"$MPY" skills/dreaming/scripts/dream_harvest.py --task suggest-rules --palace <p> --ontology-out <p>/ontology.json
+# evidence induction
+"$MPY" skills/dreaming/scripts/dream_harvest.py --task induce-rules --palace <p> --min-support 2 --ontology-out <p>/ontology.json
+# then a HUMAN reviews ontology.json and flips enabled:true only on approved rules
+```
+
+- `suggest-rules` scans distinct predicate names and proposes transitive,
+  inverse, or symmetric candidates from naming patterns. It is a day-1
+  bootstrap, not evidence of semantics.
+- `induce-rules` scans observed base triples and proposes inverse, symmetric,
+  or transitive candidates from actual co-occurrence at `--min-support`.
+
+Generator output uses the `ontology.json` rule schema above rather than a
+separate worklist schema. Each generated rule is a disabled candidate:
+`enabled: false`, with a `rationale` describing the name heuristic or evidence
+support. Humans review the file and edit only approved rules to
+`enabled: true`; generators never approve rules themselves.
+
+Guardrails:
+
+- **Never auto-enable** — generated rules are always `enabled: false`. A wrong
+  enabled rule pollutes the KG, and closure can amplify that error.
+- **Base-triples only** — `induce-rules` reads observed base facts and excludes
+  derived `*_closure` triples and derivation lineage, avoiding a
+  self-reinforcing feedback loop.
+- **Support threshold** — `induce-rules` requires `--min-support`
+  co-occurrences. Sparse KGs legitimately yield few or no candidates.
+
+An eval gate is deferred, not shipped here: later work should measure whether
+enabling induced rules improves multi-session task success more than it adds
+drift, using LongMemEval/LoCoMo-style methodology.
+
 ## `worklist.json`
 
 Harvest emits:

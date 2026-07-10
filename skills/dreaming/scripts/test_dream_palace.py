@@ -119,6 +119,93 @@ class TestLoadActiveTriples(unittest.TestCase):
             self.assertEqual([row["triple_id"] for row in triples], ["t-person-1", "t-person-2"])
 
 
+class TestLoadActiveTriplesKgPathResolution(unittest.TestCase):
+    def _make_palace(self, root):
+        palace = os.path.join(root, "palace")
+        os.mkdir(palace)
+        return palace
+
+    def _write_kg(self, db_path, triple_id, object_name):
+        con = sqlite3.connect(db_path)
+        con.executescript(
+            f"""
+            CREATE TABLE entities (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+            CREATE TABLE triples (
+                id TEXT PRIMARY KEY,
+                subject INTEGER,
+                predicate TEXT,
+                object INTEGER,
+                valid_from TEXT,
+                valid_to TEXT,
+                extracted_at TEXT,
+                source_drawer_id TEXT,
+                confidence REAL
+            );
+            INSERT INTO entities (id, name) VALUES (1, 'Alice'), (2, '{object_name}');
+            INSERT INTO triples (
+                id, subject, predicate, object, valid_from, valid_to,
+                extracted_at, source_drawer_id, confidence
+            ) VALUES (
+                '{triple_id}', 1, 'lives_in', 2, '2026-01-01', NULL,
+                '2026-01-02', 'drawer-{triple_id}', 0.75
+            );
+            """
+        )
+        con.commit()
+        con.close()
+
+    def _assert_single_triple(self, triples, triple_id, object_name):
+        self.assertEqual(triples, [
+            {
+                "triple_id": triple_id,
+                "subject": "Alice",
+                "subject_id": 1,
+                "predicate": "lives_in",
+                "object": object_name,
+                "object_id": 2,
+                "valid_from": "2026-01-01",
+                "valid_to": None,
+                "extracted_at": "2026-01-02",
+                "source_drawer_id": f"drawer-{triple_id}",
+                "confidence": 0.75,
+            }
+        ])
+
+    def test_palace_local_kg_is_loaded(self):
+        with _test_tmpdir() as root:
+            palace = self._make_palace(root)
+            self._write_kg(os.path.join(palace, "knowledge_graph.sqlite3"), "local", "Portland")
+
+            triples = dream_palace.load_active_triples(palace)
+
+            self._assert_single_triple(triples, "local", "Portland")
+
+    def test_home_level_kg_is_loaded_when_palace_local_is_absent(self):
+        with _test_tmpdir() as root:
+            palace = self._make_palace(root)
+            self._write_kg(os.path.join(root, "knowledge_graph.sqlite3"), "home", "Seattle")
+
+            triples = dream_palace.load_active_triples(palace)
+
+            self._assert_single_triple(triples, "home", "Seattle")
+
+    def test_palace_local_kg_wins_when_both_exist(self):
+        with _test_tmpdir() as root:
+            palace = self._make_palace(root)
+            self._write_kg(os.path.join(root, "knowledge_graph.sqlite3"), "home", "Seattle")
+            self._write_kg(os.path.join(palace, "knowledge_graph.sqlite3"), "local", "Portland")
+
+            triples = dream_palace.load_active_triples(palace)
+
+            self._assert_single_triple(triples, "local", "Portland")
+
+    def test_missing_kg_returns_empty_list(self):
+        with _test_tmpdir() as root:
+            palace = self._make_palace(root)
+
+            self.assertEqual(dream_palace.load_active_triples(palace), [])
+
+
 class TestKgSourceDegree(unittest.TestCase):
     def test_missing_kg_returns_empty_dict(self):
         with _test_tmpdir() as palace:
@@ -505,6 +592,44 @@ class TestKgWriter(unittest.TestCase):
             else:
                 sys.modules["mempalace.knowledge_graph"] = original_kg_module
 
+    def test_uses_home_level_db_path_when_palace_local_db_is_absent(self):
+        original_mempalace = sys.modules.get("mempalace")
+        original_kg_module = sys.modules.get("mempalace.knowledge_graph")
+        calls = []
+
+        class FakeKnowledgeGraph:
+            def __init__(self, db_path):
+                calls.append(("init", db_path))
+
+            def close(self):
+                calls.append(("close",))
+
+        mempalace_module = types.ModuleType("mempalace")
+        kg_module = types.ModuleType("mempalace.knowledge_graph")
+        kg_module.KnowledgeGraph = FakeKnowledgeGraph
+        sys.modules["mempalace"] = mempalace_module
+        sys.modules["mempalace.knowledge_graph"] = kg_module
+        try:
+            with _test_tmpdir() as root:
+                palace = os.path.join(root, "palace")
+                os.mkdir(palace)
+                home_kg = os.path.join(root, "knowledge_graph.sqlite3")
+                sqlite3.connect(home_kg).close()
+
+                writer = dream_palace.KgWriter(palace)
+                writer.close()
+
+                self.assertEqual(calls, [("init", home_kg), ("close",)])
+        finally:
+            if original_mempalace is None:
+                sys.modules.pop("mempalace", None)
+            else:
+                sys.modules["mempalace"] = original_mempalace
+            if original_kg_module is None:
+                sys.modules.pop("mempalace.knowledge_graph", None)
+            else:
+                sys.modules["mempalace.knowledge_graph"] = original_kg_module
+
     def test_invalidate_triples_updates_only_requested_ids(self):
         original_mempalace = sys.modules.get("mempalace")
         original_kg_module = sys.modules.get("mempalace.knowledge_graph")
@@ -554,6 +679,48 @@ class TestKgWriter(unittest.TestCase):
                 self.assertEqual(rows["t1"], "2026-07-06T15:00:00+00:00")
                 self.assertIsNone(rows["t2"])
                 self.assertEqual(rows["t3"], "already-ended")
+        finally:
+            if original_mempalace is None:
+                sys.modules.pop("mempalace", None)
+            else:
+                sys.modules["mempalace"] = original_mempalace
+            if original_kg_module is None:
+                sys.modules.pop("mempalace.knowledge_graph", None)
+            else:
+                sys.modules["mempalace.knowledge_graph"] = original_kg_module
+
+
+class TestKgDeriveWriterPathResolution(unittest.TestCase):
+    def test_uses_home_level_db_path_when_palace_local_db_is_absent(self):
+        original_mempalace = sys.modules.get("mempalace")
+        original_kg_module = sys.modules.get("mempalace.knowledge_graph")
+        calls = []
+
+        class FakeKnowledgeGraph:
+            def __init__(self, db_path):
+                calls.append(("init", db_path))
+
+            def close(self):
+                calls.append(("close",))
+
+        mempalace_module = types.ModuleType("mempalace")
+        kg_module = types.ModuleType("mempalace.knowledge_graph")
+        kg_module.KnowledgeGraph = FakeKnowledgeGraph
+        sys.modules["mempalace"] = mempalace_module
+        sys.modules["mempalace.knowledge_graph"] = kg_module
+        try:
+            with _test_tmpdir() as root:
+                palace = os.path.join(root, "palace")
+                os.mkdir(palace)
+                home_kg = os.path.join(root, "knowledge_graph.sqlite3")
+                sqlite3.connect(home_kg).close()
+
+                writer = dream_palace.KgDeriveWriter(palace)
+                writer.close()
+
+                self.assertEqual(calls, [("init", home_kg), ("close",)])
+                self.assertTrue(os.path.exists(home_kg))
+                self.assertFalse(os.path.exists(os.path.join(palace, "knowledge_graph.sqlite3")))
         finally:
             if original_mempalace is None:
                 sys.modules.pop("mempalace", None)
