@@ -20,11 +20,15 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import os
 import sys
+import tempfile
 from typing import Any
 
+import dream_harvest
 import dream_palace
 import dream_lib as _dream_lib
 from dream_lib import (
@@ -392,6 +396,47 @@ def _print_errors(report: dict[str, Any]) -> None:
         print(f"  ERROR {err}", file=sys.stderr)
 
 
+def _verify_reharvest(task: str, worklist: dict[str, Any], path: str) -> int:
+    """Re-run the same harvest after adopt and return the residual item count.
+
+    Reconstructs the harvest scope/params from the worklist so a caller can run
+    adopt+verify in a single invocation (one technical step instead of two).
+    """
+    scope = worklist.get("scope") or {}
+    params = worklist.get("params") or {}
+    with tempfile.TemporaryDirectory() as td:
+        out = os.path.join(td, "verify.json")
+        argv = ["--palace", path, "--task", task, "--out", out]
+        if task == "merge":
+            if scope.get("wing"):
+                argv += ["--wing", scope["wing"]]
+            if scope.get("room"):
+                argv += ["--room", scope["room"]]
+            if params.get("tau") is not None:
+                argv += ["--tau", str(params["tau"])]
+        elif task == "pattern":
+            if scope.get("wing"):
+                argv += ["--wing", scope["wing"]]
+            if scope.get("rooms"):
+                argv += ["--rooms", ",".join(scope["rooms"])]
+            if params.get("min_support") is not None:
+                argv += ["--min-support", str(params["min_support"])]
+        elif task == "prune":
+            if scope.get("wing"):
+                argv += ["--wing", scope["wing"]]
+            if scope.get("room"):
+                argv += ["--room", scope["room"]]
+            if params.get("v_min") is not None:
+                argv += ["--v-min", str(params["v_min"])]
+            if params.get("age_floor_days") is not None:
+                argv += ["--age-floor-days", str(params["age_floor_days"])]
+        # contradiction takes no scope/param args (KG is palace-global)
+        with contextlib.redirect_stderr(io.StringIO()):
+            dream_harvest.main(argv)
+        with open(out, encoding="utf-8") as fh:
+            return len(json.load(fh).get("items") or [])
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--palace", required=True, help="Path to the mempalace palace directory")
@@ -400,7 +445,7 @@ def main(argv: list[str] | None = None) -> int:
                     choices=["merge", "contradiction", "pattern", "prune", "derive"],
                     help="Override task (default: derived from worklist)")
     ap.add_argument("--archive-file", default=None,
-                    help="Append-only prune archive JSONL path (default: <palace>/dream-archive.jsonl)")
+                    help="Append-only archive JSONL path for merge/prune deletes (default: <palace>/dream-archive.jsonl)")
     ap.add_argument("--dry-run", action="store_true", help="Print planned changes; write nothing")
     ap.add_argument("--rules", default=None,
                     help="Path to ontology config (default: <palace>/ontology.json)")
@@ -534,7 +579,7 @@ def main(argv: list[str] | None = None) -> int:
         decisions = _resolve_decisions(worklist)
         decisions, preflight_errors = _preflight_merge_decisions(path, decisions)
         writer = dream_palace.MempalaceWriter()
-        archiver = dream_palace.Archiver(path, writer=writer)
+        archiver = dream_palace.Archiver(path, writer=writer, archive_path=args.archive_file)
         report = _add_preflight_errors(
             apply_merge_decisions(decisions, writer, archiver),
             preflight_errors,
@@ -587,6 +632,13 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print(f"unknown dreaming task: {task}", file=sys.stderr)
         return 2
+
+    if args.verify and task in ("merge", "contradiction", "pattern", "prune"):
+        residual = _verify_reharvest(task, worklist, path)
+        print(f"verify: {residual} residual {task} candidate(s) after re-harvest", file=sys.stderr)
+        if args.strict and residual:
+            _print_errors(report)
+            return 1
 
     _print_errors(report)
     return 1 if report["errors"] else 0

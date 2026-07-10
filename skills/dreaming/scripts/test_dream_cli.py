@@ -580,6 +580,79 @@ class TestAdoptPatternTask(unittest.TestCase):
             self.assertIn("[dry-run] would surface 1, skip 0, errors 0", stderr.getvalue())
 
 
+class TestAdoptMergeArchiveAndVerify(unittest.TestCase):
+    """Regression: --archive-file must reach the live merge Archiver; --verify re-harvests."""
+
+    def _merge_decisions(self):
+        return {
+            "task": "merge",
+            "scope": {"palace": "/palace", "wing": "wing", "room": "room"},
+            "params": {"tau": 0.9},
+            "items": [{
+                "kind": "merge",
+                "members": [
+                    {"id": "drawer-1", "member_ids": ["chunk-1"], "wing": "wing", "room": "room", "text": "old A"},
+                    {"id": "drawer-2", "member_ids": ["chunk-2"], "wing": "wing", "room": "room", "text": "old B"},
+                ],
+                "supersedes": ["chunk-1", "chunk-2"],
+                "decision": {"action": "merge", "text": "merged fact"},
+            }],
+        }
+
+    def test_live_merge_passes_archive_file_to_archiver(self):
+        report = {"merged": 1, "skipped": 0, "deleted": ["chunk-1", "chunk-2"], "errors": []}
+        with _test_tmpdir() as td:
+            decisions_path = os.path.join(td, "decisions.json")
+            with open(decisions_path, "w", encoding="utf-8") as fh:
+                json.dump(self._merge_decisions(), fh)
+            archive_path = os.path.join(td, "custom-archive.jsonl")
+            with mock.patch.object(dream_adopt.dream_palace, "bind_palace", return_value="/bound"), \
+                 mock.patch.object(dream_adopt.dream_palace, "MempalaceWriter", return_value=mock.MagicMock()), \
+                 mock.patch.object(dream_adopt.dream_palace, "Archiver") as archiver_cls, \
+                 mock.patch.object(dream_adopt, "_preflight_merge_decisions", side_effect=lambda p, d: (d, [])), \
+                 mock.patch.object(dream_adopt, "apply_merge_decisions", return_value=report), \
+                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                rc = dream_adopt.main([
+                    "--palace", "/palace", "--decisions", decisions_path,
+                    "--archive-file", archive_path,
+                ])
+            self.assertEqual(rc, 0)
+            _, kwargs = archiver_cls.call_args
+            self.assertEqual(kwargs.get("archive_path"), archive_path)
+
+    def test_verify_reharvests_merge_and_reports_residual(self):
+        report = {"merged": 1, "skipped": 0, "deleted": ["chunk-1", "chunk-2"], "errors": []}
+
+        def fake_harvest(argv):
+            out = argv[argv.index("--out") + 1]
+            with open(out, "w", encoding="utf-8") as fh:
+                json.dump({"task": "merge", "items": []}, fh)
+            return 0
+
+        with _test_tmpdir() as td:
+            decisions_path = os.path.join(td, "decisions.json")
+            with open(decisions_path, "w", encoding="utf-8") as fh:
+                json.dump(self._merge_decisions(), fh)
+            stderr = io.StringIO()
+            with mock.patch.object(dream_adopt.dream_palace, "bind_palace", return_value=td), \
+                 mock.patch.object(dream_adopt.dream_palace, "MempalaceWriter", return_value=mock.MagicMock()), \
+                 mock.patch.object(dream_adopt.dream_palace, "Archiver", return_value=mock.MagicMock()), \
+                 mock.patch.object(dream_adopt, "_preflight_merge_decisions", side_effect=lambda p, d: (d, [])), \
+                 mock.patch.object(dream_adopt, "apply_merge_decisions", return_value=report), \
+                 mock.patch.object(dream_adopt.dream_harvest, "main", side_effect=fake_harvest) as harvest_main, \
+                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr):
+                rc = dream_adopt.main([
+                    "--palace", td, "--decisions", decisions_path, "--verify",
+                ])
+            self.assertEqual(rc, 0)
+            self.assertIn("verify: 0 residual", stderr.getvalue())
+            # re-harvest reconstructed the merge scope from the worklist
+            called_argv = harvest_main.call_args[0][0]
+            self.assertIn("--task", called_argv)
+            self.assertIn("merge", called_argv)
+            self.assertIn("--wing", called_argv)
+
+
 class TestAdoptMergeTask(unittest.TestCase):
     def test_dry_run_merge_archives_without_real_writes_or_deletes(self):
         worklist = {

@@ -16,6 +16,32 @@ mechanics live in Python scripts; storage stays in mempalace.
 > Current-task salience contaminates consolidation. Dispatch it as a subagent or
 > run it off-hours.
 
+## Execution model — keep it unattended
+
+A dream is meant to run **unattended**: the only judgement calls are *semantic*
+(synthesise a merge, keep/invalidate a fact, surface/skip a pattern,
+prune/keep). The mechanical phases (harvest, adopt, verify) must **not** turn
+into a stream of per-phase approval prompts.
+
+- **Dispatch the dream as a background subagent** (`task` tool). The subagent
+  runs the scripts in its own context and reports back — you are not asked to
+  approve each script invocation. Running the pipeline inline in an interactive
+  session instead will prompt once per command; that is the wrong way to run it.
+- **Collapse the mechanics to ~2 calls**, cognition in between:
+  1. **Harvest everything once** with the read-only survey, dumping worklists:
+     `dream_survey.py --palace <p> --worklists-dir <dir>` (all tasks × wings in
+     one process — see "Fast reconnaissance" below).
+  2. **Adjudicate** the dumped worklists in-context; write `decisions.json`.
+  3. **Adopt + verify in one call**: `dream_adopt.py --palace <p> --decisions
+     <d> --verify` (optionally `--archive-file <f>`). `--verify` re-harvests the
+     same scope after adopting and prints the residual count, so you do not run a
+     separate verify command. Use `--dry-run` only when a human wants to preview
+     before an *attended* run.
+
+Reserve human interaction for genuine semantic sign-off (e.g. approving a
+destructive merge/prune), never for "may I run this script".
+
+
 ## Architecture (three layers)
 
 ```
@@ -56,10 +82,12 @@ Artifacts go in the session workspace — never commit them.
 | 1 | Harvest | script | merge: `dream_harvest.py --palace <p> --wing <w> --tau 0.9 --out worklist.json`; contradiction: `dream_harvest.py --palace <p> --task contradiction --out worklist.json`; pattern: `dream_harvest.py --palace <p> --task pattern --wing <w> --rooms diary --min-support 3 --out worklist.json`; rule induction: `dream_harvest.py --palace <p> --task induce-rules --min-support 2 --ontology-out <p>/ontology.json`; prune: `dream_harvest.py --palace <p> --task prune --wing <w> --room <r> --v-min 0.35 --age-floor-days 30 --out worklist.json` (READ-ONLY except ontology candidate writes for `induce-rules`) |
 | 2 | Adjudicate | **you** | fill each `worklist.json` item's `decision`; save as `decisions.json` |
 | 3 | Review | human/auto | diff proposed merge text vs the originals; approve a subset |
-| 4 | Adopt | script | `dream_adopt.py --palace <p> --decisions decisions.json` (merge: add merged/delete originals; contradiction: soft-invalidate stale KG facts; pattern: add surfaced lessons only; prune: archive to JSONL then delete) |
-| 5 | Verify | script | re-run the same harvest; expect resolved merge clusters or functional contradictions to disappear. For pattern and prune, treat this as a maintenance loop. Non-empty ⇒ didn't converge or was intentionally skipped |
+| 4 | Adopt | script | `dream_adopt.py --palace <p> --decisions decisions.json [--verify]` (merge: add merged/delete originals; contradiction: soft-invalidate stale KG facts; pattern: add surfaced lessons only; prune: archive to JSONL then delete) |
+| 5 | Verify | script | pass `--verify` to Phase 4 to re-harvest the same scope in the *same* call and print the residual count (no separate command). Expect resolved merge clusters or functional contradictions to disappear. For pattern and prune, treat this as a maintenance loop. Non-empty ⇒ didn't converge or was intentionally skipped |
 
-Always `dream_adopt.py --dry-run` first to preview the exact writes.
+For an *attended* run, `dream_adopt.py --dry-run` first previews the exact
+writes. For an *unattended* dream (the default), skip the separate dry-run and
+adopt with `--verify` in one call — the adjudication already is the decision.
 
 For a mempalace tool install, prefer the interpreter that owns the package:
 
@@ -67,20 +95,19 @@ For a mempalace tool install, prefer the interpreter that owns the package:
 MPY=$(head -1 "$(command -v mempalace)" | sed 's/^#!//')
 "$MPY" dream_harvest.py --palace <palace> --task pattern --wing <wing> \
   --rooms diary --min-support 3 --out worklist.json
-"$MPY" dream_adopt.py --palace <palace> --decisions decisions.json --dry-run
-"$MPY" dream_adopt.py --palace <palace> --decisions decisions.json
+"$MPY" dream_adopt.py --palace <palace> --decisions decisions.json --verify
 ```
 
-Prune uses the same interpreter and an explicit archive file:
+Prune and merge both archive superseded/deleted records to an append-only JSONL
+before the sanctioned delete; `--archive-file` sets the path for either (default
+`<palace>/dream-archive.jsonl`):
 
 ```bash
 MPY=$(head -1 "$(command -v mempalace)" | sed 's/^#!//')
 "$MPY" dream_harvest.py --palace <palace> --task prune --wing <wing> \
   --room <room> --v-min 0.35 --age-floor-days 30 --out worklist.json
 "$MPY" dream_adopt.py --palace <palace> --decisions decisions.json \
-  --archive-file archive.jsonl --dry-run
-"$MPY" dream_adopt.py --palace <palace> --decisions decisions.json \
-  --archive-file archive.jsonl
+  --archive-file archive.jsonl --verify
 ```
 
 ## Phase 2 — how you adjudicate (the cognitive step)
