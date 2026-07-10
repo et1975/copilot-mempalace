@@ -9,6 +9,7 @@ an ``adjudicate`` phase to produce ``decisions.json`` for ``dream_adopt.py``.
 Usage:
     python3 dream_harvest.py --palace ~/.mempalace/palace --wing myproj \\
         --tau 0.9 --out worklist.json
+    python3 dream_harvest.py --wing myproj --tau 0.9 --out worklist.json
 """
 from __future__ import annotations
 
@@ -47,6 +48,18 @@ def _content_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def _default_palace() -> str | None:
+    config_path = os.environ.get("MEMPALACE_CONFIG") or os.path.expanduser("~/.mempalace/config.json")
+    if not os.path.exists(config_path):
+        return None
+    try:
+        with open(config_path, encoding="utf-8") as fh:
+            palace_path = json.load(fh).get("palace_path")
+    except (OSError, json.JSONDecodeError):
+        return None
+    return os.path.expanduser(palace_path) if palace_path else None
+
+
 def _is_surfaced_lesson(entry: dict) -> bool:
     metadata = entry.get("metadata") or {}
     return metadata.get("kind") == "lesson" or _LESSON_TRAILER_RE.search(entry.get("text", "")) is not None
@@ -74,7 +87,7 @@ def _degree_for(drawer: dict, degrees: dict[str, int]) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--palace", required=True, help="Path to the mempalace palace directory")
+    ap.add_argument("--palace", help="Path to the mempalace palace directory (default: mempalace config)")
     ap.add_argument("--task", choices=[
         "merge", "contradiction", "pattern", "prune", "derive", "suggest-rules", "induce-rules"
     ], default="merge",
@@ -110,7 +123,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--out", default="worklist.json", help="Output worklist path (default worklist.json)")
     args = ap.parse_args(argv)
 
-    path = dream_palace.bind_palace(args.palace)
+    effective_palace = args.palace or _default_palace()
+    if effective_palace is None:
+        config_path = os.environ.get("MEMPALACE_CONFIG") or "~/.mempalace/config.json"
+        print(f"error: no --palace given and {config_path} has no palace_path", file=sys.stderr)
+        return 2
+
+    path = dream_palace.bind_palace(effective_palace)
     if args.task == "contradiction":
         triples = dream_palace.load_active_triples(path)
         worklist = build_contradiction_worklist(

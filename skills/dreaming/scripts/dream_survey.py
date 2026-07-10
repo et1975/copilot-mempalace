@@ -12,6 +12,7 @@ temporary ontology and reported, never to the live ``<palace>/ontology.json``.
 Usage::
 
     MPY=$(head -1 "$(command -v mempalace)" | sed 's/^#!//')
+    "$MPY" dream_survey.py
     "$MPY" dream_survey.py --palace ~/.mempalace/palace
     "$MPY" dream_survey.py --palace <p> --tasks merge,prune --wings avs,icm_automation
     "$MPY" dream_survey.py --palace <p> --format json --out survey.json \
@@ -32,6 +33,18 @@ import dream_palace
 DEFAULT_TASKS = ["contradiction", "induce-rules", "pattern", "merge", "prune"]
 PALACE_WIDE = {"contradiction", "induce-rules"}
 WING_SCOPED = {"merge", "pattern", "prune"}
+
+
+def _default_palace() -> str | None:
+    config_path = os.environ.get("MEMPALACE_CONFIG") or os.path.expanduser("~/.mempalace/config.json")
+    if not os.path.exists(config_path):
+        return None
+    try:
+        with open(config_path, encoding="utf-8") as fh:
+            palace_path = json.load(fh).get("palace_path")
+    except (OSError, json.JSONDecodeError):
+        return None
+    return os.path.expanduser(palace_path) if palace_path else None
 
 
 # --------------------------------------------------------------------------
@@ -262,7 +275,7 @@ def _dump(directory: str, name: str, obj) -> None:
 def main(argv: list | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--palace", required=True, help="Path to the mempalace palace directory")
+    ap.add_argument("--palace", help="Path to the mempalace palace directory (default: mempalace config)")
     ap.add_argument("--tasks", default=",".join(DEFAULT_TASKS),
                     help=f"Comma-separated tasks (default: {','.join(DEFAULT_TASKS)})")
     ap.add_argument("--wings", default=None,
@@ -282,9 +295,14 @@ def main(argv: list | None = None) -> int:
 
     tasks = [t.strip() for t in args.tasks.split(",") if t.strip()]
     wings = [w.strip() for w in args.wings.split(",") if w.strip()] if args.wings else None
+    effective_palace = args.palace or _default_palace()
+    if effective_palace is None:
+        config_path = os.environ.get("MEMPALACE_CONFIG") or "~/.mempalace/config.json"
+        print(f"error: no --palace given and {config_path} has no palace_path", file=sys.stderr)
+        return 2
 
     report = survey(
-        args.palace, wings=wings, tasks=tasks, tau=args.tau,
+        effective_palace, wings=wings, tasks=tasks, tau=args.tau,
         min_support=args.min_support, v_min=args.v_min,
         age_floor_days=args.age_floor_days, n=args.examples,
         worklists_dir=args.worklists_dir,

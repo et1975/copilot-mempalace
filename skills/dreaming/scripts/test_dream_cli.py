@@ -654,6 +654,46 @@ class TestAdoptMergeArchiveAndVerify(unittest.TestCase):
 
 
 class TestAdoptMergeTask(unittest.TestCase):
+    def test_adopt_uses_mempalace_config_when_palace_is_omitted(self):
+        with _test_tmpdir() as td:
+            configured_palace = os.path.join(td, "configured-palace")
+            config_path = os.path.join(td, "config.json")
+            _dump_json(config_path, {"palace_path": configured_palace})
+            decisions_path = os.path.join(td, "decisions.json")
+            _dump_json(decisions_path, {"task": "merge", "items": []})
+
+            with mock.patch.dict(os.environ, {"MEMPALACE_CONFIG": config_path}), \
+                 mock.patch.object(dream_adopt.dream_palace, "bind_palace", return_value=td) as bind_palace, \
+                 contextlib.redirect_stdout(io.StringIO()), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                rc = dream_adopt.main(["--decisions", decisions_path, "--dry-run"])
+
+            self.assertEqual(rc, 0)
+            bind_palace.assert_called_once_with(configured_palace)
+
+    def test_default_palace_helper_reads_mempalace_config(self):
+        with _test_tmpdir() as td:
+            configured_palace = os.path.join(td, "configured-palace")
+            config_path = os.path.join(td, "config.json")
+            _dump_json(config_path, {"palace_path": configured_palace})
+
+            with mock.patch.dict(os.environ, {"MEMPALACE_CONFIG": config_path}):
+                self.assertEqual(dream_adopt._default_palace_from_config(), configured_palace)
+
+    def test_adopt_without_palace_or_config_returns_clear_error(self):
+        with _test_tmpdir() as td:
+            decisions_path = os.path.join(td, "decisions.json")
+            _dump_json(decisions_path, {"task": "merge", "items": []})
+            stderr = io.StringIO()
+
+            with mock.patch.dict(os.environ, {"MEMPALACE_CONFIG": os.path.join(td, "missing.json")}), \
+                 contextlib.redirect_stderr(stderr):
+                rc = dream_adopt.main(["--decisions", decisions_path])
+
+        self.assertEqual(rc, 2)
+        self.assertIn("--palace omitted", stderr.getvalue())
+        self.assertIn("palace_path", stderr.getvalue())
+
     def test_dry_run_merge_archives_without_real_writes_or_deletes(self):
         worklist = {
             "task": "merge",
@@ -909,6 +949,90 @@ class TestAdoptPruneTask(unittest.TestCase):
             self.assertEqual(rc, 1)
             self.assertEqual(stdout.getvalue(), "")
             self.assertIn("protected", stderr.getvalue())
+
+
+class TestAdoptDeriveTask(unittest.TestCase):
+    def _derive_item(self):
+        return {
+            "kind": "derive",
+            "candidate_id": "cand-1",
+            "conclusion": {
+                "subject_id": "A",
+                "predicate": "depends_on_closure",
+                "object_id": "C",
+            },
+            "rule": {"id": "transitive:depends_on"},
+            "proof": {"premise_ids": ["t1", "t2"], "premise_drawer_ids": ["d1"]},
+            "evidence": {"confidence": 1.0, "valid_from": "2026-01-01"},
+            "ontology_version": "onto:test",
+        }
+
+    def _apply_resolved(self, worklist):
+        decisions = dream_adopt._resolve_derive_decisions(worklist)
+        return dream_adopt.apply_derive_decisions(decisions, dream_adopt._DryRunKgWriter())[0]
+
+    def test_nested_derive_decision_materializes(self):
+        item = self._derive_item()
+        item["decision"] = {"action": "materialize", "reason": "approved"}
+        report = self._apply_resolved({"task": "contemplate", "items": [item]})
+
+        self.assertEqual(report["materialized"], 1)
+        self.assertEqual(report["skipped"], 0)
+        self.assertEqual(report["errors"], [])
+
+    def test_top_level_derive_action_still_materializes(self):
+        item = self._derive_item()
+        item["action"] = "materialize"
+        report = self._apply_resolved({"task": "contemplate", "items": [item]})
+
+        self.assertEqual(report["materialized"], 1)
+        self.assertEqual(report["errors"], [])
+
+    def test_derive_item_without_decision_or_action_is_noop(self):
+        report = self._apply_resolved({"task": "contemplate", "items": [self._derive_item()]})
+
+        self.assertEqual(report["materialized"], 0)
+        self.assertEqual(report["skipped"], 0)
+        self.assertEqual(report["ignored"], 0)
+        self.assertEqual(report["errors"], [])
+
+    def test_live_derive_adopt_prints_final_summary_line_to_stderr(self):
+        report = {
+            "materialized": 1,
+            "skipped": 0,
+            "ignored": 0,
+            "rejected_rules": [],
+            "materialized_facts": [],
+            "errors": [],
+        }
+        with _test_tmpdir() as td:
+            decisions_path = os.path.join(td, "decisions.json")
+            _dump_json(
+                decisions_path,
+                {"task": "contemplate", "ontology_version": "onto:test", "items": [self._derive_item()]},
+            )
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            writer = mock.MagicMock()
+
+            with mock.patch.object(dream_adopt.dream_palace, "bind_palace", return_value=td), \
+                 mock.patch.object(dream_adopt.dream_palace, "KgDeriveWriter", return_value=writer), \
+                 mock.patch.object(dream_adopt, "apply_derive_decisions", return_value=(report, [])), \
+                 mock.patch.object(dream_adopt.dream_palace, "append_skip_markers"), \
+                 contextlib.redirect_stdout(stdout), \
+                 contextlib.redirect_stderr(stderr):
+                rc = dream_adopt.main([
+                    "--task", "derive",
+                    "--palace", "/palace",
+                    "--decisions", decisions_path,
+                ])
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(stdout.getvalue()), report)
+        self.assertEqual(
+            stderr.getvalue().splitlines()[-1],
+            "adopt: task=derive materialized=1 skipped=0 errors=0",
+        )
 
 
 @unittest.skipUnless(_HAS_MEMPALACE, "requires mempalace interpreter")

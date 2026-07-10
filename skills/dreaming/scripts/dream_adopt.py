@@ -16,6 +16,7 @@ first member's wing/room and the item's ``supersedes`` list.
 Usage:
     python3 dream_adopt.py --palace ~/.mempalace/palace --decisions decisions.json
     python3 dream_adopt.py --palace ~/.mempalace/palace --decisions decisions.json --dry-run
+    python3 dream_adopt.py --decisions decisions.json  # palace_path from config
 """
 from __future__ import annotations
 
@@ -193,8 +194,15 @@ def _resolve_prune_decisions(worklist: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _resolve_derive_decisions(worklist: dict[str, Any]) -> list[dict[str, Any]]:
-    """Items already carry action + conclusion/rule/proof/evidence/ontology_version from harvest."""
-    return [dict(item) for item in worklist.get("items", []) if item.get("action")]
+    """Extract derive decisions while preserving harvested proof/conclusion fields."""
+    resolved = []
+    for item in worklist.get("items", []):
+        decision = item.get("decision")
+        if isinstance(decision, dict) and decision.get("action"):
+            resolved.append({**item, **decision})
+        elif item.get("action"):
+            resolved.append(dict(item))
+    return resolved
 
 
 def _task_from_worklist(worklist: dict[str, Any]) -> str:
@@ -214,6 +222,19 @@ def _task_from_worklist(worklist: dict[str, Any]) -> str:
     if task == "contemplate":
         return "derive"
     return task or "merge"
+
+
+def _default_palace_from_config() -> str | None:
+    config_path = os.environ.get("MEMPALACE_CONFIG") or os.path.expanduser("~/.mempalace/config.json")
+    try:
+        with open(os.path.expanduser(config_path), encoding="utf-8") as fh:
+            config = json.load(fh)
+    except (OSError, json.JSONDecodeError, TypeError):
+        return None
+    palace_path = config.get("palace_path") if isinstance(config, dict) else None
+    if not isinstance(palace_path, str) or not palace_path.strip():
+        return None
+    return os.path.expanduser(palace_path)
 
 
 class _DryRunWriter:
@@ -439,7 +460,7 @@ def _verify_reharvest(task: str, worklist: dict[str, Any], path: str) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--palace", required=True, help="Path to the mempalace palace directory")
+    ap.add_argument("--palace", default=None, help="Path to the mempalace palace directory")
     ap.add_argument("--decisions", required=True, help="Path to the adjudicated decisions.json")
     ap.add_argument("--task", default=None,
                     choices=["merge", "contradiction", "pattern", "prune", "derive"],
@@ -462,6 +483,15 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--strict", action="store_true",
                     help="With --verify, return exit code 1 if any residual candidates remain")
     args = ap.parse_args(argv)
+
+    args.palace = args.palace or _default_palace_from_config()
+    if not args.palace:
+        print(
+            "error: --palace omitted and no readable palace_path found in "
+            "MEMPALACE_CONFIG or ~/.mempalace/config.json",
+            file=sys.stderr,
+        )
+        return 2
 
     path = dream_palace.bind_palace(args.palace)
     if args.archive_file is None:
@@ -617,6 +647,11 @@ def main(argv: list[str] | None = None) -> int:
         dream_palace.append_skip_markers(skips_path, skip_markers)
         print(json.dumps(report, indent=2))
         _print_errors(report)
+        print(
+            f"adopt: task=derive materialized={report['materialized']} "
+            f"skipped={report['skipped']} errors={len(report['errors'])}",
+            file=sys.stderr,
+        )
         if args.verify:
             rules = dream_palace.load_ontology_config(args.rules or os.path.join(path, "ontology.json"))
             triples = dream_palace.load_active_triples_with_ids(path)

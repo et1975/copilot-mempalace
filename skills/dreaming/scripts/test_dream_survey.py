@@ -1,4 +1,8 @@
+import json
+import os
+import tempfile
 import unittest
+from unittest import mock
 
 import dream_survey as ds
 
@@ -158,6 +162,26 @@ class TestBuildReport(unittest.TestCase):
         self.assertIn("prune", text)
         # totals surfaced in the human summary
         self.assertRegex(text, r"prune[^\n]*5")
+
+
+class TestDefaultPalace(unittest.TestCase):
+    def test_default_palace_reads_mempalace_config_env(self):
+        with tempfile.TemporaryDirectory(dir=os.path.dirname(__file__)) as td:
+            config_path = os.path.join(td, "config.json")
+            with open(config_path, "w", encoding="utf-8") as fh:
+                json.dump({"palace_path": "~/palace-from-config"}, fh)
+
+            with mock.patch.dict(os.environ, {"MEMPALACE_CONFIG": config_path}):
+                self.assertEqual(ds._default_palace(), os.path.expanduser("~/palace-from-config"))
+
+    def test_default_palace_returns_none_without_palace_path(self):
+        with tempfile.TemporaryDirectory(dir=os.path.dirname(__file__)) as td:
+            config_path = os.path.join(td, "config.json")
+            with open(config_path, "w", encoding="utf-8") as fh:
+                json.dump({"collection_name": "mempalace_drawers"}, fh)
+
+            with mock.patch.dict(os.environ, {"MEMPALACE_CONFIG": config_path}):
+                self.assertIsNone(ds._default_palace())
 
 
 if __name__ == "__main__":

@@ -146,6 +146,18 @@ Additional worklist `kind`s should keep the same harvest/adjudicate/adopt shape.
 
 ## Artifacts (session workspace — never commit)
 
+Phase-2 adjudication should use the human-readable renderer instead of opening
+large raw JSON:
+
+```bash
+"$MPY" dream_show.py --worklist <worklist.json>
+"$MPY" dream_show.py --worklist <worklist.json> --task derive --full
+```
+
+The renderer prints one compact block/line per candidate and avoids the 20KB file
+view limit. Use it for merge, contradiction, pattern, prune, and derive worklists
+before filling `item["decision"]`.
+
 ### `worklist.json` (harvest → agent)
 
 ```jsonc
@@ -256,6 +268,51 @@ Prune worklist:
 }
 ```
 
+Derive / contemplate worklist:
+
+```jsonc
+{
+  "version": 1,
+  "task": "contemplate",
+  "scope": {"palace": "<path>"},
+  "params": {"max_depth": 3, "max_iterations": 10, "max_candidates": 500},
+  "ontology_version": "onto:<hash>",
+  "rules": ["<ontology rules...>"],
+  "instructions": "<optional steering|null>",
+  "items": [
+    {
+      "kind": "derive",
+      "candidate_id": "derive:<stable hash>",
+      "conclusion": {
+        "subject_id": "<entity id>",
+        "subject": "<display name|null>",
+        "predicate": "<derived predicate>",
+        "object_id": "<entity id>",
+        "object": "<display name|null>"
+      },
+      "rule": {"id": "<rule id>", "family": "transitive", "predicate": "<base predicate>"},
+      "proof": {
+        "depth": 2,
+        "premise_ids": ["<kg triple id>", "..."],
+        "premise_drawer_ids": ["<source drawer id|null>", "..."]
+      },
+      "evidence": {
+        "already_active": false,
+        "confidence": 1.0,
+        "valid_from": "<premise interval start|null>",
+        "valid_to": "<premise interval end|null>"
+      },
+      "decision": null,
+      "ontology_version": "onto:<hash>"
+    }
+  ]
+}
+```
+
+The derive conclusion is nested at `item["conclusion"]`; there are no top-level
+`subject`, `predicate`, or `object` fields on derive items. See
+[`derive.md`](derive.md) for the full derive schema and decision contract.
+
 ### `decisions.json` (agent → adopt)
 
 Same document with each `item.decision` set to one of:
@@ -313,6 +370,24 @@ For pattern items, `skip` means the rule is unsupported, not generalizable, or
 already covered by an existing filed lesson.
 For prune items, use `keep` rather than `skip`; missing or non-`prune` decisions
 are treated as keep.
+
+Derive:
+
+```jsonc
+{"action": "materialize"}
+```
+
+```jsonc
+{"action": "skip", "reason": "<why this candidate should not materialize>"}
+```
+
+```jsonc
+{"action": "reject_rule", "reason": "<why this ontology rule is unsound>"}
+```
+
+For derive items, write the decision into `item["decision"]`. The subject,
+predicate, and object remain nested under `item["conclusion"]`; adoption relies
+on that shape when materializing approved facts.
 
 ## Verified mempalace API facts (mempalace 3.5.0)
 
