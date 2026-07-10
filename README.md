@@ -49,6 +49,17 @@ audit hook that nags when an external tool is about to run without a prior `memp
   `agentName == "Explore"`, second-or-later `grep_search`/`file_search` in the same window, and
   `run_in_terminal` commands matching broad-probe patterns (`find ./…`, `grep -r/-R`, `ls -*R`, `locate`,
   `(apt-cache|brew|npm|pip|cargo|gem) search`).
+- **[hooks/mempalace-save.json](hooks/mempalace-save.json) + [hooks/copilot_transcript.py](hooks/copilot_transcript.py)** —
+  `Stop` + `PreCompact` **save** hook (the automated counterpart to the read-first nudge). MemPalace's built-in
+  `mempalace hook run --harness claude-code` writes a diary entry via silent-save, but its transcript parsers only
+  understand Claude Code and Codex schemas — Copilot CLI writes `events.jsonl` in a third schema
+  (`{"type":"user.message","data":{"content":…}}`, `cwd` nested under `session.start`), so wiring the CLI hook
+  directly is a **silent no-op**: 0 messages counted, no wing derived, nothing saved. `copilot_transcript.py`
+  bridges that: it translates `events.jsonl` into a temporary Claude-format JSONL (top-level `cwd` on every line so
+  wing derivation works), then invokes `mempalace hook run`, reusing all of mempalace's count/theme/save/ingest
+  logic. Any error → `{}` exit 0; a save helper, never a gate. Posix-only (`python3` `command`), matching
+  the `palace-reflex` hook; Windows is untested. Fires the actual save every `SAVE_INTERVAL` (15) human messages;
+  `PreCompact` is the emergency save before context loss.
 - **[memories/mempalace-first.md](memories/mempalace-first.md)** — terse auto-loaded reflex stub designed for
   Copilot's user memory (`/memories/`). First 200 lines of user memory are auto-loaded into every conversation,
   so the rule is in context even when the full instructions get pushed out.
@@ -119,6 +130,11 @@ ln -s "$(pwd)/skills/mempalace" ~/.copilot/skills/mempalace
 mkdir -p ~/.copilot/hooks
 ln -s "$(pwd)/hooks/palace-reflex.json" ~/.copilot/hooks/palace-reflex.json
 ln -s "$(pwd)/hooks/palace-reflex.py"   ~/.copilot/hooks/palace-reflex.py
+
+# 1.4 Save hook (Stop + PreCompact → automated diary save). Requires the
+#     mempalace binary on PATH (or set MEMPALACE_BIN). Both files together.
+ln -s "$(pwd)/hooks/mempalace-save.json"   ~/.copilot/hooks/mempalace-save.json
+ln -s "$(pwd)/hooks/copilot_transcript.py" ~/.copilot/hooks/copilot_transcript.py
 ```
 
 The hook JSON references `python3 ~/.copilot/hooks/palace-reflex.py`. If you'd rather keep the script outside
@@ -150,11 +166,36 @@ echo '{"session_id":"probe","tool_name":"run_in_terminal","tool_input":{"command
 
 The first call prints the reminder; the second pair is silent; the broad-probe call prints the reminder.
 
+## Verifying the save hook
+
+```bash
+# Unit + integration tests (integration needs the mempalace interpreter):
+cd hooks
+MPY=$(head -1 "$(command -v mempalace)" | sed 's/^#!//')
+"$MPY" -m unittest test_copilot_transcript -v   # 13 tests, all pass
+
+# Smoke test the adapter with a Copilot Stop payload. A short transcript is below
+# Smoke test the adapter with a Copilot Stop payload + a tiny events.jsonl. A short
+# transcript is below the 15-message save threshold, so it prints {} (nothing saved yet):
+printf '%s\n' '{"type":"user.message","data":{"content":"hello palace"}}' > /tmp/ev.jsonl
+echo '{"hook_event_name":"Stop","session_id":"t","transcript_path":"/tmp/ev.jsonl","cwd":"/tmp"}' \
+  | python3 copilot_transcript.py   # -> {}
+```
+
+Once installed, a real session that crosses 15 human messages prints
+`✦ N memories woven into the palace — …` at a turn end (the `Stop` hook), and `PreCompact` forces a save
+before compaction. The save is silent (writes a diary entry directly); it never blocks the agent.
+
 ## Harness compatibility
 
 The hook protocol matches Claude Code's: stdin JSON with `tool_name` / `tool_input` / `session_id`, stdout
 JSON with `hookSpecificOutput.additionalContext` to inject context. Verified with VS Code Copilot Chat and
 Copilot CLI. Should work in any harness that consumes the same shape (Claude Code, Cursor).
+
+The **save** hook is Copilot-CLI-specific: it bridges Copilot's `events.jsonl` transcript schema to the
+`claude-code` transcript schema mempalace expects (see the `hooks/copilot_transcript.py` bullet above). VS Code
+Copilot writes a Claude-compatible transcript, so there the upstream `mempalace hook run --harness claude-code`
+config from [discussion #1419](https://github.com/MemPalace/mempalace/discussions/1419) works without the adapter.
 
 ## License
 

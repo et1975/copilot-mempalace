@@ -1,0 +1,20 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "type": "command",
+        "command": "python3 ~/.copilot/hooks/copilot_transcript.py",
+        "cwd": ".",
+        "timeout": 30
+      }
+    ],
+    "PreCompact": [
+      {
+        "type": "command",
+        "command": "python3 ~/.copilot/hooks/copilot_transcript.py",
+        "cwd": ".",
+        "timeout": 30
+      }
+    ]
+  }
+}
