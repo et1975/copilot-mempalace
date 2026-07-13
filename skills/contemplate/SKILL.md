@@ -27,6 +27,22 @@ Substrate  = mempalace             → active KG triples + derived lineage table
 `skills/dreaming/scripts/` and runs the `derive` task through the same
 `dream_harvest.py` / `dream_adopt.py` rails.
 
+## One-shot driver (fewer prompts)
+
+Prefer the one-shot driver for inline reconnaissance:
+
+```bash
+MPY=$(head -1 "$(command -v mempalace)" | sed 's/^#!//')
+"$MPY" skills/dreaming/scripts/dream_contemplate.py --palace <p>
+"$MPY" skills/dreaming/scripts/dream_contemplate.py --palace <p> --bootstrap
+```
+
+`dream_contemplate.py` runs the read-only derive scan in one in-process call
+instead of the multi-command harvest flow, minimizing per-command approval
+prompts. `--bootstrap` only writes disabled ontology rule candidates for review;
+it never enables rules and never adopts derived KG facts. For a fully
+unattended/zero-prompt run, dispatch the driver as a background subagent.
+
 ## The 5-phase pipeline
 
 Artifacts go in the session workspace — never commit them. Use the interpreter
