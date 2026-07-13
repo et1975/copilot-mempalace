@@ -43,6 +43,46 @@ prompts. `--bootstrap` only writes disabled ontology rule candidates for review;
 it never enables rules and never adopts derived KG facts. For a fully
 unattended/zero-prompt run, dispatch the driver as a background subagent.
 
+## Relevance recall driver (session reconnaissance)
+
+Use `--recall` when the current reasoning task needs grounding from past Copilot
+host sessions:
+
+```bash
+MPY=$(head -1 "$(command -v mempalace)" | sed 's/^#!//')
+"$MPY" skills/dreaming/scripts/dream_contemplate.py --palace <p> \
+  --recall "<reasoning query>" [--k 5] [--repository <substr>] \
+  [--since <iso>] [--limit-sessions N] [--min-similarity 0.0] \
+  [--format summary|json]
+```
+
+Given a reasoning query, `--recall` retrieves the top-`k` most relevant past
+Copilot host sessions from the session store, relevance-ranked by embedding
+cosine similarity in the palace's own embedding space. It is read-only
+reconnaissance: it surfaces session context for the agent to use as
+grounding/premises while reasoning inline. It does **not** materialize anything
+and does **not** run the deductive derive scan; the no-`--recall` driver remains
+the read-only derive path.
+
+Summary output is intentionally skim-friendly, for example:
+
+```text
+1. score=0.84 session=01J... repo=copilot-mempalace updated=2026-07-12 — discussed Track B gap selection and acquire-loop boundaries
+```
+
+### Same session substrate, opposite access pattern
+
+- **Dreaming = mine for recurrence** — offline/aggregate, cluster-all, with a
+  `min_support` gate over distinct sessions before promoting durable lessons.
+- **Contemplation = query for relevance** — inline/on-demand, query-conditioned
+  k-NN, with no support gate; a single relevant session (`n=1`) is a valid
+  result for grounding the current question.
+
+This is the key contrast with the `dreaming` skill's `pattern --source sessions`
+task: pattern mining looks for themes that recur across `>= min_support`
+distinct sessions, while `--recall` asks which sessions are most relevant to
+this specific reasoning query.
+
 ## The 5-phase pipeline
 
 Artifacts go in the session workspace — never commit them. Use the interpreter
@@ -164,10 +204,17 @@ human review.
 
 ## Deferred (Track B)
 
-v1 ships Track A only: bounded deductive closure over active KG facts. The
-ACQUIRE loop, gap/question worklists, external research, clarification queues,
-and abduction/best-explanation reasoning are deferred future work. Do not claim
-that `contemplate` v1 asks questions, researches gaps, or performs abduction.
+v1 ships Track A only for derivation: bounded deductive closure over active KG
+facts. `--recall` adds the relevance-retrieval building block for on-demand
+session reconnaissance, but it does not close Track B.
+
+The full ACQUIRE loop remains deferred future work: deduce → find the
+highest-value gap → acquire/read a session or source to fill it → re-derive.
+`--recall` does not choose what to seek by abduction, does not auto-inject
+retrieved facts as premises into the derive closure, and does not run an
+iterative acquire loop. External research, clarification queues, and
+abduction/best-explanation reasoning are still out of scope. Do not claim that
+`contemplate` v1 asks questions, researches gaps, or performs abduction.
 
 See [`references/derive.md`](references/derive.md) for the contract, schemas,
 and guardrails.

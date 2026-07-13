@@ -145,6 +145,54 @@ def summarize_report(report: dict) -> str:
     return "\n".join(lines)
 
 
+def _recall_snippet(text: str, limit: int = 100) -> str:
+    normalized = " ".join(str(text or "").split())
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: limit - 3].rstrip() + "..."
+
+
+def build_recall_report(query: str, k: int, palace: str, hits: list[dict]) -> dict:
+    sanitized_hits = []
+    for hit in hits or []:
+        sanitized_hits.append({
+            "session_id": hit.get("session_id"),
+            "similarity": hit.get("similarity"),
+            "topic": hit.get("topic"),
+            "date": hit.get("date"),
+            "text": hit.get("text"),
+        })
+    return {
+        "query": query,
+        "k": k,
+        "palace": palace,
+        "count": len(sanitized_hits),
+        "hits": sanitized_hits,
+    }
+
+
+def summarize_recall_report(report: dict) -> str:
+    lines = [
+        f"recall query: {report.get('query')}",
+        f"k: {report.get('k')}",
+        f"palace: {report.get('palace')}",
+    ]
+    hits = report.get("hits") or []
+    if not hits:
+        lines.append("no relevant sessions found")
+        return "\n".join(lines)
+    for hit in hits:
+        session_id = str(hit.get("session_id") or "")
+        label = hit.get("topic") or hit.get("date") or ""
+        similarity = hit.get("similarity")
+        try:
+            similarity_text = f"{float(similarity):.4f}"
+        except (TypeError, ValueError):
+            similarity_text = "nan"
+        lines.append(f"  - {similarity_text} [{session_id[:8]}] {label}: {_recall_snippet(hit.get('text'))}")
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # Palace-facing orchestration
 # ---------------------------------------------------------------------------
@@ -255,6 +303,29 @@ def run(
     )
 
 
+def run_recall(
+    palace: str,
+    query: str,
+    *,
+    k: int = 5,
+    repository: str | None = None,
+    since: str | None = None,
+    limit_sessions: int | None = None,
+    min_similarity: float = 0.0,
+) -> dict:
+    path = dream_palace.bind_palace(palace)
+    hits = dream_palace.retrieve_relevant_session_observations(
+        path,
+        query,
+        k=k,
+        repository=repository,
+        since=since,
+        limit_sessions=limit_sessions,
+        min_similarity=min_similarity,
+    )
+    return build_recall_report(query, k, path, hits)
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--palace", help="Path to the mempalace palace directory (default: mempalace config)")
@@ -267,6 +338,12 @@ def main(argv: list[str] | None = None) -> int:
         help="Ontology output path for --bootstrap (default: <palace>/ontology.json)",
     )
     ap.add_argument("--format", choices=["summary", "json"], default="summary", help="Output format (default summary)")
+    ap.add_argument("--recall", default=None, help="Reasoning query for relevance-ranked past session recall")
+    ap.add_argument("--k", type=int, default=5, help="Maximum relevant sessions to return for --recall (default 5)")
+    ap.add_argument("--repository", default=None, help="Repository filter passed through to --recall retrieval")
+    ap.add_argument("--since", default=None, help="Lower date/time bound passed through to --recall retrieval")
+    ap.add_argument("--limit-sessions", type=int, default=None, help="Maximum sessions to inspect for --recall")
+    ap.add_argument("--min-similarity", type=float, default=0.0, help="Minimum similarity for --recall (default 0.0)")
     ap.add_argument("--skips", default=None, help="Path to skip-markers file (default: <palace>/dream-derive-skips.jsonl)")
     ap.add_argument("--max-depth", type=int, default=3, help="Maximum derivation depth (default 3)")
     ap.add_argument("--max-iterations", type=int, default=10, help="Maximum closure iterations (default 10)")
@@ -278,6 +355,22 @@ def main(argv: list[str] | None = None) -> int:
         config_path = os.environ.get("MEMPALACE_CONFIG") or "~/.mempalace/config.json"
         print(f"error: no --palace given and {config_path} has no palace_path", file=sys.stderr)
         return 2
+
+    if args.recall is not None:
+        report = run_recall(
+            effective_palace,
+            args.recall,
+            k=args.k,
+            repository=args.repository,
+            since=args.since,
+            limit_sessions=args.limit_sessions,
+            min_similarity=args.min_similarity,
+        )
+        if args.format == "json":
+            print(json.dumps(report, indent=2, ensure_ascii=False))
+        else:
+            print(summarize_recall_report(report))
+        return 0
 
     report = run(
         effective_palace,

@@ -8,6 +8,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from unittest import mock
 
 import dream_contemplate as dc
 
@@ -107,6 +108,56 @@ class TestReportBuilding(unittest.TestCase):
         self.assertIn("inverse:authored:authored_by [inverse]", text)
         self.assertIn("heuristic: predicate names suggest inverse relationship", text)
 
+    def test_recall_report_preserves_order_truncates_summary_and_excludes_embeddings(self):
+        long_text = "alpha " * 40
+        report = dc.build_recall_report(
+            "why alpha?",
+            2,
+            "/palace",
+            [
+                {
+                    "session_id": "highabcd-123",
+                    "similarity": 0.987654,
+                    "topic": "High topic",
+                    "date": "2026-07-01",
+                    "text": long_text,
+                    "embedding": [0.1, 0.2],
+                },
+                {
+                    "session_id": "lowabcd-456",
+                    "similarity": 0.75,
+                    "topic": "",
+                    "date": "2026-06-30",
+                    "text": "short text",
+                    "embedding": [0.3],
+                },
+            ],
+        )
+
+        self.assertEqual(report["query"], "why alpha?")
+        self.assertEqual(report["k"], 2)
+        self.assertEqual(report["count"], 2)
+        self.assertEqual([hit["session_id"] for hit in report["hits"]], ["highabcd-123", "lowabcd-456"])
+        self.assertNotIn("embedding", report["hits"][0])
+        self.assertNotIn("embedding", json.dumps(report))
+
+        text = dc.summarize_recall_report(report)
+        self.assertIn("recall query: why alpha?", text)
+        self.assertIn("k: 2", text)
+        self.assertIn("palace: /palace", text)
+        self.assertIn("0.9877 [highabcd] High topic:", text)
+        first_hit_line = next(line for line in text.splitlines() if "[highabcd]" in line)
+        self.assertLess(len(first_hit_line), len(long_text))
+        self.assertTrue(first_hit_line.endswith("..."))
+        self.assertIn("0.7500 [lowabcd-] 2026-06-30: short text", text)
+
+    def test_empty_recall_report_says_no_relevant_sessions(self):
+        report = dc.build_recall_report("missing", 5, "/palace", [])
+
+        self.assertEqual(report["count"], 0)
+        self.assertEqual(report["hits"], [])
+        self.assertIn("no relevant sessions", dc.summarize_recall_report(report).lower())
+
 
 class TestCliSmoke(unittest.TestCase):
     def _palace_with_kg(self, td):
@@ -192,6 +243,79 @@ class TestCliSmoke(unittest.TestCase):
             self.assertTrue(disabled)
             self.assertEqual(len(disabled), len(ontology["rules"]) - 1)
             self.assertTrue(all(rule.get("enabled") is False for rule in report["bootstrap"]["proposed_disabled_rules"]))
+
+    def test_recall_json_mode_calls_retrieval_with_filters_and_prints_sanitized_hits(self):
+        hits = [
+            {
+                "session_id": "session-abcdef",
+                "similarity": 0.91,
+                "topic": "Recall topic",
+                "date": "2026-07-13",
+                "text": "Relevant memory",
+                "embedding": [1.0, 2.0],
+            }
+        ]
+        stdout = io.StringIO()
+        with mock.patch.object(
+            dc.dream_palace,
+            "retrieve_relevant_session_observations",
+            return_value=hits,
+            create=True,
+        ) as retrieve, contextlib.redirect_stdout(stdout):
+            rc = dc.main([
+                "--recall",
+                "why memory?",
+                "--palace",
+                "/p",
+                "--format",
+                "json",
+                "--k",
+                "1",
+                "--repository",
+                "repo",
+                "--since",
+                "2026-01-01",
+                "--limit-sessions",
+                "10",
+                "--min-similarity",
+                "0.25",
+            ])
+
+        self.assertEqual(rc, 0)
+        retrieve.assert_called_once_with(
+            "/p",
+            "why memory?",
+            k=1,
+            repository="repo",
+            since="2026-01-01",
+            limit_sessions=10,
+            min_similarity=0.25,
+        )
+        report = json.loads(stdout.getvalue())
+        self.assertEqual(report["query"], "why memory?")
+        self.assertEqual(report["count"], 1)
+        self.assertEqual(report["hits"][0]["session_id"], "session-abcdef")
+        self.assertNotIn("embedding", report["hits"][0])
+
+    def test_derive_mode_does_not_call_recall_retrieval(self):
+        stdout = io.StringIO()
+        derive_report = dc.build_report(
+            palace="/p",
+            rules_path="/p/ontology.json",
+            enabled_rule_count=0,
+            worklist={"task": "contemplate", "items": []},
+            ontology_rules=[],
+        )
+        with mock.patch.object(
+            dc.dream_palace,
+            "retrieve_relevant_session_observations",
+            create=True,
+        ) as retrieve, mock.patch.object(dc, "run", return_value=derive_report), contextlib.redirect_stdout(stdout):
+            rc = dc.main(["--palace", "/p", "--format", "json"])
+
+        self.assertEqual(rc, 0)
+        retrieve.assert_not_called()
+        self.assertEqual(json.loads(stdout.getvalue())["derive_candidate_count"], 0)
 
 
 if __name__ == "__main__":

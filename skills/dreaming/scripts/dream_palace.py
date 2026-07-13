@@ -21,6 +21,8 @@ import sys
 from datetime import datetime, timezone
 from typing import Any
 
+from dream_lib import cosine_similarity
+
 SESSION_ID_RE = re.compile(
     r"SESSION_ID:\s*([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})",
     re.IGNORECASE,
@@ -361,6 +363,44 @@ def load_session_observation_entries(
             }
         )
     return entries
+
+
+def retrieve_relevant_session_observations(
+    palace_path: str,
+    query: str,
+    *,
+    k: int = 5,
+    repository: str | None = None,
+    since: str | None = None,
+    limit_sessions: int | None = None,
+    min_similarity: float = 0.0,
+) -> list[dict]:
+    """Return the top-k host-session observations most relevant to ``query``."""
+    if k <= 0:
+        return []
+
+    entries = load_session_observation_entries(
+        palace_path,
+        repository=repository,
+        since=since,
+        limit_sessions=limit_sessions,
+    )
+    if not entries:
+        return []
+
+    query_vec = _palace_embed(palace_path, [query])[0]
+    ranked = []
+    for entry in entries:
+        embedding = entry.get("embedding") or []
+        similarity = 0.0 if not query_vec or not embedding else float(cosine_similarity(query_vec, embedding))
+        if similarity < min_similarity:
+            continue
+        result = dict(entry)
+        result["similarity"] = similarity
+        ranked.append(result)
+
+    ranked.sort(key=lambda entry: -entry["similarity"])
+    return ranked[:k]
 
 
 def load_active_triples(palace_path: str) -> list[dict[str, Any]]:

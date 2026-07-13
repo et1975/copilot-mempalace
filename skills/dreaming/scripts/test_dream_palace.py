@@ -1104,5 +1104,102 @@ class TestLoadSessionObservationEntries(unittest.TestCase):
         self.assertFalse(called["embed"])
 
 
+class TestRetrieveRelevantSessionObservations(unittest.TestCase):
+    def _install_fake_retrieval_inputs(self, entries, query_embedding):
+        original_load = dream_palace.load_session_observation_entries
+        original_embed = dream_palace._palace_embed
+        calls = {"load": [], "embed": []}
+
+        def fake_load(palace, **kwargs):
+            calls["load"].append((palace, kwargs))
+            return entries
+
+        def fake_embed(palace, texts):
+            calls["embed"].append((palace, list(texts)))
+            return [query_embedding]
+
+        dream_palace.load_session_observation_entries = fake_load
+        dream_palace._palace_embed = fake_embed
+        self.addCleanup(lambda: setattr(dream_palace, "load_session_observation_entries", original_load))
+        self.addCleanup(lambda: setattr(dream_palace, "_palace_embed", original_embed))
+        return calls
+
+    def test_returns_relevance_ranked_entries_with_k_cap(self):
+        entries = [
+            {"id": "middle", "member_ids": ["middle"], "text": "b", "embedding": [0.0, 1.0],
+             "session_id": "sid-b", "agent": None, "date": "2026-07-02", "topic": "b", "wing": None, "room": "__session__"},
+            {"id": "best", "member_ids": ["best"], "text": "a", "embedding": [1.0, 0.0],
+             "session_id": "sid-a", "agent": None, "date": "2026-07-01", "topic": "a", "wing": None, "room": "__session__"},
+            {"id": "worst", "member_ids": ["worst"], "text": "c", "embedding": [-1.0, 0.0],
+             "session_id": "sid-c", "agent": None, "date": "2026-07-03", "topic": "c", "wing": None, "room": "__session__"},
+        ]
+        calls = self._install_fake_retrieval_inputs(entries, [1.0, 0.0])
+
+        results = dream_palace.retrieve_relevant_session_observations(
+            "/bound",
+            "query text",
+            k=2,
+            repository="copilot-mempalace",
+            since="2026-07-01",
+            limit_sessions=20,
+        )
+
+        self.assertEqual([entry["id"] for entry in results], ["best", "middle"])
+        self.assertEqual(calls["embed"], [("/bound", ["query text"])])
+        self.assertEqual(calls["load"], [
+            ("/bound", {"repository": "copilot-mempalace", "since": "2026-07-01", "limit_sessions": 20})
+        ])
+
+    def test_min_similarity_drops_low_matches(self):
+        entries = [
+            {"id": "keep", "member_ids": ["keep"], "text": "a", "embedding": [1.0, 0.0],
+             "session_id": "sid-a", "agent": None, "date": None, "topic": None, "wing": None, "room": "__session__"},
+            {"id": "drop", "member_ids": ["drop"], "text": "b", "embedding": [0.0, 1.0],
+             "session_id": "sid-b", "agent": None, "date": None, "topic": None, "wing": None, "room": "__session__"},
+        ]
+        self._install_fake_retrieval_inputs(entries, [1.0, 0.0])
+
+        results = dream_palace.retrieve_relevant_session_observations("/bound", "", min_similarity=0.5)
+
+        self.assertEqual([entry["id"] for entry in results], ["keep"])
+        self.assertAlmostEqual(results[0]["similarity"], 1.0)
+
+    def test_single_session_match_does_not_require_recurrence_support(self):
+        entries = [
+            {"id": "only", "member_ids": ["only"], "text": "single support", "embedding": [1.0, 0.0],
+             "session_id": "sid-only", "agent": None, "date": None, "topic": None, "wing": None, "room": "__session__"},
+        ]
+        self._install_fake_retrieval_inputs(entries, [1.0, 0.0])
+
+        results = dream_palace.retrieve_relevant_session_observations("/bound", "single", k=1)
+
+        self.assertEqual([entry["id"] for entry in results], ["only"])
+
+    def test_empty_entries_and_non_positive_k_return_empty(self):
+        calls = self._install_fake_retrieval_inputs([], [1.0, 0.0])
+
+        self.assertEqual(dream_palace.retrieve_relevant_session_observations("/bound", "anything"), [])
+        self.assertEqual(dream_palace.retrieve_relevant_session_observations("/bound", "anything", k=0), [])
+        self.assertEqual(calls["embed"], [])
+
+    def test_adds_numeric_similarity_without_mutating_source_entries(self):
+        entries = [
+            {"id": "zero", "member_ids": ["zero"], "text": "zero", "embedding": [],
+             "session_id": "sid-zero", "agent": None, "date": None, "topic": None, "wing": None, "room": "__session__"},
+            {"id": "match", "member_ids": ["match"], "text": "match", "embedding": [1.0, 0.0],
+             "session_id": "sid-match", "agent": None, "date": None, "topic": None, "wing": None, "room": "__session__"},
+        ]
+        self._install_fake_retrieval_inputs(entries, [1.0, 0.0])
+
+        results = dream_palace.retrieve_relevant_session_observations("/bound", "match", k=2)
+
+        self.assertEqual([entry["id"] for entry in results], ["match", "zero"])
+        self.assertTrue(all(isinstance(entry["similarity"], float) for entry in results))
+        self.assertEqual(results[1]["similarity"], 0.0)
+        self.assertNotIn("similarity", entries[0])
+        self.assertNotIn("similarity", entries[1])
+        self.assertIsNot(results[0], entries[1])
+
+
 if __name__ == "__main__":
     unittest.main()
