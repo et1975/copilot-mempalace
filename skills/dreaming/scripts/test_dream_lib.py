@@ -509,6 +509,65 @@ class TestDrawerSalience(unittest.TestCase):
         self.assertEqual(scored["age_days"], 30)
         self.assertEqual(missing["age_days"], 0)
 
+    def test_usage_access_count_increases_salience(self):
+        never_retrieved = dl.drawer_salience(
+            self._drawer(),
+            redundancy=0.0,
+            kg_degree=0,
+            now=self.now,
+            usage={"access_count": 0, "strength": 0.0, "last_activated": None},
+        )
+        frequently_retrieved = dl.drawer_salience(
+            self._drawer(),
+            redundancy=0.0,
+            kg_degree=0,
+            now=self.now,
+            usage={"access_count": 50, "strength": 0.0, "last_activated": "2026-07-01T20:20:12"},
+        )
+
+        self.assertFalse(never_retrieved["usage_known"])
+        self.assertTrue(frequently_retrieved["usage_known"])
+        self.assertEqual(frequently_retrieved["access_count"], 50)
+        self.assertGreater(frequently_retrieved["v"], never_retrieved["v"])
+
+    def test_usage_unknown_and_zero_access_do_not_penalize_salience(self):
+        unknown = dl.drawer_salience(
+            self._drawer(),
+            redundancy=0.0,
+            kg_degree=0,
+            now=self.now,
+            usage=None,
+        )
+        zero_access = dl.drawer_salience(
+            self._drawer(),
+            redundancy=0.0,
+            kg_degree=0,
+            now=self.now,
+            usage={"access_count": 0, "strength": 1.0, "last_activated": None},
+        )
+
+        self.assertEqual(unknown["v"], zero_access["v"])
+        self.assertFalse(unknown["usage_known"])
+        self.assertFalse(zero_access["usage_known"])
+
+    def test_usage_salience_is_non_decreasing_in_access_count(self):
+        low = dl.drawer_salience(
+            self._drawer(),
+            redundancy=0.0,
+            kg_degree=0,
+            now=self.now,
+            usage={"access_count": 1, "strength": 0.5, "last_activated": None},
+        )
+        high = dl.drawer_salience(
+            self._drawer(),
+            redundancy=0.0,
+            kg_degree=0,
+            now=self.now,
+            usage={"access_count": 50, "strength": 0.5, "last_activated": None},
+        )
+
+        self.assertGreaterEqual(high["v"], low["v"])
+
 
 class TestSelectPruneCandidates(unittest.TestCase):
     def _drawer(self, _id, v, age_days, kg_degree=0, pinned=False, topic=None, room="r"):
@@ -707,16 +766,24 @@ class _FakeWriter:
 
 
 class _FakeKgWriter:
-    def __init__(self, fail_triple_ids=None):
+    def __init__(self, fail_triple_ids=None, invalidate_count=None):
         self.calls = []
+        self.supersede_calls = []
         self.fail_triple_ids = set(fail_triple_ids or [])
+        self.invalidate_count = invalidate_count
 
     def invalidate_triples(self, triple_ids):
         self.calls.append(list(triple_ids))
         failed = self.fail_triple_ids.intersection(triple_ids)
         if failed:
             raise RuntimeError(f"cannot invalidate {sorted(failed)[0]}")
-        return {"invalidated": len(triple_ids)}
+        if self.invalidate_count is not None:
+            return self.invalidate_count
+        return len(triple_ids)
+
+    def supersede(self, subject, predicate, old_object, new_object):
+        self.supersede_calls.append((subject, predicate, old_object, new_object))
+        return True
 
 
 class _FakePatternWriter:
@@ -897,6 +964,68 @@ class TestApplyContradictionDecisions(unittest.TestCase):
         self.assertEqual(report["invalidated_facts"], [
             {"triple_id": "triple-3"},
         ])
+
+    def test_invalidate_uses_writer_rowcount_and_records_shortfall(self):
+        w = _FakeKgWriter(invalidate_count=1)
+        decisions = [{"action": "invalidate", "invalidate": ["triple-1", "triple-2"]}]
+
+        report = dl.apply_contradiction_decisions(decisions, w)
+
+        self.assertEqual(report["invalidated"], 1)
+        self.assertEqual(len(report["errors"]), 1)
+        self.assertEqual(report["errors"][0]["stage"], "failed_adopt")
+        self.assertEqual(report["errors"][0]["error"], "invalidated 1 of 2")
+        self.assertEqual(report["errors"][0]["triple_ids"], ["triple-1", "triple-2"])
+
+    def test_full_invalidate_rowcount_records_no_error(self):
+        w = _FakeKgWriter(invalidate_count=2)
+        decisions = [{"action": "invalidate", "invalidate": ["triple-1", "triple-2"]}]
+
+        report = dl.apply_contradiction_decisions(decisions, w)
+
+        self.assertEqual(report["invalidated"], 2)
+        self.assertEqual(report["errors"], [])
+
+    def test_supersede_calls_writer_for_single_retired_object(self):
+        w = _FakeKgWriter()
+        decisions = [
+            {
+                "action": "supersede",
+                "subject": "Alice",
+                "predicate": "lives_in",
+                "keep": "Seattle",
+                "retire": ["Portland"],
+            }
+        ]
+
+        report = dl.apply_contradiction_decisions(decisions, w)
+
+        self.assertEqual(report["superseded"], 1)
+        self.assertEqual(report["invalidated"], 0)
+        self.assertEqual(w.supersede_calls, [("Alice", "lives_in", "Portland", "Seattle")])
+        self.assertEqual(w.calls, [])
+        self.assertEqual(report["errors"], [])
+
+    def test_supersede_with_multiple_retired_objects_is_rejected(self):
+        w = _FakeKgWriter()
+        decisions = [
+            {
+                "action": "supersede",
+                "subject": "Alice",
+                "predicate": "lives_in",
+                "keep": "Seattle",
+                "retire": ["Portland", "Vancouver"],
+            }
+        ]
+
+        report = dl.apply_contradiction_decisions(decisions, w)
+
+        self.assertEqual(report["superseded"], 0)
+        self.assertEqual(report["invalidated"], 0)
+        self.assertEqual(w.supersede_calls, [])
+        self.assertEqual(w.calls, [])
+        self.assertEqual(report["errors"][0]["stage"], "groundedness")
+        self.assertEqual(report["errors"][0]["error"], "supersede requires exactly one retired object")
 
 
 if __name__ == "__main__":

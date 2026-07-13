@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+from datetime import datetime
 import hashlib
 import io
 import json
@@ -203,6 +204,7 @@ class TestHarvestPruneTask(unittest.TestCase):
             stderr = io.StringIO()
             with mock.patch.object(dream_harvest.dream_palace, "bind_palace", return_value="/bound"), \
                  mock.patch.object(dream_harvest.dream_palace, "load_logical_drawers", return_value=drawers) as load_drawers, \
+                 mock.patch.object(dream_harvest.dream_palace, "load_drawer_usage", return_value={}), \
                  mock.patch.object(dream_harvest.dream_palace, "kg_source_degree", return_value={}), \
                  contextlib.redirect_stderr(stderr):
                 rc = dream_harvest.main([
@@ -236,6 +238,157 @@ class TestHarvestPruneTask(unittest.TestCase):
                 "harvested 2 drawers -> 1 prune candidate(s) (v<v_min, age>=floor, kg_degree=0)",
                 stderr.getvalue(),
             )
+
+    def test_prune_task_uses_usage_as_protection_only_signal(self):
+        high_use = {
+            "id": "high-use",
+            "member_ids": ["high-use"],
+            "text": "old note that was retrieved",
+            "embedding": [1.0, 0.0],
+            "metadata": {"filed_at": "2000-01-01T00:00:00", "topic": "same-topic"},
+            "wing": "wing",
+            "room": "room",
+        }
+        unused = {
+            "id": "unused",
+            "member_ids": ["unused"],
+            "text": "old note with no recorded retrieval",
+            "embedding": [0.1, 0.99498743710662],
+            "metadata": {"filed_at": "2000-01-01T00:00:00", "topic": "same-topic"},
+            "wing": "wing",
+            "room": "room",
+        }
+        sibling = {
+            "id": "sibling",
+            "member_ids": ["sibling"],
+            "text": "old related note with no recorded retrieval",
+            "embedding": [-0.1, 0.99498743710662],
+            "metadata": {"filed_at": "2000-01-01T00:00:00", "topic": "same-topic"},
+            "wing": "wing",
+            "room": "room",
+        }
+        drawers = [high_use, unused, sibling]
+        fixed_now = datetime(2026, 7, 6)
+        with _test_tmpdir() as td:
+            out = os.path.join(td, "worklist.json")
+            stderr = io.StringIO()
+            with mock.patch.object(dream_harvest.dream_palace, "bind_palace", return_value="/bound"), \
+                 mock.patch.object(dream_harvest.dream_palace, "load_logical_drawers", return_value=drawers), \
+                 mock.patch.object(dream_harvest.dream_palace, "load_drawer_usage", return_value={
+                     "high-use": {"access_count": 100, "strength": 1.0, "last_activated": "2026-07-01T00:00:00"},
+                     "sibling": {"access_count": 0, "strength": 0.0, "last_activated": None},
+                 }) as load_usage, \
+                 mock.patch.object(dream_harvest.dream_palace, "kg_source_degree", return_value={}), \
+                 mock.patch.object(dream_harvest, "datetime") as harvest_datetime, \
+                 contextlib.redirect_stderr(stderr):
+                harvest_datetime.now.return_value = fixed_now
+                rc = dream_harvest.main([
+                    "--palace", "/palace",
+                    "--task", "prune",
+                    "--wing", "wing",
+                    "--room", "room",
+                    "--v-min", "0.15",
+                    "--age-floor-days", "30",
+                    "--out", out,
+                ])
+
+            self.assertEqual(rc, 0)
+            load_usage.assert_called_once_with("/bound", wing="wing", room="room")
+            with open(out, encoding="utf-8") as fh:
+                worklist = json.load(fh)
+            item_ids = [item["id"] for item in worklist["items"]]
+            self.assertNotIn("high-use", item_ids)
+            self.assertIn("unused", item_ids)
+            unused_item = next(item for item in worklist["items"] if item["id"] == "unused")
+            baseline = dream_harvest.drawer_salience(
+                {**unused, "filed_at": unused["metadata"]["filed_at"]},
+                dream_harvest.compute_redundancy(drawers)["unused"],
+                0,
+                now=fixed_now,
+            )
+            self.assertEqual(unused_item["salience"], baseline)
+            self.assertFalse(unused_item["salience"]["usage_known"])
+            self.assertIn("usage incorporated", stderr.getvalue())
+
+
+class TestHarvestMergeTask(unittest.TestCase):
+    def test_merge_task_uses_find_duplicate_clusters_and_stamps_hashes(self):
+        clusters = [
+            {
+                "members": [
+                    {
+                        "id": "drawer-1",
+                        "member_ids": ["chunk-1", "chunk-2"],
+                        "text": "same note",
+                        "wing": "wing",
+                        "room": "room",
+                    },
+                    {
+                        "id": "drawer-2",
+                        "member_ids": ["chunk-3"],
+                        "text": "same note revised",
+                        "wing": "wing",
+                        "room": "room",
+                    },
+                    {
+                        "id": "drawer-3",
+                        "member_ids": ["chunk-4"],
+                        "text": "same note elsewhere",
+                        "wing": "wing",
+                        "room": "other",
+                    },
+                ],
+                "pair_sims": [
+                    {"a": "drawer-1", "b": "drawer-2", "sim": 0.94},
+                    {"a": "drawer-1", "b": "drawer-3", "sim": 0.93},
+                    {"a": "drawer-2", "b": "drawer-3", "sim": 0.92},
+                ],
+                "size": 3,
+            }
+        ]
+        with _test_tmpdir() as td:
+            out = os.path.join(td, "worklist.json")
+            stderr = io.StringIO()
+            with mock.patch.object(dream_harvest.dream_palace, "bind_palace", return_value="/bound"), \
+                 mock.patch.object(dream_harvest.dream_palace, "find_duplicate_clusters", return_value=clusters) as find_clusters, \
+                 mock.patch.object(dream_harvest.dream_palace, "load_logical_drawers", side_effect=AssertionError("old loader used")), \
+                 contextlib.redirect_stderr(stderr):
+                rc = dream_harvest.main([
+                    "--palace", "/palace",
+                    "--wing", "wing",
+                    "--room", "room",
+                    "--tau", "0.91",
+                    "--max-clusters", "10",
+                    "--out", out,
+                ])
+
+            self.assertEqual(rc, 0)
+            find_clusters.assert_called_once_with(
+                "/bound",
+                wing="wing",
+                room="room",
+                tau=0.91,
+                max_clusters=10,
+            )
+            with open(out, encoding="utf-8") as fh:
+                worklist = json.load(fh)
+            self.assertEqual(worklist["task"], "merge")
+            self.assertEqual(worklist["params"], {"tau": 0.91, "max_clusters": 10})
+            self.assertEqual(len(worklist["items"]), 1)
+            item = worklist["items"][0]
+            self.assertTrue(item["mixed_room_split"])
+            self.assertEqual([m["id"] for m in item["members"]], ["drawer-1", "drawer-2"])
+            self.assertEqual(item["supersedes"], ["chunk-1", "chunk-2", "chunk-3"])
+            self.assertEqual(item["evidence"], {"pair_sims": [{"a": "drawer-1", "b": "drawer-2", "sim": 0.94}], "size": 2})
+            self.assertEqual(
+                item["content_hashes"],
+                {
+                    "drawer-1": hashlib.sha256("same note".encode("utf-8")).hexdigest(),
+                    "drawer-2": hashlib.sha256("same note revised".encode("utf-8")).hexdigest(),
+                },
+            )
+            self.assertEqual(item["members"][0]["content_hash"], item["content_hashes"]["drawer-1"])
+            self.assertIn("harvested 1 duplicate cluster(s) -> 1 merge cluster(s)", stderr.getvalue())
 
 
 class TestHarvestOntologyTasks(unittest.TestCase):
@@ -389,7 +542,7 @@ class TestHarvestOntologyTasks(unittest.TestCase):
 
 
 class TestAdoptContradictionTask(unittest.TestCase):
-    def test_resolve_defaults_invalidate_to_all_candidates_except_keep(self):
+    def test_resolve_defaults_single_retire_to_supersede(self):
         worklist = {
             "task": "contradiction",
             "items": [
@@ -419,9 +572,34 @@ class TestAdoptContradictionTask(unittest.TestCase):
         decisions = dream_adopt._resolve_contradiction_decisions(worklist)
 
         self.assertEqual(decisions, [
-            {"action": "invalidate", "subject": "Alice", "predicate": "lives_in",
-             "invalidate": ["t-pdx"]},
+            {"action": "supersede", "subject": "Alice", "predicate": "lives_in",
+             "keep": "Seattle", "retire": ["Portland"]},
             {"action": "skip"},
+        ])
+
+    def test_resolve_defaults_multi_retire_stays_invalidate(self):
+        worklist = {
+            "task": "contradiction",
+            "items": [
+                {
+                    "kind": "contradiction",
+                    "subject": "Alice",
+                    "predicate": "lives_in",
+                    "candidates": [
+                        {"object": "Seattle", "object_id": "city-sea", "triple_id": "t-sea", "triple_ids": ["t-sea"]},
+                        {"object": "Portland", "object_id": "city-pdx", "triple_id": "t-pdx", "triple_ids": ["t-pdx"]},
+                        {"object": "Vancouver", "object_id": "city-yvr", "triple_id": "t-yvr", "triple_ids": ["t-yvr"]},
+                    ],
+                    "decision": {"action": "invalidate", "keep": "Seattle"},
+                },
+            ],
+        }
+
+        decisions = dream_adopt._resolve_contradiction_decisions(worklist)
+
+        self.assertEqual(decisions, [
+            {"action": "invalidate", "subject": "Alice", "predicate": "lives_in",
+             "invalidate": ["t-pdx", "t-yvr"]},
         ])
 
     def test_dry_run_prints_contradiction_invalidations(self):
@@ -462,7 +640,46 @@ class TestAdoptContradictionTask(unittest.TestCase):
 
             self.assertEqual(rc, 0)
             self.assertIn("INVALIDATE_TRIPLES t-pdx", stdout.getvalue())
-            self.assertIn("[dry-run] would invalidate 1, skip 0", stderr.getvalue())
+            self.assertIn("[dry-run] would invalidate 1, supersede 0, skip 0", stderr.getvalue())
+
+    def test_dry_run_prints_contradiction_supersedes(self):
+        worklist = {
+            "task": "contradiction",
+            "items": [
+                {
+                    "kind": "contradiction",
+                    "subject": "Alice",
+                    "predicate": "lives_in",
+                    "candidates": [
+                        {"object": "Portland", "object_id": "city-pdx", "triple_id": "t-pdx", "triple_ids": ["t-pdx"]},
+                        {"object": "Seattle", "object_id": "city-sea", "triple_id": "t-sea", "triple_ids": ["t-sea"]},
+                    ],
+                    "decision": {
+                        "action": "invalidate",
+                        "keep": "Seattle",
+                    },
+                }
+            ],
+        }
+        with _test_tmpdir() as td:
+            decisions_path = os.path.join(td, "decisions.json")
+            with open(decisions_path, "w", encoding="utf-8") as fh:
+                json.dump(worklist, fh)
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            with mock.patch.object(dream_adopt.dream_palace, "bind_palace", return_value="/bound"), \
+                 contextlib.redirect_stdout(stdout), \
+                 contextlib.redirect_stderr(stderr):
+                rc = dream_adopt.main([
+                    "--palace", "/palace",
+                    "--decisions", decisions_path,
+                    "--dry-run",
+                ])
+
+            self.assertEqual(rc, 0)
+            self.assertIn("SUPERSEDE Alice lives_in: Portland -> Seattle", stdout.getvalue())
+            self.assertIn("[dry-run] would invalidate 0, supersede 1, skip 0", stderr.getvalue())
 
 
 class TestAdoptPatternTask(unittest.TestCase):

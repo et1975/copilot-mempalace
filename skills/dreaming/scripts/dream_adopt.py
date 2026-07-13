@@ -93,6 +93,20 @@ def _candidate_matches(candidate: dict[str, Any], selected: Any) -> bool:
     }
 
 
+def _candidate_object_matches(candidate: dict[str, Any], selected: Any) -> bool:
+    return selected in {candidate.get("object"), candidate.get("object_id")}
+
+
+def _supersede_decision(item: dict[str, Any], keep: Any, retired: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "action": "supersede",
+        "subject": item["subject"],
+        "predicate": item["predicate"],
+        "keep": keep,
+        "retire": [retired.get("object")],
+    }
+
+
 def _resolve_contradiction_decisions(worklist: dict[str, Any]) -> list[dict[str, Any]]:
     """Extract concrete KG invalidate/skip decisions from an adjudicated worklist."""
     resolved = []
@@ -105,15 +119,27 @@ def _resolve_contradiction_decisions(worklist: dict[str, Any]) -> list[dict[str,
         selected = decision.get("invalidate")
         if selected is None:
             keep = decision.get("keep")
+            retired = [c for c in candidates if not _candidate_matches(c, keep)]
+            if keep is not None and len(retired) == 1:
+                resolved.append(_supersede_decision(item, keep, retired[0]))
+                continue
             invalidate = [
                 triple_id
-                for c in candidates
-                if not _candidate_matches(c, keep)
+                for c in retired
                 for triple_id in _candidate_triple_ids(c)
             ]
         else:
+            keep = decision.get("keep")
+            selected_values = list(selected)
+            selected_object_matches = [
+                c for value in selected_values for c in candidates
+                if _candidate_object_matches(c, value)
+            ]
+            if keep is not None and len(selected_values) == 1 and len(selected_object_matches) == 1:
+                resolved.append(_supersede_decision(item, keep, selected_object_matches[0]))
+                continue
             invalidate = []
-            for value in selected:
+            for value in selected_values:
                 matches = [c for c in candidates if _candidate_matches(c, value)]
                 if matches:
                     invalidate.extend(
@@ -273,6 +299,9 @@ class _DryRunKgWriter:
         obj = conclusion.get("object") or conclusion.get("object_id", "?")
         self.planned.append(f"DERIVE  {subj} -{pred}-> {obj}  (rule={rule_id})")
         return {"ok": True, "triple_id": "dry-run", "dry_run": True}
+
+    def supersede(self, subject: str, predicate: str, old_object: str, new_object: str, at: str | None = None) -> None:
+        self.planned.append(f"SUPERSEDE {subject} {predicate}: {old_object} -> {new_object}")
 
 
 class _DryRunArchiver:
@@ -508,7 +537,8 @@ def main(argv: list[str] | None = None) -> int:
             for line in kg_writer.planned:
                 print(line)
             print(
-                f"[dry-run] would invalidate {report['invalidated']}, skip {report['skipped']}",
+                f"[dry-run] would invalidate {report['invalidated']}, "
+                f"supersede {report['superseded']}, skip {report['skipped']}",
                 file=sys.stderr,
             )
             return 0
@@ -593,7 +623,7 @@ def main(argv: list[str] | None = None) -> int:
         finally:
             kg_writer.close()
         print(
-            f"adopted: invalidated {report['invalidated']}, skipped {report['skipped']}, "
+            f"adopted: invalidated {report['invalidated']}, superseded {report['superseded']}, skipped {report['skipped']}, "
             f"facts {len(report['invalidated_facts'])}, errors {len(report['errors'])}",
             file=sys.stderr,
         )
