@@ -118,12 +118,12 @@ class TestHarvestPatternTask(unittest.TestCase):
             self.assertEqual(worklist["task"], "pattern")
             self.assertEqual(
                 worklist["scope"],
-                {"palace": "/bound", "wing": "wing_copilot-cli", "rooms": ["diary", "signals"], "task": "pattern"},
+                {"palace": "/bound", "wing": "wing_copilot-cli", "rooms": ["diary", "signals"], "source": "diary", "task": "pattern"},
             )
             self.assertEqual(worklist["params"], {"tau": 0.8, "min_support": 2})
             self.assertEqual(worklist["items"][0]["kind"], "pattern")
             self.assertIn(
-                "harvested 2 observation entries -> 1 pattern theme(s) spanning >= 2 sessions",
+                "harvested 2 observation entries (diary) -> 1 pattern theme(s) spanning >= 2 sessions",
                 stderr.getvalue(),
             )
 
@@ -173,7 +173,103 @@ class TestHarvestPatternTask(unittest.TestCase):
             with open(out, encoding="utf-8") as fh:
                 worklist = json.load(fh)
             self.assertEqual(worklist["items"][0]["evidence"]["support_ids"], ["s1", "s2"])
-            self.assertIn("harvested 2 observation entries -> 1 pattern theme(s)", stderr.getvalue())
+            self.assertIn("harvested 2 observation entries (diary) -> 1 pattern theme(s)", stderr.getvalue())
+
+
+    def test_pattern_task_sessions_source_uses_host_sessions(self):
+        session_entries = [
+            {
+                "id": "session:s1", "member_ids": ["session:s1"],
+                "text": "make this repo a copilot marketplace skillset",
+                "embedding": [1.0, 0.0], "session_id": "s1",
+                "agent": None, "date": "2026-07-01", "topic": "packaging",
+                "wing": None, "room": "__session__",
+            },
+            {
+                "id": "session:s2", "member_ids": ["session:s2"],
+                "text": "package this repo for the copilot marketplace",
+                "embedding": [1.0, 0.0], "session_id": "s2",
+                "agent": None, "date": "2026-07-02", "topic": "packaging",
+                "wing": None, "room": "__session__",
+            },
+        ]
+        with _test_tmpdir() as td:
+            out = os.path.join(td, "worklist.json")
+            stderr = io.StringIO()
+            with mock.patch.object(dream_harvest.dream_palace, "bind_palace", return_value="/bound"), \
+                 mock.patch.object(dream_harvest.dream_palace, "load_observation_entries") as load_diary, \
+                 mock.patch.object(
+                     dream_harvest.dream_palace, "load_session_observation_entries", return_value=session_entries
+                 ) as load_sessions, \
+                 contextlib.redirect_stderr(stderr):
+                rc = dream_harvest.main([
+                    "--palace", "/palace",
+                    "--task", "pattern",
+                    "--source", "sessions",
+                    "--repository", "copilot-mempalace",
+                    "--since", "2026-07-01",
+                    "--limit-sessions", "50",
+                    "--tau", "0.8",
+                    "--min-support", "2",
+                    "--out", out,
+                ])
+
+            self.assertEqual(rc, 0)
+            load_diary.assert_not_called()
+            load_sessions.assert_called_once_with(
+                "/bound",
+                repository="copilot-mempalace",
+                since="2026-07-01",
+                limit_sessions=50,
+            )
+            worklist = _load_json(out)
+            self.assertEqual(worklist["scope"]["source"], "sessions")
+            self.assertEqual(worklist["items"][0]["kind"], "pattern")
+            self.assertEqual(worklist["items"][0]["evidence"]["support_ids"], ["s1", "s2"])
+            self.assertIn("harvested 2 observation entries (sessions)", stderr.getvalue())
+
+    def test_pattern_task_both_source_unions_diary_and_sessions(self):
+        diary_entries = [
+            {
+                "id": "diary-1", "text": "SESSION_ID: d1 dreaming pipeline design",
+                "embedding": [1.0, 0.0], "session_id": "d1",
+            },
+        ]
+        session_entries = [
+            {
+                "id": "session:s2", "member_ids": ["session:s2"],
+                "text": "dreaming pipeline design notes",
+                "embedding": [1.0, 0.0], "session_id": "s2", "room": "__session__",
+            },
+        ]
+        with _test_tmpdir() as td:
+            out = os.path.join(td, "worklist.json")
+            stderr = io.StringIO()
+            with mock.patch.object(dream_harvest.dream_palace, "bind_palace", return_value="/bound"), \
+                 mock.patch.object(
+                     dream_harvest.dream_palace, "load_observation_entries", return_value=diary_entries
+                 ) as load_diary, \
+                 mock.patch.object(
+                     dream_harvest.dream_palace, "load_session_observation_entries", return_value=session_entries
+                 ) as load_sessions, \
+                 contextlib.redirect_stderr(stderr):
+                rc = dream_harvest.main([
+                    "--palace", "/palace",
+                    "--task", "pattern",
+                    "--source", "both",
+                    "--tau", "0.8",
+                    "--min-support", "2",
+                    "--out", out,
+                ])
+
+            self.assertEqual(rc, 0)
+            load_diary.assert_called_once()
+            load_sessions.assert_called_once()
+            worklist = _load_json(out)
+            self.assertEqual(worklist["scope"]["source"], "both")
+            # theme spans one diary session (d1) and one host session (s2) => support 2
+            self.assertEqual(worklist["items"][0]["evidence"]["support_ids"], ["d1", "s2"])
+            self.assertIn("harvested 2 observation entries (both)", stderr.getvalue())
 
 
 class TestHarvestPruneTask(unittest.TestCase):

@@ -107,6 +107,17 @@ def main(argv: list[str] | None = None) -> int:
                         "Comma-separated rooms for pattern observation harvest (default diary). "
                         "Put surfaced lessons in a non-mined room so future pattern harvests ignore them."
                     ))
+    ap.add_argument("--source", choices=["diary", "sessions", "both"], default="diary",
+                    help=(
+                        "Observation source for the pattern task: diary rooms (default), raw Copilot "
+                        "host sessions, or both unioned. 'sessions'/'both' mine raw session turns."
+                    ))
+    ap.add_argument("--repository",
+                    help="Filter host sessions by repository substring (pattern --source sessions/both)")
+    ap.add_argument("--since",
+                    help="Only host sessions created at/after this ISO timestamp (pattern --source sessions/both)")
+    ap.add_argument("--limit-sessions", type=int, default=None,
+                    help="Cap the number of host sessions read (pattern --source sessions/both)")
     ap.add_argument("--instructions", help="Optional steering note recorded in the worklist")
     ap.add_argument("--rules", default=None,
                     help="Path to ontology config (default: <palace>/ontology.json)")
@@ -149,22 +160,39 @@ def main(argv: list[str] | None = None) -> int:
     if args.task == "pattern":
         tau = args.tau if args.tau is not None else 0.75
         rooms = tuple(room.strip() for room in args.rooms.split(",") if room.strip())
-        entries = [
-            entry for entry in dream_palace.load_observation_entries(path, wing=args.wing, rooms=rooms)
-            if not _is_surfaced_lesson(entry)
-        ]
+        entries = []
+        if args.source in ("diary", "both"):
+            entries.extend(
+                entry for entry in dream_palace.load_observation_entries(path, wing=args.wing, rooms=rooms)
+                if not _is_surfaced_lesson(entry)
+            )
+        if args.source in ("sessions", "both"):
+            entries.extend(
+                dream_palace.load_session_observation_entries(
+                    path,
+                    repository=args.repository,
+                    since=args.since,
+                    limit_sessions=args.limit_sessions,
+                )
+            )
         min_support = args.min_support if args.min_support is not None else 3
         themes = group_observation_themes(entries, tau=tau, min_support=min_support)
         worklist = build_pattern_worklist(
             themes,
-            scope={"palace": path, "wing": args.wing, "rooms": list(rooms), "task": "pattern"},
+            scope={
+                "palace": path,
+                "wing": args.wing,
+                "rooms": list(rooms),
+                "source": args.source,
+                "task": "pattern",
+            },
             params={"tau": tau, "min_support": min_support},
             instructions=args.instructions,
         )
         with open(args.out, "w", encoding="utf-8") as fh:
             json.dump(worklist, fh, indent=2, ensure_ascii=False)
         print(
-            f"harvested {len(entries)} observation entries -> {len(worklist['items'])} "
+            f"harvested {len(entries)} observation entries ({args.source}) -> {len(worklist['items'])} "
             f"pattern theme(s) spanning >= {min_support} sessions -> {args.out}",
             file=sys.stderr,
         )

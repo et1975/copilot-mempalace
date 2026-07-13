@@ -78,7 +78,7 @@ Artifacts go in the session workspace — never commit them.
 
 | # | Phase | Who | Command / action |
 |---|-------|-----|------------------|
-| 0 | Scope | you | pick task: merge (`--wing`, optional `--room`, `--tau`), contradiction (`--task contradiction`), pattern (`--task pattern`, `--wing`, `--rooms`, `--min-support`), rule induction (`--task induce-rules`, `--min-support`, `--ontology-out`), or prune (`--task prune`, `--wing`, optional `--room`, `--v-min`, `--age-floor-days`) + optional `--instructions` |
+| 0 | Scope | you | pick task: merge (`--wing`, optional `--room`, `--tau`), contradiction (`--task contradiction`), pattern (`--task pattern`, `--wing`, `--rooms`, `--min-support`, `--source {diary,sessions,both}`), rule induction (`--task induce-rules`, `--min-support`, `--ontology-out`), or prune (`--task prune`, `--wing`, optional `--room`, `--v-min`, `--age-floor-days`) + optional `--instructions` |
 | 1 | Harvest | script | merge: `dream_harvest.py --palace <p> --wing <w> --tau 0.9 --out worklist.json`; contradiction: `dream_harvest.py --palace <p> --task contradiction --out worklist.json`; pattern: `dream_harvest.py --palace <p> --task pattern --wing <w> --rooms diary --min-support 3 --out worklist.json`; rule induction: `dream_harvest.py --palace <p> --task induce-rules --min-support 2 --ontology-out <p>/ontology.json`; prune: `dream_harvest.py --palace <p> --task prune --wing <w> --room <r> --v-min 0.35 --age-floor-days 30 --out worklist.json` (READ-ONLY except ontology candidate writes for `induce-rules`) |
 | 2 | Adjudicate | **you** | fill each `worklist.json` item's `decision`; save as `decisions.json` |
 | 3 | Review | human/auto | diff proposed merge text vs the originals; approve a subset |
@@ -97,6 +97,33 @@ MPY=$(head -1 "$(command -v mempalace)" | sed 's/^#!//')
   --rooms diary --min-support 3 --out worklist.json
 "$MPY" dream_adopt.py --palace <palace> --decisions decisions.json --verify
 ```
+
+### Pattern observation source (`--source`)
+
+By default (`--source diary`) the `pattern` task mines only diary rooms — themes
+across lessons the agent chose to journal. Two other sources mine the **raw
+Copilot host session store** (`~/.copilot/session-store.db`, or
+`COPILOT_SESSION_STORE`) so themes can be induced from what actually happened in
+past sessions — repeated user corrections, converged tool sequences, restated
+preferences — even when nothing was journaled:
+
+```bash
+# raw host sessions only
+"$MPY" dream_harvest.py --palace <palace> --task pattern --source sessions \
+  --repository <repo-substr> --since 2026-01-01 --limit-sessions 200 \
+  --min-support 2 --out worklist.json
+# union of diary + raw sessions (support-counted across both by distinct session_id)
+"$MPY" dream_harvest.py --palace <palace> --task pattern --source both \
+  --rooms diary --repository <repo-substr> --min-support 2 --out worklist.json
+```
+
+Raw session text is stripped of injected framework boilerplate
+(`<skill-context…>`, hook/system-reminder blocks) and embedded in the palace's
+own space before clustering, so session and diary observations cluster together.
+Support counting keys on the real host-minted `session_id`, so `--source both`
+never double-counts a session that appears in both a diary entry and its raw
+turns. Output volume tracks history volume: sparse or topically-diverse history
+legitimately yields few themes.
 
 Prune and merge both archive superseded/deleted records to an append-only JSONL
 before the sanctioned delete; `--archive-file` sets the path for either (default
@@ -258,9 +285,11 @@ Implemented tasks:
 - `contradiction`: palace-wide active KG triples sharing `(subject, predicate)`
   with 2+ distinct objects. `--wing`, `--room`, and `--tau` do not apply because
   the KG is global to the palace.
-- `pattern`: cross-session diary observations grouped into themes, requiring
-  `--min-support` distinct stamped sessions before the agent may surface a
-  general lesson.
+- `pattern`: cross-session observations grouped into themes, requiring
+  `--min-support` distinct sessions before the agent may surface a general lesson.
+  Source is selectable with `--source {diary,sessions,both}` (default `diary`):
+  `sessions`/`both` mine raw Copilot host-session turns, not just journaled diary
+  entries.
 - `induce-rules`: pattern-family ontology induction over observed base KG
   triples. It writes disabled transitive/inverse/symmetric rule candidates to
   `--ontology-out` and never auto-enables them.

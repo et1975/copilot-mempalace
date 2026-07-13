@@ -135,6 +135,76 @@ def _session_id_state(text: str) -> tuple[str | None, bool]:
     return None, False
 
 
+# Injected framework context that pollutes raw host-session user messages. These
+# blocks describe the harness (skills, reminders, environment), not the user's
+# intent, so they are stripped before embedding session observations.
+_CONTEXT_TAGS = (
+    "skill-context",
+    "system_reminder",
+    "system-reminder",
+    "system_notification",
+    "available_skills",
+    "current_datetime",
+    "session_context",
+    "environment_context",
+    "custom_instruction",
+    "functions",
+)
+_CONTEXT_BLOCK_RES = [
+    re.compile(rf"<{tag}\b[^>]*>.*?</{tag}>", re.DOTALL | re.IGNORECASE)
+    for tag in _CONTEXT_TAGS
+]
+_UNCLOSED_CONTEXT_RE = re.compile(
+    r"<(?:skill-context|system_reminder|system-reminder)\b.*",
+    re.DOTALL | re.IGNORECASE,
+)
+_HOOK_LINE_RE = re.compile(
+    r"^\s*(?:Additional context from preToolUse hook:.*|\[palace-reflex\].*|\[fsx-[a-z]+\].*)$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _strip_context_boilerplate(text: str) -> str:
+    """Remove injected skill/hook/system context from a raw session message."""
+    if not text:
+        return ""
+    cleaned = text
+    for pattern in _CONTEXT_BLOCK_RES:
+        cleaned = pattern.sub(" ", cleaned)
+    cleaned = _UNCLOSED_CONTEXT_RE.sub(" ", cleaned)
+    cleaned = _HOOK_LINE_RE.sub(" ", cleaned)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _resolve_embed_fn(collection: Any):
+    """Resolve the palace collection's embedding function.
+
+    Prefers any public wrapper attribute; falls back to the underlying Chroma
+    collection's private embedding function. Isolated here so a future public
+    mempalace embed API is a one-line swap.
+    """
+    for attr in ("embedding_function", "_embedding_function"):
+        fn = getattr(collection, attr, None)
+        if callable(fn):
+            return fn
+    inner = getattr(collection, "_collection", None)
+    if inner is not None:
+        fn = getattr(inner, "_embedding_function", None)
+        if callable(fn):
+            return fn
+    raise RuntimeError("could not resolve palace embedding function for session observations")
+
+
+def _palace_embed(palace_path: str, texts: list[str]) -> list[list[float]]:
+    """Embed ``texts`` in the palace's own embedding space (same as drawers)."""
+    if not texts:
+        return []
+    from mempalace.palace import get_collection  # lazy: heavy import
+
+    embed_fn = _resolve_embed_fn(get_collection(palace_path))
+    return [[float(value) for value in vector] for vector in embed_fn(list(texts))]
+
+
 def load_logical_drawers(
     palace_path: str, wing: str | None = None, room: str | None = None
 ) -> list[dict[str, Any]]:
@@ -237,6 +307,59 @@ def load_observation_entries(
         if ambiguous:
             entry["ambiguous"] = True
         entries.append(entry)
+    return entries
+
+
+def load_session_observation_entries(
+    palace_path: str,
+    repository: str | None = None,
+    since: str | None = None,
+    limit_sessions: int | None = None,
+) -> list[dict[str, Any]]:
+    """Read raw Copilot host sessions as pattern-mining observation entries.
+
+    Bridges the host-only ``dream_sessions`` adapter into the palace embedding
+    space: strips injected framework boilerplate, embeds each session's user
+    text with the palace's own embedder, and returns entries shaped exactly like
+    :func:`load_observation_entries` so both pools cluster together. Each entry's
+    support key is the real host-minted ``session_id``.
+    """
+    import dream_sessions  # host-only adapter; never imports mempalace
+
+    observations = dream_sessions.load_session_observations(
+        repository=repository,
+        since=since,
+        limit_sessions=limit_sessions,
+    )
+
+    cleaned: list[tuple[dict[str, Any], str]] = []
+    for obs in observations:
+        text = _strip_context_boilerplate(obs.get("text") or "")
+        if text:
+            cleaned.append((obs, text))
+    if not cleaned:
+        return []
+
+    vectors = _palace_embed(palace_path, [text for _obs, text in cleaned])
+
+    entries = []
+    for (obs, text), embedding in zip(cleaned, vectors):
+        session_id = obs.get("session_id")
+        entry_id = f"session:{session_id}"
+        entries.append(
+            {
+                "id": entry_id,
+                "member_ids": [entry_id],
+                "text": text,
+                "embedding": embedding,
+                "session_id": str(session_id) if session_id is not None else None,
+                "agent": None,
+                "date": obs.get("created_at"),
+                "topic": obs.get("summary"),
+                "wing": None,
+                "room": "__session__",
+            }
+        )
     return entries
 
 

@@ -981,5 +981,128 @@ class KgDeriveWriterTests(unittest.TestCase):
             self.assertEqual(vt, "2026-05-01")
 
 
+class TestStripContextBoilerplate(unittest.TestCase):
+    def test_removes_paired_skill_context_block(self):
+        text = 'review and implement <skill-context name="using-superpowers">Base directory: /home/x</skill-context> now'
+        self.assertEqual(dream_palace._strip_context_boilerplate(text), "review and implement now")
+
+    def test_removes_unclosed_trailing_skill_context(self):
+        text = 'what does this repo lack <skill-context name="using-superpowers"> Base directory for this skill: /home'
+        self.assertEqual(dream_palace._strip_context_boilerplate(text), "what does this repo lack")
+
+    def test_removes_system_reminder_and_hook_lines(self):
+        text = (
+            "fix the bug\n"
+            "<system_reminder>sql tables: todos</system_reminder>\n"
+            "[palace-reflex] About to call 'Grep' without a recent mempalace_search"
+        )
+        self.assertEqual(dream_palace._strip_context_boilerplate(text), "fix the bug")
+
+    def test_empty_and_none_safe(self):
+        self.assertEqual(dream_palace._strip_context_boilerplate(""), "")
+        self.assertEqual(dream_palace._strip_context_boilerplate(None), "")
+
+
+class TestResolveEmbedFn(unittest.TestCase):
+    def test_prefers_public_then_falls_back_to_inner_private(self):
+        pub = types.SimpleNamespace(embedding_function=lambda xs: [[1.0] for _ in xs])
+        self.assertTrue(callable(dream_palace._resolve_embed_fn(pub)))
+
+        inner = types.SimpleNamespace(_embedding_function=lambda xs: [[2.0] for _ in xs])
+        wrapper = types.SimpleNamespace(_collection=inner)
+        self.assertIs(dream_palace._resolve_embed_fn(wrapper), inner._embedding_function)
+
+    def test_raises_when_unresolvable(self):
+        with self.assertRaises(RuntimeError):
+            dream_palace._resolve_embed_fn(types.SimpleNamespace())
+
+
+class TestLoadSessionObservationEntries(unittest.TestCase):
+    def _install_fake_sessions(self, observations):
+        fake = types.ModuleType("dream_sessions")
+        fake.load_session_observations = lambda **kwargs: observations
+        fake._calls = []
+        original_load = fake.load_session_observations
+
+        def _record(**kwargs):
+            fake._calls.append(kwargs)
+            return original_load(**kwargs)
+
+        fake.load_session_observations = _record
+        sys.modules["dream_sessions"] = fake
+        self.addCleanup(lambda: sys.modules.pop("dream_sessions", None))
+        return fake
+
+    def test_builds_embedded_entries_and_strips_boilerplate(self):
+        observations = [
+            {
+                "session_id": "sid-1",
+                "repository": "copilot-mempalace",
+                "created_at": "2026-07-01",
+                "summary": "packaging",
+                "text": 'make this a marketplace skillset <skill-context name="x">noise</skill-context>',
+                "turn_count": 3,
+            },
+        ]
+        self._install_fake_sessions(observations)
+        captured = {}
+
+        def fake_embed(palace, texts):
+            captured["texts"] = list(texts)
+            return [[0.5] * 4 for _ in texts]
+
+        original_embed = dream_palace._palace_embed
+        dream_palace._palace_embed = fake_embed
+        self.addCleanup(lambda: setattr(dream_palace, "_palace_embed", original_embed))
+
+        entries = dream_palace.load_session_observation_entries(
+            "/bound", repository="copilot-mempalace", since="2026-07-01", limit_sessions=10
+        )
+
+        self.assertEqual(captured["texts"], ["make this a marketplace skillset"])
+        self.assertEqual(len(entries), 1)
+        entry = entries[0]
+        self.assertEqual(entry["id"], "session:sid-1")
+        self.assertEqual(entry["member_ids"], ["session:sid-1"])
+        self.assertEqual(entry["session_id"], "sid-1")
+        self.assertEqual(entry["room"], "__session__")
+        self.assertEqual(entry["topic"], "packaging")
+        self.assertEqual(entry["date"], "2026-07-01")
+        self.assertEqual(entry["embedding"], [0.5, 0.5, 0.5, 0.5])
+        self.assertNotIn("skill-context", entry["text"])
+        self.assertEqual(sys.modules["dream_sessions"]._calls, [
+            {"repository": "copilot-mempalace", "since": "2026-07-01", "limit_sessions": 10}
+        ])
+
+    def test_drops_sessions_that_are_pure_boilerplate(self):
+        observations = [
+            {"session_id": "keep", "created_at": "d", "summary": "s", "text": "real user intent"},
+            {"session_id": "drop", "created_at": "d", "summary": "s",
+             "text": '<skill-context name="x">only framework noise</skill-context>'},
+        ]
+        self._install_fake_sessions(observations)
+        original_embed = dream_palace._palace_embed
+        dream_palace._palace_embed = lambda palace, texts: [[1.0] for _ in texts]
+        self.addCleanup(lambda: setattr(dream_palace, "_palace_embed", original_embed))
+
+        entries = dream_palace.load_session_observation_entries("/bound")
+        self.assertEqual([e["session_id"] for e in entries], ["keep"])
+
+    def test_no_observations_returns_empty(self):
+        self._install_fake_sessions([])
+        called = {"embed": False}
+
+        def fake_embed(palace, texts):
+            called["embed"] = True
+            return []
+
+        original_embed = dream_palace._palace_embed
+        dream_palace._palace_embed = fake_embed
+        self.addCleanup(lambda: setattr(dream_palace, "_palace_embed", original_embed))
+
+        self.assertEqual(dream_palace.load_session_observation_entries("/bound"), [])
+        self.assertFalse(called["embed"])
+
+
 if __name__ == "__main__":
     unittest.main()
