@@ -204,7 +204,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.task == "prune":
         drawers = dream_palace.load_logical_drawers(path, wing=args.wing, room=args.room)
-        degrees = dream_palace.kg_source_degree(path)
+        degrees = dream_palace.kg_protection_degree(path)
         redundancy = compute_redundancy(drawers)
         now = datetime.now()
         scored = []

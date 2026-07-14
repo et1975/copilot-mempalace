@@ -1245,6 +1245,53 @@ def kg_source_degree(palace_path: str) -> dict[str, int]:
         con.close()
 
 
+def kg_protection_degree(palace_path: str) -> dict[str, int]:
+    """Return per-drawer counts that should block pruning KG-dependent drawers."""
+    degrees = dict(kg_source_degree(palace_path))
+    db_path = _resolve_kg_path(palace_path)
+    if not os.path.exists(db_path):
+        return degrees
+
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except sqlite3.OperationalError:
+        con = sqlite3.connect(db_path)
+
+    try:
+        con.row_factory = sqlite3.Row
+        if not (_has_table(con, "triples") and _has_table(con, "kg_derivations")):
+            return degrees
+        triple_columns = _table_columns(con, "triples")
+        derivation_columns = _table_columns(con, "kg_derivations")
+        if "valid_to" not in triple_columns or not {
+            "conclusion_triple_id",
+            "premise_drawer_ids",
+        }.issubset(derivation_columns):
+            return degrees
+
+        rows = con.execute(
+            """
+            SELECT d.id, d.premise_drawer_ids
+            FROM kg_derivations d
+            JOIN triples t ON t.id = d.conclusion_triple_id
+            WHERE t.valid_to IS NULL
+            ORDER BY d.id
+            """
+        ).fetchall()
+        for row in rows:
+            try:
+                premise_drawer_ids = json.loads(row["premise_drawer_ids"] or "[]")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(premise_drawer_ids, list):
+                continue
+            for drawer_id in {str(value) for value in premise_drawer_ids if value}:
+                degrees[drawer_id] = degrees.get(drawer_id, 0) + 1
+        return degrees
+    finally:
+        con.close()
+
+
 class MempalaceWriter:
     """Writes through the sanctioned MCP tool handlers against the bound palace."""
 
@@ -1482,6 +1529,7 @@ def reconcile_firewall_provenance(palace_path: str) -> dict[str, int]:
     counts = {
         "triples_scanned": 0,
         "supports_inserted": 0,
+        "orphans_quarantined": 0,
         "derivations_scanned": 0,
         "derivation_premises_inserted": 0,
         "malformed_derivations": 0,
@@ -1493,6 +1541,9 @@ def reconcile_firewall_provenance(palace_path: str) -> dict[str, int]:
     try:
         con.execute("PRAGMA busy_timeout = 5000")
         con.execute("BEGIN IMMEDIATE")
+        epoch_present = con.execute(
+            "SELECT 1 FROM kg_firewall_meta WHERE key='epoch_committed_at' LIMIT 1"
+        ).fetchone() is not None
         if _has_table(con, "triples"):
             columns = _table_columns(con, "triples")
             valid_from_expr = "t.valid_from" if "valid_from" in columns else "NULL"
@@ -1523,19 +1574,26 @@ def reconcile_firewall_provenance(palace_path: str) -> dict[str, int]:
                 triple_id = str(row["triple_id"])
                 adapter_name = row["adapter_name"]
                 source_drawer_id = row["source_drawer_id"]
-                is_derive = (
-                    bool(row["has_derivation"])
-                    or adapter_name == "contemplate:derive"
-                    or (isinstance(source_drawer_id, str) and source_drawer_id.startswith("derive:"))
-                )
-                if is_derive:
-                    status = "deduced"
-                    source_trust = "trusted_rule"
-                    source_kind = adapter_name or "contemplate:derive"
+                quarantined = False
+                if epoch_present:
+                    status = "unknown"
+                    source_trust = "unknown"
+                    source_kind = adapter_name or "unknown"
+                    quarantined = True
                 else:
-                    status = "asserted"
-                    source_trust = "trusted_legacy"
-                    source_kind = adapter_name or "legacy"
+                    is_derive = (
+                        bool(row["has_derivation"])
+                        or adapter_name == "contemplate:derive"
+                        or (isinstance(source_drawer_id, str) and source_drawer_id.startswith("derive:"))
+                    )
+                    if is_derive:
+                        status = "deduced"
+                        source_trust = "trusted_rule"
+                        source_kind = adapter_name or "contemplate:derive"
+                    else:
+                        status = "asserted"
+                        source_trust = "trusted_legacy"
+                        source_kind = adapter_name or "legacy"
                 cur = con.execute(
                     "INSERT OR IGNORE INTO kg_triple_supports(support_id, triple_id, status,"
                     " source_trust, inherited_status, conditional_on_triple_ids, scope,"
@@ -1557,6 +1615,8 @@ def reconcile_firewall_provenance(palace_path: str) -> dict[str, int]:
                     ),
                 )
                 counts["supports_inserted"] += cur.rowcount
+                if quarantined:
+                    counts["orphans_quarantined"] += cur.rowcount
 
         derivation_rows = con.execute("SELECT id, premise_triple_ids FROM kg_derivations ORDER BY id").fetchall()
         counts["derivations_scanned"] = len(derivation_rows)

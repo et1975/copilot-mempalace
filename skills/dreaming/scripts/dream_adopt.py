@@ -365,7 +365,7 @@ def _preflight_merge_decisions(path: str, decisions: list[dict[str, Any]]) -> tu
 
 def _preflight_prune_decisions(path: str, decisions: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     try:
-        degrees = dream_palace.kg_source_degree(path)
+        degrees = dream_palace.kg_protection_degree(path)
     except Exception as exc:  # noqa: BLE001
         return (
             [{"action": "keep"} if d.get("action") == "prune" else d for d in decisions],
