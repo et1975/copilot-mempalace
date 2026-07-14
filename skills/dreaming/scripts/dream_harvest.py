@@ -146,7 +146,7 @@ def main(argv: list[str] | None = None) -> int:
 
     path = dream_palace.bind_palace(effective_palace)
     if args.task == "contradiction":
-        triples = dream_palace.load_active_triples(path)
+        triples = dream_palace.load_premises(path, purpose="audit")
         worklist = build_contradiction_worklist(
             triples,
             scope={"palace": path, "task": "contradiction"},
@@ -246,7 +246,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.task == "suggest-rules":
         ontology_out = args.ontology_out or os.path.join(path, "ontology.json")
-        triples = dream_palace.load_active_triples_with_ids(path)
+        triples = dream_palace.load_premises(path, purpose="audit")
         predicates = sorted({
             triple.get("predicate") for triple in triples
             if isinstance(triple.get("predicate"), str) and triple.get("predicate")
@@ -269,7 +269,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.task == "induce-rules":
         ontology_out = args.ontology_out or os.path.join(path, "ontology.json")
-        triples = dream_palace.load_active_triples_with_ids(path)
+        triples = dream_palace.load_premises(path, purpose="audit")
         existing = dream_ontology.read_ontology_doc(ontology_out)
         base = dream_ontology.filter_base_triples(triples, existing.get("rules", []))
         min_support = args.min_support if args.min_support is not None else 2
@@ -293,7 +293,7 @@ def main(argv: list[str] | None = None) -> int:
         skips_path = args.skips or os.path.join(path, "dream-derive-skips.jsonl")
         rules = dream_palace.load_ontology_config(rules_path)
         onto_ver = ontology_version(rules)
-        triples = dream_palace.load_active_triples_with_ids(path)
+        triples = dream_palace.load_premises(path, purpose="durable")
         candidates = deductive_closure(
             triples, rules, max_depth=args.max_depth,
             max_iterations=args.max_iterations, max_candidates=args.max_candidates)
@@ -314,7 +314,7 @@ def main(argv: list[str] | None = None) -> int:
         rules_path = args.rules or os.path.join(path, "ontology.json")
         rules = dream_palace.load_ontology_config(rules_path)
         onto_ver = ontology_version(rules)
-        triples = dream_palace.load_active_triples_with_ids(path)
+        triples = dream_palace.load_premises(path, purpose="durable")
         gaps = find_transitive_gaps(
             triples, rules, target_subject=args.target_subject,
             max_candidates=args.max_candidates)

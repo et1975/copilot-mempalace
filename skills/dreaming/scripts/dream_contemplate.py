@@ -207,7 +207,7 @@ def derive_worklist(
 ) -> tuple[dict, list[dict], list[dict]]:
     rules = dream_palace.load_ontology_config(rules_path)
     onto_ver = ontology_version(rules)
-    triples = dream_palace.load_active_triples_with_ids(palace)
+    triples = dream_palace.load_premises(palace, purpose="durable")
     candidates = deductive_closure(
         triples,
         rules,

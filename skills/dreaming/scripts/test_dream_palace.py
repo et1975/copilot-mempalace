@@ -1648,5 +1648,147 @@ class EpistemicFirewallB10AcceptanceTests(unittest.TestCase):
             self.assertIn(("B", "C"), edges)
 
 
+@unittest.skipUnless(_HAS_MEMPALACE, "requires mempalace interpreter")
+class LoadPremisesB11CoreTests(unittest.TestCase):
+    def _kg_path(self, palace):
+        return os.path.join(palace, "knowledge_graph.sqlite3")
+
+    def _seed_triples(self, palace):
+        kg = _RealKG(db_path=self._kg_path(palace))
+        try:
+            ids = [
+                str(kg.add_triple("A", "relates_to", "B", valid_from="2026-01-01")),
+                str(kg.add_triple("B", "relates_to", "C", valid_from="2026-01-02")),
+                str(kg.add_triple("C", "relates_to", "D", valid_from="2026-01-03")),
+                str(kg.add_triple("D", "relates_to", "E", valid_from="2026-01-04")),
+                str(kg.add_triple("E", "relates_to", "F", valid_from="2026-01-05")),
+            ]
+        finally:
+            kg.close()
+        return ids
+
+    def _insert_epoch(self, palace):
+        db_path = self._kg_path(palace)
+        dream_palace.ensure_firewall_schema(db_path)
+        con = sqlite3.connect(db_path)
+        try:
+            con.execute(
+                "INSERT OR IGNORE INTO kg_firewall_meta(key, value) VALUES (?, ?)",
+                ("epoch_committed_at", "2026-07-14T00:00:00+00:00"),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+    def _insert_support(self, palace, triple_id, status, source_trust, inherited_status=None, conditional_on="[]"):
+        con = sqlite3.connect(self._kg_path(palace))
+        try:
+            con.execute(
+                """
+                INSERT INTO kg_triple_supports(
+                    support_id, triple_id, status, source_trust, inherited_status,
+                    conditional_on_triple_ids, scope, source_kind, source_ref, created_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    f"support:{triple_id}",
+                    triple_id,
+                    status,
+                    source_trust,
+                    inherited_status or status,
+                    conditional_on,
+                    "durable",
+                    "test",
+                    "test",
+                    "2026-07-14T00:00:00+00:00",
+                ),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+    def _strip_epistemic(self, rows):
+        return [
+            {key: value for key, value in row.items() if key not in {"epistemic_status", "source_trust"}}
+            for row in rows
+        ]
+
+    def test_allowed_premise_pairs_match_contract(self):
+        self.assertEqual(
+            dream_palace.ALLOWED_PREMISE_PAIRS,
+            {
+                ("asserted", "trusted_legacy"),
+                ("asserted", "trusted_user"),
+                ("asserted", "verified_source"),
+                ("deduced", "trusted_rule"),
+            },
+        )
+
+    def test_durable_auto_reconciles_fresh_palace_and_returns_seeded_triples(self):
+        with _test_tmpdir() as palace:
+            self._seed_triples(palace)
+            audit = dream_palace.load_active_triples(palace)
+
+            durable = dream_palace.load_premises(palace)
+
+            self.assertEqual(self._strip_epistemic(durable), audit)
+            self.assertEqual(
+                {(row["epistemic_status"], row["source_trust"]) for row in durable},
+                {("asserted", "trusted_legacy")},
+            )
+            con = sqlite3.connect(self._kg_path(palace))
+            try:
+                epoch = con.execute(
+                    "SELECT value FROM kg_firewall_meta WHERE key='epoch_committed_at'"
+                ).fetchone()
+                support_count = con.execute("SELECT COUNT(*) FROM kg_triple_supports").fetchone()[0]
+            finally:
+                con.close()
+            self.assertIsNotNone(epoch)
+            self.assertEqual(support_count, len(audit))
+
+    def test_durable_equals_audit_set_on_legacy_palace_after_reconcile(self):
+        with _test_tmpdir() as palace:
+            self._seed_triples(palace)
+            dream_palace.reconcile_firewall_provenance(palace)
+
+            durable = dream_palace.load_premises(palace, purpose="durable")
+            audit = dream_palace.load_premises(palace, purpose="audit")
+
+            self.assertEqual(self._strip_epistemic(durable), audit)
+
+    def test_durable_excludes_tainted_disallowed_and_conditional_supports_but_audit_includes_them(self):
+        with _test_tmpdir() as palace:
+            ids = self._seed_triples(palace)
+            self._insert_epoch(palace)
+            self._insert_support(palace, ids[0], "asserted", "trusted_user")
+            self._insert_support(palace, ids[1], "deduced", "trusted_rule")
+            self._insert_support(palace, ids[2], "abduced", "hypothesis")
+            self._insert_support(palace, ids[3], "deduced", "untrusted_source")
+            self._insert_support(palace, ids[4], "asserted", "trusted_legacy", conditional_on='["tainted"]')
+
+            durable = dream_palace.load_premises(palace, purpose="durable")
+            audit = dream_palace.load_premises(palace, purpose="audit")
+
+            self.assertEqual([row["triple_id"] for row in durable], ids[:2])
+            self.assertEqual([row["triple_id"] for row in audit], ids)
+
+    def test_simulation_without_run_id_raises_value_error(self):
+        with _test_tmpdir() as palace:
+            self._seed_triples(palace)
+
+            with self.assertRaises(ValueError):
+                dream_palace.load_premises(palace, purpose="simulation")
+
+    def test_audit_output_equals_load_active_triples_output(self):
+        with _test_tmpdir() as palace:
+            self._seed_triples(palace)
+
+            self.assertEqual(
+                dream_palace.load_premises(palace, purpose="audit"),
+                dream_palace.load_active_triples(palace),
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

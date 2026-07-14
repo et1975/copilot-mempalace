@@ -28,6 +28,13 @@ SESSION_ID_RE = re.compile(
     re.IGNORECASE,
 )
 
+ALLOWED_PREMISE_PAIRS = {
+    ("asserted", "trusted_legacy"),
+    ("asserted", "trusted_user"),
+    ("asserted", "verified_source"),
+    ("deduced", "trusted_rule"),
+}
+
 KG_DERIVATIONS_DDL = (
     "CREATE TABLE IF NOT EXISTS kg_derivations("
     " id INTEGER PRIMARY KEY,"
@@ -507,6 +514,92 @@ def load_active_triples(palace_path: str) -> list[dict[str, Any]]:
         con.close()
 
 
+def load_premises(
+    palace_path: str,
+    *,
+    purpose: str = "durable",
+    run_id: str | None = None,
+    strict_schema: bool = True,
+) -> list[dict]:
+    """Load KG triples through the B1.1 epistemic firewall premise contract."""
+    if purpose == "audit":
+        return load_active_triples(palace_path)
+    if purpose == "simulation":
+        if run_id is None:
+            raise ValueError("load_premises(purpose='simulation') requires run_id")
+        # B1.5 will add the run's provisional overlay; B1.1 returns durable premises only.
+        return load_premises(palace_path, purpose="durable", strict_schema=strict_schema)
+    if purpose != "durable":
+        raise ValueError(f"unknown load_premises purpose: {purpose!r}")
+
+    db_path = _resolve_kg_path(palace_path)
+    if not os.path.exists(db_path):
+        return []
+
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except sqlite3.OperationalError:
+        con = sqlite3.connect(db_path)
+    try:
+        row = con.execute(
+            "SELECT value FROM kg_firewall_meta WHERE key='epoch_committed_at'"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        row = None
+    finally:
+        con.close()
+
+    if row is None:
+        reconcile_firewall_provenance(palace_path)
+
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except sqlite3.OperationalError:
+        con = sqlite3.connect(db_path)
+
+    try:
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            """
+            SELECT
+                t.id AS triple_id,
+                subj.name AS subject,
+                t.subject AS subject_id,
+                t.predicate AS predicate,
+                obj.name AS object,
+                t.object AS object_id,
+                t.valid_from AS valid_from,
+                t.valid_to AS valid_to,
+                t.extracted_at AS extracted_at,
+                t.source_drawer_id AS source_drawer_id,
+                t.confidence AS confidence,
+                s.status AS epistemic_status,
+                s.source_trust AS source_trust
+            FROM triples t
+            JOIN kg_triple_supports s ON s.triple_id = t.id
+            JOIN entities subj ON t.subject = subj.id
+            JOIN entities obj ON t.object = obj.id
+            WHERE t.valid_to IS NULL
+              AND s.status IN ('asserted', 'deduced')
+              AND s.inherited_status IN ('asserted', 'deduced')
+              AND s.conditional_on_triple_ids = '[]'
+              AND (
+                (s.status = 'asserted' AND s.source_trust IN ('trusted_legacy', 'trusted_user', 'verified_source'))
+                OR (s.status = 'deduced' AND s.source_trust = 'trusted_rule')
+              )
+            GROUP BY t.id
+            ORDER BY t.id
+            """
+        ).fetchall()
+        return [dict(row) for row in rows]
+    except sqlite3.OperationalError:
+        if strict_schema:
+            raise
+        return []
+    finally:
+        con.close()
+
+
 def kg_source_degree(palace_path: str) -> dict[str, int]:
     """Return per-drawer counts of KG triples sourced from each drawer id."""
     db_path = _resolve_kg_path(palace_path)
@@ -865,6 +958,13 @@ def reconcile_firewall_provenance(palace_path: str) -> dict[str, int]:
                     )
                     counts["derivation_premises_inserted"] += cur.rowcount
 
+        con.execute(
+            """
+            INSERT OR IGNORE INTO kg_firewall_meta(key, value, created_at)
+            VALUES ('epoch_committed_at', ?, ?)
+            """,
+            (now, now),
+        )
         cur = con.execute(
             """
             INSERT INTO kg_firewall_meta(key, value, created_at)

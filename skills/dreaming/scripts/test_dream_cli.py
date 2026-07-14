@@ -50,7 +50,7 @@ class TestHarvestContradictionTask(unittest.TestCase):
             out = os.path.join(td, "worklist.json")
             stderr = io.StringIO()
             with mock.patch.object(dream_harvest.dream_palace, "bind_palace", return_value="/bound"), \
-                 mock.patch.object(dream_harvest.dream_palace, "load_active_triples", return_value=triples), \
+                 mock.patch.object(dream_harvest.dream_palace, "load_premises", return_value=triples), \
                  contextlib.redirect_stderr(stderr):
                 rc = dream_harvest.main([
                     "--palace", "/palace",
@@ -1316,6 +1316,186 @@ class GapsCliTests(unittest.TestCase):
             for g in wl["items"]:
                 for u in g["evidence"]["unblocks"]:
                     self.assertEqual(u["subject"], "A")
+
+
+@unittest.skipUnless(_HAS_MEMPALACE, "requires mempalace KnowledgeGraph")
+class B11RewireCliTests(unittest.TestCase):
+    def _derive_palace(self, td):
+        palace = os.path.join(td, "palace")
+        os.makedirs(palace)
+        kg = _RealKG(db_path=os.path.join(palace, "knowledge_graph.sqlite3"))
+        kg.add_triple("A", "depends_on", "B", valid_from="2026-01-01")
+        kg.add_triple("B", "depends_on", "C", valid_from="2026-01-01")
+        kg.close()
+        with open(os.path.join(palace, "ontology.json"), "w", encoding="utf-8") as fh:
+            json.dump({"version": 1, "rules": [{"id": "transitive:depends_on",
+                "family": "transitive", "predicate": "depends_on", "enabled": True,
+                "max_depth": 3}]}, fh)
+        return palace
+
+    def _gaps_palace(self, td):
+        palace = os.path.join(td, "palace")
+        os.makedirs(palace)
+        kg = _RealKG(db_path=os.path.join(palace, "knowledge_graph.sqlite3"))
+        kg.add_triple("A", "depends_on", "B", valid_from="2026-01-01")
+        kg.add_triple("C", "depends_on", "D", valid_from="2026-01-01")
+        kg.close()
+        with open(os.path.join(palace, "ontology.json"), "w", encoding="utf-8") as fh:
+            json.dump({"version": 1, "rules": [{"id": "transitive:depends_on",
+                "family": "transitive", "predicate": "depends_on", "enabled": True,
+                "max_depth": 3}]}, fh)
+        return palace
+
+    def _audit_palace(self, td):
+        palace = os.path.join(td, "palace")
+        os.makedirs(palace)
+        kg = _RealKG(db_path=os.path.join(palace, "knowledge_graph.sqlite3"))
+        kg.add_triple("Alice", "lives_in", "Portland", valid_from="2024-01-01")
+        kg.add_triple("Alice", "lives_in", "Seattle", valid_from="2025-01-01")
+        kg.add_triple("Author", "authored", "Post", valid_from="2026-01-01")
+        kg.add_triple("Post", "authored_by", "Author", valid_from="2026-01-01")
+        kg.add_triple("ModuleA", "depends_on", "ModuleB", valid_from="2026-01-01")
+        kg.add_triple("ModuleB", "depends_on", "ModuleC", valid_from="2026-01-01")
+        kg.add_triple("FriendOne", "collaborates_with", "FriendTwo", valid_from="2026-01-01")
+        kg.add_triple("FriendTwo", "collaborates_with", "FriendOne", valid_from="2026-01-01")
+        kg.close()
+        return palace
+
+    def test_durable_derive_harvest_preserves_single_closure_candidate(self):
+        with _test_tmpdir() as td:
+            palace = self._derive_palace(td)
+            out = os.path.join(td, "wl.json")
+
+            with mock.patch.object(
+                dream_harvest.dream_palace,
+                "load_premises",
+                wraps=dream_harvest.dream_palace.load_premises,
+            ) as load_premises:
+                rc = dream_harvest.main(["--task", "derive", "--palace", palace, "--out", out])
+
+            self.assertEqual(rc, 0)
+            load_premises.assert_called_once_with(palace, purpose="durable")
+            wl = _load_json(out)
+            self.assertEqual(wl["task"], "contemplate")
+            self.assertEqual(len(wl["items"]), 1)
+            conclusion = wl["items"][0]["conclusion"]
+            self.assertEqual((conclusion["subject"], conclusion["predicate"], conclusion["object"]),
+                             ("A", "depends_on_closure", "C"))
+
+    def test_durable_gaps_harvest_preserves_bridging_gap(self):
+        with _test_tmpdir() as td:
+            palace = self._gaps_palace(td)
+            out = os.path.join(td, "wl.json")
+
+            with mock.patch.object(
+                dream_harvest.dream_palace,
+                "load_premises",
+                wraps=dream_harvest.dream_palace.load_premises,
+            ) as load_premises:
+                rc = dream_harvest.main(["--task", "gaps", "--palace", palace, "--out", out])
+
+            self.assertEqual(rc, 0)
+            load_premises.assert_called_once_with(palace, purpose="durable")
+            wl = _load_json(out)
+            self.assertEqual(wl["task"], "gaps")
+            edges = {(item["hypothesis"]["subject"], item["hypothesis"]["object"]) for item in wl["items"]}
+            self.assertIn(("B", "C"), edges)
+
+    def test_durable_derive_materialize_verify_reaches_fixpoint(self):
+        with _test_tmpdir() as td:
+            palace = self._derive_palace(td)
+            out = os.path.join(td, "wl.json")
+            rc = dream_harvest.main(["--task", "derive", "--palace", palace, "--out", out])
+            self.assertEqual(rc, 0)
+            wl = _load_json(out)
+            wl["items"][0]["action"] = "materialize"
+            decisions = os.path.join(td, "decisions.json")
+            _dump_json(decisions, wl)
+            stderr = io.StringIO()
+
+            with mock.patch.object(
+                dream_adopt.dream_palace,
+                "load_premises",
+                wraps=dream_adopt.dream_palace.load_premises,
+            ) as load_premises, contextlib.redirect_stderr(stderr):
+                rc = dream_adopt.main([
+                    "--task", "derive",
+                    "--palace", palace,
+                    "--decisions", decisions,
+                    "--verify",
+                    "--strict",
+                ])
+
+            self.assertEqual(rc, 0)
+            load_premises.assert_called_once_with(palace, purpose="durable")
+            self.assertIn("verify: 0 residual candidate(s)", stderr.getvalue())
+
+    def test_audit_contradiction_harvest_preserves_worklist_shape(self):
+        with _test_tmpdir() as td:
+            palace = self._audit_palace(td)
+            out = os.path.join(td, "contradictions.json")
+
+            with mock.patch.object(
+                dream_harvest.dream_palace,
+                "load_premises",
+                wraps=dream_harvest.dream_palace.load_premises,
+            ) as load_premises:
+                rc = dream_harvest.main(["--task", "contradiction", "--palace", palace, "--out", out])
+
+            self.assertEqual(rc, 0)
+            load_premises.assert_called_once_with(palace, purpose="audit")
+            wl = _load_json(out)
+            self.assertEqual(wl["task"], "contradiction")
+            self.assertEqual(wl["items"][0]["kind"], "contradiction")
+            self.assertEqual(wl["items"][0]["evidence"]["size"], 2)
+            self.assertEqual(len(wl["items"][0]["candidates"]), 2)
+
+    def test_audit_suggest_rules_preserves_rule_doc_shape(self):
+        with _test_tmpdir() as td:
+            palace = self._audit_palace(td)
+            ontology = os.path.join(td, "ontology.json")
+
+            with mock.patch.object(
+                dream_harvest.dream_palace,
+                "load_premises",
+                wraps=dream_harvest.dream_palace.load_premises,
+            ) as load_premises:
+                rc = dream_harvest.main([
+                    "--task", "suggest-rules",
+                    "--palace", palace,
+                    "--ontology-out", ontology,
+                ])
+
+            self.assertEqual(rc, 0)
+            load_premises.assert_called_once_with(palace, purpose="audit")
+            rules = _load_json(ontology)["rules"]
+            self.assertTrue(rules)
+            self.assertTrue(all(rule["enabled"] is False for rule in rules))
+            self.assertIn("transitive:depends_on", {rule["id"] for rule in rules})
+
+    def test_audit_induce_rules_preserves_rule_doc_shape(self):
+        with _test_tmpdir() as td:
+            palace = self._audit_palace(td)
+            ontology = os.path.join(td, "ontology.json")
+
+            with mock.patch.object(
+                dream_harvest.dream_palace,
+                "load_premises",
+                wraps=dream_harvest.dream_palace.load_premises,
+            ) as load_premises:
+                rc = dream_harvest.main([
+                    "--task", "induce-rules",
+                    "--palace", palace,
+                    "--min-support", "1",
+                    "--ontology-out", ontology,
+                ])
+
+            self.assertEqual(rc, 0)
+            load_premises.assert_called_once_with(palace, purpose="audit")
+            rules = _load_json(ontology)["rules"]
+            self.assertTrue(rules)
+            self.assertTrue(all(rule["enabled"] is False for rule in rules))
+            self.assertIn("transitive:depends_on", {rule["id"] for rule in rules})
 
 
 if __name__ == "__main__":

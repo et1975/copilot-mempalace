@@ -654,7 +654,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         if args.verify:
             rules = dream_palace.load_ontology_config(args.rules or os.path.join(path, "ontology.json"))
-            triples = dream_palace.load_active_triples_with_ids(path)
+            triples = dream_palace.load_premises(path, purpose="durable")
             residual = _dream_lib.deductive_closure(
                 triples, rules, max_depth=args.max_depth,
                 max_iterations=args.max_iterations, max_candidates=args.max_candidates)
