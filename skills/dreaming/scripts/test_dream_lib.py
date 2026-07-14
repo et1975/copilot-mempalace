@@ -3,6 +3,7 @@
 Run: cd skills/dreaming/scripts && python3 -m unittest -v
 """
 from datetime import datetime
+import json
 import unittest
 
 import dream_lib as dl
@@ -1009,10 +1010,12 @@ class IntervalOverlapTests(unittest.TestCase):
 # Task 4: deductive_closure — bounded semi-naive forward chaining
 # ---------------------------------------------------------------------------
 
-def _t(tid, s, p, o, sid=None, oid=None, vf=None, vt=None, conf=1.0):
-    return {"triple_id": tid, "subject": s, "predicate": p, "object": o,
-            "subject_id": sid if sid is not None else s, "object_id": oid if oid is not None else o,
-            "valid_from": vf, "valid_to": vt, "confidence": conf, "source_drawer_id": f"d{tid}"}
+def _t(tid, s, p, o, sid=None, oid=None, vf=None, vt=None, conf=1.0, **extra):
+    row = {"triple_id": tid, "subject": s, "predicate": p, "object": o,
+           "subject_id": sid if sid is not None else s, "object_id": oid if oid is not None else o,
+           "valid_from": vf, "valid_to": vt, "confidence": conf, "source_drawer_id": f"d{tid}"}
+    row.update(extra)
+    return row
 
 TRANS_RULES = [{"id": "transitive:depends_on", "family": "transitive",
                 "predicate": "depends_on", "enabled": True, "max_depth": 3}]
@@ -1157,6 +1160,109 @@ class DeductiveClosureTests(unittest.TestCase):
         cands = dream_lib.deductive_closure(triples, rules, max_depth=1,
                                             max_iterations=10, max_candidates=500)
         self.assertEqual(len(cands), 1)
+
+
+class EpistemicTaintRound1Tests(unittest.TestCase):
+    def _strip_additive_taint(self, item):
+        stripped = json.loads(json.dumps(item))
+        stripped.get("evidence", {}).pop("epistemic_status", None)
+        stripped.get("evidence", {}).pop("inherited_status", None)
+        stripped.get("proof", {}).pop("entailed_given", None)
+        return stripped
+
+    def test_min_status_returns_weakest_lattice_status(self):
+        self.assertEqual(dream_lib._min_status([]), "asserted")
+        self.assertEqual(dream_lib._min_status(["deduced", "abduced"]), "abduced")
+        self.assertEqual(dream_lib._min_status(["asserted", "deduced"]), "deduced")
+        self.assertEqual(dream_lib._min_status(["asserted"]), "asserted")
+        self.assertEqual(dream_lib._min_status(["asserted", "surprise"]), "unknown")
+
+    def test_all_trusted_candidate_is_deduced_without_entailed_given(self):
+        triples = [
+            _t("1", "A", "depends_on", "B", epistemic_status="asserted"),
+            _t("2", "B", "depends_on", "C", inherited_status="deduced"),
+        ]
+
+        cands = dream_lib.deductive_closure(
+            triples, TRANS_RULES, max_depth=3, max_iterations=10, max_candidates=500
+        )
+
+        self.assertEqual(len(cands), 1)
+        self.assertEqual(cands[0]["evidence"]["epistemic_status"], "deduced")
+        self.assertEqual(cands[0]["evidence"]["inherited_status"], "deduced")
+        self.assertEqual(cands[0]["proof"]["entailed_given"], [])
+
+    def test_abduced_premise_taints_candidate_with_premise_id(self):
+        rule = {"id": "inverse:depends_on:dependency_of", "family": "inverse",
+                "predicate": "depends_on", "inverse_predicate": "dependency_of", "enabled": True}
+        triples = [_t("p-abduced", "A", "depends_on", "B", epistemic_status="abduced")]
+
+        cands = dream_lib.deductive_closure(
+            triples, [rule], max_depth=1, max_iterations=10, max_candidates=500
+        )
+
+        self.assertEqual(len(cands), 1)
+        self.assertEqual(cands[0]["evidence"]["epistemic_status"], "entailed_given")
+        self.assertEqual(cands[0]["evidence"]["inherited_status"], "abduced")
+        self.assertEqual(cands[0]["proof"]["entailed_given"], ["p-abduced"])
+
+    def test_malformed_conditional_on_is_treated_as_empty(self):
+        rule = {"id": "inverse:depends_on:dependency_of", "family": "inverse",
+                "predicate": "depends_on", "inverse_predicate": "dependency_of", "enabled": True}
+        triples = [_t("p-trusted", "A", "depends_on", "B", conditional_on="not-json")]
+
+        cands = dream_lib.deductive_closure(
+            triples, [rule], max_depth=1, max_iterations=10, max_candidates=500
+        )
+
+        self.assertEqual(cands[0]["evidence"]["epistemic_status"], "deduced")
+        self.assertEqual(cands[0]["proof"]["entailed_given"], [])
+
+    def test_existing_derive_candidate_is_unchanged_after_dropping_additive_taint(self):
+        triples = [_t(1, "A", "depends_on", "B"), _t(2, "B", "depends_on", "C")]
+        cands = dream_lib.deductive_closure(
+            triples, TRANS_RULES, max_depth=3, max_iterations=10, max_candidates=500
+        )
+
+        self.assertEqual(self._strip_additive_taint(cands[0]), {
+            "kind": "derive",
+            "candidate_id": dream_lib.derive_candidate_id(
+                {
+                    "subject_id": "A",
+                    "predicate": "depends_on_closure",
+                    "object_id": "C",
+                    "subject": "A",
+                    "object": "C",
+                },
+                "transitive:depends_on",
+                [1, 2],
+                dream_lib.ontology_version(TRANS_RULES),
+            ),
+            "conclusion": {
+                "subject_id": "A",
+                "predicate": "depends_on_closure",
+                "object_id": "C",
+                "subject": "A",
+                "object": "C",
+            },
+            "rule": {
+                "id": "transitive:depends_on",
+                "family": "transitive",
+                "predicate": "depends_on",
+            },
+            "proof": {
+                "depth": 2,
+                "premise_ids": [1, 2],
+                "premise_drawer_ids": ["d1", "d2"],
+            },
+            "evidence": {
+                "already_active": False,
+                "confidence": 1.0,
+                "valid_from": None,
+                "valid_to": None,
+            },
+            "decision": None,
+        })
 
 
 # ---------------------------------------------------------------------------

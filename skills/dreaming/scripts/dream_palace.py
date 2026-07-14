@@ -18,6 +18,7 @@ import inspect
 import re
 import sqlite3
 import sys
+from collections import defaultdict, deque
 from datetime import datetime, timezone
 from typing import Any
 
@@ -34,6 +35,11 @@ ALLOWED_PREMISE_PAIRS = {
     ("asserted", "verified_source"),
     ("deduced", "trusted_rule"),
 }
+SUPPORT_ACTIVE_NOW_SQL = "s.ended_at IS NULL AND s.valid_to IS NULL"
+
+
+def _support_active_now(row) -> bool:
+    return row["ended_at"] is None and row["valid_to"] is None
 
 KG_DERIVATIONS_DDL = (
     "CREATE TABLE IF NOT EXISTS kg_derivations("
@@ -91,6 +97,8 @@ def bind_palace(palace_path: str) -> str:
 def _resolve_kg_path(palace_path: str) -> str | None:
     """Resolve the KG SQLite path for palace-local and home-level layouts."""
     palace_dir = os.path.abspath(os.path.expanduser(palace_path))
+    if palace_dir.endswith(".sqlite3"):
+        return palace_dir
     palace_local = os.path.join(palace_dir, "knowledge_graph.sqlite3")
     home_level = os.path.abspath(os.path.join(palace_dir, os.pardir, "knowledge_graph.sqlite3"))
     for db_path in (palace_local, home_level):
@@ -560,7 +568,7 @@ def load_premises(
     try:
         con.row_factory = sqlite3.Row
         rows = con.execute(
-            """
+            f"""
             SELECT
                 t.id AS triple_id,
                 subj.name AS subject,
@@ -574,14 +582,15 @@ def load_premises(
                 t.source_drawer_id AS source_drawer_id,
                 t.confidence AS confidence,
                 s.status AS epistemic_status,
-                s.source_trust AS source_trust
+                s.source_trust AS source_trust,
+                s.inherited_status AS inherited_status,
+                s.conditional_on_triple_ids AS conditional_on
             FROM triples t
             JOIN kg_triple_supports s ON s.triple_id = t.id
             JOIN entities subj ON t.subject = subj.id
             JOIN entities obj ON t.object = obj.id
             WHERE t.valid_to IS NULL
-              AND s.ended_at IS NULL
-              AND s.valid_to IS NULL
+              AND {SUPPORT_ACTIVE_NOW_SQL}
               AND s.status IN ('asserted', 'deduced')
               AND s.inherited_status IN ('asserted', 'deduced')
               AND s.conditional_on_triple_ids = '[]'
@@ -598,6 +607,277 @@ def load_premises(
         if strict_schema:
             raise
         return []
+    finally:
+        con.close()
+
+
+def _eligible_triple_ids(palace_path: str) -> set[str]:
+    """Return durable-premise-eligible active triple ids via the authoritative loader."""
+    return {
+        str(triple["triple_id"])
+        for triple in load_premises(palace_path, purpose="durable")
+    }
+
+
+def _revalidate_premise_ids(palace_path: str, premise_ids: list[Any]) -> None:
+    """B1.2/3 C4: independently reject any premise that is provisional or not
+    durable-premise-eligible. Never mutates the ids; fails closed."""
+    eligible = _eligible_triple_ids(palace_path)
+    for premise_id in premise_ids:
+        pid = str(premise_id)
+        if pid.startswith("prov:") or pid not in eligible:
+            raise ValueError(f"premise not grounded/eligible: {pid}")
+
+
+def _support_ids(con: sqlite3.Connection) -> set[str]:
+    if not _has_table(con, "kg_triple_supports"):
+        return set()
+    return {
+        str(row[0])
+        for row in con.execute("SELECT support_id FROM kg_triple_supports").fetchall()
+    }
+
+
+def _parse_derivation_premise_ids(raw: Any, derivation_id: Any) -> list[str]:
+    try:
+        parsed = json.loads(raw or "[]")
+    except (TypeError, json.JSONDecodeError) as ex:
+        raise ValueError(f"malformed premise_triple_ids for derivation {derivation_id}") from ex
+    if not isinstance(parsed, list):
+        raise ValueError(f"malformed premise_triple_ids for derivation {derivation_id}")
+    return [str(premise_id) for premise_id in parsed if premise_id]
+
+
+def _active_support_clause() -> str:
+    return "ended_at IS NULL AND valid_to IS NULL"
+
+
+def _is_independently_asserted(con: sqlite3.Connection, triple_id: str) -> bool:
+    row = con.execute(
+        f"""
+        SELECT 1
+        FROM kg_triple_supports s
+        WHERE s.triple_id = ?
+          AND s.status = 'asserted'
+          AND {_active_support_clause()}
+        LIMIT 1
+        """,
+        (triple_id,),
+    ).fetchone()
+    return row is not None
+
+
+def _load_derivation_graph(con: sqlite3.Connection) -> tuple[dict[int, dict[str, Any]], dict[str, list[dict[str, Any]]], dict[str, list[dict[str, Any]]]]:
+    derivations_by_id: dict[int, dict[str, Any]] = {}
+    derivations_by_conclusion: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    derivations_by_premise: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    seen_by_premise: dict[str, set[int]] = defaultdict(set)
+
+    rows = con.execute(
+        """
+        SELECT id, candidate_id, conclusion_triple_id, rule_id, premise_triple_ids
+        FROM kg_derivations
+        ORDER BY id
+        """
+    ).fetchall()
+    for row in rows:
+        derivation_id = int(row["id"])
+        premise_ids = _parse_derivation_premise_ids(row["premise_triple_ids"], derivation_id)
+        derivation = {
+            "id": derivation_id,
+            "candidate_id": row["candidate_id"],
+            "conclusion_triple_id": str(row["conclusion_triple_id"]),
+            "rule_id": row["rule_id"],
+            "premise_ids": premise_ids,
+        }
+        derivations_by_id[derivation_id] = derivation
+        derivations_by_conclusion[derivation["conclusion_triple_id"]].append(derivation)
+        for premise_id in premise_ids:
+            derivations_by_premise[premise_id].append(derivation)
+            seen_by_premise[premise_id].add(derivation_id)
+
+    sidecar_rows = con.execute(
+        """
+        SELECT derivation_id, premise_triple_id
+        FROM kg_derivation_premises
+        ORDER BY derivation_id, premise_triple_id
+        """
+    ).fetchall()
+    for row in sidecar_rows:
+        derivation_id = int(row["derivation_id"])
+        derivation = derivations_by_id.get(derivation_id)
+        if derivation is None:
+            raise ValueError(f"kg_derivation_premises references missing derivation {derivation_id}")
+        premise_id = str(row["premise_triple_id"])
+        if derivation_id not in seen_by_premise[premise_id]:
+            derivations_by_premise[premise_id].append(derivation)
+            seen_by_premise[premise_id].add(derivation_id)
+
+    return derivations_by_id, derivations_by_conclusion, derivations_by_premise
+
+
+def _active_triple_intervals(con: sqlite3.Connection) -> dict[str, dict[str, Any]]:
+    columns = _table_columns(con, "triples")
+    valid_from_expr = "valid_from" if "valid_from" in columns else "NULL AS valid_from"
+    valid_to_expr = "valid_to" if "valid_to" in columns else "NULL AS valid_to"
+    rows = con.execute(
+        f"""
+        SELECT id, {valid_from_expr}, {valid_to_expr}
+        FROM triples
+        WHERE valid_to IS NULL
+        """
+    ).fetchall()
+    return {
+        str(row["id"]): {"valid_from": row["valid_from"], "valid_to": row["valid_to"]}
+        for row in rows
+    }
+
+
+def _premise_interval_nonempty(triple_intervals: dict[str, dict[str, Any]], premise_ids: list[str]) -> bool:
+    if not premise_ids:
+        return False
+    premises = []
+    for premise_id in premise_ids:
+        row = triple_intervals.get(str(premise_id))
+        if row is None:
+            return False
+        premises.append(row)
+    from dream_lib import premise_interval
+
+    return premise_interval(premises) is not None
+
+
+def invalidate_triples_cascade(palace_path: str, root_triple_ids: list[str], ended_at: str) -> dict:
+    """Force-end roots and atomically invalidate derived dependents without an active proof."""
+    db_path = _resolve_kg_path(palace_path)
+    if not db_path or not os.path.exists(db_path):
+        return {
+            "roots_ended": [],
+            "cascade_invalidated": [],
+            "survived_by_alternate_proof": [],
+        }
+
+    ensure_firewall_schema(db_path)
+    roots = [str(root_id) for root_id in root_triple_ids]
+    con = sqlite3.connect(db_path)
+    con.row_factory = sqlite3.Row
+    try:
+        con.execute("PRAGMA busy_timeout = 5000")
+        con.execute("BEGIN IMMEDIATE")
+
+        root_active_before = {
+            str(row["id"])
+            for row in con.execute(
+                "SELECT id FROM triples WHERE valid_to IS NULL AND id IN (%s)"
+                % ",".join("?" for _ in roots),
+                roots,
+            ).fetchall()
+        } if roots else set()
+        root_support_active_before = {
+            str(row["triple_id"])
+            for row in con.execute(
+                "SELECT DISTINCT triple_id FROM kg_triple_supports s"
+                " WHERE s.triple_id IN (%s) AND %s"
+                % (",".join("?" for _ in roots), SUPPORT_ACTIVE_NOW_SQL),
+                roots,
+            ).fetchall()
+        } if roots else set()
+
+        for root_id in roots:
+            con.execute(
+                "UPDATE triples SET valid_to=? WHERE id=? AND valid_to IS NULL",
+                (ended_at, root_id),
+            )
+            con.execute(
+                f"""
+                UPDATE kg_triple_supports
+                SET ended_at=?
+                WHERE triple_id=?
+                  AND {_active_support_clause()}
+                """,
+                (ended_at, root_id),
+            )
+
+        _, derivations_by_conclusion, derivations_by_premise = _load_derivation_graph(con)
+
+        affected: set[str] = set()
+        queue = deque(roots)
+        while queue:
+            premise_id = queue.popleft()
+            for derivation in derivations_by_premise.get(str(premise_id), []):
+                conclusion_id = str(derivation["conclusion_triple_id"])
+                if conclusion_id not in affected:
+                    affected.add(conclusion_id)
+                    queue.append(conclusion_id)
+
+        triple_intervals = _active_triple_intervals(con)
+        active_triples = set(triple_intervals)
+        independently_asserted = {
+            triple_id
+            for triple_id in affected
+            if triple_id in active_triples and _is_independently_asserted(con, triple_id)
+        }
+        candidates = {
+            triple_id
+            for triple_id in affected
+            if triple_id in active_triples and triple_id not in independently_asserted
+        }
+
+        grounded = set(active_triples - candidates)
+        grounded.update(independently_asserted)
+
+        changed = True
+        while changed:
+            changed = False
+            for triple_id in sorted(candidates - grounded):
+                for derivation in derivations_by_conclusion.get(triple_id, []):
+                    premise_ids = list(derivation["premise_ids"])
+                    if not _premise_interval_nonempty(triple_intervals, premise_ids):
+                        continue
+                    if all(premise_id in active_triples and premise_id in grounded for premise_id in premise_ids):
+                        grounded.add(triple_id)
+                        changed = True
+                        break
+
+        to_end = sorted(candidates - grounded)
+        for triple_id in to_end:
+            con.execute(
+                f"""
+                UPDATE kg_triple_supports
+                SET ended_at=?
+                WHERE triple_id=?
+                  AND status='deduced'
+                  AND {_active_support_clause()}
+                """,
+                (ended_at, triple_id),
+            )
+            has_active_support = con.execute(
+                f"""
+                SELECT 1
+                FROM kg_triple_supports
+                WHERE triple_id=?
+                  AND {_active_support_clause()}
+                LIMIT 1
+                """,
+                (triple_id,),
+            ).fetchone()
+            if has_active_support is None:
+                con.execute(
+                    "UPDATE triples SET valid_to=? WHERE id=? AND valid_to IS NULL",
+                    (ended_at, triple_id),
+                )
+
+        survived = sorted(candidates & grounded)
+        roots_ended = sorted(root_active_before | root_support_active_before)
+        con.commit()
+        return {
+            "roots_ended": roots_ended,
+            "cascade_invalidated": to_end,
+            "survived_by_alternate_proof": survived,
+        }
+    except Exception:
+        con.rollback()
+        raise
     finally:
         con.close()
 
@@ -998,6 +1278,7 @@ class KgDeriveWriter:
 
     def __init__(self, palace_path):
         from mempalace.knowledge_graph import KnowledgeGraph  # lazy
+        self._palace_or_db = palace_path
         self._db_path = _resolve_kg_path(palace_path)
         self._kg = KnowledgeGraph(db_path=self._db_path)
         ensure_firewall_schema(self._db_path)
@@ -1012,6 +1293,13 @@ class KgDeriveWriter:
     def add_derived(self, conclusion, rule_id, premise_ids, premise_drawer_ids,
                     ontology_version, confidence, valid_from, valid_to):
         from dream_lib import derive_candidate_id, normalize_predicate
+        preexisting_support_ids: set[str] = set()
+        if os.path.exists(self._db_path):
+            pre_con = sqlite3.connect(self._db_path)
+            try:
+                preexisting_support_ids = _support_ids(pre_con)
+            finally:
+                pre_con.close()
         candidate_id = derive_candidate_id(conclusion, rule_id, premise_ids, ontology_version)
         con = sqlite3.connect(self._db_path)
         try:
@@ -1022,6 +1310,9 @@ class KgDeriveWriter:
             obj = self._resolve_name(con, conclusion["object_id"])
         finally:
             con.close()
+        # B1.2/3 C4: independently re-validate premises before any durable write.
+        # Never trust the caller; reject provisional or now-ineligible premises.
+        _revalidate_premise_ids(self._palace_or_db, premise_ids)
         pred = normalize_predicate(conclusion["predicate"])
         normalized_valid_from = _normalize_dt_for_kg(valid_from)
         normalized_valid_to = _normalize_dt_for_kg(valid_to)
@@ -1065,6 +1356,18 @@ class KgDeriveWriter:
                     now,
                 ),
             )
+            legacy_support_id = _legacy_support_id(str(triple_id))
+            if legacy_support_id not in preexisting_support_ids:
+                con.execute(
+                    """
+                    DELETE FROM kg_triple_supports
+                    WHERE support_id=?
+                      AND triple_id=?
+                      AND status='asserted'
+                      AND source_trust='trusted_legacy'
+                    """,
+                    (legacy_support_id, str(triple_id)),
+                )
             for premise_id in premise_ids:
                 if premise_id:
                     con.execute(

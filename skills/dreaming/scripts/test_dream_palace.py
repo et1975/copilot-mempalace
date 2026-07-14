@@ -912,24 +912,31 @@ except Exception:
 @unittest.skipUnless(_HAS_MEMPALACE, "requires mempalace interpreter")
 class KgDeriveWriterTests(unittest.TestCase):
     def _seed(self, palace):
-        # create entities A, B, C via real add_triple; return their ids
+        # create entities A, B, C via real add_triple; return (entity ids, base triple ids)
         kg = _RealKG(db_path=os.path.join(palace, "knowledge_graph.sqlite3"))
         kg.add_triple("A", "depends_on", "B", valid_from="2026-01-01")
         kg.add_triple("B", "depends_on", "C", valid_from="2026-01-01")
         kg.close()
+        # provenance sidecars so the base triples are durable-premise-eligible (C4)
+        dream_palace.reconcile_firewall_provenance(palace)
         con = sqlite3.connect(os.path.join(palace, "knowledge_graph.sqlite3"))
         ids = {r[1]: r[0] for r in con.execute("SELECT id,name FROM entities").fetchall()}
+        base_ids = [
+            r[0] for r in con.execute(
+                "SELECT id FROM triples WHERE predicate='depends_on' AND valid_to IS NULL ORDER BY id"
+            ).fetchall()
+        ]
         con.close()
-        return ids
+        return ids, base_ids
 
     def test_add_derived_creates_derivation_row_and_triple(self):
         with _test_tmpdir() as palace:
-            ids = self._seed(palace)
+            ids, base_ids = self._seed(palace)
             w = dream_palace.KgDeriveWriter(palace)
             try:
                 res = w.add_derived(
                     {"subject_id": ids["A"], "predicate": "depends_on_closure", "object_id": ids["C"]},
-                    "transitive:depends_on", ["t1", "t2"], ["d1", "d2"], "onto:v", 0.7,
+                    "transitive:depends_on", base_ids, ["d1", "d2"], "onto:v", 0.7,
                     "2026-01-01", None)
             finally:
                 w.close()
@@ -947,10 +954,10 @@ class KgDeriveWriterTests(unittest.TestCase):
 
     def test_add_derived_is_idempotent_on_same_candidate(self):
         with _test_tmpdir() as palace:
-            ids = self._seed(palace)
+            ids, base_ids = self._seed(palace)
             w = dream_palace.KgDeriveWriter(palace)
             args = ({"subject_id": ids["A"], "predicate": "depends_on_closure", "object_id": ids["C"]},
-                    "r", ["t1", "t2"], ["d1", "d2"], "onto:v", 0.7, "2026-01-01", None)
+                    "r", base_ids, ["d1", "d2"], "onto:v", 0.7, "2026-01-01", None)
             try:
                 w.add_derived(*args)
                 second = w.add_derived(*args)
@@ -966,12 +973,12 @@ class KgDeriveWriterTests(unittest.TestCase):
 
     def test_valid_to_is_persisted(self):
         with _test_tmpdir() as palace:
-            ids = self._seed(palace)
+            ids, base_ids = self._seed(palace)
             w = dream_palace.KgDeriveWriter(palace)
             try:
                 w.add_derived(
                     {"subject_id": ids["A"], "predicate": "depends_on_closure", "object_id": ids["C"]},
-                    "r", ["t1"], ["d1"], "onto:v", 1.0, "2026-01-01", "2026-05-01")
+                    "r", base_ids[:1], ["d1"], "onto:v", 1.0, "2026-01-01", "2026-05-01")
             finally:
                 w.close()
             con = sqlite3.connect(os.path.join(palace, "knowledge_graph.sqlite3"))
@@ -1709,7 +1716,11 @@ class LoadPremisesB11CoreTests(unittest.TestCase):
 
     def _strip_epistemic(self, rows):
         return [
-            {key: value for key, value in row.items() if key not in {"epistemic_status", "source_trust"}}
+            {
+                key: value
+                for key, value in row.items()
+                if key not in {"epistemic_status", "source_trust", "inherited_status", "conditional_on"}
+            }
             for row in rows
         ]
 
@@ -1724,6 +1735,15 @@ class LoadPremisesB11CoreTests(unittest.TestCase):
             },
         )
 
+    def test_support_active_now_uses_open_ended_support_predicate(self):
+        self.assertEqual(
+            dream_palace.SUPPORT_ACTIVE_NOW_SQL,
+            "s.ended_at IS NULL AND s.valid_to IS NULL",
+        )
+        self.assertTrue(dream_palace._support_active_now({"ended_at": None, "valid_to": None}))
+        self.assertFalse(dream_palace._support_active_now({"ended_at": "2026-01-01", "valid_to": None}))
+        self.assertFalse(dream_palace._support_active_now({"ended_at": None, "valid_to": "2026-01-01"}))
+
     def test_durable_auto_reconciles_fresh_palace_and_returns_seeded_triples(self):
         with _test_tmpdir() as palace:
             self._seed_triples(palace)
@@ -1736,6 +1756,8 @@ class LoadPremisesB11CoreTests(unittest.TestCase):
                 {(row["epistemic_status"], row["source_trust"]) for row in durable},
                 {("asserted", "trusted_legacy")},
             )
+            self.assertEqual({row["inherited_status"] for row in durable}, {"asserted"})
+            self.assertEqual({row["conditional_on"] for row in durable}, {"[]"})
             con = sqlite3.connect(self._kg_path(palace))
             try:
                 epoch = con.execute(
@@ -1756,6 +1778,20 @@ class LoadPremisesB11CoreTests(unittest.TestCase):
             audit = dream_palace.load_premises(palace, purpose="audit")
 
             self.assertEqual(self._strip_epistemic(durable), audit)
+
+    def test_durable_surfaces_inherited_status_and_conditional_on(self):
+        with _test_tmpdir() as palace:
+            ids = self._seed_triples(palace)
+            self._insert_epoch(palace)
+            self._insert_support(palace, ids[0], "asserted", "trusted_user", inherited_status="asserted")
+            self._insert_support(palace, ids[1], "deduced", "trusted_rule", inherited_status="deduced")
+
+            durable = dream_palace.load_premises(palace, purpose="durable")
+
+            self.assertEqual(
+                [(row["triple_id"], row["inherited_status"], row["conditional_on"]) for row in durable],
+                [(ids[0], "asserted", "[]"), (ids[1], "deduced", "[]")],
+            )
 
     def test_durable_excludes_tainted_disallowed_and_conditional_supports_but_audit_includes_them(self):
         with _test_tmpdir() as palace:

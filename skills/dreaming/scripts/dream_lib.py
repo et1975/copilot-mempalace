@@ -21,6 +21,9 @@ from typing import Any
 
 WORKLIST_VERSION = 1
 DEG_CAP = 5
+TRUSTED_STATUSES = {"asserted", "deduced", "promoted"}
+_STATUS_ORDER = ["unknown", "abduced", "materialized_abduced", "acquired", "deduced", "promoted", "asserted"]
+_STATUS_INDEX = {status: i for i, status in enumerate(_STATUS_ORDER)}
 
 _EPHEMERAL_RE = re.compile(
     r"\b(?:for now|this session|temporarily|one-off|throwaway|scratch|just for this)\b",
@@ -30,6 +33,19 @@ _SESSION_ID_RE = re.compile(
     r"SESSION_ID:\s*([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})",
     re.IGNORECASE,
 )
+
+
+def _min_status(statuses) -> str:
+    """Return the weakest epistemic status; unknown names collapse to ``unknown``."""
+    weakest = "asserted"
+    weakest_i = _STATUS_INDEX[weakest]
+    for status in statuses:
+        name = status if status in _STATUS_INDEX else "unknown"
+        idx = _STATUS_INDEX[name]
+        if idx < weakest_i:
+            weakest = name
+            weakest_i = idx
+    return weakest
 
 
 def cosine_similarity(a: list[float], b: list[float]) -> float:
@@ -881,6 +897,18 @@ def _entity_name_map(triples: list[dict[str, Any]]) -> dict[Any, str]:
     return names
 
 
+def _premise_effective_status(premise: dict[str, Any]) -> str:
+    return premise.get("inherited_status") or premise.get("epistemic_status") or "asserted"
+
+
+def _premise_conditional_on(premise: dict[str, Any]) -> list[Any]:
+    try:
+        parsed = json.loads(premise.get("conditional_on") or "[]")
+    except (TypeError, json.JSONDecodeError):
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
 def _mk_candidate(subj_id, pred, obj_id, names, rule, premises, onto_version, depth):
     interval = premise_interval(premises)
     if interval is None:
@@ -891,17 +919,35 @@ def _mk_candidate(subj_id, pred, obj_id, names, rule, premises, onto_version, de
         "subject": names.get(subj_id), "object": names.get(obj_id),
     }
     conf = min((float(c) if (c := p.get("confidence")) is not None else 1.0 for p in premises), default=1.0)
+    statuses = [_premise_effective_status(p) for p in premises]
+    conditional: set[Any] = set()
+    for premise, status in zip(premises, statuses):
+        conditional.update(_premise_conditional_on(premise))
+        if status not in TRUSTED_STATUSES:
+            conditional.add(premise["triple_id"])
+    conditional_on = sorted(conditional)
+    inherited = _min_status(statuses)
+    proof = {"depth": depth,
+             "premise_ids": premise_ids,
+             "premise_drawer_ids": [p.get("source_drawer_id") for p in premises]}
+    evidence = {"already_active": False, "confidence": conf,
+                "valid_from": interval[0], "valid_to": interval[1]}
+    if conditional_on == [] and inherited in TRUSTED_STATUSES:
+        evidence["epistemic_status"] = "deduced"
+        proof["entailed_given"] = []
+        evidence["inherited_status"] = inherited
+    else:
+        evidence["epistemic_status"] = "entailed_given"
+        proof["entailed_given"] = conditional_on
+        evidence["inherited_status"] = inherited
     return {
         "kind": "derive",
         "candidate_id": derive_candidate_id(conclusion, rule["id"], premise_ids, onto_version),
         "conclusion": conclusion,
         "rule": {"id": rule["id"], "family": rule["family"],
                  "predicate": normalize_predicate(rule["predicate"])},
-        "proof": {"depth": depth,
-                  "premise_ids": premise_ids,
-                  "premise_drawer_ids": [p.get("source_drawer_id") for p in premises]},
-        "evidence": {"already_active": False, "confidence": conf,
-                     "valid_from": interval[0], "valid_to": interval[1]},
+        "proof": proof,
+        "evidence": evidence,
         "decision": None,
     }
 
@@ -1186,6 +1232,11 @@ def apply_derive_decisions(decisions, writer):
             rule = d.get("rule") or {}
             proof = d.get("proof") or {}
             ev = d.get("evidence") or {}
+            if ev.get("epistemic_status") == "entailed_given" or bool(proof.get("entailed_given") or []):
+                report["errors"].append({"stage": "materialize",
+                    "error": f"refused to materialize entailed_given candidate {d.get('candidate_id')}",
+                    "decision": d})
+                continue
             missing = [k for k in ("subject_id", "predicate", "object_id") if concl.get(k) is None]
             if missing or not rule.get("id"):
                 report["errors"].append({"stage": "groundedness",

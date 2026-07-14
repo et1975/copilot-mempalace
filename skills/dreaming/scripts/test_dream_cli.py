@@ -1067,6 +1067,44 @@ class TestAdoptDeriveTask(unittest.TestCase):
         decisions = dream_adopt._resolve_derive_decisions(worklist)
         return dream_adopt.apply_derive_decisions(decisions, dream_adopt._DryRunKgWriter())[0]
 
+    class _RecordingKgWriter:
+        def __init__(self):
+            self.added = []
+
+        def add_derived(self, *args, **kwargs):
+            self.added.append((args, kwargs))
+            return {"ok": True, "triple_id": f"t-derived-{len(self.added)}"}
+
+    def test_entailed_given_materialize_is_rejected_without_writer_call(self):
+        item = self._derive_item()
+        item["action"] = "materialize"
+        item["evidence"]["epistemic_status"] = "entailed_given"
+        item["proof"]["entailed_given"] = ["t_x"]
+        writer = self._RecordingKgWriter()
+
+        report, markers = dream_adopt.apply_derive_decisions([item], writer)
+
+        self.assertEqual(writer.added, [])
+        self.assertEqual(report["materialized"], 0)
+        self.assertEqual(markers, [])
+        self.assertEqual(len(report["errors"]), 1)
+        self.assertEqual(report["errors"][0]["stage"], "materialize")
+        self.assertIn("refused to materialize entailed_given candidate cand-1", report["errors"][0]["error"])
+
+    def test_deduced_materialize_still_calls_writer(self):
+        item = self._derive_item()
+        item["action"] = "materialize"
+        item["evidence"]["epistemic_status"] = "deduced"
+        item["proof"]["entailed_given"] = []
+        writer = self._RecordingKgWriter()
+
+        report, markers = dream_adopt.apply_derive_decisions([item], writer)
+
+        self.assertEqual(len(writer.added), 1)
+        self.assertEqual(report["materialized"], 1)
+        self.assertEqual(report["errors"], [])
+        self.assertEqual(markers, [])
+
     def test_nested_derive_decision_materializes(self):
         item = self._derive_item()
         item["decision"] = {"action": "materialize", "reason": "approved"}
@@ -1427,7 +1465,35 @@ class B11RewireCliTests(unittest.TestCase):
                 ])
 
             self.assertEqual(rc, 0)
-            load_premises.assert_called_once_with(palace, purpose="durable")
+            # adopt now calls the durable loader for BOTH the C4 premise re-validation
+            # (during materialize) and the verify re-harvest.
+            load_premises.assert_any_call(palace, purpose="durable")
+            self.assertIn("verify: 0 residual candidate(s)", stderr.getvalue())
+
+    def test_deduced_derive_adopt_verify_reaches_fixpoint_after_firewall(self):
+        with _test_tmpdir() as td:
+            palace = self._derive_palace(td)
+            out = os.path.join(td, "wl.json")
+            rc = dream_harvest.main(["--task", "derive", "--palace", palace, "--out", out])
+            self.assertEqual(rc, 0)
+            wl = _load_json(out)
+            self.assertEqual(wl["items"][0]["evidence"]["epistemic_status"], "deduced")
+            self.assertEqual(wl["items"][0]["proof"]["entailed_given"], [])
+            wl["items"][0]["action"] = "materialize"
+            decisions = os.path.join(td, "decisions.json")
+            _dump_json(decisions, wl)
+            stderr = io.StringIO()
+
+            with contextlib.redirect_stderr(stderr):
+                rc = dream_adopt.main([
+                    "--task", "derive",
+                    "--palace", palace,
+                    "--decisions", decisions,
+                    "--verify",
+                    "--strict",
+                ])
+
+            self.assertEqual(rc, 0)
             self.assertIn("verify: 0 residual candidate(s)", stderr.getvalue())
 
     def test_audit_contradiction_harvest_preserves_worklist_shape(self):
