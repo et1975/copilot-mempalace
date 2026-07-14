@@ -28,6 +28,51 @@ SESSION_ID_RE = re.compile(
     re.IGNORECASE,
 )
 
+KG_DERIVATIONS_DDL = (
+    "CREATE TABLE IF NOT EXISTS kg_derivations("
+    " id INTEGER PRIMARY KEY,"
+    " candidate_id TEXT UNIQUE,"
+    " conclusion_triple_id TEXT,"
+    " rule_id TEXT,"
+    " ontology_version TEXT,"
+    " premise_triple_ids TEXT,"
+    " premise_drawer_ids TEXT,"
+    " confidence REAL,"
+    " created_at TEXT)"
+)
+
+FIREWALL_SCHEMA_DDL = (
+    KG_DERIVATIONS_DDL,
+    """
+    CREATE TABLE IF NOT EXISTS kg_triple_supports (
+      support_id TEXT PRIMARY KEY,
+      triple_id  TEXT NOT NULL,
+      status TEXT NOT NULL,
+      source_trust TEXT NOT NULL,
+      inherited_status TEXT NOT NULL,
+      conditional_on_triple_ids TEXT NOT NULL DEFAULT '[]',
+      scope TEXT NOT NULL DEFAULT 'durable',
+      source_kind TEXT, source_ref TEXT,
+      valid_from TEXT, valid_to TEXT,
+      created_at TEXT NOT NULL, ended_at TEXT);
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_supports_triple ON kg_triple_supports(triple_id)",
+    "CREATE INDEX IF NOT EXISTS idx_supports_status ON kg_triple_supports(status)",
+    """
+    CREATE TABLE IF NOT EXISTS kg_derivation_premises (
+      derivation_id INTEGER NOT NULL,
+      premise_triple_id TEXT NOT NULL,
+      PRIMARY KEY (derivation_id, premise_triple_id));
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_derivprem_premise ON kg_derivation_premises(premise_triple_id)",
+    "CREATE INDEX IF NOT EXISTS idx_derivations_conclusion ON kg_derivations(conclusion_triple_id)",
+    """
+    CREATE TABLE IF NOT EXISTS kg_firewall_meta (
+      key TEXT PRIMARY KEY, value TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+    """,
+)
+
 
 def bind_palace(palace_path: str) -> str:
     """Point mempalace at ``palace_path`` for this process. Call before imports."""
@@ -46,6 +91,26 @@ def _resolve_kg_path(palace_path: str) -> str | None:
             print(f"dream_palace: KG resolved to {db_path}", file=sys.stderr)
             return db_path
     return palace_local
+
+
+def ensure_firewall_schema(db_path: str) -> None:
+    """Create B1.0 epistemic-firewall sidecars in the KG SQLite database."""
+    con = sqlite3.connect(db_path)
+    try:
+        for ddl in FIREWALL_SCHEMA_DDL:
+            con.execute(ddl)
+        con.commit()
+    finally:
+        con.close()
+
+
+def _derived_support_id(triple_id: str, rule_id: str, candidate_id: str) -> str:
+    key = f"{triple_id}|{rule_id}|{candidate_id}".encode("utf-8")
+    return "sup:" + hashlib.sha256(key).hexdigest()[:32]
+
+
+def _legacy_support_id(triple_id: str) -> str:
+    return "sup:legacy:" + triple_id
 
 
 def _where(wing: str | None, room: str | None) -> dict[str, Any] | None:
@@ -685,6 +750,139 @@ def _normalize_dt_for_kg(value):
     return value + "Z"
 
 
+def _table_columns(con: sqlite3.Connection, table_name: str) -> set[str]:
+    rows = con.execute(f"PRAGMA table_info({table_name})").fetchall()
+    return {row[1] for row in rows}
+
+
+def _has_table(con: sqlite3.Connection, table_name: str) -> bool:
+    return con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (table_name,),
+    ).fetchone() is not None
+
+
+def reconcile_firewall_provenance(palace_path: str) -> dict[str, int]:
+    """Backfill B1.0 support and reverse-index sidecars for an existing KG."""
+    db_path = _resolve_kg_path(palace_path)
+    ensure_firewall_schema(db_path)
+    now = datetime.now(timezone.utc).isoformat()
+    counts = {
+        "triples_scanned": 0,
+        "supports_inserted": 0,
+        "derivations_scanned": 0,
+        "derivation_premises_inserted": 0,
+        "malformed_derivations": 0,
+        "meta_written": 0,
+    }
+
+    con = sqlite3.connect(db_path)
+    con.row_factory = sqlite3.Row
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        if _has_table(con, "triples"):
+            columns = _table_columns(con, "triples")
+            valid_from_expr = "t.valid_from" if "valid_from" in columns else "NULL"
+            valid_to_expr = "t.valid_to" if "valid_to" in columns else "NULL"
+            adapter_expr = "t.adapter_name" if "adapter_name" in columns else "NULL"
+            source_expr = "t.source_drawer_id" if "source_drawer_id" in columns else "NULL"
+            rows = con.execute(
+                f"""
+                SELECT
+                    t.id AS triple_id,
+                    {valid_from_expr} AS valid_from,
+                    {valid_to_expr} AS valid_to,
+                    {adapter_expr} AS adapter_name,
+                    {source_expr} AS source_drawer_id,
+                    EXISTS(
+                        SELECT 1 FROM kg_derivations d
+                        WHERE d.conclusion_triple_id = t.id
+                    ) AS has_derivation
+                FROM triples t
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM kg_triple_supports s WHERE s.triple_id = t.id
+                )
+                ORDER BY t.id
+                """
+            ).fetchall()
+            counts["triples_scanned"] = len(rows)
+            for row in rows:
+                triple_id = str(row["triple_id"])
+                adapter_name = row["adapter_name"]
+                source_drawer_id = row["source_drawer_id"]
+                is_derive = (
+                    bool(row["has_derivation"])
+                    or adapter_name == "contemplate:derive"
+                    or (isinstance(source_drawer_id, str) and source_drawer_id.startswith("derive:"))
+                )
+                if is_derive:
+                    status = "deduced"
+                    source_trust = "trusted_rule"
+                    source_kind = adapter_name or "contemplate:derive"
+                else:
+                    status = "asserted"
+                    source_trust = "trusted_legacy"
+                    source_kind = adapter_name or "legacy"
+                cur = con.execute(
+                    "INSERT OR IGNORE INTO kg_triple_supports(support_id, triple_id, status,"
+                    " source_trust, inherited_status, conditional_on_triple_ids, scope,"
+                    " source_kind, source_ref, valid_from, valid_to, created_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        _legacy_support_id(triple_id),
+                        triple_id,
+                        status,
+                        source_trust,
+                        status,
+                        "[]",
+                        "durable",
+                        source_kind,
+                        source_drawer_id,
+                        row["valid_from"],
+                        row["valid_to"],
+                        now,
+                    ),
+                )
+                counts["supports_inserted"] += cur.rowcount
+
+        derivation_rows = con.execute("SELECT id, premise_triple_ids FROM kg_derivations ORDER BY id").fetchall()
+        counts["derivations_scanned"] = len(derivation_rows)
+        for row in derivation_rows:
+            try:
+                premise_ids = json.loads(row["premise_triple_ids"] or "[]")
+            except (TypeError, json.JSONDecodeError):
+                counts["malformed_derivations"] += 1
+                continue
+            if not isinstance(premise_ids, list):
+                counts["malformed_derivations"] += 1
+                continue
+            for premise_id in premise_ids:
+                if premise_id:
+                    cur = con.execute(
+                        "INSERT OR IGNORE INTO kg_derivation_premises(derivation_id, premise_triple_id)"
+                        " VALUES (?,?)",
+                        (row["id"], str(premise_id)),
+                    )
+                    counts["derivation_premises_inserted"] += cur.rowcount
+
+        cur = con.execute(
+            """
+            INSERT INTO kg_firewall_meta(key, value, created_at)
+            VALUES ('reconciled_at', ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            (now, now),
+        )
+        counts["meta_written"] = cur.rowcount
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+    return counts
+
+
 class KgDeriveWriter:
     """Writes derived triples + a kg_derivations lineage row to the resolved KG.
 
@@ -693,29 +891,13 @@ class KgDeriveWriter:
     triple id (existing on dedupe, new otherwise) so no post-write re-query is needed.
     """
 
-    _DDL = (
-        "CREATE TABLE IF NOT EXISTS kg_derivations("
-        " id INTEGER PRIMARY KEY,"
-        " candidate_id TEXT UNIQUE,"
-        " conclusion_triple_id TEXT,"
-        " rule_id TEXT,"
-        " ontology_version TEXT,"
-        " premise_triple_ids TEXT,"
-        " premise_drawer_ids TEXT,"
-        " confidence REAL,"
-        " created_at TEXT)"
-    )
+    _DDL = KG_DERIVATIONS_DDL
 
     def __init__(self, palace_path):
         from mempalace.knowledge_graph import KnowledgeGraph  # lazy
         self._db_path = _resolve_kg_path(palace_path)
         self._kg = KnowledgeGraph(db_path=self._db_path)
-        con = sqlite3.connect(self._db_path)
-        try:
-            con.execute(self._DDL)
-            con.commit()
-        finally:
-            con.close()
+        ensure_firewall_schema(self._db_path)
 
     def _resolve_name(self, con, entity_id):
         row = con.execute("SELECT name FROM entities WHERE id=?", (entity_id,)).fetchone()
@@ -738,23 +920,59 @@ class KgDeriveWriter:
         finally:
             con.close()
         pred = normalize_predicate(conclusion["predicate"])
+        normalized_valid_from = _normalize_dt_for_kg(valid_from)
+        normalized_valid_to = _normalize_dt_for_kg(valid_to)
         # add_triple resolves entities by NAME (mempalace is name-keyed) and RETURNS the id.
         triple_id = self._kg.add_triple(
             subj, pred, obj,
-            valid_from=_normalize_dt_for_kg(valid_from), valid_to=_normalize_dt_for_kg(valid_to),
+            valid_from=normalized_valid_from, valid_to=normalized_valid_to,
             confidence=confidence if confidence is not None else 1.0,
             source_drawer_id="derive:" + rule_id,
             adapter_name="contemplate:derive")
         con = sqlite3.connect(self._db_path)
         try:
+            now = datetime.now(timezone.utc).isoformat()
+            con.execute("BEGIN IMMEDIATE")
             con.execute(
                 "INSERT OR IGNORE INTO kg_derivations(candidate_id, conclusion_triple_id,"
                 " rule_id, ontology_version, premise_triple_ids, premise_drawer_ids,"
                 " confidence, created_at) VALUES (?,?,?,?,?,?,?,?)",
                 (candidate_id, str(triple_id), rule_id, ontology_version,
                  json.dumps(premise_ids), json.dumps(premise_drawer_ids),
-                 confidence, datetime.now(timezone.utc).isoformat()))
+                 confidence, now))
+            row = con.execute("SELECT id FROM kg_derivations WHERE candidate_id=?", (candidate_id,)).fetchone()
+            derivation_id = row[0]
+            con.execute(
+                "INSERT OR IGNORE INTO kg_triple_supports(support_id, triple_id, status,"
+                " source_trust, inherited_status, conditional_on_triple_ids, scope,"
+                " source_kind, source_ref, valid_from, valid_to, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    _derived_support_id(str(triple_id), rule_id, candidate_id),
+                    str(triple_id),
+                    "deduced",
+                    "trusted_rule",
+                    "deduced",
+                    "[]",
+                    "durable",
+                    "contemplate:derive",
+                    "derive:" + rule_id,
+                    normalized_valid_from,
+                    normalized_valid_to,
+                    now,
+                ),
+            )
+            for premise_id in premise_ids:
+                if premise_id:
+                    con.execute(
+                        "INSERT OR IGNORE INTO kg_derivation_premises(derivation_id, premise_triple_id)"
+                        " VALUES (?,?)",
+                        (derivation_id, str(premise_id)),
+                    )
             con.commit()
+        except Exception:
+            con.rollback()
+            raise
         finally:
             con.close()
         return {"ok": True, "triple_id": triple_id}

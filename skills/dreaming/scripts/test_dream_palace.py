@@ -1201,5 +1201,452 @@ class TestRetrieveRelevantSessionObservations(unittest.TestCase):
         self.assertIsNot(results[0], entries[1])
 
 
+@unittest.skipUnless(_HAS_MEMPALACE, "requires mempalace interpreter")
+class EpistemicFirewallB10AcceptanceTests(unittest.TestCase):
+    def _kg_path(self, palace):
+        return os.path.join(palace, "knowledge_graph.sqlite3")
+
+    def _load_json(self, path):
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+
+    def _dump_json(self, path, value):
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(value, fh)
+
+    def _write_transitive_ontology(self, palace):
+        with open(os.path.join(palace, "ontology.json"), "w", encoding="utf-8") as fh:
+            json.dump({
+                "version": 1,
+                "rules": [{
+                    "id": "transitive:depends_on",
+                    "family": "transitive",
+                    "predicate": "depends_on",
+                    "enabled": True,
+                    "max_depth": 3,
+                }],
+            }, fh)
+
+    def _chain_palace(self, td):
+        palace = os.path.join(td, "palace")
+        os.makedirs(palace)
+        kg = _RealKG(db_path=self._kg_path(palace))
+        try:
+            premise_ab = str(kg.add_triple("A", "depends_on", "B", valid_from="2026-01-01"))
+            premise_bc = str(kg.add_triple("B", "depends_on", "C", valid_from="2026-01-01"))
+        finally:
+            kg.close()
+        self._write_transitive_ontology(palace)
+        return palace, [premise_ab, premise_bc]
+
+    def _gaps_palace(self, td):
+        palace = os.path.join(td, "palace")
+        os.makedirs(palace)
+        kg = _RealKG(db_path=self._kg_path(palace))
+        try:
+            kg.add_triple("A", "depends_on", "B", valid_from="2026-01-01")
+            kg.add_triple("C", "depends_on", "D", valid_from="2026-01-01")
+        finally:
+            kg.close()
+        self._write_transitive_ontology(palace)
+        return palace
+
+    def _harvest(self, task, palace, out):
+        import dream_harvest
+
+        rc = dream_harvest.main(["--task", task, "--palace", palace, "--out", out])
+        self.assertEqual(rc, 0)
+        return self._load_json(out)
+
+    def _adopt_derive(self, palace, decisions_path):
+        import dream_adopt
+
+        rc = dream_adopt.main([
+            "--task", "derive",
+            "--palace", palace,
+            "--decisions", decisions_path,
+        ])
+        self.assertEqual(rc, 0)
+
+    def _materialize_first_derive_candidate(self, td, palace):
+        out = os.path.join(td, "derive-worklist.json")
+        worklist = self._harvest("derive", palace, out)
+        self.assertEqual(len(worklist["items"]), 1)
+        worklist["items"][0]["action"] = "materialize"
+        decisions_path = os.path.join(td, "derive-decisions.json")
+        self._dump_json(decisions_path, worklist)
+        self._adopt_derive(palace, decisions_path)
+        return worklist, decisions_path
+
+    def _conclusion_triple_id(self, palace):
+        con = sqlite3.connect(self._kg_path(palace))
+        try:
+            rows = con.execute(
+                """
+                SELECT t.id
+                FROM triples t
+                JOIN entities s ON t.subject = s.id
+                JOIN entities o ON t.object = o.id
+                WHERE s.name = 'A'
+                  AND t.predicate = 'depends_on_closure'
+                  AND o.name = 'C'
+                  AND t.valid_to IS NULL
+                """
+            ).fetchall()
+        finally:
+            con.close()
+        self.assertEqual(len(rows), 1)
+        return str(rows[0][0])
+
+    def _support_rows(self, palace, triple_id):
+        con = sqlite3.connect(self._kg_path(palace))
+        con.row_factory = sqlite3.Row
+        try:
+            return [
+                dict(row)
+                for row in con.execute(
+                    """
+                    SELECT status, source_trust, inherited_status,
+                           conditional_on_triple_ids, scope, source_kind, source_ref
+                    FROM kg_triple_supports
+                    WHERE triple_id = ?
+                    ORDER BY support_id
+                    """,
+                    (triple_id,),
+                ).fetchall()
+            ]
+        finally:
+            con.close()
+
+    def _derivation_premise_ids(self, palace, conclusion_triple_id):
+        con = sqlite3.connect(self._kg_path(palace))
+        try:
+            rows = con.execute(
+                """
+                SELECT p.premise_triple_id
+                FROM kg_derivation_premises p
+                JOIN kg_derivations d ON p.derivation_id = d.id
+                WHERE d.conclusion_triple_id = ?
+                ORDER BY p.premise_triple_id
+                """,
+                (conclusion_triple_id,),
+            ).fetchall()
+        finally:
+            con.close()
+        return [str(row[0]) for row in rows]
+
+    def _sidecar_counts(self, palace):
+        con = sqlite3.connect(self._kg_path(palace))
+        try:
+            return {
+                "supports": con.execute("SELECT COUNT(*) FROM kg_triple_supports").fetchone()[0],
+                "premises": con.execute("SELECT COUNT(*) FROM kg_derivation_premises").fetchone()[0],
+            }
+        finally:
+            con.close()
+
+    def test_schema_creation_is_idempotent_and_creates_firewall_sidecars(self):
+        with _test_tmpdir() as td:
+            palace = os.path.join(td, "palace")
+            os.makedirs(palace)
+            db_path = self._kg_path(palace)
+            kg = _RealKG(db_path=db_path)
+            kg.close()
+
+            ensure_schema = getattr(dream_palace, "ensure_firewall_schema", None)
+            if ensure_schema is not None:
+                ensure_schema(db_path)
+                ensure_schema(db_path)
+            else:
+                first = dream_palace.KgDeriveWriter(palace)
+                first.close()
+                second = dream_palace.KgDeriveWriter(palace)
+                second.close()
+
+            con = sqlite3.connect(db_path)
+            try:
+                tables = {
+                    row[0]
+                    for row in con.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    ).fetchall()
+                }
+                indexes = {
+                    row[0]
+                    for row in con.execute(
+                        "SELECT name FROM sqlite_master WHERE type='index'"
+                    ).fetchall()
+                }
+                support_cols = {
+                    row[1]
+                    for row in con.execute("PRAGMA table_info(kg_triple_supports)").fetchall()
+                }
+            finally:
+                con.close()
+
+        self.assertTrue({
+            "kg_triple_supports",
+            "kg_derivation_premises",
+            "kg_firewall_meta",
+        }.issubset(tables))
+        self.assertTrue({
+            "support_id",
+            "triple_id",
+            "status",
+            "source_trust",
+            "inherited_status",
+            "conditional_on_triple_ids",
+            "scope",
+            "source_kind",
+            "source_ref",
+            "valid_from",
+            "valid_to",
+            "created_at",
+            "ended_at",
+        }.issubset(support_cols))
+        self.assertIn("idx_supports_triple", indexes)
+        self.assertIn("idx_derivprem_premise", indexes)
+
+    def test_derive_materialize_records_deduced_support_and_premise_reverse_index(self):
+        with _test_tmpdir() as td:
+            palace, base_premises = self._chain_palace(td)
+            worklist, _decisions_path = self._materialize_first_derive_candidate(td, palace)
+            conclusion_id = self._conclusion_triple_id(palace)
+
+            support_rows = self._support_rows(palace, conclusion_id)
+            premise_rows = self._derivation_premise_ids(palace, conclusion_id)
+
+        proof_premises = [str(p) for p in worklist["items"][0]["proof"]["premise_ids"]]
+        self.assertEqual(set(proof_premises), set(base_premises))
+        self.assertEqual(support_rows, [{
+            "status": "deduced",
+            "source_trust": "trusted_rule",
+            "inherited_status": "deduced",
+            "conditional_on_triple_ids": "[]",
+            "scope": "durable",
+            "source_kind": "contemplate:derive",
+            "source_ref": "derive:transitive:depends_on",
+        }])
+        self.assertEqual(set(premise_rows), set(base_premises))
+        self.assertEqual(len(premise_rows), len(base_premises))
+
+    def test_repeated_derive_adopt_does_not_duplicate_supports_or_premises(self):
+        with _test_tmpdir() as td:
+            palace, _base_premises = self._chain_palace(td)
+            _worklist, decisions_path = self._materialize_first_derive_candidate(td, palace)
+            first_counts = self._sidecar_counts(palace)
+
+            self._adopt_derive(palace, decisions_path)
+            second_counts = self._sidecar_counts(palace)
+
+        self.assertEqual(second_counts, first_counts)
+
+    def test_deduped_existing_conclusion_still_gets_deduced_support(self):
+        with _test_tmpdir() as td:
+            palace, premise_ids = self._chain_palace(td)
+            kg = _RealKG(db_path=self._kg_path(palace))
+            try:
+                existing_closure_id = str(
+                    kg.add_triple("A", "depends_on_closure", "C", valid_from="2026-01-01")
+                )
+            finally:
+                kg.close()
+
+            con = sqlite3.connect(self._kg_path(palace))
+            try:
+                entity_ids = {
+                    name: entity_id
+                    for entity_id, name in con.execute("SELECT id, name FROM entities").fetchall()
+                }
+            finally:
+                con.close()
+
+            writer = dream_palace.KgDeriveWriter(palace)
+            try:
+                result = writer.add_derived(
+                    {
+                        "subject_id": entity_ids["A"],
+                        "predicate": "depends_on_closure",
+                        "object_id": entity_ids["C"],
+                    },
+                    "transitive:depends_on",
+                    premise_ids,
+                    [],
+                    "ontology:v1",
+                    1.0,
+                    "2026-01-01",
+                    None,
+                )
+            finally:
+                writer.close()
+
+            support_rows = self._support_rows(palace, existing_closure_id)
+
+        self.assertEqual(str(result["triple_id"]), existing_closure_id)
+        self.assertEqual(len(support_rows), 1)
+        self.assertEqual(support_rows[0]["status"], "deduced")
+        self.assertEqual(support_rows[0]["source_trust"], "trusted_rule")
+
+    def test_reconcile_classifies_legacy_and_derive_and_backfills_premises_idempotently(self):
+        with _test_tmpdir() as td:
+            palace = os.path.join(td, "palace")
+            os.makedirs(palace)
+            kg = _RealKG(db_path=self._kg_path(palace))
+            try:
+                legacy_id = str(kg.add_triple("Legacy", "states", "Fact", valid_from="2026-01-01"))
+                premise_id = str(kg.add_triple("Premise", "supports", "Fact", valid_from="2026-01-01"))
+                derive_id = str(kg.add_triple(
+                    "Derived", "depends_on_closure", "Result",
+                    valid_from="2026-01-01",
+                    source_drawer_id="derive:manual",
+                    adapter_name="contemplate:derive",
+                ))
+                malformed_id = str(kg.add_triple(
+                    "Malformed", "depends_on_closure", "Result",
+                    valid_from="2026-01-01",
+                    adapter_name="contemplate:derive",
+                ))
+            finally:
+                kg.close()
+
+            con = sqlite3.connect(self._kg_path(palace))
+            try:
+                con.executescript(
+                    """
+                    CREATE TABLE kg_derivations(
+                        id INTEGER PRIMARY KEY,
+                        candidate_id TEXT UNIQUE,
+                        conclusion_triple_id TEXT,
+                        rule_id TEXT,
+                        ontology_version TEXT,
+                        premise_triple_ids TEXT,
+                        premise_drawer_ids TEXT,
+                        confidence REAL,
+                        created_at TEXT
+                    );
+                    """
+                )
+                con.execute(
+                    """
+                    INSERT INTO kg_derivations(
+                        candidate_id, conclusion_triple_id, rule_id, ontology_version,
+                        premise_triple_ids, premise_drawer_ids, confidence, created_at
+                    ) VALUES (?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        "valid-derivation",
+                        derive_id,
+                        "transitive:depends_on",
+                        "ontology:v1",
+                        json.dumps([legacy_id, premise_id]),
+                        "[]",
+                        1.0,
+                        "2026-07-14T00:00:00+00:00",
+                    ),
+                )
+                con.execute(
+                    """
+                    INSERT INTO kg_derivations(
+                        candidate_id, conclusion_triple_id, rule_id, ontology_version,
+                        premise_triple_ids, premise_drawer_ids, confidence, created_at
+                    ) VALUES (?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        "malformed-derivation",
+                        malformed_id,
+                        "transitive:depends_on",
+                        "ontology:v1",
+                        "not-json",
+                        "[]",
+                        1.0,
+                        "2026-07-14T00:00:00+00:00",
+                    ),
+                )
+                con.commit()
+            finally:
+                con.close()
+
+            reconcile = getattr(dream_palace, "reconcile_firewall_provenance")
+            first = reconcile(palace)
+            support_count = self._sidecar_counts(palace)["supports"]
+            premise_count = self._sidecar_counts(palace)["premises"]
+            second = reconcile(palace)
+            support_count_after_second = self._sidecar_counts(palace)["supports"]
+            premise_count_after_second = self._sidecar_counts(palace)["premises"]
+
+            con = sqlite3.connect(self._kg_path(palace))
+            con.row_factory = sqlite3.Row
+            try:
+                support_by_triple = {
+                    row["triple_id"]: (row["status"], row["source_trust"])
+                    for row in con.execute(
+                        "SELECT triple_id, status, source_trust FROM kg_triple_supports"
+                    ).fetchall()
+                }
+                valid_derivation_id = con.execute(
+                    "SELECT id FROM kg_derivations WHERE candidate_id='valid-derivation'"
+                ).fetchone()[0]
+                malformed_derivation_id = con.execute(
+                    "SELECT id FROM kg_derivations WHERE candidate_id='malformed-derivation'"
+                ).fetchone()[0]
+                backfilled = [
+                    str(row[0])
+                    for row in con.execute(
+                        """
+                        SELECT premise_triple_id
+                        FROM kg_derivation_premises
+                        WHERE derivation_id = ?
+                        ORDER BY premise_triple_id
+                        """,
+                        (valid_derivation_id,),
+                    ).fetchall()
+                ]
+                malformed_backfill_count = con.execute(
+                    "SELECT COUNT(*) FROM kg_derivation_premises WHERE derivation_id = ?",
+                    (malformed_derivation_id,),
+                ).fetchone()[0]
+            finally:
+                con.close()
+
+        self.assertEqual(support_by_triple[legacy_id], ("asserted", "trusted_legacy"))
+        self.assertEqual(support_by_triple[premise_id], ("asserted", "trusted_legacy"))
+        self.assertEqual(support_by_triple[derive_id], ("deduced", "trusted_rule"))
+        self.assertEqual(support_by_triple[malformed_id], ("deduced", "trusted_rule"))
+        self.assertEqual(set(backfilled), {legacy_id, premise_id})
+        self.assertEqual(malformed_backfill_count, 0)
+        self.assertGreaterEqual(first["supports_inserted"], 4)
+        self.assertEqual(first["malformed_derivations"], 1)
+        self.assertEqual(second["supports_inserted"], 0)
+        self.assertEqual(second["derivation_premises_inserted"], 0)
+        self.assertEqual(support_count_after_second, support_count)
+        self.assertEqual(premise_count_after_second, premise_count)
+
+    def test_derive_and_gaps_harvest_items_are_read_neutral_after_sidecars(self):
+        with _test_tmpdir() as td:
+            palace, _premise_ids = self._chain_palace(td)
+            before = self._harvest("derive", palace, os.path.join(td, "derive-before.json"))
+
+            getattr(dream_palace, "reconcile_firewall_provenance")(palace)
+            after = self._harvest("derive", palace, os.path.join(td, "derive-after.json"))
+
+            self.assertEqual(before["items"], after["items"])
+            self.assertEqual(len(after["items"]), 1)
+            self.assertEqual(after["items"][0]["conclusion"]["predicate"], "depends_on_closure")
+
+        with _test_tmpdir() as td:
+            palace = self._gaps_palace(td)
+            before = self._harvest("gaps", palace, os.path.join(td, "gaps-before.json"))
+
+            getattr(dream_palace, "reconcile_firewall_provenance")(palace)
+            after = self._harvest("gaps", palace, os.path.join(td, "gaps-after.json"))
+
+            self.assertEqual(before["items"], after["items"])
+            edges = {
+                (item["hypothesis"]["subject"], item["hypothesis"]["object"])
+                for item in after["items"]
+            }
+            self.assertIn(("B", "C"), edges)
+
+
 if __name__ == "__main__":
     unittest.main()
