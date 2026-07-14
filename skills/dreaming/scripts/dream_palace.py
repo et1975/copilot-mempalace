@@ -580,6 +580,8 @@ def load_premises(
             JOIN entities subj ON t.subject = subj.id
             JOIN entities obj ON t.object = obj.id
             WHERE t.valid_to IS NULL
+              AND s.ended_at IS NULL
+              AND s.valid_to IS NULL
               AND s.status IN ('asserted', 'deduced')
               AND s.inherited_status IN ('asserted', 'deduced')
               AND s.conditional_on_triple_ids = '[]'
@@ -872,6 +874,7 @@ def reconcile_firewall_provenance(palace_path: str) -> dict[str, int]:
     con = sqlite3.connect(db_path)
     con.row_factory = sqlite3.Row
     try:
+        con.execute("PRAGMA busy_timeout = 5000")
         con.execute("BEGIN IMMEDIATE")
         if _has_table(con, "triples"):
             columns = _table_columns(con, "triples")

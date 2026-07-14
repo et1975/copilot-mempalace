@@ -277,5 +277,32 @@ class B11PremiseLoaderRegressionTests(unittest.TestCase):
         self.assertEqual(simulation, durable)
 
 
+    def test_ended_support_is_excluded_from_durable_but_triple_still_active(self):
+        """A support ended by (future) M1 invalidation must not keep a triple premise-eligible."""
+        with _test_tmpdir() as td:
+            palace = self._make_palace(td)
+            ids = self._seed_triples(palace, count=2)
+            self._reconcile(palace)
+            target = ids[0]
+            # Simulate B1.3 invalidation ending the sole support (triple row stays valid_to IS NULL).
+            con = sqlite3.connect(self._kg_path(palace))
+            try:
+                con.execute(
+                    "UPDATE kg_triple_supports SET ended_at=?, valid_to=? WHERE triple_id=?",
+                    ("2026-06-01T00:00:00+00:00", "2026-06-01T00:00:00+00:00", target),
+                )
+                self.assertEqual(con.total_changes, 1)
+                con.commit()
+            finally:
+                con.close()
+
+            durable = self._load_premises(palace, purpose="durable")
+            audit = self._load_premises(palace, purpose="audit")
+
+        self.assertNotIn(target, self._triple_ids(durable))
+        self.assertIn(target, self._triple_ids(audit))
+        self.assertIn(ids[1], self._triple_ids(durable))
+
+
 if __name__ == "__main__":
     unittest.main()
