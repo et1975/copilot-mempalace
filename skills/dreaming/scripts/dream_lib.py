@@ -999,6 +999,163 @@ def deductive_closure(triples, rules, *, max_depth, max_iterations, max_candidat
     return result
 
 
+def gap_candidate_id(hypothesis: dict[str, Any], rule_id: str, onto_version: str) -> str:
+    payload = {
+        "g": [hypothesis["subject_id"], normalize_predicate(hypothesis["predicate"]),
+              hypothesis["object_id"]],
+        "r": rule_id,
+        "o": onto_version,
+    }
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return "gap:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _resolve_target_id(target: Any, triples: list[dict[str, Any]]) -> Any:
+    """Resolve a target subject given as an entity id or display name to its id."""
+    ids = set()
+    name_to_id: dict[Any, Any] = {}
+    for t in triples:
+        for id_key, name_key in (("subject_id", "subject"), ("object_id", "object")):
+            ids.add(t[id_key])
+            name = t.get(name_key)
+            if name is not None:
+                name_to_id.setdefault(name, t[id_key])
+    if target in ids:
+        return target
+    return name_to_id.get(target, target)
+
+
+_GAP_UNBLOCKS_DISPLAY_CAP = 20
+
+
+def find_transitive_gaps(triples, rules, *, target_subject=None, max_candidates=500, max_scan=20000):
+    """Track B / phase B0 — read-only sole-missing-base-edge gap reconnaissance.
+
+    For each enabled *transitive* rule, propose hypothesised base edges whose
+    addition would unblock currently-underivable ``_closure`` conclusions, ranked
+    by DUC (distinct conclusions unblocked). Only the transitive family has a
+    "missing premise" (it is the only multi-premise family). Never writes; never
+    hallucinates entities (both endpoints must already exist in the KG).
+    """
+    active = enabled_rules(rules)
+    trans_rules = [r for r in active if r.get("family") == "transitive"]
+    if not trans_rules:
+        return []
+
+    onto_version = ontology_version(rules)
+    names = _entity_name_map(triples)
+    target_id = _resolve_target_id(target_subject, triples) if target_subject is not None else None
+
+    all_gaps: list[dict[str, Any]] = []
+    truncated = False
+
+    for rule in trans_rules:
+        p = normalize_predicate(rule["predicate"])
+        cp = derived_predicate_for(rule)
+        present: set[tuple[Any, Any]] = set()
+        entities: set[Any] = set()
+        adj: dict[Any, set[Any]] = {}
+        for t in triples:
+            tp = normalize_predicate(t["predicate"])
+            if tp == p:
+                present.add((t["subject_id"], t["object_id"]))
+                adj.setdefault(t["subject_id"], set()).add(t["object_id"])
+            if tp == p or tp == cp:
+                entities.add(t["subject_id"])
+                entities.add(t["object_id"])
+        if not present:
+            continue
+
+        # out_reach[x] = nodes reachable from x via >=1 present edge (transitive closure)
+        out_reach: dict[Any, set[Any]] = {}
+        for start in entities:
+            seen: set[Any] = set()
+            stack = list(adj.get(start, ()))
+            while stack:
+                n = stack.pop()
+                if n in seen:
+                    continue
+                seen.add(n)
+                stack.extend(adj.get(n, ()))
+            out_reach[start] = seen
+        in_reach: dict[Any, set[Any]] = {e: set() for e in entities}
+        for x in entities:
+            for z in out_reach[x]:
+                in_reach[z].add(x)
+        reach_pairs = {(x, z) for x in entities for z in out_reach[x]}
+
+        scanned = 0
+        for b in entities:
+            inb = in_reach[b] | {b}
+            for d in entities:
+                if d == b or (b, d) in present:
+                    continue
+                scanned += 1
+                if scanned > max_scan:
+                    truncated = True
+                    break
+                outd = out_reach[d] | {d}
+                unblocked: list[tuple[Any, Any]] = []
+                for x in inb:
+                    if target_id is not None and x != target_id:
+                        continue
+                    for z in outd:
+                        if (x, z) == (b, d) or x == z:
+                            continue
+                        if (x, z) in reach_pairs or (x, z) in present:
+                            continue
+                        unblocked.append((x, z))
+                if not unblocked:
+                    continue
+                unblocked = list(dict.fromkeys(unblocked))
+                hypothesis = {
+                    "subject_id": b, "predicate": p, "object_id": d,
+                    "subject": names.get(b), "object": names.get(d),
+                }
+                all_gaps.append({
+                    "kind": "gap",
+                    "gap_id": gap_candidate_id(hypothesis, rule["id"], onto_version),
+                    "hypothesis": hypothesis,
+                    "rule": {"id": rule["id"], "family": "transitive",
+                             "predicate": p, "derived_predicate": cp},
+                    "evidence": {
+                        "duc": len(unblocked),
+                        "unblocks": [
+                            {"subject": names.get(x), "subject_id": x,
+                             "predicate": cp, "object": names.get(z), "object_id": z}
+                            for x, z in unblocked[:_GAP_UNBLOCKS_DISPLAY_CAP]
+                        ],
+                    },
+                    "decision": None,
+                })
+            if truncated:
+                break
+
+    all_gaps.sort(key=lambda g: (-g["evidence"]["duc"],
+                                 str(g["hypothesis"]["subject_id"]),
+                                 str(g["hypothesis"]["object_id"])))
+    if len(all_gaps) > max_candidates:
+        all_gaps = all_gaps[:max_candidates]
+        truncated = True
+    if truncated:
+        for g in all_gaps:
+            g["truncated"] = True
+    return all_gaps
+
+
+def build_gap_worklist(gaps, *, scope, params, rules, onto_version, instructions=None):
+    return {
+        "version": WORKLIST_VERSION,
+        "task": "gaps",
+        "scope": scope,
+        "params": params,
+        "ontology_version": onto_version,
+        "rules": rules,
+        "instructions": instructions,
+        "items": list(gaps),
+    }
+
+
 def filter_skipped(candidates, skip_markers, onto_version):
     skipped = {m["candidate_id"] for m in (skip_markers or [])
                if m.get("ontology_version") == onto_version}

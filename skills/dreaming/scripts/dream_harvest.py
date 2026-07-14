@@ -25,6 +25,7 @@ import dream_ontology
 import dream_palace
 from dream_lib import (
     build_contradiction_worklist,
+    build_gap_worklist,
     build_pattern_worklist,
     build_prune_worklist,
     build_worklist,
@@ -32,6 +33,7 @@ from dream_lib import (
     deductive_closure,
     drawer_salience,
     filter_skipped,
+    find_transitive_gaps,
     build_contemplate_worklist,
     group_observation_themes,
     ontology_version,
@@ -89,7 +91,7 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--palace", help="Path to the mempalace palace directory (default: mempalace config)")
     ap.add_argument("--task", choices=[
-        "merge", "contradiction", "pattern", "prune", "derive", "suggest-rules", "induce-rules"
+        "merge", "contradiction", "pattern", "prune", "derive", "gaps", "suggest-rules", "induce-rules"
     ], default="merge",
                     help="Dreaming task to harvest (default merge)")
     ap.add_argument("--wing", help="Scope merge harvest to this wing (ignored for contradiction)")
@@ -131,6 +133,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="Maximum closure iterations for derive (default 10)")
     ap.add_argument("--max-candidates", type=int, default=500,
                     help="Maximum candidates for derive (default 500)")
+    ap.add_argument("--target-subject", default=None,
+                    help="Restrict gaps (--task gaps) to conclusions about this subject (entity id or display name)")
     ap.add_argument("--out", default="worklist.json", help="Output worklist path (default worklist.json)")
     args = ap.parse_args(argv)
 
@@ -304,6 +308,27 @@ def main(argv: list[str] | None = None) -> int:
         with open(args.out, "w", encoding="utf-8") as fh:
             json.dump(worklist, fh, indent=2, ensure_ascii=False)
         print(f"derive: {len(candidates)} candidate(s) ({onto_ver}) -> {args.out}", file=sys.stderr)
+        return 0
+
+    if args.task == "gaps":
+        rules_path = args.rules or os.path.join(path, "ontology.json")
+        rules = dream_palace.load_ontology_config(rules_path)
+        onto_ver = ontology_version(rules)
+        triples = dream_palace.load_active_triples_with_ids(path)
+        gaps = find_transitive_gaps(
+            triples, rules, target_subject=args.target_subject,
+            max_candidates=args.max_candidates)
+        for g in gaps:
+            g["ontology_version"] = onto_ver
+        worklist = build_gap_worklist(
+            gaps,
+            scope={"palace": path, "task": "gaps", "target_subject": args.target_subject},
+            params={"max_candidates": args.max_candidates},
+            rules=rules, onto_version=onto_ver,
+            instructions=args.instructions)
+        with open(args.out, "w", encoding="utf-8") as fh:
+            json.dump(worklist, fh, indent=2, ensure_ascii=False)
+        print(f"gaps: {len(gaps)} gap(s) ({onto_ver}) -> {args.out}", file=sys.stderr)
         return 0
 
     tau = args.tau if args.tau is not None else 0.9

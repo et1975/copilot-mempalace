@@ -83,6 +83,36 @@ task: pattern mining looks for themes that recur across `>= min_support`
 distinct sessions, while `--recall` asks which sessions are most relevant to
 this specific reasoning query.
 
+## Gap reconnaissance driver (Track B phase B0)
+
+`--task gaps` is the first shipped slice of Track B: **read-only** detection of
+the highest-value *missing* facts. Given the active KG and the enabled ontology
+rules, it reports hypothesised edges whose addition would unblock currently-
+underivable `_closure` conclusions, ranked by **DUC** (how many conclusions each
+gap would unblock).
+
+```bash
+MPY=$(head -1 "$(command -v mempalace)" | sed 's/^#!//')
+"$MPY" skills/dreaming/scripts/dream_harvest.py --palace <p> --task gaps \
+  [--target-subject "<entity id or name>"] [--rules <p>/ontology.json] \
+  [--max-candidates 500] --out worklist.json
+```
+
+- **Transitive-only.** A "missing premise" only exists for the transitive family
+  (the sole multi-premise rule); inverse/symmetric rules never yield gaps.
+- **No hallucinated entities.** Both endpoints of a proposed gap edge must already
+  exist in the KG.
+- **Goal-directed (optional).** `--target-subject` restricts gaps to conclusions
+  about that subject; without it, gaps are ranked across the whole KG.
+- **Empty ontology ⇒ zero gaps**, exactly like `--task derive`.
+
+Each `gap` item carries a `hypothesis` (the missing edge), the `rule`, and
+`evidence.duc` + `evidence.unblocks` (the conclusions it would enable). This is
+**reconnaissance only**: it writes nothing to the KG, does not acquire anything,
+and does not perform abduction — it just tells the agent *which* missing fact is
+worth seeking next. Acting on a gap (recall/search/ask, then assert) is the
+deferred remainder of Track B.
+
 ## The 5-phase pipeline
 
 Artifacts go in the session workspace — never commit them. Use the interpreter
@@ -206,15 +236,17 @@ human review.
 
 v1 ships Track A only for derivation: bounded deductive closure over active KG
 facts. `--recall` adds the relevance-retrieval building block for on-demand
-session reconnaissance, but it does not close Track B.
+session reconnaissance, and `--task gaps` (phase B0) adds read-only, VoI-ranked
+detection of the highest-value missing facts. Neither closes Track B.
 
 The full ACQUIRE loop remains deferred future work: deduce → find the
-highest-value gap → acquire/read a session or source to fill it → re-derive.
-`--recall` does not choose what to seek by abduction, does not auto-inject
-retrieved facts as premises into the derive closure, and does not run an
-iterative acquire loop. External research, clarification queues, and
-abduction/best-explanation reasoning are still out of scope. Do not claim that
-`contemplate` v1 asks questions, researches gaps, or performs abduction.
+highest-value gap (`--task gaps` does this part, read-only) → acquire/read a
+session or source to fill it → re-derive. Gap detection does **not** choose what
+to seek by abduction, does not acquire, and does not auto-inject retrieved facts
+as premises into the derive closure; `--recall` does not run an iterative acquire
+loop. External research, clarification queues, and abduction/best-explanation
+reasoning are still out of scope. Do not claim that `contemplate` asks questions,
+researches gaps autonomously, or performs abduction.
 
 See [`references/derive.md`](references/derive.md) for the contract, schemas,
 and guardrails.

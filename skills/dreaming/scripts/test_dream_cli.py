@@ -1262,5 +1262,61 @@ class DeriveHarvestCliTests(unittest.TestCase):
             self.assertEqual(len(_load_json(out)["items"]), 0)
 
 
+@unittest.skipUnless(_HAS_MEMPALACE, "requires mempalace KnowledgeGraph")
+class GapsCliTests(unittest.TestCase):
+    def _palace(self, td):
+        palace = os.path.join(td, "palace"); os.makedirs(palace)
+        kg = _RealKG(db_path=os.path.join(palace, "knowledge_graph.sqlite3"))
+        # broken chain: A->B and C->D; the sole missing edge B->C would unblock closure facts
+        kg.add_triple("A", "depends_on", "B", valid_from="2026-01-01")
+        kg.add_triple("C", "depends_on", "D", valid_from="2026-01-01")
+        kg.close()
+        with open(os.path.join(palace, "ontology.json"), "w") as f:
+            json.dump({"version": 1, "rules": [{"id": "transitive:depends_on",
+                "family": "transitive", "predicate": "depends_on", "enabled": True,
+                "max_depth": 3}]}, f)
+        return palace
+
+    def test_harvest_gaps_emits_bridging_gap(self):
+        with _test_tmpdir() as td:
+            palace = self._palace(td); out = os.path.join(td, "wl.json")
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                rc = dream_harvest.main(["--task", "gaps", "--palace", palace, "--out", out])
+            self.assertEqual(rc, 0)
+            wl = _load_json(out)
+            self.assertEqual(wl["task"], "gaps")
+            self.assertEqual(wl["scope"]["task"], "gaps")
+            self.assertIsNone(wl["scope"]["target_subject"])
+            edges = {(g["hypothesis"]["subject"], g["hypothesis"]["object"]) for g in wl["items"]}
+            self.assertIn(("B", "C"), edges)
+            bc = next(g for g in wl["items"] if (g["hypothesis"]["subject"], g["hypothesis"]["object"]) == ("B", "C"))
+            self.assertEqual(bc["kind"], "gap")
+            self.assertGreaterEqual(bc["evidence"]["duc"], 1)
+            self.assertIn("gaps:", stderr.getvalue())
+
+    def test_harvest_gaps_empty_ontology_yields_zero(self):
+        with _test_tmpdir() as td:
+            palace = os.path.join(td, "palace"); os.makedirs(palace)
+            kg = _RealKG(db_path=os.path.join(palace, "knowledge_graph.sqlite3"))
+            kg.add_triple("A", "depends_on", "B", valid_from="2026-01-01")
+            kg.close()
+            out = os.path.join(td, "wl.json")
+            rc = dream_harvest.main(["--task", "gaps", "--palace", palace, "--out", out])
+            self.assertEqual(rc, 0)
+            self.assertEqual(_load_json(out)["items"], [])
+
+    def test_harvest_gaps_target_subject_filters(self):
+        with _test_tmpdir() as td:
+            palace = self._palace(td); out = os.path.join(td, "wl.json")
+            dream_harvest.main(["--task", "gaps", "--palace", palace,
+                                "--target-subject", "A", "--out", out])
+            wl = _load_json(out)
+            self.assertEqual(wl["scope"]["target_subject"], "A")
+            for g in wl["items"]:
+                for u in g["evidence"]["unblocks"]:
+                    self.assertEqual(u["subject"], "A")
+
+
 if __name__ == "__main__":
     unittest.main()

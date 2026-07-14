@@ -1267,3 +1267,123 @@ class ApplyDeriveTests(unittest.TestCase):
         self.assertEqual({m["candidate_id"] for m in markers}, {"derive:a", "derive:b"})
         self.assertTrue(all(m["ontology_version"] == "onto:v" for m in markers))
         self.assertTrue(all(m.get("reason") == "reject_rule" for m in markers))
+
+
+# ---------------------------------------------------------------------------
+# Track B phase B0: find_transitive_gaps — sole-missing-base-edge reconnaissance
+# ---------------------------------------------------------------------------
+
+class FindTransitiveGapsTests(unittest.TestCase):
+    def _gaps(self, triples, rules=None, **kw):
+        rules = rules if rules is not None else TRANS_RULES
+        return dream_lib.find_transitive_gaps(triples, rules, max_candidates=500, **kw)
+
+    def _edges(self, gaps):
+        return {(g["hypothesis"]["subject_id"], g["hypothesis"]["object_id"]) for g in gaps}
+
+    def test_no_enabled_transitive_rules_yields_no_gaps(self):
+        triples = [_t(1, "A", "depends_on", "B")]
+        self.assertEqual(self._gaps(triples, rules=[]), [])
+        disabled = [{"id": "x", "family": "transitive", "predicate": "depends_on", "enabled": False}]
+        self.assertEqual(self._gaps(triples, rules=disabled), [])
+        # inverse/symmetric families never produce missing-premise gaps
+        inv = [{"id": "i", "family": "inverse", "predicate": "depends_on",
+                "inverse_predicate": "dependency_of", "enabled": True}]
+        self.assertEqual(self._gaps(triples, rules=inv), [])
+
+    def test_tail_gap_unblocks_two_hop_conclusion(self):
+        # A->B present; hypothesizing B->C would yield A ->closure C.
+        triples = [_t(1, "A", "depends_on", "B")]
+        gaps = self._gaps(triples)
+        tail = [g for g in gaps if (g["hypothesis"]["subject_id"], g["hypothesis"]["object_id"]) == ("B", "C")]
+        # C is not an entity in the graph yet, so (B,C) should NOT be proposed (no hallucinated entities).
+        self.assertEqual(tail, [])
+
+    def test_gap_completes_broken_chain_A_B__C_D(self):
+        # A->B and C->D present, B and C distinct: the sole missing edge B->C
+        # unblocks A->closure D (and A->closure C, B->closure D).
+        triples = [_t(1, "A", "depends_on", "B"), _t(2, "C", "depends_on", "D")]
+        gaps = self._gaps(triples)
+        edges = self._edges(gaps)
+        self.assertIn(("B", "C"), edges)
+        bc = next(g for g in gaps if (g["hypothesis"]["subject_id"], g["hypothesis"]["object_id"]) == ("B", "C"))
+        # unblocked closure conclusions with subject A: (A,C) and (A,D)
+        subj_obj = {(u["subject"], u["object"]) for u in bc["evidence"]["unblocks"]}
+        self.assertIn(("A", "C"), subj_obj)
+        self.assertIn(("A", "D"), subj_obj)
+        self.assertEqual(bc["evidence"]["duc"], len(subj_obj))
+        self.assertEqual(bc["rule"]["id"], "transitive:depends_on")
+        self.assertTrue(bc["gap_id"].startswith("gap:"))
+        self.assertIsNone(bc["decision"])
+
+    def test_existing_edge_is_not_a_gap(self):
+        triples = [_t(1, "A", "depends_on", "B"), _t(2, "B", "depends_on", "C")]
+        # (A,B) and (B,C) already present; neither should be proposed as a gap.
+        edges = self._edges(self._gaps(triples))
+        self.assertNotIn(("A", "B"), edges)
+        self.assertNotIn(("B", "C"), edges)
+
+    def test_already_derivable_conclusion_not_counted(self):
+        # A->B->C already gives A->closure C; a gap must not claim to unblock it.
+        triples = [_t(1, "A", "depends_on", "B"), _t(2, "B", "depends_on", "C"),
+                   _t(3, "C", "depends_on", "D")]
+        gaps = self._gaps(triples)
+        for g in gaps:
+            for u in g["evidence"]["unblocks"]:
+                # (A,C),(A,D),(B,D) are already derivable and must never appear as "unblocked"
+                self.assertNotIn((u["subject"], u["object"]),
+                                 {("A", "C"), ("A", "D"), ("B", "D")})
+
+    def test_reflexive_conclusions_never_unblocked(self):
+        triples = [_t(1, "A", "depends_on", "B"), _t(2, "C", "depends_on", "A")]
+        for g in self._gaps(triples):
+            for u in g["evidence"]["unblocks"]:
+                self.assertNotEqual(u["subject"], u["object"])
+
+    def test_ranked_by_duc_descending(self):
+        # Two chains into a hub. A->B, X->B present, plus B is hub; hypothesize B->Z.
+        # Gap (B,Z) unblocks A->Z and X->Z (duc=2). A lone Y->? gives duc=1.
+        triples = [_t(1, "A", "depends_on", "B"), _t(2, "X", "depends_on", "B"),
+                   _t(3, "Y", "depends_on", "W")]
+        gaps = self._gaps(triples)
+        ducs = [g["evidence"]["duc"] for g in gaps]
+        self.assertEqual(ducs, sorted(ducs, reverse=True))
+        top = gaps[0]
+        self.assertGreaterEqual(top["evidence"]["duc"], 2)
+
+    def test_target_subject_filters_to_conclusions_about_target(self):
+        triples = [_t(1, "A", "depends_on", "B"), _t(2, "C", "depends_on", "D")]
+        gaps = self._gaps(triples, target_subject="A")
+        # every unblocked conclusion must have subject A
+        for g in gaps:
+            for u in g["evidence"]["unblocks"]:
+                self.assertEqual(u["subject"], "A")
+        # a target absent from the graph yields nothing
+        self.assertEqual(self._gaps(triples, target_subject="ZZZ"), [])
+
+    def test_gap_id_stable_and_worklist_shape(self):
+        triples = [_t(1, "A", "depends_on", "B"), _t(2, "C", "depends_on", "D")]
+        g1 = self._gaps(triples)
+        g2 = self._gaps(triples)
+        self.assertEqual([g["gap_id"] for g in g1], [g["gap_id"] for g in g2])
+        wl = dream_lib.build_gap_worklist(
+            g1, scope={"palace": "/p", "task": "gaps"},
+            params={"target_subject": None},
+            rules=TRANS_RULES, onto_version="onto:v")
+        self.assertEqual(wl["task"], "gaps")
+        self.assertEqual(wl["items"], g1)
+        self.assertEqual(wl["scope"], {"palace": "/p", "task": "gaps"})
+        self.assertEqual(wl["ontology_version"], "onto:v")
+
+    def test_max_candidates_truncates_and_marks(self):
+        # Build a fan: many distinct chains needing distinct gap edges.
+        triples = []
+        tid = 0
+        for i in range(30):
+            tid += 1
+            triples.append(_t(tid, f"S{i}", "depends_on", f"M{i}"))
+            tid += 1
+            triples.append(_t(tid, f"N{i}", "depends_on", f"T{i}"))
+        gaps = dream_lib.find_transitive_gaps(triples, TRANS_RULES, max_candidates=5)
+        self.assertLessEqual(len(gaps), 5)
+        self.assertTrue(all(g.get("truncated") for g in gaps))
