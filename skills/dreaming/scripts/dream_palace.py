@@ -19,10 +19,11 @@ import re
 import sqlite3
 import sys
 from collections import defaultdict, deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
+from uuid import uuid4
 
-from dream_lib import cosine_similarity
+from dream_lib import TRUSTED_STATUSES, cosine_similarity
 
 SESSION_ID_RE = re.compile(
     r"SESSION_ID:\s*([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})",
@@ -84,6 +85,26 @@ FIREWALL_SCHEMA_DDL = (
       key TEXT PRIMARY KEY, value TEXT NOT NULL,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
     """,
+    """
+    CREATE TABLE IF NOT EXISTS contemplate_runs (
+      run_id TEXT PRIMARY KEY,
+      status TEXT NOT NULL DEFAULT 'active',
+      created_at TEXT NOT NULL, last_seen_at TEXT NOT NULL, expires_at TEXT NOT NULL,
+      expired_at TEXT, metadata_json TEXT NOT NULL DEFAULT '{}');
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_runs_expiry ON contemplate_runs(status, expires_at)",
+    """
+    CREATE TABLE IF NOT EXISTS contemplate_provisional_facts (
+      provisional_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, fact_key TEXT NOT NULL,
+      subject TEXT, predicate TEXT, object TEXT,
+      status TEXT NOT NULL DEFAULT 'abduced',
+      confidence REAL, source_kind TEXT, source_ref TEXT,
+      created_at TEXT NOT NULL, last_seen_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL, expired_at TEXT, fact_status TEXT NOT NULL DEFAULT 'active',
+      UNIQUE(run_id, fact_key),
+      FOREIGN KEY(run_id) REFERENCES contemplate_runs(run_id));
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_prov_active ON contemplate_provisional_facts(run_id, fact_status, expires_at)",
 )
 
 
@@ -114,9 +135,283 @@ def ensure_firewall_schema(db_path: str) -> None:
     try:
         for ddl in FIREWALL_SCHEMA_DDL:
             con.execute(ddl)
+        if "expires_at" not in _table_columns(con, "kg_triple_supports"):
+            con.execute("ALTER TABLE kg_triple_supports ADD COLUMN expires_at TEXT")
         con.commit()
     finally:
         con.close()
+
+
+def _utc_now_iso(now: datetime | str | None = None) -> str:
+    if now is None:
+        dt = datetime.now(timezone.utc)
+    elif isinstance(now, datetime):
+        dt = now
+    elif isinstance(now, str):
+        text = now[:-1] + "+00:00" if now.endswith("Z") else now
+        dt = datetime.fromisoformat(text)
+    else:
+        raise TypeError("now must be None, datetime, or ISO timestamp string")
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat()
+
+
+def _add_hours_iso(now_iso: str, ttl_hours: float) -> str:
+    dt = datetime.fromisoformat(now_iso)
+    return (dt + timedelta(hours=ttl_hours)).isoformat()
+
+
+def _provisional_fact_key(
+    subject: Any,
+    predicate: Any,
+    object: Any,
+    source_kind: Any,
+    source_ref: Any,
+) -> str:
+    parts = [subject, predicate, object, source_kind, source_ref]
+    text = "|".join("" if part is None else str(part) for part in parts)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def create_or_resume_run(
+    palace_path,
+    run_id: str | None = None,
+    *,
+    ttl_hours: float = 24,
+    now: datetime | str | None = None,
+) -> str:
+    """Create a contemplate run or refresh last_seen_at for an active unexpired run."""
+    db_path = _resolve_kg_path(palace_path)
+    ensure_firewall_schema(db_path)
+    now_iso = _utc_now_iso(now)
+    expires_at = _add_hours_iso(now_iso, ttl_hours)
+    chosen_run_id = run_id or str(uuid4())
+
+    con = sqlite3.connect(db_path)
+    con.row_factory = sqlite3.Row
+    try:
+        con.execute("PRAGMA busy_timeout = 5000")
+        con.execute("BEGIN IMMEDIATE")
+        row = con.execute(
+            "SELECT status, expires_at FROM contemplate_runs WHERE run_id=?",
+            (chosen_run_id,),
+        ).fetchone()
+        if row is not None:
+            if row["status"] != "active" or row["expires_at"] <= now_iso:
+                raise ValueError(f"contemplate run is not active: {chosen_run_id}")
+            con.execute(
+                "UPDATE contemplate_runs SET last_seen_at=? WHERE run_id=?",
+                (now_iso, chosen_run_id),
+            )
+        else:
+            con.execute(
+                """
+                INSERT INTO contemplate_runs(
+                    run_id, status, created_at, last_seen_at, expires_at, expired_at, metadata_json
+                ) VALUES (?, 'active', ?, ?, ?, NULL, '{}')
+                """,
+                (chosen_run_id, now_iso, now_iso, expires_at),
+            )
+        con.commit()
+        return chosen_run_id
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+
+
+def assert_provisional(
+    palace_path,
+    run_id,
+    subject,
+    predicate,
+    object,
+    *,
+    status: str = "abduced",
+    confidence: float | None = None,
+    source_kind: str | None = None,
+    source_ref: str | None = None,
+    now: datetime | str | None = None,
+) -> str:
+    """Record a tainted, run-scoped provisional fact without touching the durable KG."""
+    if status in TRUSTED_STATUSES:
+        raise ValueError(f"provisional facts cannot use trusted status: {status!r}")
+
+    db_path = _resolve_kg_path(palace_path)
+    ensure_firewall_schema(db_path)
+    now_iso = _utc_now_iso(now)
+    fact_key = _provisional_fact_key(subject, predicate, object, source_kind, source_ref)
+    provisional_id = str(uuid4())
+
+    con = sqlite3.connect(db_path)
+    con.row_factory = sqlite3.Row
+    try:
+        con.execute("PRAGMA busy_timeout = 5000")
+        con.execute("BEGIN IMMEDIATE")
+        run = con.execute(
+            """
+            SELECT expires_at
+            FROM contemplate_runs
+            WHERE run_id=?
+              AND status='active'
+              AND expires_at > ?
+            """,
+            (run_id, now_iso),
+        ).fetchone()
+        if run is None:
+            raise ValueError(f"contemplate run is not active: {run_id}")
+
+        con.execute(
+            """
+            INSERT INTO contemplate_provisional_facts(
+                provisional_id, run_id, fact_key,
+                subject, predicate, object,
+                status, confidence, source_kind, source_ref,
+                created_at, last_seen_at, expires_at, expired_at, fact_status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'active')
+            ON CONFLICT(run_id, fact_key) DO UPDATE SET
+                subject=excluded.subject,
+                predicate=excluded.predicate,
+                object=excluded.object,
+                status=excluded.status,
+                confidence=excluded.confidence,
+                source_kind=excluded.source_kind,
+                source_ref=excluded.source_ref,
+                last_seen_at=excluded.last_seen_at,
+                expires_at=excluded.expires_at,
+                expired_at=NULL,
+                fact_status='active'
+            """,
+            (
+                provisional_id,
+                run_id,
+                fact_key,
+                subject,
+                predicate,
+                object,
+                status,
+                confidence,
+                source_kind,
+                source_ref,
+                now_iso,
+                now_iso,
+                run["expires_at"],
+            ),
+        )
+        row = con.execute(
+            """
+            SELECT provisional_id
+            FROM contemplate_provisional_facts
+            WHERE run_id=? AND fact_key=?
+            """,
+            (run_id, fact_key),
+        ).fetchone()
+        con.commit()
+        return str(row["provisional_id"])
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+
+
+def startup_cleanup(palace_path, *, now: datetime | str | None = None) -> dict:
+    """Expire stale contemplate state and expired materialized-abduced supports."""
+    db_path = _resolve_kg_path(palace_path)
+    ensure_firewall_schema(db_path)
+    now_iso = _utc_now_iso(now)
+    counts = {
+        "runs_expired": 0,
+        "provisional_expired": 0,
+        "abduced_supports_expired": 0,
+        "abduced_triples_cascaded": 0,
+    }
+    cascade_roots: list[str] = []
+
+    con = sqlite3.connect(db_path)
+    con.row_factory = sqlite3.Row
+    try:
+        con.execute("PRAGMA busy_timeout = 5000")
+        con.execute("BEGIN IMMEDIATE")
+        cur = con.execute(
+            """
+            UPDATE contemplate_runs
+            SET status='expired',
+                expired_at=COALESCE(expired_at, ?)
+            WHERE status='active'
+              AND expires_at <= ?
+            """,
+            (now_iso, now_iso),
+        )
+        counts["runs_expired"] = cur.rowcount
+
+        cur = con.execute(
+            """
+            UPDATE contemplate_provisional_facts
+            SET fact_status='expired',
+                expired_at=COALESCE(expired_at, ?)
+            WHERE fact_status='active'
+              AND expires_at <= ?
+            """,
+            (now_iso, now_iso),
+        )
+        counts["provisional_expired"] = cur.rowcount
+
+        expired_supports = con.execute(
+            """
+            SELECT support_id, triple_id
+            FROM kg_triple_supports
+            WHERE status='materialized_abduced'
+              AND expires_at IS NOT NULL
+              AND expires_at <= ?
+              AND ended_at IS NULL
+            ORDER BY support_id
+            """,
+            (now_iso,),
+        ).fetchall()
+        ended_triple_ids: list[str] = []
+        for support in expired_supports:
+            cur = con.execute(
+                """
+                UPDATE kg_triple_supports
+                SET ended_at=?
+                WHERE support_id=?
+                  AND ended_at IS NULL
+                """,
+                (now_iso, support["support_id"]),
+            )
+            if cur.rowcount:
+                counts["abduced_supports_expired"] += cur.rowcount
+                ended_triple_ids.append(str(support["triple_id"]))
+
+        for triple_id in sorted(set(ended_triple_ids)):
+            has_active_support = con.execute(
+                f"""
+                SELECT 1
+                FROM kg_triple_supports
+                WHERE triple_id=?
+                  AND {_active_support_clause()}
+                LIMIT 1
+                """,
+                (triple_id,),
+            ).fetchone()
+            if has_active_support is None:
+                cascade_roots.append(triple_id)
+
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+
+    for triple_id in cascade_roots:
+        invalidate_triples_cascade(palace_path, [triple_id], now_iso)
+        counts["abduced_triples_cascaded"] += 1
+
+    return counts
 
 
 def _derived_support_id(triple_id: str, rule_id: str, candidate_id: str) -> str:
@@ -535,8 +830,50 @@ def load_premises(
     if purpose == "simulation":
         if run_id is None:
             raise ValueError("load_premises(purpose='simulation') requires run_id")
-        # B1.5 will add the run's provisional overlay; B1.1 returns durable premises only.
-        return load_premises(palace_path, purpose="durable", strict_schema=strict_schema)
+        durable = load_premises(palace_path, purpose="durable", strict_schema=strict_schema)
+        db_path = _resolve_kg_path(palace_path)
+        if not os.path.exists(db_path):
+            return durable
+        ensure_firewall_schema(db_path)
+        try:
+            con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        except sqlite3.OperationalError:
+            con = sqlite3.connect(db_path)
+        try:
+            con.row_factory = sqlite3.Row
+            rows = con.execute(
+                """
+                SELECT f.provisional_id, f.subject, f.predicate, f.object, f.status
+                FROM contemplate_provisional_facts f
+                JOIN contemplate_runs r ON r.run_id = f.run_id
+                WHERE f.run_id=?
+                  AND r.status='active'
+                  AND f.fact_status='active'
+                  AND r.expires_at > r.last_seen_at
+                  AND f.expires_at > r.last_seen_at
+                ORDER BY f.provisional_id
+                """,
+                (run_id,),
+            ).fetchall()
+        finally:
+            con.close()
+        durable.extend(
+            {
+                "triple_id": "prov:" + str(row["provisional_id"]),
+                "subject": row["subject"],
+                "object": row["object"],
+                "subject_id": row["subject"],
+                "object_id": row["object"],
+                "predicate": row["predicate"],
+                "epistemic_status": row["status"],
+                "inherited_status": row["status"],
+                "conditional_on": "[]",
+                "source_trust": "hypothesis",
+                "tainted": True,
+            }
+            for row in rows
+        )
+        return durable
     if purpose != "durable":
         raise ValueError(f"unknown load_premises purpose: {purpose!r}")
 
