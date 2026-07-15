@@ -282,22 +282,31 @@ def _candidate_rules_from_triples(triples: list[dict], current_rules: list[dict]
     return merged_candidates
 
 
-def _would_derive_now(triples: list[dict], rule: dict) -> bool:
-    if not triples:
-        return False
-    enabled_rule = dict(rule)
-    enabled_rule["enabled"] = True
+def _preview_candidate_derivations(triples, candidate_rule, *, limit=3) -> list[str]:
+    """Return up to ``limit`` plain-language example conclusions this one candidate rule would derive."""
     try:
+        max_depth = int(candidate_rule.get("max_depth", 8) or 8)
         candidates = deductive_closure(
             triples,
-            [enabled_rule],
-            max_depth=3,
-            max_iterations=10,
-            max_candidates=1,
+            [{**candidate_rule, "enabled": True}],
+            max_depth=max_depth,
+            max_iterations=50,
+            max_candidates=max(limit, 10),
         )
+        previews = []
+        for candidate in candidates:
+            conclusion = candidate.get("conclusion") or {}
+            subject = conclusion.get("subject") or conclusion.get("subject_id")
+            predicate = conclusion.get("predicate")
+            obj = conclusion.get("object") or conclusion.get("object_id")
+            if subject is None or predicate is None or obj is None:
+                continue
+            previews.append(f"{subject} {predicate} {obj}")
+            if len(previews) >= limit:
+                break
+        return previews
     except Exception:
-        return False
-    return bool(candidates)
+        return []
 
 
 def _plain_evidence_text(evidence) -> str:
@@ -337,9 +346,11 @@ def propose_rules(palace, *, rules_path=None, min_support=2) -> dict:
         if rule_id in enabled_ids:
             continue
         described = dream_ontology.describe_rule_candidate(candidate)
+        preview = _preview_candidate_derivations(triples, candidate)
         proposals.append({
             **described,
-            "would_derive_now": _would_derive_now(triples, candidate),
+            "would_derive_now": len(preview) > 0,
+            "example_derivations": preview,
             "accept_command": f"--enable-rule {rule_id}",
         })
 
@@ -377,9 +388,36 @@ def summarize_proposals(report) -> str:
             lines.append("   why: no evidence text available")
         lines.append(f"   effect: {proposal.get('effect') or ''}")
         lines.append(f"   would help right now: {'yes' if proposal.get('would_derive_now') else 'no'}")
+        examples = proposal.get("example_derivations") or []
+        if examples:
+            lines.append("   for example, enabling this would let me conclude:")
+            for example in examples:
+                lines.append(f"     - {example}")
+        else:
+            lines.append("   (no new conclusions from your current notes yet)")
     lines.append("")
     lines.append("To turn any of these on, just say the number (e.g. \"enable 1\") and I'll do it.")
     return "\n".join(lines)
+
+
+def _summarize_enable_result(report: dict) -> str:
+    return "\n".join([
+        f"palace: {report.get('palace')}",
+        f"rules: {report.get('rules_path')}",
+        "enabled: " + (", ".join(report.get("enabled") or []) or "none"),
+        "unknown: " + (", ".join(report.get("unknown") or []) or "none"),
+        f"now enabled: {report.get('now_enabled_count')}",
+    ])
+
+
+def _summarize_disable_result(report: dict) -> str:
+    return "\n".join([
+        f"palace: {report.get('palace')}",
+        f"rules: {report.get('rules_path')}",
+        "disabled: " + (", ".join(report.get("disabled") or []) or "none"),
+        "unknown: " + (", ".join(report.get("unknown") or []) or "none"),
+        f"now enabled: {report.get('now_enabled_count')}",
+    ])
 
 
 def enable_rules(palace, rule_ids: list[str], *, rules_path=None, min_support=2) -> dict:
@@ -423,6 +461,39 @@ def enable_rules(palace, rule_ids: list[str], *, rules_path=None, min_support=2)
         "palace": path,
         "rules_path": effective_rules_path,
         "enabled": enabled,
+        "unknown": unknown,
+        "now_enabled_count": sum(1 for rule in current_rules if bool(rule.get("enabled", False))),
+    }
+
+
+def disable_rules(palace, rule_ids: list[str], *, rules_path=None) -> dict:
+    """Set enabled=false for the named rules in the palace ontology."""
+    path = dream_palace.bind_palace(palace)
+    effective_rules_path = rules_path or os.path.join(path, "ontology.json")
+    doc = dream_ontology.read_ontology_doc(effective_rules_path)
+    current_rules, version = _ontology_rules_doc(doc)
+
+    existing_by_id = {rule.get("id"): rule for rule in current_rules if rule.get("id")}
+    disabled = []
+    unknown = []
+    seen_requested = set()
+    for rule_id in rule_ids:
+        if rule_id in seen_requested:
+            continue
+        seen_requested.add(rule_id)
+        existing = existing_by_id.get(rule_id)
+        if existing is None:
+            unknown.append(rule_id)
+            continue
+        existing["enabled"] = False
+        disabled.append(rule_id)
+
+    updated_doc = dream_ontology.build_ontology_doc(current_rules, version)
+    dream_ontology.write_ontology_doc(effective_rules_path, updated_doc)
+    return {
+        "palace": path,
+        "rules_path": effective_rules_path,
+        "disabled": disabled,
         "unknown": unknown,
         "now_enabled_count": sum(1 for rule in current_rules if bool(rule.get("enabled", False))),
     }
@@ -737,6 +808,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--bootstrap", action="store_true", help="Write disabled ontology candidates for review")
     ap.add_argument("--propose", action="store_true", help="Show plain-language ontology rule proposals")
     ap.add_argument("--enable-rule", action="append", default=[], metavar="ID", help="Enable one proposed ontology rule by id")
+    ap.add_argument("--disable-rule", action="append", default=[], metavar="ID", help="Disable one ontology rule by id")
     ap.add_argument(
         "--out",
         default=None,
@@ -915,25 +987,36 @@ def main(argv: list[str] | None = None) -> int:
             print(summarize_proposals(report))
         return 0
 
-    if args.enable_rule:
-        report = enable_rules(
-            effective_palace,
-            args.enable_rule,
-            rules_path=args.rules,
-            min_support=args.min_support,
-        )
+    if args.enable_rule or args.disable_rule:
+        enable_report = None
+        if args.enable_rule:
+            enable_report = enable_rules(
+                effective_palace,
+                args.enable_rule,
+                rules_path=args.rules,
+                min_support=args.min_support,
+            )
+        disable_report = None
+        if args.disable_rule:
+            disable_report = disable_rules(
+                effective_palace,
+                args.disable_rule,
+                rules_path=args.rules,
+            )
         if args.format == "json":
+            report = (
+                {"enable": enable_report, "disable": disable_report}
+                if enable_report is not None and disable_report is not None
+                else enable_report or disable_report
+            )
             print(json.dumps(report, indent=2, ensure_ascii=False))
         else:
-            print(
-                "\n".join([
-                    f"palace: {report.get('palace')}",
-                    f"rules: {report.get('rules_path')}",
-                    "enabled: " + (", ".join(report.get("enabled") or []) or "none"),
-                    "unknown: " + (", ".join(report.get("unknown") or []) or "none"),
-                    f"now enabled: {report.get('now_enabled_count')}",
-                ])
-            )
+            sections = []
+            if enable_report is not None:
+                sections.append(_summarize_enable_result(enable_report))
+            if disable_report is not None:
+                sections.append(_summarize_disable_result(disable_report))
+            print("\n\n".join(sections))
         return 0
 
     report = run(
