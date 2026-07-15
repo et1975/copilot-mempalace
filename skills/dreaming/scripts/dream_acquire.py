@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from functools import partial
 from typing import Any
@@ -25,6 +26,66 @@ from dream_palace import (
 
 
 DEFAULT_ACQUIRE_BUDGETS = {"max_iterations": 5, "max_acquisitions": 5, "max_tool_calls": 20}
+
+
+def heuristic_support_extractor(prompt_payload: dict) -> dict:
+    """Deterministic, LLM-free F8 extractor stand-in.
+
+    Returns verdict 'supports'/factual with an EXACT-substring sentence quote when
+    the source content contains a single sentence co-mentioning BOTH the target
+    subject and object (by name tokens derived from their entity ids); otherwise
+    'not_addressed'. This is a heuristic for demos/tests, NOT semantic judgement;
+    real deployments inject an LLM extractor. The F8 boundary re-validates the
+    quote/span regardless.
+    """
+    try:
+        target = prompt_payload.get("target") or {}
+        source = prompt_payload.get("source") or {}
+        content = source.get("content")
+        if not isinstance(content, str):
+            content = "" if content is None else str(content)
+
+        subject_names = _entity_name_candidates(target.get("subject_id"))
+        object_names = _entity_name_candidates(target.get("object_id"))
+        if not subject_names or not object_names:
+            return {"verdict": "not_addressed"}
+
+        for match in re.finditer(r"[^.!?]*[.!?]", content):
+            sentence = match.group(0)
+            offset = len(sentence) - len(sentence.lstrip())
+            start = match.start() + offset
+            end = match.end()
+            quote = content[start:end]
+            lowered = quote.lower()
+            if (
+                any(name in lowered for name in subject_names)
+                and any(name in lowered for name in object_names)
+                and content[start:end] == quote
+            ):
+                return {
+                    "verdict": "supports",
+                    "quote": quote,
+                    "char_span": {"start": start, "end": end},
+                    "speaker": None,
+                    "modality": "factual",
+                }
+    except Exception:
+        return {"verdict": "not_addressed"}
+    return {"verdict": "not_addressed"}
+
+
+def _entity_name_candidates(entity_id: Any) -> list[str]:
+    if entity_id is None:
+        return []
+    value = str(entity_id).strip()
+    if not value:
+        return []
+    names = []
+    for candidate in (value, value.replace("_", " ")):
+        lowered = candidate.lower()
+        if lowered and lowered not in names:
+            names.append(lowered)
+    return names
 
 
 def closure_predicate_for(base_predicate: str, rules: list[dict[str, Any]]) -> str | None:
