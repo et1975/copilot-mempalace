@@ -16,6 +16,7 @@ import os
 import hashlib
 import inspect
 import re
+import secrets
 import sqlite3
 import sys
 from collections import defaultdict, deque
@@ -37,6 +38,36 @@ ALLOWED_PREMISE_PAIRS = {
     ("deduced", "trusted_rule"),
 }
 SUPPORT_ACTIVE_NOW_SQL = "s.ended_at IS NULL AND s.valid_to IS NULL"
+CONTROLLER_STATES = {
+    "open",
+    "deducing",
+    "deduced",
+    "gap_selected",
+    "acquire_proposed",
+    "acquire_approved",
+    "acquiring",
+    "acquired",
+    "extracting",
+    "claim_extracted",
+    "assert_proposed",
+    "assert_approved",
+    "asserting",
+    "asserted",
+    "fixpoint",
+    "budget_exhausted",
+    "abandoned",
+}
+CONTROLLER_TERMINAL_STATES = {"fixpoint", "budget_exhausted", "abandoned"}
+S1_CONTROLLER_TRANSITIONS = {
+    ("open", "start_deduction"): "deducing",
+    ("asserted", "start_deduction"): "deducing",
+    ("deducing", "record_deduction"): "deduced",
+    ("deduced", "select_gap"): "gap_selected",
+    ("deduced", "finish_fixpoint"): "fixpoint",
+    ("gap_selected", "finish_fixpoint"): "fixpoint",
+    ("asserted", "finish_fixpoint"): "fixpoint",
+}
+S1_ACTIONS = {"start_deduction", "record_deduction", "select_gap", "finish_fixpoint", "abandon"}
 
 
 def _support_active_now(row) -> bool:
@@ -93,6 +124,20 @@ FIREWALL_SCHEMA_DDL = (
       expired_at TEXT, metadata_json TEXT NOT NULL DEFAULT '{}');
     """,
     "CREATE INDEX IF NOT EXISTS idx_runs_expiry ON contemplate_runs(status, expires_at)",
+    """
+    CREATE TABLE IF NOT EXISTS contemplate_run_events (
+      event_id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL,
+      version_before INTEGER NOT NULL,
+      version_after INTEGER NOT NULL,
+      from_state TEXT NOT NULL,
+      to_state TEXT NOT NULL,
+      action TEXT NOT NULL,
+      actor TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY(run_id) REFERENCES contemplate_runs(run_id));
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_run_events_run ON contemplate_run_events(run_id, version_after)",
     """
     CREATE TABLE IF NOT EXISTS contemplate_provisional_facts (
       provisional_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, fact_key TEXT NOT NULL,
@@ -151,6 +196,7 @@ def ensure_firewall_schema(db_path: str) -> None:
         if "expires_at" not in _table_columns(con, "kg_triple_supports"):
             con.execute("ALTER TABLE kg_triple_supports ADD COLUMN expires_at TEXT")
         _ensure_provisional_entity_columns(con)
+        _ensure_controlled_run_columns(con)
         con.commit()
     finally:
         con.close()
@@ -174,6 +220,19 @@ def _utc_now_iso(now: datetime | str | None = None) -> str:
 def _add_hours_iso(now_iso: str, ttl_hours: float) -> str:
     dt = datetime.fromisoformat(now_iso)
     return (dt + timedelta(hours=ttl_hours)).isoformat()
+
+
+def _add_seconds_iso(now_iso: str, secs: int) -> str:
+    dt = datetime.fromisoformat(now_iso)
+    return (dt + timedelta(seconds=secs)).isoformat()
+
+
+def _new_owner_token() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def _hash_owner_token(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
 
 
 def _provisional_fact_key(
@@ -204,6 +263,22 @@ def _ensure_provisional_entity_columns(con: sqlite3.Connection) -> None:
         con.execute("ALTER TABLE contemplate_provisional_facts ADD COLUMN subject_id TEXT")
     if "object_id" not in columns:
         con.execute("ALTER TABLE contemplate_provisional_facts ADD COLUMN object_id TEXT")
+
+
+def _ensure_controlled_run_columns(con: sqlite3.Connection) -> None:
+    columns = _table_columns(con, "contemplate_runs")
+    if "state" not in columns:
+        con.execute("ALTER TABLE contemplate_runs ADD COLUMN state TEXT NOT NULL DEFAULT 'open'")
+    if "version" not in columns:
+        con.execute("ALTER TABLE contemplate_runs ADD COLUMN version INTEGER NOT NULL DEFAULT 0")
+    if "owner_token_hash" not in columns:
+        con.execute("ALTER TABLE contemplate_runs ADD COLUMN owner_token_hash TEXT")
+    if "lease_expires_at" not in columns:
+        con.execute("ALTER TABLE contemplate_runs ADD COLUMN lease_expires_at TEXT")
+    if "lease_ttl_seconds" not in columns:
+        con.execute(
+            "ALTER TABLE contemplate_runs ADD COLUMN lease_ttl_seconds INTEGER NOT NULL DEFAULT 300"
+        )
 
 
 def create_or_resume_run(
@@ -247,6 +322,358 @@ def create_or_resume_run(
             )
         con.commit()
         return chosen_run_id
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+
+
+def _controller_refusal(
+    run_id: str,
+    state: str | None,
+    version: int | None,
+    code: str,
+    message: str,
+) -> dict:
+    return {
+        "ok": False,
+        "run_id": run_id,
+        "state": state,
+        "version": version,
+        "refusal": {"code": code, "message": message},
+    }
+
+
+def _insert_run_event(
+    con: sqlite3.Connection,
+    *,
+    run_id: str,
+    version_before: int,
+    version_after: int,
+    from_state: str,
+    to_state: str,
+    action: str,
+    actor: str,
+    created_at: str,
+) -> None:
+    con.execute(
+        """
+        INSERT INTO contemplate_run_events(
+            event_id, run_id, version_before, version_after,
+            from_state, to_state, action, actor, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            str(uuid4()),
+            run_id,
+            version_before,
+            version_after,
+            from_state,
+            to_state,
+            action,
+            actor,
+            created_at,
+        ),
+    )
+
+
+def create_or_resume_controlled_run(
+    palace_path,
+    *,
+    run_id: str | None = None,
+    ttl_hours: float = 24.0,
+    lease_ttl_seconds: int = 300,
+    now: datetime | str | None = None,
+) -> dict:
+    """Create or take over a leased contemplate controller run."""
+    db_path = _resolve_kg_path(palace_path)
+    ensure_firewall_schema(db_path)
+    now_iso = _utc_now_iso(now)
+    expires_at = _add_hours_iso(now_iso, ttl_hours)
+    lease_expires_at = _add_seconds_iso(now_iso, lease_ttl_seconds)
+    chosen_run_id = run_id or str(uuid4())
+    owner_token = _new_owner_token()
+    owner_hash = _hash_owner_token(owner_token)
+
+    con = sqlite3.connect(db_path)
+    con.row_factory = sqlite3.Row
+    try:
+        con.execute("PRAGMA busy_timeout = 5000")
+        con.execute("BEGIN IMMEDIATE")
+        row = con.execute(
+            """
+            SELECT status, state, version, lease_expires_at, expires_at
+            FROM contemplate_runs
+            WHERE run_id=?
+            """,
+            (chosen_run_id,),
+        ).fetchone()
+        if row is None:
+            con.execute(
+                """
+                INSERT INTO contemplate_runs(
+                    run_id, status, state, version, owner_token_hash,
+                    lease_expires_at, lease_ttl_seconds,
+                    created_at, last_seen_at, expires_at, expired_at, metadata_json
+                ) VALUES (?, 'active', 'open', 0, ?, ?, ?, ?, ?, ?, NULL, '{}')
+                """,
+                (
+                    chosen_run_id,
+                    owner_hash,
+                    lease_expires_at,
+                    lease_ttl_seconds,
+                    now_iso,
+                    now_iso,
+                    expires_at,
+                ),
+            )
+            con.commit()
+            return {
+                "run_id": chosen_run_id,
+                "owner_token": owner_token,
+                "state": "open",
+                "version": 0,
+                "lease_expires_at": lease_expires_at,
+                "resumed": False,
+                "took_over": False,
+            }
+
+        state = str(row["state"])
+        version_before = int(row["version"])
+        current_lease = row["lease_expires_at"]
+        if row["status"] != "active" or row["expires_at"] <= now_iso:
+            raise ValueError(f"contemplate run is not active: {chosen_run_id}")
+        if state in CONTROLLER_TERMINAL_STATES:
+            raise ValueError(f"contemplate run is terminal: {chosen_run_id}")
+        if current_lease is not None and current_lease > now_iso:
+            raise ValueError(f"contemplate run is leased by another driver: {chosen_run_id}")
+
+        version_after = version_before + 1
+        con.execute(
+            """
+            UPDATE contemplate_runs
+            SET owner_token_hash=?,
+                version=?,
+                lease_expires_at=?,
+                last_seen_at=?
+            WHERE run_id=?
+            """,
+            (owner_hash, version_after, lease_expires_at, now_iso, chosen_run_id),
+        )
+        _insert_run_event(
+            con,
+            run_id=chosen_run_id,
+            version_before=version_before,
+            version_after=version_after,
+            from_state=state,
+            to_state=state,
+            action="takeover",
+            actor="controller",
+            created_at=now_iso,
+        )
+        con.commit()
+        return {
+            "run_id": chosen_run_id,
+            "owner_token": owner_token,
+            "state": state,
+            "version": version_after,
+            "lease_expires_at": lease_expires_at,
+            "resumed": False,
+            "took_over": True,
+        }
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+
+
+def renew_lease(
+    palace_path,
+    run_id,
+    *,
+    owner_token,
+    expected_version,
+    now: datetime | str | None = None,
+) -> dict:
+    """Renew a controller lease without changing state or version."""
+    db_path = _resolve_kg_path(palace_path)
+    ensure_firewall_schema(db_path)
+    now_iso = _utc_now_iso(now)
+    owner_hash = _hash_owner_token(owner_token)
+
+    con = sqlite3.connect(db_path)
+    con.row_factory = sqlite3.Row
+    try:
+        con.execute("PRAGMA busy_timeout = 5000")
+        con.execute("BEGIN IMMEDIATE")
+        row = con.execute(
+            """
+            SELECT status, state, version, owner_token_hash, lease_expires_at, lease_ttl_seconds
+            FROM contemplate_runs
+            WHERE run_id=?
+            """,
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            con.rollback()
+            return _controller_refusal(run_id, None, None, "unknown_run", f"unknown run: {run_id}")
+
+        lease_expires_at = _add_seconds_iso(now_iso, int(row["lease_ttl_seconds"]))
+        cur = con.execute(
+            """
+            UPDATE contemplate_runs
+            SET lease_expires_at=?,
+                last_seen_at=?
+            WHERE run_id=?
+              AND version=?
+              AND owner_token_hash=?
+              AND status='active'
+            """,
+            (lease_expires_at, now_iso, run_id, expected_version, owner_hash),
+        )
+        if cur.rowcount == 1:
+            con.commit()
+            return {
+                "ok": True,
+                "run_id": run_id,
+                "version": expected_version,
+                "lease_expires_at": lease_expires_at,
+            }
+
+        state = row["state"]
+        version = int(row["version"])
+        if version != expected_version:
+            code = "cas_conflict"
+            message = f"expected version {expected_version}, found {version}"
+        elif row["owner_token_hash"] != owner_hash:
+            code = "lease_lost"
+            message = f"lease lost for run: {run_id}"
+        else:
+            code = "bad_state"
+            message = f"run cannot renew lease in current state: {run_id}"
+        con.rollback()
+        return _controller_refusal(run_id, state, version, code, message)
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+
+
+def controller_step(
+    palace_path,
+    run_id,
+    action,
+    payload=None,
+    *,
+    owner_token,
+    expected_version,
+    now: datetime | str | None = None,
+) -> dict:
+    """Accept or refuse one deterministic S1 controller transition."""
+    del payload
+    db_path = _resolve_kg_path(palace_path)
+    ensure_firewall_schema(db_path)
+    now_iso = _utc_now_iso(now)
+    owner_hash = _hash_owner_token(owner_token)
+
+    con = sqlite3.connect(db_path)
+    con.row_factory = sqlite3.Row
+    try:
+        con.execute("PRAGMA busy_timeout = 5000")
+        con.execute("BEGIN IMMEDIATE")
+        row = con.execute(
+            """
+            SELECT status, state, version, owner_token_hash, lease_expires_at, lease_ttl_seconds
+            FROM contemplate_runs
+            WHERE run_id=?
+            """,
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            con.rollback()
+            return _controller_refusal(run_id, None, None, "unknown_run", f"unknown run: {run_id}")
+
+        state = str(row["state"])
+        version = int(row["version"])
+        if action == "abandon" and state not in CONTROLLER_TERMINAL_STATES:
+            to_state = "abandoned"
+        elif (state, action) in S1_CONTROLLER_TRANSITIONS:
+            to_state = S1_CONTROLLER_TRANSITIONS[(state, action)]
+        elif action not in S1_ACTIONS:
+            con.rollback()
+            return _controller_refusal(
+                run_id,
+                state,
+                version,
+                "unsupported_action",
+                f"unsupported controller action: {action}",
+            )
+        elif state in CONTROLLER_TERMINAL_STATES:
+            con.rollback()
+            return _controller_refusal(
+                run_id,
+                state,
+                version,
+                "terminal",
+                f"contemplate run is terminal: {run_id}",
+            )
+        else:
+            con.rollback()
+            return _controller_refusal(
+                run_id,
+                state,
+                version,
+                "bad_transition",
+                f"cannot {action} from state {state}",
+            )
+
+        new_lease = _add_seconds_iso(now_iso, int(row["lease_ttl_seconds"]))
+        cur = con.execute(
+            """
+            UPDATE contemplate_runs
+            SET state=?,
+                version=version+1,
+                last_seen_at=?,
+                lease_expires_at=?
+            WHERE run_id=?
+              AND version=?
+              AND owner_token_hash=?
+              AND state=?
+              AND lease_expires_at > ?
+              AND status='active'
+            """,
+            (to_state, now_iso, new_lease, run_id, expected_version, owner_hash, state, now_iso),
+        )
+        if cur.rowcount == 1:
+            _insert_run_event(
+                con,
+                run_id=run_id,
+                version_before=expected_version,
+                version_after=expected_version + 1,
+                from_state=state,
+                to_state=to_state,
+                action=action,
+                actor="agent",
+                created_at=now_iso,
+            )
+            con.commit()
+            return {"ok": True, "run_id": run_id, "state": to_state, "version": expected_version + 1}
+
+        current_lease = row["lease_expires_at"]
+        if version != expected_version:
+            code = "cas_conflict"
+            message = f"expected version {expected_version}, found {version}"
+        elif row["owner_token_hash"] != owner_hash or current_lease is None or current_lease <= now_iso:
+            code = "lease_lost"
+            message = f"lease lost for run: {run_id}"
+        else:
+            code = "bad_state"
+            message = f"run state changed before transition: {run_id}"
+        con.rollback()
+        return _controller_refusal(run_id, state, version, code, message)
     except Exception:
         con.rollback()
         raise
