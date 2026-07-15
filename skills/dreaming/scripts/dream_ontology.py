@@ -229,8 +229,8 @@ def describe_rule_candidate(rule: dict) -> dict:
 
     if family == "transitive":
         plain_question = (
-            f"When '{predicate}' links things in a chain "
-            f"(A {predicate} B and B {predicate} C), should I treat A as '{predicate}' C too?"
+            f"When '{predicate}' forms a chain — A {predicate} B, and B {predicate} C — "
+            f"should I conclude that A {predicate} C too?"
         )
         effect = f"Lets me follow chains of '{predicate}' to connect things you didn't state directly."
     elif family == "inverse":
