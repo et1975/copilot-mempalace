@@ -220,6 +220,42 @@ def merge_ontology_candidates(existing: list[dict], new: list[dict]) -> tuple[li
     return merged, {"added": len(to_add), "skipped_existing": skipped_existing}
 
 
+def describe_rule_candidate(rule: dict) -> dict:
+    """Render an ontology rule candidate as a plain-language approval prompt."""
+    rule_id = rule.get("id", "")
+    family = rule.get("family")
+    predicate = rule.get("predicate", "")
+    inverse_predicate = rule.get("inverse_predicate", "")
+
+    if family == "transitive":
+        plain_question = (
+            f"When '{predicate}' links things in a chain "
+            f"(A {predicate} B and B {predicate} C), should I treat A as '{predicate}' C too?"
+        )
+        effect = f"Lets me follow chains of '{predicate}' to connect things you didn't state directly."
+    elif family == "inverse":
+        plain_question = (
+            f"Are '{predicate}' and '{inverse_predicate}' just two ways of saying the same link "
+            f"(X {predicate} Y means Y {inverse_predicate} X)?"
+        )
+        effect = f"Lets me use a '{predicate}' fact and its '{inverse_predicate}' restatement interchangeably."
+    elif family == "symmetric":
+        plain_question = f"If A '{predicate}' B, is B always '{predicate}' A as well?"
+        effect = f"Lets me treat '{predicate}' as going both directions."
+    else:
+        plain_question = f"Enable rule {rule_id}?"
+        effect = rule.get("rationale") or ""
+
+    return {
+        "id": rule_id,
+        "family": family,
+        "plain_question": plain_question,
+        "effect": effect,
+        "evidence": rule.get("rationale") or "",
+        "enabled": bool(rule.get("enabled", False)),
+    }
+
+
 def build_ontology_doc(rules: list[dict], version: int = 1) -> dict:
     """Build an ontology.json document."""
     return {"version": version, "rules": rules}
