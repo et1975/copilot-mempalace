@@ -1,14 +1,30 @@
-"""Pure reasoning helpers for the Track B B3 ACQUIRE loop.
-
-This module deliberately performs no I/O and owns no loop state.  The brokered
-S4b loop supplies premises, deductive candidates, rules, and gap worklists.
-"""
+"""Reasoning helpers and S4b ACQUIRE-loop driver for Track B B3."""
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+from functools import partial
 from typing import Any
 
-from dream_lib import normalize_predicate, derived_predicate_for, enabled_rules
+from dream_f8 import f8_assess
+from dream_lib import (
+    deductive_closure,
+    find_transitive_gaps,
+    normalize_predicate,
+    derived_predicate_for,
+    enabled_rules,
+)
+from dream_palace import (
+    broker_assert_provisional,
+    controller_step,
+    create_or_resume_controlled_run,
+    issue_approval,
+    load_premises,
+    retrieve_relevant_session_observations,
+)
+
+
+DEFAULT_ACQUIRE_BUDGETS = {"max_iterations": 5, "max_acquisitions": 5, "max_tool_calls": 20}
 
 
 def closure_predicate_for(base_predicate: str, rules: list[dict[str, Any]]) -> str | None:
@@ -110,6 +126,231 @@ def answers_equivalent(a: dict[str, Any], b: dict[str, Any]) -> bool:
 def answer_changed(a: dict[str, Any], b: dict[str, Any]) -> bool:
     """Return whether two answer frames differ."""
     return not answers_equivalent(a, b)
+
+
+def default_recall(
+    palace_path,
+    query_text,
+    gap,
+    *,
+    k=5,
+    now=None,
+) -> list[dict]:
+    """Recall host-session observations and wrap them as F8 UntrustedSource dicts."""
+    del gap
+    retrieved_at = _iso_now(now)
+    sources = []
+    for obs in retrieve_relevant_session_observations(palace_path, query_text, k=k):
+        locator = {
+            key: obs.get(key)
+            for key in ("id", "member_ids", "session_id", "agent", "date", "topic", "wing", "room", "similarity")
+            if key in obs and obs.get(key) is not None
+        }
+        sources.append(
+            {
+                "source_type": "session_recall",
+                "trust_domain": "session_store",
+                "locator": locator,
+                "retrieved_at": retrieved_at,
+                "content": obs.get("text") or "",
+            }
+        )
+    return sources
+
+
+def acquire_loop(
+    palace_path,
+    *,
+    query,
+    rules,
+    extractor_fn,
+    recall_fn=None,
+    run_id=None,
+    budgets=None,
+    trusted_speakers=None,
+    source_kind="recall",
+    now=None,
+) -> dict:
+    """Run the deterministic S4b deduce→gap→recall→F8→broker loop."""
+    if extractor_fn is None:
+        raise ValueError("acquire_loop requires extractor_fn")
+
+    limits = dict(DEFAULT_ACQUIRE_BUDGETS)
+    limits.update(budgets or {})
+    recall = recall_fn if recall_fn is not None else partial(default_recall, palace_path)
+
+    run = create_or_resume_controlled_run(palace_path, run_id=run_id, now=now)
+    run_id = run["run_id"]
+    owner_token = run["owner_token"]
+    state = run["state"]
+    version = int(run["version"])
+
+    acquired: list[dict[str, Any]] = []
+    attempted_keys: set[tuple[Any, str, Any]] = set()
+    acquired_keys: set[tuple[Any, str, Any]] = set()
+    iterations_used = 0
+    acquisitions_used = 0
+    tool_calls_used = 0
+    answer: dict[str, Any] | None = None
+    refusal = None
+    status = "budget_exhausted"
+    unfilled_reasons: dict[tuple[Any, str, Any], str] = {}
+    last_gaps: list[dict[str, Any]] = []
+    should_finalize = True
+
+    def controller(action: str) -> bool:
+        nonlocal state, version, refusal
+        result = controller_step(
+            palace_path,
+            run_id,
+            action,
+            owner_token=owner_token,
+            expected_version=version,
+            now=now,
+        )
+        if not result.get("ok"):
+            refusal = result.get("refusal", result)
+            return False
+        state = result["state"]
+        version = int(result["version"])
+        return True
+
+    def terminate(next_status: str, next_answer: dict[str, Any], *, next_refusal=None) -> dict:
+        nonlocal status, answer, refusal
+        status = next_status
+        answer = next_answer
+        if next_refusal is not None:
+            refusal = next_refusal
+        return _acquire_result(
+            status=status,
+            run_id=run_id,
+            answer=answer,
+            acquired=acquired,
+            unfilled_gaps=_unfilled_gaps(last_gaps, acquired_keys, unfilled_reasons),
+            iterations_used=iterations_used,
+            acquisitions_used=acquisitions_used,
+            tool_calls_used=tool_calls_used,
+            limits=limits,
+            refusal=refusal,
+        )
+
+    try:
+        for _ in range(int(limits["max_iterations"])):
+            iterations_used += 1
+            if state in {"open", "asserted"}:
+                if not controller("start_deduction"):
+                    return terminate("abandoned", answer or _unsupported_answer_for(query), next_refusal=refusal)
+                if not controller("record_deduction"):
+                    return terminate("abandoned", answer or _unsupported_answer_for(query), next_refusal=refusal)
+            elif state == "deducing":
+                if not controller("record_deduction"):
+                    return terminate("abandoned", answer or _unsupported_answer_for(query), next_refusal=refusal)
+            elif state != "deduced":
+                refusal = {
+                    "code": "bad_state",
+                    "message": f"acquire_loop cannot deduce from state {state}",
+                }
+                return terminate("abandoned", answer or _unsupported_answer_for(query), next_refusal=refusal)
+
+            prem = load_premises(palace_path, purpose="simulation", run_id=run_id)
+            cands = deductive_closure(prem, rules, max_depth=8, max_iterations=50, max_candidates=500)
+            answer = extract_boolean_reachability_answer(query, prem, cands, rules)
+            if answer["value"] is True:
+                return terminate("answered", answer)
+
+            last_gaps = find_transitive_gaps(prem, rules)
+            gap = select_gap(last_gaps, acquired_keys=acquired_keys, attempted_keys=attempted_keys, query=query)
+            if gap is None:
+                return terminate("fixpoint", answer)
+
+            if acquisitions_used >= int(limits["max_acquisitions"]) or tool_calls_used >= int(limits["max_tool_calls"]):
+                return terminate("budget_exhausted", answer)
+
+            gap_key = gap_hypothesis_key(gap)
+            hyp = gap["hypothesis"]
+            sources = recall(_query_text_for(query, hyp), gap)
+            tool_calls_used += 1
+            supported = False
+            for source in sources or []:
+                target = {
+                    "subject_id": hyp["subject_id"],
+                    "predicate": hyp["predicate"],
+                    "object_id": hyp["object_id"],
+                }
+                assessment = f8_assess(
+                    source,
+                    target,
+                    extractor=extractor_fn,
+                    trusted_speakers=trusted_speakers or set(),
+                    now=now,
+                )
+                if assessment.get("valid") and assessment.get("supports"):
+                    source_ref = _source_ref(source, gap, assessment)
+                    canonical_args = {
+                        "subject": hyp["subject_id"],
+                        "predicate": hyp["predicate"],
+                        "object": hyp["object_id"],
+                        "status": "acquired",
+                        "source_kind": source_kind,
+                        "source_ref": source_ref,
+                    }
+                    approval = issue_approval(
+                        palace_path,
+                        run_id,
+                        owner_token=owner_token,
+                        expected_version=version,
+                        approval_kind="assert_provisional",
+                        tool_name="assert_provisional",
+                        canonical_args=canonical_args,
+                        now=now,
+                    )
+                    if not approval.get("ok"):
+                        return terminate("abandoned", answer, next_refusal=approval.get("refusal", approval))
+                    brokered = broker_assert_provisional(
+                        palace_path,
+                        run_id,
+                        owner_token=owner_token,
+                        expected_version=version,
+                        approval_token=approval["approval_token"],
+                        subject=hyp["subject_id"],
+                        predicate=hyp["predicate"],
+                        object=hyp["object_id"],
+                        status="acquired",
+                        source_kind=source_kind,
+                        source_ref=source_ref,
+                        now=now,
+                    )
+                    if not brokered.get("ok"):
+                        return terminate("abandoned", answer, next_refusal=brokered.get("refusal", brokered))
+                    state = brokered["state"]
+                    version = int(brokered["version"])
+                    acquired.append(
+                        {
+                            "gap_key": gap_key,
+                            "provisional_id": brokered["provisional_id"],
+                            "source_kind": source_kind,
+                            "source_ref": source_ref,
+                            "epistemic_status": "acquired",
+                        }
+                    )
+                    acquired_keys.add(gap_key)
+                    acquisitions_used += 1
+                    supported = True
+                    break
+
+            if not supported:
+                attempted_keys.add(gap_key)
+                unfilled_reasons[gap_key] = "recall_no_support"
+                if _gap_explicitly_unblocks_query(gap, query):
+                    return terminate("fixpoint", answer)
+
+        return terminate("budget_exhausted", answer or _unsupported_answer_for(query))
+    finally:
+        if should_finalize:
+            if status == "abandoned":
+                _best_effort_controller_step(palace_path, run_id, "abandon", owner_token, version, now)
+            elif status in {"answered", "fixpoint"} and state in {"deduced", "gap_selected", "asserted"}:
+                _best_effort_controller_step(palace_path, run_id, "finish_fixpoint", owner_token, version, now)
 
 
 def gap_hypothesis_key(gap: dict[str, Any]) -> tuple[Any, str, Any]:
@@ -227,14 +468,154 @@ def _gap_duc(gap: dict[str, Any]) -> float:
 
 
 def _gap_prefers_query(gap: dict[str, Any], query: dict[str, str]) -> bool:
-    target = (query["subject_id"], query["object_id"])
-    evidence = gap.get("evidence") or {}
-    for unblocked in evidence.get("unblocks") or []:
-        if (unblocked.get("subject_id"), unblocked.get("object_id")) == target:
-            return True
+    if _gap_explicitly_unblocks_query(gap, query):
+        return True
 
     hypothesis = gap.get("hypothesis") or {}
     return (
         hypothesis.get("subject_id") == query["subject_id"]
         or hypothesis.get("object_id") == query["object_id"]
     )
+
+
+def _gap_explicitly_unblocks_query(gap: dict[str, Any], query: dict[str, str]) -> bool:
+    target = (query["subject_id"], query["object_id"])
+    evidence = gap.get("evidence") or {}
+    for unblocked in evidence.get("unblocks") or []:
+        if (unblocked.get("subject_id"), unblocked.get("object_id")) == target:
+            return True
+    return False
+
+
+def _iso_now(now=None) -> str:
+    if now is None:
+        return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    if isinstance(now, datetime):
+        value = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc).replace(microsecond=0).isoformat()
+    return str(now)
+
+
+def _query_text_for(query: dict[str, Any], hypothesis: dict[str, Any]) -> str:
+    parts = [
+        query.get("subject") or query.get("subject_id"),
+        query.get("base_predicate"),
+        query.get("object") or query.get("object_id"),
+        hypothesis.get("subject") or hypothesis.get("subject_id"),
+        hypothesis.get("predicate"),
+        hypothesis.get("object") or hypothesis.get("object_id"),
+    ]
+    return " ".join(str(part) for part in parts if part is not None)
+
+
+def _source_ref(source: dict[str, Any], gap: dict[str, Any], assessment: dict[str, Any]) -> str:
+    if assessment.get("evidence_id"):
+        return str(assessment["evidence_id"])
+    if assessment.get("source_id"):
+        return str(assessment["source_id"])
+    locator = source.get("locator") or {}
+    for key in ("id", "session_id", "source_ref"):
+        if locator.get(key) is not None:
+            return str(locator[key])
+    if gap.get("gap_id") is not None:
+        return str(gap["gap_id"])
+    return ":".join(str(part) for part in gap_hypothesis_key(gap))
+
+
+def _confidence(answer: dict[str, Any]) -> dict[str, str]:
+    status = answer.get("epistemic_status")
+    if status == "deduced":
+        return {"level": "high", "rationale": "grounded on durable trusted premises"}
+    if status == "entailed_given":
+        return {"level": "medium", "rationale": "entailed by acquired provisional(s)"}
+    return {"level": "low", "rationale": "no supporting acquisition found"}
+
+
+def _unfilled_gaps(
+    gaps: list[dict[str, Any]],
+    acquired_keys: set[tuple[Any, str, Any]],
+    reasons: dict[tuple[Any, str, Any], str],
+) -> list[dict[str, Any]]:
+    out = []
+    seen = set()
+    for gap in gaps or []:
+        key = gap_hypothesis_key(gap)
+        if key in acquired_keys or key in seen:
+            continue
+        seen.add(key)
+        out.append(
+            {
+                "gap_key": key,
+                "duc": _gap_duc(gap),
+                "reason": reasons.get(key, "not_selected"),
+            }
+        )
+    for key, reason in reasons.items():
+        if key not in seen and key not in acquired_keys:
+            out.append({"gap_key": key, "duc": 0.0, "reason": reason})
+    return out
+
+
+def _acquire_result(
+    *,
+    status: str,
+    run_id: str,
+    answer: dict[str, Any],
+    acquired: list[dict[str, Any]],
+    unfilled_gaps: list[dict[str, Any]],
+    iterations_used: int,
+    acquisitions_used: int,
+    tool_calls_used: int,
+    limits: dict[str, Any],
+    refusal: dict[str, Any] | None,
+) -> dict[str, Any]:
+    return {
+        "status": status,
+        "run_id": run_id,
+        "answer": answer,
+        "confidence": _confidence(answer),
+        "acquired": list(acquired),
+        "unfilled_gaps": unfilled_gaps,
+        "budgets": {
+            "iterations_used": iterations_used,
+            "acquisitions_used": acquisitions_used,
+            "tool_calls_used": tool_calls_used,
+            "max_iterations": int(limits["max_iterations"]),
+            "max_acquisitions": int(limits["max_acquisitions"]),
+            "max_tool_calls": int(limits["max_tool_calls"]),
+        },
+        "refusal": refusal if status == "abandoned" else None,
+    }
+
+
+def _unsupported_answer_for(query: dict[str, Any]) -> dict[str, Any]:
+    return _answer_frame(
+        query["subject_id"],
+        query["base_predicate"],
+        query["object_id"],
+        value=False,
+        epistemic_status="unsupported",
+        support=None,
+        conditional_on=[],
+    )
+
+
+def _best_effort_controller_step(
+    palace_path,
+    run_id,
+    action,
+    owner_token,
+    version,
+    now,
+) -> None:
+    try:
+        controller_step(
+            palace_path,
+            run_id,
+            action,
+            owner_token=owner_token,
+            expected_version=version,
+            now=now,
+        )
+    except Exception:
+        pass
