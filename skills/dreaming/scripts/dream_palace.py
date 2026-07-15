@@ -68,6 +68,7 @@ S1_CONTROLLER_TRANSITIONS = {
     ("asserted", "finish_fixpoint"): "fixpoint",
 }
 S1_ACTIONS = {"start_deduction", "record_deduction", "select_gap", "finish_fixpoint", "abandon"}
+BROKER_PROVISIONAL_WRITABLE_STATES = {"deduced", "gap_selected", "acquired", "claim_extracted"}
 
 
 def _support_active_now(row) -> bool:
@@ -138,6 +139,22 @@ FIREWALL_SCHEMA_DDL = (
       FOREIGN KEY(run_id) REFERENCES contemplate_runs(run_id));
     """,
     "CREATE INDEX IF NOT EXISTS idx_run_events_run ON contemplate_run_events(run_id, version_after)",
+    """
+    CREATE TABLE IF NOT EXISTS contemplate_approvals (
+      approval_id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL,
+      run_version_issued INTEGER NOT NULL,
+      approval_kind TEXT NOT NULL,
+      tool_name TEXT NOT NULL,
+      args_hash TEXT NOT NULL,
+      token_hash TEXT NOT NULL UNIQUE,
+      status TEXT NOT NULL DEFAULT 'issued',
+      issued_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      consumed_at TEXT,
+      FOREIGN KEY(run_id) REFERENCES contemplate_runs(run_id));
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_approvals_run ON contemplate_approvals(run_id, status)",
     """
     CREATE TABLE IF NOT EXISTS contemplate_provisional_facts (
       provisional_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, fact_key TEXT NOT NULL,
@@ -247,6 +264,29 @@ def _provisional_fact_key(
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def _canonical_args_hash(tool_name: str, args: dict) -> str:
+    canonical_args = json.dumps(args, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256((tool_name + "\n" + canonical_args).encode()).hexdigest()
+
+
+def _provisional_approval_args(
+    subject: Any,
+    predicate: Any,
+    object: Any,
+    status: str,
+    source_kind: Any,
+    source_ref: Any,
+) -> dict:
+    return {
+        "subject": subject,
+        "predicate": predicate,
+        "object": object,
+        "status": status,
+        "source_kind": source_kind,
+        "source_ref": source_ref,
+    }
+
+
 def _entity_id(name: Any) -> str:
     return str(name).lower().replace(" ", "_").replace("'", "")
 
@@ -279,6 +319,87 @@ def _ensure_controlled_run_columns(con: sqlite3.Connection) -> None:
         con.execute(
             "ALTER TABLE contemplate_runs ADD COLUMN lease_ttl_seconds INTEGER NOT NULL DEFAULT 300"
         )
+
+
+def _check_provisional_endpoints(con: sqlite3.Connection, subject: Any, object: Any) -> tuple[str, str]:
+    subject_id = _entity_id(subject)
+    object_id = _entity_id(object)
+    subject_exists = _entity_exists(con, subject_id)
+    object_exists = _entity_exists(con, object_id)
+    if not subject_exists:
+        raise ValueError(f"provisional subject does not exist in KG entities: {subject!r}")
+    if not object_exists:
+        raise ValueError(f"provisional object does not exist in KG entities: {object!r}")
+    return subject_id, object_id
+
+
+def _write_provisional_row(
+    con: sqlite3.Connection,
+    run_id: str,
+    subject: Any,
+    predicate: Any,
+    object: Any,
+    *,
+    status: str,
+    confidence: float | None,
+    source_kind: str | None,
+    source_ref: str | None,
+    now_iso: str,
+    run_expires_at: str,
+) -> str:
+    subject_id, object_id = _check_provisional_endpoints(con, subject, object)
+    fact_key = _provisional_fact_key(subject, predicate, object, source_kind, source_ref)
+    provisional_id = str(uuid4())
+    con.execute(
+        """
+        INSERT INTO contemplate_provisional_facts(
+            provisional_id, run_id, fact_key,
+            subject, predicate, object, subject_id, object_id,
+            status, confidence, source_kind, source_ref,
+            created_at, last_seen_at, expires_at, expired_at, fact_status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'active')
+        ON CONFLICT(run_id, fact_key) DO UPDATE SET
+            subject=excluded.subject,
+            predicate=excluded.predicate,
+            object=excluded.object,
+            subject_id=excluded.subject_id,
+            object_id=excluded.object_id,
+            status=excluded.status,
+            confidence=excluded.confidence,
+            source_kind=excluded.source_kind,
+            source_ref=excluded.source_ref,
+            last_seen_at=excluded.last_seen_at,
+            expires_at=excluded.expires_at,
+            expired_at=NULL,
+            fact_status='active'
+        """,
+        (
+            provisional_id,
+            run_id,
+            fact_key,
+            subject,
+            predicate,
+            object,
+            subject_id,
+            object_id,
+            status,
+            confidence,
+            source_kind,
+            source_ref,
+            now_iso,
+            now_iso,
+            run_expires_at,
+        ),
+    )
+    row = con.execute(
+        """
+        SELECT provisional_id
+        FROM contemplate_provisional_facts
+        WHERE run_id=? AND fact_key=?
+        """,
+        (run_id, fact_key),
+    ).fetchone()
+    return str(row["provisional_id"])
 
 
 def create_or_resume_run(
@@ -701,26 +822,16 @@ def assert_provisional(
     db_path = _resolve_kg_path(palace_path)
     ensure_firewall_schema(db_path)
     now_iso = _utc_now_iso(now)
-    subject_id = _entity_id(subject)
-    object_id = _entity_id(object)
-    fact_key = _provisional_fact_key(subject, predicate, object, source_kind, source_ref)
-    provisional_id = str(uuid4())
 
     con = sqlite3.connect(db_path)
     con.row_factory = sqlite3.Row
     try:
         con.execute("PRAGMA busy_timeout = 5000")
         _ensure_provisional_entity_columns(con)
-        subject_exists = _entity_exists(con, subject_id)
-        object_exists = _entity_exists(con, object_id)
-        if not subject_exists:
-            raise ValueError(f"provisional subject does not exist in KG entities: {subject!r}")
-        if not object_exists:
-            raise ValueError(f"provisional object does not exist in KG entities: {object!r}")
         con.execute("BEGIN IMMEDIATE")
         run = con.execute(
             """
-            SELECT expires_at
+            SELECT expires_at, owner_token_hash
             FROM contemplate_runs
             WHERE run_id=?
               AND status='active'
@@ -730,58 +841,321 @@ def assert_provisional(
         ).fetchone()
         if run is None:
             raise ValueError(f"contemplate run is not active: {run_id}")
+        if run["owner_token_hash"] is not None:
+            raise ValueError(f"controlled run requires broker; use broker_assert_provisional: {run_id}")
 
-        con.execute(
-            """
-            INSERT INTO contemplate_provisional_facts(
-                provisional_id, run_id, fact_key,
-                subject, predicate, object, subject_id, object_id,
-                status, confidence, source_kind, source_ref,
-                created_at, last_seen_at, expires_at, expired_at, fact_status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'active')
-            ON CONFLICT(run_id, fact_key) DO UPDATE SET
-                subject=excluded.subject,
-                predicate=excluded.predicate,
-                object=excluded.object,
-                subject_id=excluded.subject_id,
-                object_id=excluded.object_id,
-                status=excluded.status,
-                confidence=excluded.confidence,
-                source_kind=excluded.source_kind,
-                source_ref=excluded.source_ref,
-                last_seen_at=excluded.last_seen_at,
-                expires_at=excluded.expires_at,
-                expired_at=NULL,
-                fact_status='active'
-            """,
-            (
-                provisional_id,
-                run_id,
-                fact_key,
-                subject,
-                predicate,
-                object,
-                subject_id,
-                object_id,
-                status,
-                confidence,
-                source_kind,
-                source_ref,
-                now_iso,
-                now_iso,
-                run["expires_at"],
-            ),
+        provisional_id = _write_provisional_row(
+            con,
+            run_id,
+            subject,
+            predicate,
+            object,
+            status=status,
+            confidence=confidence,
+            source_kind=source_kind,
+            source_ref=source_ref,
+            now_iso=now_iso,
+            run_expires_at=run["expires_at"],
         )
+        con.commit()
+        return provisional_id
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+
+
+def issue_approval(
+    palace_path,
+    run_id,
+    *,
+    owner_token,
+    expected_version,
+    approval_kind,
+    tool_name,
+    canonical_args,
+    ttl_seconds=300,
+    now: datetime | str | None = None,
+) -> dict:
+    """Mint a one-use controller approval token for a controlled run."""
+    db_path = _resolve_kg_path(palace_path)
+    ensure_firewall_schema(db_path)
+    now_iso = _utc_now_iso(now)
+    owner_hash = _hash_owner_token(owner_token)
+
+    con = sqlite3.connect(db_path)
+    con.row_factory = sqlite3.Row
+    try:
+        con.execute("PRAGMA busy_timeout = 5000")
+        con.execute("BEGIN IMMEDIATE")
         row = con.execute(
             """
-            SELECT provisional_id
-            FROM contemplate_provisional_facts
-            WHERE run_id=? AND fact_key=?
+            SELECT status, state, version, owner_token_hash, lease_expires_at
+            FROM contemplate_runs
+            WHERE run_id=?
             """,
-            (run_id, fact_key),
+            (run_id,),
         ).fetchone()
+        if row is None:
+            con.rollback()
+            return _controller_refusal(run_id, None, None, "unknown_run", f"unknown run: {run_id}")
+
+        state = str(row["state"])
+        version = int(row["version"])
+        current_lease = row["lease_expires_at"]
+        if version != expected_version:
+            con.rollback()
+            return _controller_refusal(
+                run_id,
+                state,
+                version,
+                "cas_conflict",
+                f"expected version {expected_version}, found {version}",
+            )
+        if row["owner_token_hash"] != owner_hash or current_lease is None or current_lease <= now_iso:
+            con.rollback()
+            return _controller_refusal(run_id, state, version, "lease_lost", f"lease lost for run: {run_id}")
+        if state in CONTROLLER_TERMINAL_STATES:
+            con.rollback()
+            return _controller_refusal(
+                run_id,
+                state,
+                version,
+                "terminal",
+                f"contemplate run is terminal: {run_id}",
+            )
+        if row["status"] != "active":
+            con.rollback()
+            return _controller_refusal(run_id, state, version, "inactive_run", f"run is not active: {run_id}")
+
+        approval_token = _new_owner_token()
+        token_hash = _hash_owner_token(approval_token)
+        args_hash = _canonical_args_hash(tool_name, canonical_args)
+        approval_id = str(uuid4())
+        expires_at = _add_seconds_iso(now_iso, ttl_seconds)
+        con.execute(
+            """
+            INSERT INTO contemplate_approvals(
+                approval_id, run_id, run_version_issued, approval_kind,
+                tool_name, args_hash, token_hash, status, issued_at, expires_at, consumed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'issued', ?, ?, NULL)
+            """,
+            (
+                approval_id,
+                run_id,
+                expected_version,
+                approval_kind,
+                tool_name,
+                args_hash,
+                token_hash,
+                now_iso,
+                expires_at,
+            ),
+        )
         con.commit()
-        return str(row["provisional_id"])
+        return {
+            "ok": True,
+            "approval_id": approval_id,
+            "approval_token": approval_token,
+            "expires_at": expires_at,
+        }
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+
+
+def broker_assert_provisional(
+    palace_path,
+    run_id,
+    *,
+    owner_token,
+    expected_version,
+    approval_token,
+    subject,
+    predicate,
+    object,
+    status: str = "acquired",
+    confidence: float | None = None,
+    source_kind: str | None = None,
+    source_ref: str | None = None,
+    now: datetime | str | None = None,
+) -> dict:
+    """Consume a one-use controller approval and write a controlled provisional fact."""
+    db_path = _resolve_kg_path(palace_path)
+    ensure_firewall_schema(db_path)
+    now_iso = _utc_now_iso(now)
+    owner_hash = _hash_owner_token(owner_token)
+    approval_token_hash = _hash_owner_token(approval_token)
+
+    con = sqlite3.connect(db_path)
+    con.row_factory = sqlite3.Row
+    try:
+        con.execute("PRAGMA busy_timeout = 5000")
+        _ensure_provisional_entity_columns(con)
+        con.execute("BEGIN IMMEDIATE")
+        row = con.execute(
+            """
+            SELECT status, state, version, owner_token_hash, lease_expires_at,
+                   lease_ttl_seconds, expires_at
+            FROM contemplate_runs
+            WHERE run_id=?
+            """,
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            con.rollback()
+            return _controller_refusal(run_id, None, None, "unknown_run", f"unknown run: {run_id}")
+
+        state = str(row["state"])
+        version = int(row["version"])
+        current_lease = row["lease_expires_at"]
+        if status in TRUSTED_STATUSES:
+            con.rollback()
+            return _controller_refusal(
+                run_id,
+                state,
+                version,
+                "bad_status",
+                f"provisional facts cannot use trusted status: {status!r}",
+            )
+        if version != expected_version:
+            con.rollback()
+            return _controller_refusal(
+                run_id,
+                state,
+                version,
+                "cas_conflict",
+                f"expected version {expected_version}, found {version}",
+            )
+        if row["owner_token_hash"] is None or row["owner_token_hash"] != owner_hash or current_lease is None or current_lease <= now_iso:
+            con.rollback()
+            return _controller_refusal(run_id, state, version, "lease_lost", f"lease lost for run: {run_id}")
+        if state in CONTROLLER_TERMINAL_STATES:
+            con.rollback()
+            return _controller_refusal(
+                run_id,
+                state,
+                version,
+                "terminal",
+                f"contemplate run is terminal: {run_id}",
+            )
+        if row["status"] != "active" or row["expires_at"] <= now_iso:
+            con.rollback()
+            return _controller_refusal(run_id, state, version, "inactive_run", f"run is not active: {run_id}")
+        approval = con.execute(
+            """
+            SELECT *
+            FROM contemplate_approvals
+            WHERE token_hash=?
+            """,
+            (approval_token_hash,),
+        ).fetchone()
+        if approval is None:
+            con.rollback()
+            return _controller_refusal(run_id, state, version, "approval_invalid", "approval token is invalid")
+        if approval["run_id"] != run_id:
+            con.rollback()
+            return _controller_refusal(run_id, state, version, "approval_invalid", "approval token is invalid")
+        if approval["approval_kind"] != "assert_provisional" or approval["tool_name"] != "assert_provisional":
+            con.rollback()
+            return _controller_refusal(run_id, state, version, "approval_invalid", "approval token is invalid")
+        if approval["status"] == "consumed":
+            con.rollback()
+            return _controller_refusal(run_id, state, version, "approval_consumed", "approval token already consumed")
+        if approval["status"] == "expired" or approval["expires_at"] <= now_iso:
+            con.rollback()
+            return _controller_refusal(run_id, state, version, "approval_expired", "approval token expired")
+        if int(approval["run_version_issued"]) != expected_version:
+            con.rollback()
+            return _controller_refusal(run_id, state, version, "approval_stale", "approval token was issued for a different run version")
+
+        expected_args_hash = _canonical_args_hash(
+            "assert_provisional",
+            _provisional_approval_args(subject, predicate, object, status, source_kind, source_ref),
+        )
+        if approval["args_hash"] != expected_args_hash:
+            con.rollback()
+            return _controller_refusal(run_id, state, version, "args_mismatch", "approval token arguments do not match")
+        if state not in BROKER_PROVISIONAL_WRITABLE_STATES:
+            con.rollback()
+            return _controller_refusal(
+                run_id,
+                state,
+                version,
+                "bad_transition",
+                f"cannot broker assert provisional from state {state}",
+            )
+
+        provisional_id = _write_provisional_row(
+            con,
+            run_id,
+            subject,
+            predicate,
+            object,
+            status=status,
+            confidence=confidence,
+            source_kind=source_kind,
+            source_ref=source_ref,
+            now_iso=now_iso,
+            run_expires_at=row["expires_at"],
+        )
+        cur = con.execute(
+            """
+            UPDATE contemplate_approvals
+            SET status='consumed',
+                consumed_at=?
+            WHERE token_hash=?
+              AND status='issued'
+            """,
+            (now_iso, approval_token_hash),
+        )
+        if cur.rowcount != 1:
+            con.rollback()
+            return _controller_refusal(run_id, state, version, "approval_consumed", "approval token already consumed")
+
+        new_lease = _add_seconds_iso(now_iso, int(row["lease_ttl_seconds"]))
+        cur = con.execute(
+            """
+            UPDATE contemplate_runs
+            SET state='asserted',
+                version=version+1,
+                last_seen_at=?,
+                lease_expires_at=?
+            WHERE run_id=?
+              AND version=?
+              AND owner_token_hash=?
+              AND state=?
+              AND lease_expires_at > ?
+              AND status='active'
+            """,
+            (now_iso, new_lease, run_id, expected_version, owner_hash, state, now_iso),
+        )
+        if cur.rowcount != 1:
+            con.rollback()
+            return _controller_refusal(run_id, state, version, "bad_state", f"run state changed before broker assert: {run_id}")
+
+        _insert_run_event(
+            con,
+            run_id=run_id,
+            version_before=expected_version,
+            version_after=expected_version + 1,
+            from_state=state,
+            to_state="asserted",
+            action="broker_assert_provisional",
+            actor="controller",
+            created_at=now_iso,
+        )
+        con.commit()
+        return {
+            "ok": True,
+            "run_id": run_id,
+            "provisional_id": provisional_id,
+            "state": "asserted",
+            "version": expected_version + 1,
+        }
     except Exception:
         con.rollback()
         raise
