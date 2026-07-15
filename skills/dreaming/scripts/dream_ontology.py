@@ -240,8 +240,11 @@ def describe_rule_candidate(rule: dict) -> dict:
         )
         effect = f"Lets me use a '{predicate}' fact and its '{inverse_predicate}' restatement interchangeably."
     elif family == "symmetric":
-        plain_question = f"If A '{predicate}' B, is B always '{predicate}' A as well?"
-        effect = f"Lets me treat '{predicate}' as going both directions."
+        plain_question = (
+            f"'{predicate}' looks like a two-way link between equals — if A and B are "
+            f"connected by it, does it hold in both directions (B to A as well as A to B)?"
+        )
+        effect = f"Lets me treat '{predicate}' as mutual, so it counts in both directions."
     else:
         plain_question = f"Enable rule {rule_id}?"
         effect = rule.get("rationale") or ""
