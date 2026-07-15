@@ -188,6 +188,8 @@ class B15LifecycleTests(unittest.TestCase):
         with _test_tmpdir() as palace:
             now = datetime(2026, 1, 1, tzinfo=timezone.utc)
             run_id = dream_palace.create_or_resume_run(palace, now=now)
+            for entity_name in ("A", "B", "C", "D", "asserted", "deduced"):
+                self._add_triple(palace, entity_name, "b15_seed", f"{entity_name} Seed Target")
             triple_count = self._table_count(palace, "triples")
             support_count = self._table_count(palace, "kg_triple_supports")
 
@@ -259,6 +261,8 @@ class B15LifecycleTests(unittest.TestCase):
         with _test_tmpdir() as palace:
             now = datetime(2026, 1, 1, tzinfo=timezone.utc)
             durable_id = self._add_triple(palace, "DurableA", "depends_on", "DurableB")
+            self._add_triple(palace, "HypothesisA", "b15_seed", "HypothesisA Seed Target")
+            self._add_triple(palace, "HypothesisB", "b15_seed", "HypothesisB Seed Target")
             dream_palace.reconcile_firewall_provenance(palace)
             run_id = dream_palace.create_or_resume_run(palace, now=now)
             other_run_id = dream_palace.create_or_resume_run(palace, now=now)
@@ -424,6 +428,8 @@ class B15LifecycleTests(unittest.TestCase):
     def test_startup_cleanup_expires_stale_runs_and_provisionals_idempotently(self):
         with _test_tmpdir() as palace:
             now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+            self._add_triple(palace, "A", "b15_seed", "A Seed Target")
+            self._add_triple(palace, "B", "b15_seed", "B Seed Target")
             stale_run = dream_palace.create_or_resume_run(palace, ttl_hours=0.01, now=now)
             active_run = dream_palace.create_or_resume_run(palace, now=now)
             stale_prov = dream_palace.assert_provisional(

@@ -23,7 +23,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
 
-from dream_lib import TRUSTED_STATUSES, cosine_similarity
+from dream_lib import TRUSTED_STATUSES, cosine_similarity, normalize_predicate
 
 SESSION_ID_RE = re.compile(
     r"SESSION_ID:\s*([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})",
@@ -97,6 +97,7 @@ FIREWALL_SCHEMA_DDL = (
     CREATE TABLE IF NOT EXISTS contemplate_provisional_facts (
       provisional_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, fact_key TEXT NOT NULL,
       subject TEXT, predicate TEXT, object TEXT,
+      subject_id TEXT, object_id TEXT,
       status TEXT NOT NULL DEFAULT 'abduced',
       confidence REAL, source_kind TEXT, source_ref TEXT,
       created_at TEXT NOT NULL, last_seen_at TEXT NOT NULL,
@@ -105,6 +106,18 @@ FIREWALL_SCHEMA_DDL = (
       FOREIGN KEY(run_id) REFERENCES contemplate_runs(run_id));
     """,
     "CREATE INDEX IF NOT EXISTS idx_prov_active ON contemplate_provisional_facts(run_id, fact_status, expires_at)",
+    """
+    CREATE TABLE IF NOT EXISTS kg_verification_events (
+      event_id TEXT PRIMARY KEY,
+      provisional_id TEXT,
+      new_support_id TEXT NOT NULL,
+      triple_id TEXT NOT NULL,
+      verification_kind TEXT NOT NULL,
+      claim_digest TEXT NOT NULL,
+      run_id TEXT, evidence_ref TEXT, evidence_quote TEXT,
+      created_at TEXT NOT NULL);
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_verif_support ON kg_verification_events(new_support_id)",
 )
 
 
@@ -137,6 +150,7 @@ def ensure_firewall_schema(db_path: str) -> None:
             con.execute(ddl)
         if "expires_at" not in _table_columns(con, "kg_triple_supports"):
             con.execute("ALTER TABLE kg_triple_supports ADD COLUMN expires_at TEXT")
+        _ensure_provisional_entity_columns(con)
         con.commit()
     finally:
         con.close()
@@ -172,6 +186,24 @@ def _provisional_fact_key(
     parts = [subject, predicate, object, source_kind, source_ref]
     text = "|".join("" if part is None else str(part) for part in parts)
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _entity_id(name: Any) -> str:
+    return str(name).lower().replace(" ", "_").replace("'", "")
+
+
+def _entity_exists(con: sqlite3.Connection, entity_id: str) -> bool:
+    if not _has_table(con, "entities"):
+        return False
+    return con.execute("SELECT 1 FROM entities WHERE id=? LIMIT 1", (entity_id,)).fetchone() is not None
+
+
+def _ensure_provisional_entity_columns(con: sqlite3.Connection) -> None:
+    columns = _table_columns(con, "contemplate_provisional_facts")
+    if "subject_id" not in columns:
+        con.execute("ALTER TABLE contemplate_provisional_facts ADD COLUMN subject_id TEXT")
+    if "object_id" not in columns:
+        con.execute("ALTER TABLE contemplate_provisional_facts ADD COLUMN object_id TEXT")
 
 
 def create_or_resume_run(
@@ -242,6 +274,8 @@ def assert_provisional(
     db_path = _resolve_kg_path(palace_path)
     ensure_firewall_schema(db_path)
     now_iso = _utc_now_iso(now)
+    subject_id = _entity_id(subject)
+    object_id = _entity_id(object)
     fact_key = _provisional_fact_key(subject, predicate, object, source_kind, source_ref)
     provisional_id = str(uuid4())
 
@@ -249,6 +283,13 @@ def assert_provisional(
     con.row_factory = sqlite3.Row
     try:
         con.execute("PRAGMA busy_timeout = 5000")
+        _ensure_provisional_entity_columns(con)
+        subject_exists = _entity_exists(con, subject_id)
+        object_exists = _entity_exists(con, object_id)
+        if not subject_exists:
+            raise ValueError(f"provisional subject does not exist in KG entities: {subject!r}")
+        if not object_exists:
+            raise ValueError(f"provisional object does not exist in KG entities: {object!r}")
         con.execute("BEGIN IMMEDIATE")
         run = con.execute(
             """
@@ -267,14 +308,16 @@ def assert_provisional(
             """
             INSERT INTO contemplate_provisional_facts(
                 provisional_id, run_id, fact_key,
-                subject, predicate, object,
+                subject, predicate, object, subject_id, object_id,
                 status, confidence, source_kind, source_ref,
                 created_at, last_seen_at, expires_at, expired_at, fact_status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'active')
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'active')
             ON CONFLICT(run_id, fact_key) DO UPDATE SET
                 subject=excluded.subject,
                 predicate=excluded.predicate,
                 object=excluded.object,
+                subject_id=excluded.subject_id,
+                object_id=excluded.object_id,
                 status=excluded.status,
                 confidence=excluded.confidence,
                 source_kind=excluded.source_kind,
@@ -291,6 +334,8 @@ def assert_provisional(
                 subject,
                 predicate,
                 object,
+                subject_id,
+                object_id,
                 status,
                 confidence,
                 source_kind,
@@ -315,6 +360,170 @@ def assert_provisional(
         raise
     finally:
         con.close()
+
+
+def assert_user_fact_from_provisional(
+    palace_path,
+    provisional_id,
+    *,
+    confirmation_token,
+    run_id,
+    evidence_ref=None,
+    evidence_quote=None,
+    now: datetime | str | None = None,
+) -> dict:
+    """Promote a human-confirmed provisional fact into a durable trusted-user support."""
+    if run_id is None:
+        raise ValueError("run_id is required to promote a provisional fact")
+
+    db_path = _resolve_kg_path(palace_path)
+    ensure_firewall_schema(db_path)
+    now_iso = _utc_now_iso(now)
+
+    con = sqlite3.connect(db_path)
+    con.row_factory = sqlite3.Row
+    try:
+        row = con.execute(
+            """
+            SELECT f.provisional_id, f.run_id, f.subject, f.predicate, f.object,
+                   f.subject_id, f.object_id, f.confidence, f.created_at, f.expires_at
+            FROM contemplate_provisional_facts f
+            JOIN contemplate_runs r ON r.run_id = f.run_id
+            WHERE f.provisional_id=?
+              AND f.run_id=?
+              AND f.fact_status='active'
+              AND r.status='active'
+              AND f.expires_at > ?
+              AND r.expires_at > ?
+            """,
+            (provisional_id, run_id, now_iso, now_iso),
+        ).fetchone()
+    finally:
+        con.close()
+
+    if row is None:
+        raise ValueError(f"active provisional fact not found: {provisional_id}")
+
+    subject_id = row["subject_id"] or _entity_id(row["subject"])
+    object_id = row["object_id"] or _entity_id(row["object"])
+    con = sqlite3.connect(db_path)
+    try:
+        if not _entity_exists(con, subject_id):
+            raise ValueError(f"provisional subject entity no longer exists: {subject_id!r}")
+        if not _entity_exists(con, object_id):
+            raise ValueError(f"provisional object entity no longer exists: {object_id!r}")
+    finally:
+        con.close()
+
+    predicate = normalize_predicate(row["predicate"])
+    claim_digest = hashlib.sha256(
+        f"{subject_id}|{predicate}|{object_id}".encode("utf-8")
+    ).hexdigest()
+    expected_token = hashlib.sha256(
+        f"{provisional_id}|{claim_digest}|{run_id}".encode("utf-8")
+    ).hexdigest()
+    if confirmation_token != expected_token:
+        raise ValueError("confirmation token does not match provisional claim")
+
+    from mempalace.knowledge_graph import KnowledgeGraph  # lazy
+
+    valid_from = _normalize_dt_for_kg(row["created_at"] or now_iso)
+    valid_to = None
+    kg = KnowledgeGraph(db_path=db_path)
+    try:
+        triple_id = str(
+            kg.add_triple(
+                row["subject"],
+                predicate,
+                row["object"],
+                valid_from=valid_from,
+                valid_to=valid_to,
+                confidence=row["confidence"] if row["confidence"] is not None else 1.0,
+                adapter_name="contemplate:user_assert",
+                source_drawer_id="promote:" + str(provisional_id),
+            )
+        )
+    finally:
+        kg.close()
+
+    support_id = "sup:user:" + hashlib.sha256(
+        f"{triple_id}|{provisional_id}".encode("utf-8")
+    ).hexdigest()[:32]
+    event_id = str(uuid4())
+
+    con = sqlite3.connect(db_path)
+    try:
+        con.execute("PRAGMA busy_timeout = 5000")
+        con.execute("BEGIN IMMEDIATE")
+        con.execute(
+            """
+            INSERT OR IGNORE INTO kg_triple_supports(
+                support_id, triple_id, status, source_trust, inherited_status,
+                conditional_on_triple_ids, scope, source_kind, source_ref,
+                valid_from, valid_to, created_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                support_id,
+                triple_id,
+                "asserted",
+                "trusted_user",
+                "asserted",
+                "[]",
+                "durable",
+                "contemplate:user_assert",
+                "promote:" + str(provisional_id),
+                valid_from,
+                valid_to,
+                now_iso,
+            ),
+        )
+        con.execute(
+            """
+            INSERT INTO kg_verification_events(
+                event_id, provisional_id, new_support_id, triple_id,
+                verification_kind, claim_digest, run_id, evidence_ref,
+                evidence_quote, created_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                event_id,
+                provisional_id,
+                support_id,
+                triple_id,
+                "user_confirmed",
+                claim_digest,
+                run_id,
+                evidence_ref,
+                evidence_quote,
+                now_iso,
+            ),
+        )
+        cur = con.execute(
+            """
+            UPDATE contemplate_provisional_facts
+            SET fact_status='promoted',
+                expired_at=?
+            WHERE provisional_id=?
+              AND fact_status='active'
+            """,
+            (now_iso, provisional_id),
+        )
+        if cur.rowcount != 1:
+            raise ValueError(f"provisional fact is no longer active: {provisional_id}")
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+
+    return {
+        "triple_id": triple_id,
+        "support_id": support_id,
+        "event_id": event_id,
+        "promoted": True,
+    }
 
 
 def startup_cleanup(palace_path, *, now: datetime | str | None = None) -> dict:
@@ -843,7 +1052,8 @@ def load_premises(
             con.row_factory = sqlite3.Row
             rows = con.execute(
                 """
-                SELECT f.provisional_id, f.subject, f.predicate, f.object, f.status
+                SELECT f.provisional_id, f.subject, f.predicate, f.object,
+                       f.subject_id, f.object_id, f.status
                 FROM contemplate_provisional_facts f
                 JOIN contemplate_runs r ON r.run_id = f.run_id
                 WHERE f.run_id=?
@@ -862,8 +1072,8 @@ def load_premises(
                 "triple_id": "prov:" + str(row["provisional_id"]),
                 "subject": row["subject"],
                 "object": row["object"],
-                "subject_id": row["subject"],
-                "object_id": row["object"],
+                "subject_id": row["subject_id"] or row["subject"],
+                "object_id": row["object_id"] or row["object"],
                 "predicate": row["predicate"],
                 "epistemic_status": row["status"],
                 "inherited_status": row["status"],
@@ -1499,6 +1709,7 @@ def _normalize_dt_for_kg(value):
     """
     if not value or not isinstance(value, str) or "T" not in value:
         return value
+    value = re.sub(r"\.\d+", "", value)  # add_triple wants second precision; drop fractional seconds
     if value.endswith("Z"):
         return value
     # naive datetime string: if midnight, return date-only; otherwise append Z (assume UTC)
