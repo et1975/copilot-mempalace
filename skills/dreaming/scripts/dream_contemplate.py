@@ -15,6 +15,7 @@ import sys
 import uuid
 
 import dream_acquire
+import dream_insight
 import dream_ontology
 import dream_palace
 from dream_lib import (
@@ -681,6 +682,74 @@ def run_acquire_resume(
     )
 
 
+def run_insight_start(
+    palace: str,
+    *,
+    anchor_drawer_id: str | None,
+    seed_query: str | None,
+    wing: str | None,
+    room: str | None,
+    k: int,
+    run_id: str | None,
+    now=None,
+) -> dict:
+    path = dream_palace.bind_palace(palace)
+    return dream_insight.insight_start(
+        path,
+        anchor_drawer_id=anchor_drawer_id,
+        seed_query=seed_query,
+        wing=wing,
+        room=room,
+        k=k,
+        run_id=run_id or str(uuid.uuid4()),
+        now=now,
+    )
+
+
+def run_insight_resume(
+    palace: str,
+    *,
+    run_id: str,
+    candidate_file: str,
+    now=None,
+) -> dict:
+    path = dream_palace.bind_palace(palace)
+    with open(candidate_file, encoding="utf-8") as fh:
+        candidate = json.load(fh)
+    if not isinstance(candidate, dict):
+        raise ValueError("--candidate-file must contain a JSON object")
+    return dream_insight.insight_resume(path, run_id, candidate=candidate, now=now)
+
+
+def run_insight_critique(
+    palace: str,
+    *,
+    run_id: str,
+    verdict: str,
+    now=None,
+) -> dict:
+    path = dream_palace.bind_palace(palace)
+    return dream_insight.insight_critique(path, run_id, verdict=verdict, now=now)
+
+
+def run_insight_accept(
+    palace: str,
+    *,
+    run_id: str,
+    wing: str | None,
+    room: str | None,
+    now=None,
+) -> dict:
+    path = dream_palace.bind_palace(palace)
+    return dream_insight.insight_accept(
+        path,
+        run_id,
+        wing=wing or "copilot-mempalace",
+        room=room or "insights",
+        now=now,
+    )
+
+
 def _recall_file_fn(recall_file: str | None):
     if not recall_file:
         return None
@@ -800,6 +869,40 @@ def summarize_step_result(result: dict) -> str:
     return "\n".join(lines)
 
 
+def summarize_insight_result(result: dict) -> str:
+    lines = [
+        f"status: {result.get('status')}",
+        f"run_id: {result.get('run_id')}",
+    ]
+    if result.get("reason"):
+        lines.append(f"reason: {result.get('reason')}")
+    if result.get("rejects"):
+        lines.append("rejects: " + ", ".join(result.get("rejects") or []))
+    if result.get("anchor"):
+        lines.append(f"anchor: {result['anchor'].get('id')}")
+    neighbors = result.get("neighbors") or []
+    if neighbors:
+        lines.append(f"neighbors: {len(neighbors)}")
+    if result.get("candidate"):
+        conclusion = (result["candidate"].get("conclusion") or {}).get("text")
+        if conclusion:
+            lines.append(f"candidate: {_recall_snippet(conclusion, limit=160)}")
+    nearest = result.get("nearest_existing")
+    if nearest:
+        try:
+            sim = f"{float(nearest.get('sim')):.4f}"
+        except (TypeError, ValueError):
+            sim = "nan"
+        lines.append(f"nearest_existing: {sim} {nearest.get('id')}")
+    if result.get("insight_drawer_id"):
+        lines.append(f"insight_drawer_id: {result.get('insight_drawer_id')}")
+    if result.get("instruction"):
+        lines.append(f"instruction: {result.get('instruction')}")
+    if result.get("critic_instruction"):
+        lines.append(f"critic_instruction: {result.get('critic_instruction')}")
+    return "\n".join(lines)
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--palace", help="Path to the mempalace palace directory (default: mempalace config)")
@@ -824,6 +927,16 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--acquire", action="store_true", help="Run the ACQUIRE loop instead of derive/recall")
     ap.add_argument("--acquire-start", action="store_true", help="Start a resumable ACQUIRE loop and pause for F8")
     ap.add_argument("--acquire-resume", action="store_true", help="Resume a paused ACQUIRE loop with --verdict-file")
+    ap.add_argument("--insight-start", action="store_true", help="Start drawer-only insight synthesis")
+    ap.add_argument("--insight-resume", action="store_true", help="Resume insight synthesis with --candidate-file")
+    ap.add_argument("--insight-critique", action="store_true", help="Resume insight synthesis with --verdict")
+    ap.add_argument("--insight-accept", action="store_true", help="Accept and materialize a supported insight drawer")
+    ap.add_argument("--anchor-drawer", default=None, help="Anchor drawer id for --insight-start")
+    ap.add_argument("--insight-query", default=None, help="Seed query for --insight-start")
+    ap.add_argument("--candidate-file", default=None, help="JSON Candidate object for --insight-resume")
+    ap.add_argument("--verdict", choices=["supported", "insufficient", "contradicted"], default=None, help="Critic verdict for --insight-critique")
+    ap.add_argument("--wing", default=None, help="Wing scope for --insight-start or target wing for --insight-accept")
+    ap.add_argument("--room", default=None, help="Room scope for --insight-start or target room for --insight-accept")
     ap.add_argument("--subject", default=None, help="Reachability query subject entity id for ACQUIRE")
     ap.add_argument("--predicate", default=None, help="Reachability query base predicate for ACQUIRE")
     ap.add_argument("--object", dest="object_id", default=None, help="Reachability query object entity id for ACQUIRE")
@@ -863,9 +976,17 @@ def main(argv: list[str] | None = None) -> int:
             print(summarize_recall_report(report))
         return 0
 
-    acquire_modes = [args.acquire, args.acquire_start, args.acquire_resume]
-    if sum(1 for enabled in acquire_modes if enabled) > 1:
-        print("error: choose only one of --acquire, --acquire-start, --acquire-resume", file=sys.stderr)
+    contemplate_modes = [
+        args.acquire,
+        args.acquire_start,
+        args.acquire_resume,
+        args.insight_start,
+        args.insight_resume,
+        args.insight_critique,
+        args.insight_accept,
+    ]
+    if sum(1 for enabled in contemplate_modes if enabled) > 1:
+        print("error: choose only one contemplate mode", file=sys.stderr)
         return 2
 
     if args.acquire:
@@ -973,6 +1094,71 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(report, indent=2, ensure_ascii=False))
         else:
             print(summarize_step_result(report))
+        return 0
+
+    if args.insight_start:
+        if bool(args.anchor_drawer) == bool(args.insight_query):
+            print("error: --insight-start requires exactly one of --anchor-drawer or --insight-query", file=sys.stderr)
+            return 2
+        report = run_insight_start(
+            effective_palace,
+            anchor_drawer_id=args.anchor_drawer,
+            seed_query=args.insight_query,
+            wing=args.wing,
+            room=args.room,
+            k=args.k,
+            run_id=args.run_id,
+        )
+        if args.format == "json":
+            print(json.dumps(report, indent=2, ensure_ascii=False))
+        else:
+            print(summarize_insight_result(report))
+        return 0
+
+    if args.insight_resume:
+        missing = [
+            name
+            for name, value in (
+                ("--run-id", args.run_id),
+                ("--candidate-file", args.candidate_file),
+            )
+            if not value
+        ]
+        if missing:
+            print(f"error: --insight-resume requires {', '.join(missing)}", file=sys.stderr)
+            return 2
+        report = run_insight_resume(effective_palace, run_id=args.run_id, candidate_file=args.candidate_file)
+        if args.format == "json":
+            print(json.dumps(report, indent=2, ensure_ascii=False))
+        else:
+            print(summarize_insight_result(report))
+        return 0
+
+    if args.insight_critique:
+        missing = [
+            name
+            for name, value in (("--run-id", args.run_id), ("--verdict", args.verdict))
+            if not value
+        ]
+        if missing:
+            print(f"error: --insight-critique requires {', '.join(missing)}", file=sys.stderr)
+            return 2
+        report = run_insight_critique(effective_palace, run_id=args.run_id, verdict=args.verdict)
+        if args.format == "json":
+            print(json.dumps(report, indent=2, ensure_ascii=False))
+        else:
+            print(summarize_insight_result(report))
+        return 0
+
+    if args.insight_accept:
+        if not args.run_id:
+            print("error: --insight-accept requires --run-id", file=sys.stderr)
+            return 2
+        report = run_insight_accept(effective_palace, run_id=args.run_id, wing=args.wing, room=args.room)
+        if args.format == "json":
+            print(json.dumps(report, indent=2, ensure_ascii=False))
+        else:
+            print(summarize_insight_result(report))
         return 0
 
     if args.propose:
