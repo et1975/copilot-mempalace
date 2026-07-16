@@ -246,7 +246,7 @@ The entity IDs used by closure come from MemPalace's name-keyed KG. Because the
 write API resolves entities by name, homonyms still collapse at the MemPalace
 layer; derive does not solve that in v1.
 
-Track B is deferred: ACQUIRE loops, gap/question worklists, external research,
-clarification queues, abduction, subproperty/type/composition rules, query-time
-virtual derivation, and ontology learning are future work. v1 ships facts-only
-bounded deductive materialization.
+This reference covers facts-only bounded deductive materialization. It does not
+cover standalone gap reconnaissance, drawer-text insight synthesis,
+subproperty/type/composition rules, query-time virtual derivation, or ontology
+learning.

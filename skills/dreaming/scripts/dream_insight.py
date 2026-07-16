@@ -8,6 +8,7 @@ and an explicit accept step.
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import unicodedata
 import uuid
@@ -263,6 +264,8 @@ def insight_resume(palace_path, run_id, *, candidate, now=None) -> dict:
         return _step_result(session)
 
     session["candidate"] = _neutral_candidate(candidate)
+    session["nearest_existing"] = duplicate.get("nearest_insight")
+    session["nearest_existing_checked"] = True
     session["status"] = "awaiting_critic"
     _persist_session(kg_path, session, now=now)
     return _step_result(session)
@@ -282,7 +285,9 @@ def insight_critique(palace_path, run_id, *, verdict, now=None) -> dict:
     session["critic_verdict"] = verdict
     if verdict == "supported":
         session["status"] = "awaiting_approval"
-        session["nearest_existing"] = _nearest_existing_note(palace_path, session["candidate"])
+        if session.get("nearest_existing") is None and not session.get("nearest_existing_checked"):
+            session["nearest_existing"] = _nearest_existing_note(palace_path, session["candidate"])
+            session["nearest_existing_checked"] = True
     else:
         session["status"] = "abstained"
         session["reason"] = "no_supported_synthesis"
@@ -373,11 +378,15 @@ def rank_survey_clusters(
             continue
         if not vector:
             continue
+        norm = math.sqrt(sum(value * value for value in vector))
+        if norm == 0.0:
+            continue
         prepared.append(
             {
                 "id": str(drawer.get("id")),
                 "text": str(drawer.get("text") or ""),
                 "embedding": vector,
+                "norm": norm,
                 "wing": drawer.get("wing"),
                 "room": drawer.get("room"),
             }
@@ -390,10 +399,12 @@ def rank_survey_clusters(
         for candidate in prepared:
             if candidate["id"] == anchor["id"]:
                 continue
-            try:
-                sim = cosine_similarity(anchor["embedding"], candidate["embedding"])
-            except ValueError:
+            if len(anchor["embedding"]) != len(candidate["embedding"]):
                 continue
+            sim = sum(
+                a * b
+                for a, b in zip(anchor["embedding"], candidate["embedding"])
+            ) / (anchor["norm"] * candidate["norm"])
             if float(min_sim) <= sim <= float(max_sim):
                 neighbors.append(
                     {
@@ -587,6 +598,7 @@ def _load_session(kg_path: str, run_id: str) -> dict[str, Any] | None:
         "reason": state.get("reason"),
         "rejects": state.get("rejects"),
         "nearest_existing": state.get("nearest_existing"),
+        "nearest_existing_checked": state.get("nearest_existing_checked"),
     }
 
 
@@ -601,7 +613,7 @@ def _stored_candidates(session: dict[str, Any]) -> dict[str, Any]:
     candidates = dict(session.get("candidates") or {})
     state = {
         key: session.get(key)
-        for key in ("reason", "rejects", "nearest_existing")
+        for key in ("reason", "rejects", "nearest_existing", "nearest_existing_checked")
         if session.get(key) is not None
     }
     if state:

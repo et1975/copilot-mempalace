@@ -67,7 +67,7 @@ the read-only derive path.
 Summary output is intentionally skim-friendly, for example:
 
 ```text
-1. score=0.84 session=01J... repo=copilot-mempalace updated=2026-07-12 — discussed Track B gap selection and acquire-loop boundaries
+1. score=0.84 session=01J... repo=copilot-mempalace updated=2026-07-12 — discussed gap ranking and ontology-rule boundaries
 ```
 
 ### Same session substrate, opposite access pattern
@@ -83,13 +83,12 @@ task: pattern mining looks for themes that recur across `>= min_support`
 distinct sessions, while `--recall` asks which sessions are most relevant to
 this specific reasoning query.
 
-## Gap reconnaissance driver (Track B phase B0)
+## Gap reconnaissance driver (standalone read-only)
 
-`--task gaps` is the first shipped slice of Track B: **read-only** detection of
-the highest-value *missing* facts. Given the active KG and the enabled ontology
-rules, it reports hypothesised edges whose addition would unblock currently-
-underivable `_closure` conclusions, ranked by **DUC** (how many conclusions each
-gap would unblock).
+`--task gaps` is **read-only** reconnaissance for the highest-value *missing*
+facts. Given the active KG and the enabled ontology rules, it reports
+hypothesised edges whose addition would unblock currently-underivable `_closure`
+conclusions, ranked by **DUC** (how many conclusions each gap would unblock).
 
 ```bash
 MPY=$(head -1 "$(command -v mempalace)" | sed 's/^#!//')
@@ -108,10 +107,65 @@ MPY=$(head -1 "$(command -v mempalace)" | sed 's/^#!//')
 
 Each `gap` item carries a `hypothesis` (the missing edge), the `rule`, and
 `evidence.duc` + `evidence.unblocks` (the conclusions it would enable). This is
-**reconnaissance only**: it writes nothing to the KG, does not acquire anything,
-and does not perform abduction — it just tells the agent *which* missing fact is
-worth seeking next. Acting on a gap (recall/search/ask, then assert) is the
-deferred remainder of Track B.
+**reconnaissance only**: it writes nothing to the KG, retrieves no sources, and
+asserts no facts. It just tells the agent *which* missing fact is worth
+investigating separately.
+
+## Insight synthesis driver (drawer-text-only)
+
+Use the insight modes when the task is to synthesize **one new insight** from
+existing drawer text. This workflow is agent-in-the-loop: the script gathers an
+anchor plus related-but-not-near-duplicate neighbors, the agent proposes a
+candidate JSON, the script validates it with fail-closed gates, then a blind
+critic verdict and explicit accept materialize it.
+
+Design principles:
+
+- **Drawer text only** — no KG/controller premises.
+- **Abstain over slop** — failed grounding, weak novelty, or missing decision /
+  prediction means `abstained`, not "best effort".
+- **Gates certify the insight, not presentation** — every premise quote must be
+  an exact substring of its cited drawer; at least two distinct drawers must be
+  indispensable; the candidate must name a changed decision or falsifiable
+  prediction; and `kind` must be `tension` or `shared_constraint`.
+
+Survey first to choose a promising anchor:
+
+```bash
+/home/eugene/.local/share/uv/tools/mempalace/bin/python skills/dreaming/scripts/dream_contemplate.py \
+  --palace <p> --insight-survey [--wing <w>] [--room <r>] [--k 5] [--top-n 10]
+```
+
+`--insight-survey` is read-only and ranks palace-wide candidate seed clusters of
+complementary drawers: related, but not near-duplicates. It prints each cluster's
+anchor, neighbors, and score so you can choose an `--anchor-drawer`.
+
+Then run the resumable synthesis loop:
+
+```bash
+/home/eugene/.local/share/uv/tools/mempalace/bin/python skills/dreaming/scripts/dream_contemplate.py \
+  --palace <p> --insight-start --anchor-drawer <drawer-id> [--wing <w>] [--room <r>] [--k 5] [--run-id <id>]
+# or seed by query instead of anchor; --insight-start requires exactly one:
+/home/eugene/.local/share/uv/tools/mempalace/bin/python skills/dreaming/scripts/dream_contemplate.py \
+  --palace <p> --insight-start --insight-query "<seed query>" [--wing <w>] [--room <r>] [--k 5] [--run-id <id>]
+
+# Agent writes the instructed candidate JSON to candidate.json, then:
+/home/eugene/.local/share/uv/tools/mempalace/bin/python skills/dreaming/scripts/dream_contemplate.py \
+  --palace <p> --insight-resume --run-id <id> --candidate-file candidate.json
+/home/eugene/.local/share/uv/tools/mempalace/bin/python skills/dreaming/scripts/dream_contemplate.py \
+  --palace <p> --insight-critique --run-id <id> --verdict supported
+/home/eugene/.local/share/uv/tools/mempalace/bin/python skills/dreaming/scripts/dream_contemplate.py \
+  --palace <p> --insight-accept --run-id <id> [--wing <w>] [--room <r>]
+```
+
+`--insight-start` gathers the anchor plus neighbor drawers in the complementary
+cosine band `[0.25, 0.85]`, pauses at `awaiting_synthesis`, and returns the
+anchor/neighbors plus a JSON schema instruction for the agent. `--insight-resume`
+moves to `awaiting_critic` only when validation and dedupe pass; otherwise it
+returns `abstained` with reject reasons. `--insight-critique --verdict supported`
+moves to `awaiting_approval` with a nearest-existing advisory; `insufficient` or
+`contradicted` abstains. `--insight-accept` materializes the approved result as a
+`kind=insight` drawer, defaulting to wing/room `copilot-mempalace`/`insights`.
 
 ## The 5-phase pipeline
 
@@ -212,6 +266,21 @@ enabling candidates improves multi-session task success more than it adds drift,
 using LongMemEval/LoCoMo-style methodology. This change only proposes rules for
 human review.
 
+### Plain-language ontology proposals
+
+For inline review of ontology candidates, prefer the proposal commands:
+
+```bash
+MPY=$(head -1 "$(command -v mempalace)" | sed 's/^#!//')
+"$MPY" skills/dreaming/scripts/dream_contemplate.py --palace <p> --propose
+"$MPY" skills/dreaming/scripts/dream_contemplate.py --palace <p> --enable-rule <rule-id>
+"$MPY" skills/dreaming/scripts/dream_contemplate.py --palace <p> --disable-rule <rule-id>
+```
+
+`--propose` shows plain-language disabled ontology candidates for review.
+`--enable-rule` and `--disable-rule` are deliberate operator choices; generated
+rules are never auto-enabled.
+
 ## Invariants to preserve
 
 - **Entity identity** — closure keys on entity IDs, not display names. Current
@@ -232,21 +301,21 @@ human review.
   `candidate_id + ontology_version`, so deliberate skips stop resurfacing until
   the ontology changes.
 
-## Deferred (Track B)
+## Scope limits
 
-v1 ships Track A only for derivation: bounded deductive closure over active KG
-facts. `--recall` adds the relevance-retrieval building block for on-demand
-session reconnaissance, and `--task gaps` (phase B0) adds read-only, VoI-ranked
-detection of the highest-value missing facts. Neither closes Track B.
+`contemplate` has four retained KG/reconnaissance surfaces:
 
-The full ACQUIRE loop remains deferred future work: deduce → find the
-highest-value gap (`--task gaps` does this part, read-only) → acquire/read a
-session or source to fill it → re-derive. Gap detection does **not** choose what
-to seek by abduction, does not acquire, and does not auto-inject retrieved facts
-as premises into the derive closure; `--recall` does not run an iterative acquire
-loop. External research, clarification queues, and abduction/best-explanation
-reasoning are still out of scope. Do not claim that `contemplate` asks questions,
-researches gaps autonomously, or performs abduction.
+- `--task derive` — bounded deductive closure over active KG facts under
+  explicitly enabled ontology rules.
+- `--task gaps` — standalone read-only gap reconnaissance; it ranks missing KG
+  edges but does not retrieve sources or assert facts.
+- `--recall` — relevance-ranked past-session reconnaissance for inline
+  grounding; it does not run the derive scan or materialize anything.
+- `--propose` / `--enable-rule` / `--disable-rule` — ontology proposal review
+  and deliberate rule toggling.
+
+Insight synthesis is separate from KG derivation: it creates drawer-text-grounded
+`kind=insight` drawers only after validation, critique, and explicit acceptance.
 
 See [`references/derive.md`](references/derive.md) for the contract, schemas,
 and guardrails.

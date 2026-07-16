@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
 import dream_insight
 
@@ -232,6 +233,137 @@ class SurveyRankerTests(unittest.TestCase):
         snapshot = [dict(d) for d in drawers]
         dream_insight.rank_survey_clusters(drawers, min_sim=0.25, max_sim=0.85, k=5, top_n=10)
         self.assertEqual(drawers, snapshot)
+
+    def test_matches_reference_pairwise_ranking(self):
+        drawers = [
+            *self._drawers(),
+            {"id": "zero", "text": "empty norm", "embedding": [0.0, 0.0, 0.0], "wing": "W4", "room": "r"},
+        ]
+
+        def reference_ranker():
+            prepared = []
+            for drawer in drawers:
+                vector = [float(value) for value in drawer["embedding"]]
+                prepared.append(
+                    {
+                        "id": str(drawer.get("id")),
+                        "text": str(drawer.get("text") or ""),
+                        "embedding": vector,
+                        "wing": drawer.get("wing"),
+                        "room": drawer.get("room"),
+                    }
+                )
+            clusters = []
+            for anchor in prepared:
+                neighbors = []
+                for candidate in prepared:
+                    if candidate["id"] == anchor["id"]:
+                        continue
+                    try:
+                        sim = dream_insight.cosine_similarity(anchor["embedding"], candidate["embedding"])
+                    except ValueError:
+                        continue
+                    if 0.25 <= sim <= 0.85:
+                        neighbors.append(
+                            {
+                                "id": candidate["id"],
+                                "text": candidate["text"],
+                                "wing": candidate["wing"],
+                                "sim": sim,
+                            }
+                        )
+                neighbors.sort(key=lambda item: item["sim"], reverse=True)
+                neighbors = neighbors[:5]
+                if not neighbors:
+                    continue
+                sims = [float(item["sim"]) for item in neighbors]
+                wings = sorted(
+                    {
+                        wing
+                        for wing in [anchor.get("wing")] + [item.get("wing") for item in neighbors]
+                        if wing
+                    }
+                )
+                distinct_wings = len(wings)
+                neighbor_count = len(neighbors)
+                clusters.append(
+                    {
+                        "anchor_id": anchor["id"],
+                        "anchor_wing": anchor.get("wing"),
+                        "anchor_snippet": dream_insight._snippet(anchor.get("text"), limit=120),
+                        "wings": wings,
+                        "cross_wing": distinct_wings >= 2,
+                        "neighbor_ids": [item["id"] for item in neighbors],
+                        "neighbor_snippets": [
+                            {"id": item["id"], "snippet": dream_insight._snippet(item.get("text"), limit=120), "sim": item["sim"]}
+                            for item in neighbors
+                        ],
+                        "neighbor_count": neighbor_count,
+                        "score": 1.0 * (distinct_wings - 1) + 0.5 * min(neighbor_count, 3) + (sum(sims) / len(sims)),
+                    }
+                )
+            clusters.sort(key=lambda item: (-float(item["score"]), str(item["anchor_id"])))
+            return clusters[:10]
+
+        self.assertEqual(
+            dream_insight.rank_survey_clusters(drawers, min_sim=0.25, max_sim=0.85, k=5, top_n=10),
+            reference_ranker(),
+        )
+
+
+class InsightFlowPersistenceTests(unittest.TestCase):
+    def test_resume_persists_nearest_existing_from_duplicate_scan_when_not_duplicate(self):
+        session = {
+            "run_id": "r1",
+            "status": "awaiting_synthesis",
+            "candidates": {
+                "anchor": {"id": "d_anchor", "text": ANCHOR_TEXT},
+                "neighbors": [{"id": "d_neighbor", "text": NEIGHBOR_TEXT}],
+            },
+            "member_ids": ["d_anchor", "d_neighbor"],
+        }
+        nearest = {"id": "insight-1", "text": "prior insight", "sim": 0.72}
+        persisted = {}
+
+        def capture_persist(_kg_path, updated_session, *, now=None):
+            persisted.update(updated_session)
+
+        with (
+            mock.patch.object(dream_insight, "_insight_db_path", return_value="unused.sqlite"),
+            mock.patch.object(dream_insight, "ensure_firewall_schema"),
+            mock.patch.object(dream_insight, "_ensure_insight_schema"),
+            mock.patch.object(dream_insight, "_require_session", return_value=session),
+            mock.patch.object(dream_insight, "check_insight_duplicate", return_value={"duplicate": False, "nearest_insight": nearest}),
+            mock.patch.object(dream_insight, "_persist_session", side_effect=capture_persist),
+        ):
+            result = dream_insight.insight_resume("palace", "r1", candidate=_candidate())
+
+        self.assertEqual(result["status"], "awaiting_critic")
+        self.assertEqual(persisted["nearest_existing"], nearest)
+        self.assertTrue(persisted["nearest_existing_checked"])
+
+    def test_critique_reuses_persisted_nearest_existing_without_rescan(self):
+        nearest = {"id": "insight-1", "text": "prior insight", "sim": 0.72}
+        session = {
+            "run_id": "r1",
+            "status": "awaiting_critic",
+            "candidate": _candidate(),
+            "nearest_existing": nearest,
+            "nearest_existing_checked": True,
+        }
+
+        with (
+            mock.patch.object(dream_insight, "_insight_db_path", return_value="unused.sqlite"),
+            mock.patch.object(dream_insight, "ensure_firewall_schema"),
+            mock.patch.object(dream_insight, "_ensure_insight_schema"),
+            mock.patch.object(dream_insight, "_require_session", return_value=session),
+            mock.patch.object(dream_insight, "_persist_session"),
+            mock.patch.object(dream_insight, "_nearest_existing_note", side_effect=AssertionError("unexpected full-palace rescan")),
+        ):
+            result = dream_insight.insight_critique("palace", "r1", verdict="supported")
+
+        self.assertEqual(result["status"], "awaiting_approval")
+        self.assertEqual(result["nearest_existing"], nearest)
 
 
 if __name__ == "__main__":

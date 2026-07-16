@@ -14,7 +14,6 @@ import os
 import sys
 import uuid
 
-import dream_acquire
 import dream_insight
 import dream_ontology
 import dream_palace
@@ -567,121 +566,6 @@ def run_recall(
     return build_recall_report(query, k, path, hits)
 
 
-def run_acquire(
-    palace: str,
-    *,
-    query: dict[str, str],
-    rules_path: str | None,
-    run_id: str | None,
-    budgets: dict | None,
-    recall_file: str | None,
-    extractor_mode: str,
-    oracle_file: str | None,
-    trusted_speakers: list[str] | set[str] | None,
-    now=None,
-) -> dict:
-    path = dream_palace.bind_palace(palace)
-    effective_rules_path = rules_path or os.path.join(path, "ontology.json")
-    rules = dream_palace.load_ontology_config(effective_rules_path)
-
-    recall_fn = None
-    if recall_file:
-        with open(recall_file, encoding="utf-8") as fh:
-            recall_sources = json.load(fh)
-        if not isinstance(recall_sources, list):
-            raise ValueError("--recall-file must contain a JSON list")
-        recall_sources = [dict(item) for item in recall_sources if isinstance(item, dict)]
-
-        def recall_fn(_query_text, _gap):
-            return [dict(item) for item in recall_sources]
-
-    if extractor_mode == "heuristic":
-        extractor_fn = dream_acquire.heuristic_support_extractor
-    elif extractor_mode == "oracle":
-        if not oracle_file:
-            raise ValueError("--extractor oracle requires --oracle-file")
-        extractor_fn = _oracle_extractor(oracle_file)
-    else:
-        raise ValueError(f"unsupported extractor mode: {extractor_mode}")
-
-    result = dream_acquire.acquire_loop(
-        palace_path=path,
-        query=query,
-        rules=rules,
-        extractor_fn=extractor_fn,
-        recall_fn=recall_fn,
-        run_id=run_id or str(uuid.uuid4()),
-        budgets=budgets,
-        trusted_speakers=set(trusted_speakers or []),
-        now=now,
-    )
-    report = dict(result)
-    report.update(
-        {
-            "palace": path,
-            "rules_path": effective_rules_path,
-            "query": dict(query),
-            "enabled_rule_count": len(enabled_rules(rules)),
-        }
-    )
-    return report
-
-
-def run_acquire_start(
-    palace: str,
-    *,
-    query: dict[str, str],
-    rules_path: str | None,
-    run_id: str | None,
-    budgets: dict | None,
-    recall_file: str | None,
-    trusted_speakers: list[str] | set[str] | None,
-    now=None,
-) -> dict:
-    path = dream_palace.bind_palace(palace)
-    effective_rules_path = rules_path or os.path.join(path, "ontology.json")
-    rules = dream_palace.load_ontology_config(effective_rules_path)
-    result = dream_acquire.acquire_start(
-        palace_path=path,
-        query=query,
-        rules=rules,
-        recall_fn=_recall_file_fn(recall_file),
-        run_id=run_id or str(uuid.uuid4()),
-        budgets=budgets,
-        trusted_speakers=set(trusted_speakers or []),
-        now=now,
-    )
-    return result
-
-
-def run_acquire_resume(
-    palace: str,
-    *,
-    run_id: str,
-    verdict_file: str,
-    rules_path: str | None,
-    budgets: dict | None = None,
-    recall_file: str | None = None,
-    now=None,
-) -> dict:
-    del budgets
-    path = dream_palace.bind_palace(palace)
-    effective_rules_path = rules_path or os.path.join(path, "ontology.json")
-    rules = dream_palace.load_ontology_config(effective_rules_path)
-    with open(verdict_file, encoding="utf-8") as fh:
-        verdict = json.load(fh)
-    if not isinstance(verdict, dict):
-        raise ValueError("--verdict-file must contain a JSON object")
-    return dream_acquire.acquire_resume(
-        palace_path=path,
-        run_id=run_id,
-        verdict=verdict,
-        rules=rules,
-        recall_fn=_recall_file_fn(recall_file),
-        now=now,
-    )
-
-
 def run_insight_start(
     palace: str,
     *,
@@ -760,125 +644,6 @@ def run_insight_accept(
         room=room or "insights",
         now=now,
     )
-
-
-def _recall_file_fn(recall_file: str | None):
-    if not recall_file:
-        return None
-    with open(recall_file, encoding="utf-8") as fh:
-        recall_sources = json.load(fh)
-    if not isinstance(recall_sources, list):
-        raise ValueError("--recall-file must contain a JSON list")
-    recall_sources = [dict(item) for item in recall_sources if isinstance(item, dict)]
-
-    def recall_fn(_query_text, _gap):
-        return [dict(item) for item in recall_sources]
-
-    return recall_fn
-
-
-def _oracle_extractor(oracle_file: str):
-    with open(oracle_file, encoding="utf-8") as fh:
-        payload = json.load(fh)
-    if isinstance(payload, list):
-        responses = [dict(item) for item in payload if isinstance(item, dict)]
-        index = {"value": 0}
-
-        def extractor(_prompt_payload):
-            if index["value"] >= len(responses):
-                return {"verdict": "not_addressed"}
-            response = dict(responses[index["value"]])
-            index["value"] += 1
-            return response
-
-        return extractor
-    if isinstance(payload, dict):
-        response = dict(payload)
-        return lambda _prompt_payload: dict(response)
-    raise ValueError("--oracle-file must contain a JSON object or list")
-
-
-def summarize_acquire_report(report: dict) -> str:
-    answer = report.get("answer") or {}
-    confidence = report.get("confidence") or {}
-    budgets = report.get("budgets") or {}
-    lines = [
-        f"status: {report.get('status')}",
-        "answer: "
-        f"{answer.get('value')} ({answer.get('epistemic_status')})",
-        f"confidence: {confidence.get('level')} - {confidence.get('rationale')}",
-        f"acquired: {len(report.get('acquired') or [])}",
-    ]
-    for item in report.get("acquired") or []:
-        lines.append(
-            "  - "
-            f"{item.get('gap_key')} -> {item.get('provisional_id')} "
-            f"source_ref={item.get('source_ref')}"
-        )
-    unfilled = report.get("unfilled_gaps") or []
-    lines.append(f"unfilled_gaps: {len(unfilled)}")
-    for gap in unfilled:
-        lines.append(f"  - {gap.get('gap_key')} reason={gap.get('reason')} duc={gap.get('duc')}")
-    lines.append(
-        "budgets: "
-        f"iterations {budgets.get('iterations_used')}/{budgets.get('max_iterations')}, "
-        f"acquisitions {budgets.get('acquisitions_used')}/{budgets.get('max_acquisitions')}, "
-        f"tool_calls {budgets.get('tool_calls_used')}/{budgets.get('max_tool_calls')}"
-    )
-    return "\n".join(lines)
-
-
-def summarize_step_result(result: dict) -> str:
-    lines = [
-        f"status: {result.get('status')}",
-        f"run_id: {result.get('run_id')}",
-    ]
-    pending = result.get("pending")
-    if pending:
-        target = pending.get("target") or {}
-        source = pending.get("source") or {}
-        content = source.get("content") or ""
-        lines.extend(
-            [
-                f"pending_request_id: {pending.get('request_id')}",
-                f"pending_gap: {pending.get('gap_key')}",
-                "target: "
-                f"{target.get('subject_id')} -{target.get('predicate')}-> {target.get('object_id')}",
-                f"source_type: {source.get('source_type')} trust_domain={source.get('trust_domain')}",
-                f"source_locator: {json.dumps(source.get('locator') or {}, sort_keys=True)}",
-                f"source_excerpt: {_recall_snippet(content, limit=160)}",
-                f"instruction: {pending.get('instruction')}",
-            ]
-        )
-    answer = result.get("answer") or {}
-    if answer:
-        confidence = result.get("confidence") or {}
-        lines.extend(
-            [
-                "answer: "
-                f"{answer.get('value')} ({answer.get('epistemic_status')})",
-                f"confidence: {confidence.get('level')} - {confidence.get('rationale')}",
-            ]
-        )
-    lines.append(f"acquired: {len(result.get('acquired') or [])}")
-    for item in result.get("acquired") or []:
-        lines.append(
-            "  - "
-            f"{item.get('gap_key')} -> {item.get('provisional_id')} "
-            f"source_ref={item.get('source_ref')}"
-        )
-    unfilled = result.get("unfilled_gaps") or []
-    lines.append(f"unfilled_gaps: {len(unfilled)}")
-    for gap in unfilled:
-        lines.append(f"  - {gap.get('gap_key')} reason={gap.get('reason')} duc={gap.get('duc')}")
-    budgets = result.get("budgets") or {}
-    lines.append(
-        "budgets: "
-        f"iterations {budgets.get('iterations_used')}/{budgets.get('max_iterations')}, "
-        f"acquisitions {budgets.get('acquisitions_used')}/{budgets.get('max_acquisitions')}, "
-        f"tool_calls {budgets.get('tool_calls_used')}/{budgets.get('max_tool_calls')}"
-    )
-    return "\n".join(lines)
 
 
 def summarize_insight_result(result: dict) -> str:
@@ -962,9 +727,6 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--since", default=None, help="Lower date/time bound passed through to --recall retrieval")
     ap.add_argument("--limit-sessions", type=int, default=None, help="Maximum sessions to inspect for --recall")
     ap.add_argument("--min-similarity", type=float, default=0.0, help="Minimum similarity for --recall (default 0.0)")
-    ap.add_argument("--acquire", action="store_true", help="Run the ACQUIRE loop instead of derive/recall")
-    ap.add_argument("--acquire-start", action="store_true", help="Start a resumable ACQUIRE loop and pause for F8")
-    ap.add_argument("--acquire-resume", action="store_true", help="Resume a paused ACQUIRE loop with --verdict-file")
     ap.add_argument("--insight-start", action="store_true", help="Start drawer-only insight synthesis")
     ap.add_argument("--insight-survey", action="store_true", help="Read-only survey of candidate insight seed clusters")
     ap.add_argument("--insight-resume", action="store_true", help="Resume insight synthesis with --candidate-file")
@@ -976,17 +738,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--verdict", choices=["supported", "insufficient", "contradicted"], default=None, help="Critic verdict for --insight-critique")
     ap.add_argument("--wing", default=None, help="Wing scope for insight modes or target wing for --insight-accept")
     ap.add_argument("--room", default=None, help="Room scope for insight modes or target room for --insight-accept")
-    ap.add_argument("--subject", default=None, help="Reachability query subject entity id for ACQUIRE")
-    ap.add_argument("--predicate", default=None, help="Reachability query base predicate for ACQUIRE")
-    ap.add_argument("--object", dest="object_id", default=None, help="Reachability query object entity id for ACQUIRE")
-    ap.add_argument("--run-id", default=None, help="Controlled run id for ACQUIRE (default: generated UUID)")
-    ap.add_argument("--max-acquisitions", type=int, default=5, help="Maximum ACQUIRE provisional assertions (default 5)")
-    ap.add_argument("--max-tool-calls", type=int, default=20, help="Maximum ACQUIRE recall calls (default 20)")
-    ap.add_argument("--recall-file", default=None, help="JSON list of UntrustedSource dicts for deterministic --acquire recall")
-    ap.add_argument("--extractor", choices=["heuristic", "oracle"], default="heuristic", help="F8 extractor for --acquire")
-    ap.add_argument("--oracle-file", default=None, help="JSON oracle extractor response(s) for --extractor oracle")
-    ap.add_argument("--verdict-file", default=None, help="JSON agent F8 verdict for --acquire-resume")
-    ap.add_argument("--trusted-speaker", action="append", default=[], help="Trusted speaker name for F8 promotion")
+    ap.add_argument("--run-id", default=None, help="Controlled run id for resumable insight modes (default: generated UUID)")
     ap.add_argument("--skips", default=None, help="Path to skip-markers file (default: <palace>/dream-derive-skips.jsonl)")
     ap.add_argument("--max-depth", type=int, default=3, help="Maximum derivation depth (default 3)")
     ap.add_argument("--max-iterations", type=int, default=10, help="Maximum closure iterations (default 10)")
@@ -1016,9 +768,6 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     contemplate_modes = [
-        args.acquire,
-        args.acquire_start,
-        args.acquire_resume,
         args.insight_start,
         args.insight_survey,
         args.insight_resume,
@@ -1028,113 +777,6 @@ def main(argv: list[str] | None = None) -> int:
     if sum(1 for enabled in contemplate_modes if enabled) > 1:
         print("error: choose only one contemplate mode", file=sys.stderr)
         return 2
-
-    if args.acquire:
-        missing = [
-            name
-            for name, value in (
-                ("--subject", args.subject),
-                ("--predicate", args.predicate),
-                ("--object", args.object_id),
-            )
-            if not value
-        ]
-        if missing:
-            print(f"error: --acquire requires {', '.join(missing)}", file=sys.stderr)
-            return 2
-        if args.extractor == "oracle" and not args.oracle_file:
-            print("error: --extractor oracle requires --oracle-file", file=sys.stderr)
-            return 2
-        report = run_acquire(
-            effective_palace,
-            query={
-                "subject_id": args.subject,
-                "base_predicate": args.predicate,
-                "object_id": args.object_id,
-            },
-            rules_path=args.rules,
-            run_id=args.run_id,
-            budgets={
-                "max_iterations": args.max_iterations,
-                "max_acquisitions": args.max_acquisitions,
-                "max_tool_calls": args.max_tool_calls,
-            },
-            recall_file=args.recall_file,
-            extractor_mode=args.extractor,
-            oracle_file=args.oracle_file,
-            trusted_speakers=args.trusted_speaker,
-        )
-        if args.format == "json":
-            print(json.dumps(report, indent=2, ensure_ascii=False))
-        else:
-            print(summarize_acquire_report(report))
-        return 0
-
-    if args.acquire_start:
-        missing = [
-            name
-            for name, value in (
-                ("--subject", args.subject),
-                ("--predicate", args.predicate),
-                ("--object", args.object_id),
-            )
-            if not value
-        ]
-        if missing:
-            print(f"error: --acquire-start requires {', '.join(missing)}", file=sys.stderr)
-            return 2
-        report = run_acquire_start(
-            effective_palace,
-            query={
-                "subject_id": args.subject,
-                "base_predicate": args.predicate,
-                "object_id": args.object_id,
-            },
-            rules_path=args.rules,
-            run_id=args.run_id,
-            budgets={
-                "max_iterations": args.max_iterations,
-                "max_acquisitions": args.max_acquisitions,
-                "max_tool_calls": args.max_tool_calls,
-            },
-            recall_file=args.recall_file,
-            trusted_speakers=args.trusted_speaker,
-        )
-        if args.format == "json":
-            print(json.dumps(report, indent=2, ensure_ascii=False))
-        else:
-            print(summarize_step_result(report))
-        return 0
-
-    if args.acquire_resume:
-        missing = [
-            name
-            for name, value in (
-                ("--run-id", args.run_id),
-                ("--verdict-file", args.verdict_file),
-            )
-            if not value
-        ]
-        if missing:
-            print(f"error: --acquire-resume requires {', '.join(missing)}", file=sys.stderr)
-            return 2
-        report = run_acquire_resume(
-            effective_palace,
-            run_id=args.run_id,
-            verdict_file=args.verdict_file,
-            rules_path=args.rules,
-            budgets={
-                "max_iterations": args.max_iterations,
-                "max_acquisitions": args.max_acquisitions,
-                "max_tool_calls": args.max_tool_calls,
-            },
-            recall_file=args.recall_file,
-        )
-        if args.format == "json":
-            print(json.dumps(report, indent=2, ensure_ascii=False))
-        else:
-            print(summarize_step_result(report))
-        return 0
 
     if args.insight_start:
         if bool(args.anchor_drawer) == bool(args.insight_query):
