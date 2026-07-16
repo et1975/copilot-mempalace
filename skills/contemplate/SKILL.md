@@ -167,6 +167,52 @@ moves to `awaiting_approval` with a nearest-existing advisory; `insufficient` or
 `contradicted` abstains. `--insight-accept` materializes the approved result as a
 `kind=insight` drawer, defaulting to wing/room `copilot-mempalace`/`insights`.
 
+## Focused inquiry (instruction-only deep-dive)
+
+When the user wants to **focus** contemplation on a topic/question and go
+**deeper than a single shallow search**, do not reach for a script — the depth
+comes from *you issuing better queries*, not from machinery. This is a
+cognition-only protocol: run it inline with `mempalace_search`, then reuse the
+`--insight-*` gates above to promote anything load-bearing.
+
+A by-hand benchmark (structured inquiry vs a plain-search baseline) showed the
+value is created almost entirely by **agent-driven query expansion** —
+world-knowledge concepts and one contrastive query surface load-bearing drawers
+that a direct search misses and can *change the conclusion*. Multi-hop neighbor
+traversal, KG bridging, and a similarity floor added no measured value on this
+palace (the KG is too sparse, ~40 triples) and are deliberately **not** part of
+this protocol.
+
+Steps:
+
+1. **Direct pass.** `mempalace_search` the focus as stated; skim the top hits.
+2. **Conceptual expansion (the depth mechanism).** Issue 2–4 more searches for
+   *adjacent/implied concepts you know are related but that the focus wording
+   does not contain* — bridge the vocabulary gap using your own knowledge, not
+   the focus's words.
+3. **One contrastive query.** Search explicitly for a counterexample,
+   contradiction, or constraint on the focus ("when is X false / when did the
+   opposite hold"). This is what flips a one-sided finding into a real tension.
+4. **Evidence-led follow-up (optional).** If one drawer is clearly pivotal,
+   run one query seeded by *its* specific vocabulary. Do not fan out
+   automatically.
+5. **Dedup + brief.** Deduplicate drawer IDs in context and write a short,
+   **quote-grounded** brief: findings, tensions, connections, open questions —
+   every asserted finding must carry an exact drawer quote. Label the brief a
+   set of hypotheses, not conclusions. If grounding is thin, **abstain** rather
+   than pad it.
+6. **Promote the load-bearing findings.** For any finding that names a changed
+   decision or a falsifiable prediction and *requires ≥2 distinct drawers*, run
+   it through the `--insight-*` pipeline above (`--insight-start` seeded by that
+   finding, then `--insight-resume`/`--insight-critique`/`--insight-accept`) so
+   the existing anti-slop gates certify it before it becomes a `kind=insight`
+   drawer. Findings that are mere connections or open questions stay in the
+   brief; they are not insights.
+
+The brief itself is a **session artifact** — keep it in context or the session
+workspace; do not materialize it as a drawer. Only gate-passing insights get
+written to the palace.
+
 ## The 5-phase pipeline
 
 Artifacts go in the session workspace — never commit them. Use the interpreter
