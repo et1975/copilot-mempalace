@@ -344,6 +344,139 @@ def _drawer_embedding(drawer: dict[str, Any]) -> list[float]:
     return [float(value) for value in (drawer.get("embedding") or drawer.get("vector") or [])]
 
 
+def _snippet(text, limit=120) -> str:
+    normalized = " ".join(str(text or "").split())
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: max(0, int(limit) - 3)].rstrip() + "..."
+
+
+def rank_survey_clusters(
+    drawers,
+    *,
+    min_sim=0.25,
+    max_sim=0.85,
+    k=5,
+    top_n=10,
+) -> list[dict]:
+    """Rank complementary drawer clusters without touching the palace."""
+    prepared = []
+    for drawer in drawers or []:
+        if not isinstance(drawer, dict):
+            continue
+        embedding = drawer.get("embedding") or []
+        if not embedding:
+            continue
+        try:
+            vector = [float(value) for value in embedding]
+        except (TypeError, ValueError):
+            continue
+        if not vector:
+            continue
+        prepared.append(
+            {
+                "id": str(drawer.get("id")),
+                "text": str(drawer.get("text") or ""),
+                "embedding": vector,
+                "wing": drawer.get("wing"),
+                "room": drawer.get("room"),
+            }
+        )
+
+    clusters = []
+    neighbor_limit = max(0, int(k))
+    for anchor in prepared:
+        neighbors = []
+        for candidate in prepared:
+            if candidate["id"] == anchor["id"]:
+                continue
+            try:
+                sim = cosine_similarity(anchor["embedding"], candidate["embedding"])
+            except ValueError:
+                continue
+            if float(min_sim) <= sim <= float(max_sim):
+                neighbors.append(
+                    {
+                        "id": candidate["id"],
+                        "text": candidate["text"],
+                        "wing": candidate["wing"],
+                        "sim": sim,
+                    }
+                )
+        neighbors.sort(key=lambda item: item["sim"], reverse=True)
+        neighbors = neighbors[:neighbor_limit]
+        if not neighbors:
+            continue
+
+        sims = [float(item["sim"]) for item in neighbors]
+        wings = sorted(
+            {
+                wing
+                for wing in [anchor.get("wing")] + [item.get("wing") for item in neighbors]
+                if wing
+            }
+        )
+        distinct_wings = len(wings)
+        neighbor_count = len(neighbors)
+        mean_sim = sum(sims) / len(sims)
+        score = 1.0 * (distinct_wings - 1) + 0.5 * min(neighbor_count, 3) + mean_sim
+        clusters.append(
+            {
+                "anchor_id": anchor["id"],
+                "anchor_wing": anchor.get("wing"),
+                "anchor_snippet": _snippet(anchor.get("text"), limit=120),
+                "wings": wings,
+                "cross_wing": distinct_wings >= 2,
+                "neighbor_ids": [item["id"] for item in neighbors],
+                "neighbor_snippets": [
+                    {"id": item["id"], "snippet": _snippet(item.get("text"), limit=120), "sim": item["sim"]}
+                    for item in neighbors
+                ],
+                "neighbor_count": neighbor_count,
+                "score": score,
+            }
+        )
+
+    clusters.sort(key=lambda item: (-float(item["score"]), str(item["anchor_id"])))
+    return clusters[: max(0, int(top_n))]
+
+
+def survey_insight_clusters(
+    palace_path,
+    *,
+    wing=None,
+    room=None,
+    min_sim=0.25,
+    max_sim=0.85,
+    k=5,
+    top_n=10,
+) -> dict:
+    """Load logical drawers once and rank read-only candidate insight seeds."""
+    try:
+        drawers = load_logical_drawers(palace_path, wing=wing, room=room)
+    except Exception:
+        drawers = []
+    drawers = [drawer for drawer in drawers or [] if isinstance(drawer, dict) and not _is_insight_drawer(drawer)]
+    ranker_input = [
+        {
+            "id": str(drawer.get("id")),
+            "text": _drawer_text(drawer),
+            "embedding": _drawer_embedding(drawer),
+            "wing": drawer.get("wing"),
+            "room": drawer.get("room"),
+        }
+        for drawer in drawers
+    ]
+    clusters = rank_survey_clusters(
+        ranker_input,
+        min_sim=min_sim,
+        max_sim=max_sim,
+        k=k,
+        top_n=top_n,
+    )
+    return {"palace": palace_path, "total_drawers": len(drawers), "clusters": clusters}
+
+
 def _nfc(text) -> str:
     return unicodedata.normalize("NFC", "" if text is None else str(text))
 

@@ -173,5 +173,66 @@ class InsightDuplicateTests(unittest.TestCase):
         self.assertEqual(result["nearest_index"], 1)
 
 
+class SurveyRankerTests(unittest.TestCase):
+    def _drawers(self):
+        return [
+            {"id": "a", "text": "verification drift lesson", "embedding": [1.0, 0.0, 0.0], "wing": "W1", "room": "r"},
+            {"id": "b", "text": "branch hygiene lesson", "embedding": [0.7, 0.5, 0.0], "wing": "W1", "room": "r"},
+            {"id": "c", "text": "pipeline contract lesson", "embedding": [0.6, 0.55, 0.1], "wing": "W2", "room": "r"},
+            {"id": "z", "text": "totally unrelated", "embedding": [0.0, 0.0, 1.0], "wing": "W3", "room": "r"},
+        ]
+
+    def test_returns_clusters_with_neighbors_in_band(self):
+        clusters = dream_insight.rank_survey_clusters(self._drawers(), min_sim=0.25, max_sim=0.85, k=5, top_n=10)
+        self.assertTrue(clusters)
+        top = clusters[0]
+        self.assertIn("anchor_id", top)
+        self.assertIn("neighbor_ids", top)
+        self.assertGreaterEqual(top["neighbor_count"], 1)
+        for cluster in clusters:
+            self.assertNotIn("z", cluster["neighbor_ids"])
+
+    def test_cross_wing_flag_and_wings(self):
+        clusters = dream_insight.rank_survey_clusters(self._drawers(), min_sim=0.25, max_sim=0.85, k=5, top_n=10)
+        by_anchor = {c["anchor_id"]: c for c in clusters}
+        self.assertIn("a", by_anchor)
+        self.assertTrue(by_anchor["a"]["cross_wing"])
+        self.assertEqual(by_anchor["a"]["wings"], ["W1", "W2"])
+
+    def test_near_duplicates_excluded_by_max_sim(self):
+        drawers = [
+            {"id": "a", "text": "x", "embedding": [1.0, 0.0], "wing": "W1", "room": "r"},
+            {"id": "a_dup", "text": "x", "embedding": [1.0, 0.0], "wing": "W1", "room": "r"},
+        ]
+        clusters = dream_insight.rank_survey_clusters(drawers, min_sim=0.25, max_sim=0.85, k=5, top_n=10)
+        self.assertEqual(clusters, [])
+
+    def test_ranked_by_score_desc(self):
+        clusters = dream_insight.rank_survey_clusters(self._drawers(), min_sim=0.25, max_sim=0.85, k=5, top_n=10)
+        scores = [c["score"] for c in clusters]
+        self.assertEqual(scores, sorted(scores, reverse=True))
+
+    def test_top_n_truncation(self):
+        clusters = dream_insight.rank_survey_clusters(self._drawers(), min_sim=0.25, max_sim=0.85, k=5, top_n=1)
+        self.assertEqual(len(clusters), 1)
+
+    def test_missing_embedding_skipped_no_raise(self):
+        drawers = [
+            {"id": "a", "text": "x", "embedding": [1.0, 0.0], "wing": "W1"},
+            {"id": "b", "text": "y", "embedding": [0.6, 0.6], "wing": "W2"},
+            {"id": "noemb", "text": "z"},
+        ]
+        clusters = dream_insight.rank_survey_clusters(drawers, min_sim=0.25, max_sim=0.85, k=5, top_n=10)
+        for cluster in clusters:
+            self.assertNotIn("noemb", cluster["neighbor_ids"])
+            self.assertNotEqual(cluster["anchor_id"], "noemb")
+
+    def test_input_not_mutated(self):
+        drawers = self._drawers()
+        snapshot = [dict(d) for d in drawers]
+        dream_insight.rank_survey_clusters(drawers, min_sim=0.25, max_sim=0.85, k=5, top_n=10)
+        self.assertEqual(drawers, snapshot)
+
+
 if __name__ == "__main__":
     unittest.main()

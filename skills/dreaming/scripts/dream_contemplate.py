@@ -706,6 +706,18 @@ def run_insight_start(
     )
 
 
+def run_insight_survey(
+    palace: str,
+    *,
+    wing: str | None,
+    room: str | None,
+    k: int,
+    top_n: int,
+) -> dict:
+    path = dream_palace.bind_palace(palace)
+    return dream_insight.survey_insight_clusters(path, wing=wing, room=room, k=k, top_n=top_n)
+
+
 def run_insight_resume(
     palace: str,
     *,
@@ -903,6 +915,31 @@ def summarize_insight_result(result: dict) -> str:
     return "\n".join(lines)
 
 
+def summarize_insight_survey(report: dict) -> str:
+    clusters = report.get("clusters") or []
+    lines = [
+        f"insight survey: total drawers {report.get('total_drawers')}; clusters found {len(clusters)}"
+    ]
+    if not clusters:
+        lines.append("no candidate insight clusters found")
+        return "\n".join(lines)
+    palace = report.get("palace")
+    for index, cluster in enumerate(clusters, start=1):
+        wings = cluster.get("wings") or []
+        wing_text = ", ".join(str(wing) for wing in wings) if wings else "(none)"
+        cross = " (cross-wing)" if cluster.get("cross_wing") else ""
+        anchor_id = cluster.get("anchor_id")
+        lines.extend(
+            [
+                f"{index}. {cluster.get('anchor_snippet')}",
+                f"   spans wings: {wing_text}{cross}",
+                f"   neighbors: {cluster.get('neighbor_count')}",
+                f"   to pursue: contemplate --palace {palace} --insight-start --anchor-drawer {anchor_id}",
+            ]
+        )
+    return "\n".join(lines)
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--palace", help="Path to the mempalace palace directory (default: mempalace config)")
@@ -919,7 +956,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument("--format", choices=["summary", "json"], default="summary", help="Output format (default summary)")
     ap.add_argument("--recall", default=None, help="Reasoning query for relevance-ranked past session recall")
-    ap.add_argument("--k", type=int, default=5, help="Maximum relevant sessions to return for --recall (default 5)")
+    ap.add_argument("--k", type=int, default=5, help="Maximum relevant sessions/neighbors to return (default 5)")
+    ap.add_argument("--top-n", type=int, default=10, help="Maximum --insight-survey clusters to return (default 10)")
     ap.add_argument("--repository", default=None, help="Repository filter passed through to --recall retrieval")
     ap.add_argument("--since", default=None, help="Lower date/time bound passed through to --recall retrieval")
     ap.add_argument("--limit-sessions", type=int, default=None, help="Maximum sessions to inspect for --recall")
@@ -928,6 +966,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--acquire-start", action="store_true", help="Start a resumable ACQUIRE loop and pause for F8")
     ap.add_argument("--acquire-resume", action="store_true", help="Resume a paused ACQUIRE loop with --verdict-file")
     ap.add_argument("--insight-start", action="store_true", help="Start drawer-only insight synthesis")
+    ap.add_argument("--insight-survey", action="store_true", help="Read-only survey of candidate insight seed clusters")
     ap.add_argument("--insight-resume", action="store_true", help="Resume insight synthesis with --candidate-file")
     ap.add_argument("--insight-critique", action="store_true", help="Resume insight synthesis with --verdict")
     ap.add_argument("--insight-accept", action="store_true", help="Accept and materialize a supported insight drawer")
@@ -935,8 +974,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--insight-query", default=None, help="Seed query for --insight-start")
     ap.add_argument("--candidate-file", default=None, help="JSON Candidate object for --insight-resume")
     ap.add_argument("--verdict", choices=["supported", "insufficient", "contradicted"], default=None, help="Critic verdict for --insight-critique")
-    ap.add_argument("--wing", default=None, help="Wing scope for --insight-start or target wing for --insight-accept")
-    ap.add_argument("--room", default=None, help="Room scope for --insight-start or target room for --insight-accept")
+    ap.add_argument("--wing", default=None, help="Wing scope for insight modes or target wing for --insight-accept")
+    ap.add_argument("--room", default=None, help="Room scope for insight modes or target room for --insight-accept")
     ap.add_argument("--subject", default=None, help="Reachability query subject entity id for ACQUIRE")
     ap.add_argument("--predicate", default=None, help="Reachability query base predicate for ACQUIRE")
     ap.add_argument("--object", dest="object_id", default=None, help="Reachability query object entity id for ACQUIRE")
@@ -981,6 +1020,7 @@ def main(argv: list[str] | None = None) -> int:
         args.acquire_start,
         args.acquire_resume,
         args.insight_start,
+        args.insight_survey,
         args.insight_resume,
         args.insight_critique,
         args.insight_accept,
@@ -1113,6 +1153,20 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(report, indent=2, ensure_ascii=False))
         else:
             print(summarize_insight_result(report))
+        return 0
+
+    if args.insight_survey:
+        report = run_insight_survey(
+            effective_palace,
+            wing=args.wing,
+            room=args.room,
+            k=args.k,
+            top_n=args.top_n,
+        )
+        if args.format == "json":
+            print(json.dumps(report, indent=2, ensure_ascii=False))
+        else:
+            print(summarize_insight_survey(report))
         return 0
 
     if args.insight_resume:
