@@ -149,6 +149,21 @@ def validate_insight(candidate, members_by_id) -> dict:
         if len(distinct_drawer_ids) < 2:
             rejects.append("not_cross_drawer")
 
+        # Load-bearing gate: a genuine cross-drawer insight must REQUIRE >=2 drawers.
+        # If any single member drawer already contains every premise quote, the
+        # multi-drawer citation is cosmetic (the evidence collapses into one drawer).
+        premise_quotes = [
+            _nfc(premise.get("quote"))
+            for premise in safe_premises
+            if isinstance(premise, dict) and isinstance(premise.get("quote"), str)
+        ]
+        if len(distinct_drawer_ids) >= 2 and premise_quotes:
+            for member_text in safe_members.values():
+                normalized_member = _nfc(member_text)
+                if all(quote in normalized_member for quote in premise_quotes):
+                    rejects.append("not_load_bearing")
+                    break
+
         decision = safe_conclusion.get("decision_or_prediction")
         if not isinstance(decision, str) or not decision.strip():
             rejects.append("no_decision_or_prediction")
@@ -235,6 +250,15 @@ def insight_resume(palace_path, run_id, *, candidate, now=None) -> dict:
         session["status"] = "abstained"
         session["reason"] = "validation_failed"
         session["rejects"] = list(validation["rejects"])
+        _persist_session(kg_path, session, now=now)
+        return _step_result(session)
+
+    conclusion_text = ((candidate or {}).get("conclusion") or {}).get("text")
+    duplicate = check_insight_duplicate(palace_path, conclusion_text)
+    if duplicate["duplicate"]:
+        session["status"] = "abstained"
+        session["reason"] = "duplicate_insight"
+        session["nearest_existing"] = duplicate["nearest_insight"]
         _persist_session(kg_path, session, now=now)
         return _step_result(session)
 
@@ -542,6 +566,72 @@ def _neutral_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
             if isinstance(premise, dict)
         ],
     }
+
+
+def insight_is_duplicate(query_vec, existing_vecs, *, tau_dup: float = 0.9) -> dict:
+    """Pure novelty check: is ``query_vec`` >= tau_dup cosine to any existing vector."""
+    best_index = None
+    best_sim = -1.0
+    for index, vector in enumerate(existing_vecs or []):
+        if not vector:
+            continue
+        sim = cosine_similarity(query_vec, vector)
+        if sim > best_sim:
+            best_sim = sim
+            best_index = index
+    if best_index is None:
+        return {"duplicate": False, "nearest_index": None, "sim": None}
+    return {"duplicate": best_sim >= tau_dup, "nearest_index": best_index, "sim": best_sim}
+
+
+def _is_insight_drawer(drawer: dict[str, Any]) -> bool:
+    metadata = drawer.get("metadata") or {}
+    if metadata.get("added_by") == "contemplate-synthesize":
+        return True
+    return '"kind":"insight"' in _drawer_text(drawer)
+
+
+def _insight_conclusion_text(drawer_text: str) -> str:
+    """Extract just the conclusion prose from a materialised insight drawer.
+
+    Insight drawers are ``conclusion + "\\n\\nGrounded in:" + quotes + trailer``;
+    comparing against the whole drawer (or its chunk-mean embedding) dilutes the
+    conclusion with provenance boilerplate, so novelty must compare conclusion prose
+    to conclusion prose.
+    """
+    text = str(drawer_text or "")
+    marker = "Grounded in:"
+    index = text.find(marker)
+    if index != -1:
+        text = text[:index]
+    return text.strip()
+
+
+def check_insight_duplicate(palace_path, conclusion_text, *, tau_dup: float = 0.9) -> dict:
+    """Reject regenerating an insight already materialised as a kind=insight drawer.
+
+    Compares conclusion-prose to conclusion-prose (re-embedded), NOT against the
+    drawer's chunk-mean embedding which is diluted by the grounded-in quotes/trailer.
+    """
+    text = str(conclusion_text or "").strip()
+    if not text:
+        return {"duplicate": False, "nearest_insight": None}
+    insights = [drawer for drawer in load_logical_drawers(palace_path) if _is_insight_drawer(drawer)]
+    existing = [
+        (drawer, _insight_conclusion_text(_drawer_text(drawer)))
+        for drawer in insights
+    ]
+    existing = [(drawer, conclusion) for drawer, conclusion in existing if conclusion]
+    if not existing:
+        return {"duplicate": False, "nearest_insight": None}
+    vectors = _palace_embed(palace_path, [text] + [conclusion for _drawer, conclusion in existing])
+    query_vec = vectors[0]
+    result = insight_is_duplicate(query_vec, vectors[1:], tau_dup=tau_dup)
+    nearest = None
+    if result["nearest_index"] is not None:
+        drawer = existing[result["nearest_index"]][0]
+        nearest = {"id": str(drawer.get("id")), "text": _drawer_text(drawer), "sim": result["sim"]}
+    return {"duplicate": result["duplicate"], "nearest_insight": nearest}
 
 
 def _nearest_existing_note(palace_path: str, candidate: dict[str, Any] | None) -> dict[str, Any] | None:
