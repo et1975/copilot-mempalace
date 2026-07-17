@@ -1,12 +1,107 @@
-"""Unit tests for the dreaming pure core. Stdlib unittest only — no external deps.
+"""Unit tests for the dreaming pure core. Stdlib unittest runner.
 
 Run: cd skills/dreaming/scripts && python3 -m unittest -v
 """
 from datetime import datetime
 import json
+import random
 import unittest
+from unittest import mock
 
 import dream_lib as dl
+
+
+def _reference_cosine(a, b):
+    if len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    na = sum(x * x for x in a) ** 0.5
+    nb = sum(y * y for y in b) ** 0.5
+    if na == 0.0 or nb == 0.0:
+        return 0.0
+    return dot / (na * nb)
+
+
+def _reference_clusters(items, tau):
+    uf = dl._UnionFind(len(items))
+    sims = {}
+    for i in range(len(items)):
+        for j in range(i + 1, len(items)):
+            s = _reference_cosine(items[i].get("embedding") or [], items[j].get("embedding") or [])
+            if s >= tau:
+                uf.union(i, j)
+                sims[(i, j)] = s
+
+    comps = {}
+    for i in range(len(items)):
+        comps.setdefault(uf.find(i), []).append(i)
+
+    clusters = []
+    for members in comps.values():
+        if len(members) < 2:
+            continue
+        members.sort()
+        clusters.append({
+            "member_ids": [items[k]["id"] for k in members],
+            "pair_sims": [
+                {"a": items[i]["id"], "b": items[j]["id"], "sim": round(sims[(i, j)], 4)}
+                for i in members
+                for j in members
+                if i < j and (i, j) in sims
+            ],
+        })
+    return clusters
+
+
+def _reference_redundancy(items):
+    scores = {d["id"]: 0.0 for d in items}
+    for i in range(len(items)):
+        for j in range(i + 1, len(items)):
+            s = max(0.0, _reference_cosine(items[i].get("embedding") or [], items[j].get("embedding") or []))
+            scores[items[i]["id"]] = max(scores[items[i]["id"]], s)
+            scores[items[j]["id"]] = max(scores[items[j]["id"]], s)
+    return scores
+
+
+def _reference_themes(entries, tau, min_support, support_key="session_id"):
+    themes = []
+    for cluster in _reference_clusters(entries, tau):
+        member_ids = set(cluster["member_ids"])
+        members = [entry for entry in entries if entry["id"] in member_ids]
+        support_ids = sorted(
+            {entry.get(support_key) for entry in members if entry.get(support_key) is not None}
+        )
+        support = len(support_ids)
+        if support >= min_support:
+            themes.append({
+                "member_ids": [entry["id"] for entry in members],
+                "support": support,
+                "support_ids": support_ids,
+                "pair_sims": cluster["pair_sims"],
+            })
+    return sorted(themes, key=lambda t: (-t["support"], min(t["member_ids"])))
+
+
+def _normalise_clusters(clusters):
+    return [
+        {
+            "member_ids": [m["id"] for m in c["members"]],
+            "pair_sims": c["pair_sims"],
+        }
+        for c in clusters
+    ]
+
+
+def _normalise_themes(themes):
+    return [
+        {
+            "member_ids": [m["id"] for m in t["members"]],
+            "support": t["support"],
+            "support_ids": t["support_ids"],
+            "pair_sims": t["pair_sims"],
+        }
+        for t in themes
+    ]
 
 
 class TestCosine(unittest.TestCase):
@@ -81,6 +176,29 @@ class TestCluster(unittest.TestCase):
         clusters = dl.cluster_duplicates(drawers, tau=0.9)
         self.assertEqual(len(clusters), 1)
         self.assertEqual({m["id"] for m in clusters[0]["members"]}, {"a", "b", "c"})
+
+    def test_vectorized_path_matches_reference_for_random_and_edge_cases(self):
+        rng = random.Random(12345)
+        drawers = [
+            self._d(f"r{i}", [rng.uniform(-1.0, 1.0) for _ in range(4)])
+            for i in range(8)
+        ] + [
+            self._d("identical-a", [1.0, 2.0, 3.0, 4.0]),
+            self._d("identical-b", [1.0, 2.0, 3.0, 4.0]),
+            self._d("orthogonal-a", [1.0, 0.0, 0.0, 0.0]),
+            self._d("orthogonal-b", [0.0, 1.0, 0.0, 0.0]),
+            self._d("zero", [0.0, 0.0, 0.0, 0.0]),
+            self._d("empty", []),
+            self._d("different-dim", [1.0, 2.0]),
+        ]
+        expected = _reference_clusters(drawers, tau=0.75)
+
+        with mock.patch.object(dl, "cosine_similarity", side_effect=AssertionError("scalar path called")):
+            actual = _normalise_clusters(dl.cluster_duplicates(drawers, tau=0.75))
+
+        self.assertEqual(actual, expected)
+        self.assertEqual(dl.cluster_duplicates([], tau=0.75), [])
+        self.assertEqual(dl.cluster_duplicates([self._d("solo", [1.0, 0.0])], tau=0.75), [])
 
 
 class TestBuildWorklist(unittest.TestCase):
@@ -348,6 +466,32 @@ class TestGroupObservationThemes(unittest.TestCase):
                          [["a", "b", "c"], ["z", "y"]])
         self.assertEqual([t["support"] for t in themes], [3, 2])
 
+    def test_vectorized_path_matches_reference_for_random_and_edge_cases(self):
+        rng = random.Random(67890)
+        entries = [
+            self._e(f"r{i}", [rng.uniform(-1.0, 1.0) for _ in range(5)], f"s{i % 3}")
+            for i in range(9)
+        ] + [
+            self._e("identical-a", [3.0, 1.0, 4.0, 1.0, 5.0], "same-a"),
+            self._e("identical-b", [3.0, 1.0, 4.0, 1.0, 5.0], "same-b"),
+            self._e("orthogonal-a", [1.0, 0.0, 0.0, 0.0, 0.0], "orth-a"),
+            self._e("orthogonal-b", [0.0, 1.0, 0.0, 0.0, 0.0], "orth-b"),
+            self._e("zero", [0.0, 0.0, 0.0, 0.0, 0.0], "zero-s"),
+            self._e("empty", [], "empty-s"),
+            self._e("different-dim", [1.0, 2.0], "diff-s"),
+        ]
+        expected = _reference_themes(entries, tau=0.8, min_support=2)
+
+        with mock.patch.object(dl, "cosine_similarity", side_effect=AssertionError("scalar path called")):
+            actual = _normalise_themes(dl.group_observation_themes(entries, tau=0.8, min_support=2))
+
+        self.assertEqual(actual, expected)
+        self.assertEqual(dl.group_observation_themes([], tau=0.8, min_support=2), [])
+        self.assertEqual(
+            dl.group_observation_themes([self._e("solo", [1.0, 0.0], "s1")], tau=0.8, min_support=2),
+            [],
+        )
+
 
 class TestBuildPatternWorklist(unittest.TestCase):
     def test_shape_evidence_and_params(self):
@@ -411,6 +555,30 @@ class TestComputeRedundancy(unittest.TestCase):
 
     def test_singleton_scores_zero(self):
         self.assertEqual(dl.compute_redundancy([{"id": "a", "embedding": [1.0]}]), {"a": 0.0})
+
+    def test_vectorized_path_matches_reference_for_random_and_edge_cases(self):
+        rng = random.Random(24680)
+        drawers = [
+            {"id": f"r{i}", "embedding": [rng.uniform(-1.0, 1.0) for _ in range(6)]}
+            for i in range(10)
+        ] + [
+            {"id": "identical-a", "embedding": [2.0, 7.0, 1.0, 8.0, 2.0, 8.0]},
+            {"id": "identical-b", "embedding": [2.0, 7.0, 1.0, 8.0, 2.0, 8.0]},
+            {"id": "orthogonal-a", "embedding": [1.0, 0.0, 0.0, 0.0, 0.0, 0.0]},
+            {"id": "orthogonal-b", "embedding": [0.0, 1.0, 0.0, 0.0, 0.0, 0.0]},
+            {"id": "zero", "embedding": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]},
+            {"id": "empty", "embedding": []},
+            {"id": "missing"},
+            {"id": "different-dim", "embedding": [1.0, 2.0]},
+        ]
+        expected = _reference_redundancy(drawers)
+
+        with mock.patch.object(dl, "cosine_similarity", side_effect=AssertionError("scalar path called")):
+            actual = dl.compute_redundancy(drawers)
+
+        for drawer_id, expected_score in expected.items():
+            self.assertAlmostEqual(actual[drawer_id], expected_score, places=9)
+        self.assertEqual(dl.compute_redundancy([]), {})
 
 
 class TestDrawerSalience(unittest.TestCase):

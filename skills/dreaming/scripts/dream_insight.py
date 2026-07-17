@@ -8,11 +8,12 @@ and an explicit accept step.
 from __future__ import annotations
 
 import json
-import math
 import sqlite3
 import unicodedata
 import uuid
 from typing import Any
+
+import numpy as np
 
 from dream_lib import cosine_similarity
 from dream_palace import (
@@ -356,6 +357,15 @@ def _snippet(text, limit=120) -> str:
     return normalized[: max(0, int(limit) - 3)].rstrip() + "..."
 
 
+def _cosine_matrix(vectors) -> np.ndarray:
+    matrix = np.asarray(vectors, dtype=np.float32)
+    if matrix.size == 0:
+        return np.zeros((0, 0), dtype=np.float32)
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    matrix = matrix / norms
+    return matrix @ matrix.T
+
+
 def rank_survey_clusters(
     drawers,
     *,
@@ -378,7 +388,7 @@ def rank_survey_clusters(
             continue
         if not vector:
             continue
-        norm = math.sqrt(sum(value * value for value in vector))
+        norm = sum(value * value for value in vector) ** 0.5
         if norm == 0.0:
             continue
         prepared.append(
@@ -394,59 +404,64 @@ def rank_survey_clusters(
 
     clusters = []
     neighbor_limit = max(0, int(k))
-    for anchor in prepared:
-        neighbors = []
-        for candidate in prepared:
-            if candidate["id"] == anchor["id"]:
-                continue
-            if len(anchor["embedding"]) != len(candidate["embedding"]):
-                continue
-            sim = sum(
-                a * b
-                for a, b in zip(anchor["embedding"], candidate["embedding"])
-            ) / (anchor["norm"] * candidate["norm"])
-            if float(min_sim) <= sim <= float(max_sim):
-                neighbors.append(
-                    {
-                        "id": candidate["id"],
-                        "text": candidate["text"],
-                        "wing": candidate["wing"],
-                        "sim": sim,
-                    }
-                )
-        neighbors.sort(key=lambda item: item["sim"], reverse=True)
-        neighbors = neighbors[:neighbor_limit]
-        if not neighbors:
-            continue
+    groups: dict[int, list[dict]] = {}
+    for item in prepared:
+        groups.setdefault(len(item["embedding"]), []).append(item)
 
-        sims = [float(item["sim"]) for item in neighbors]
-        wings = sorted(
-            {
-                wing
-                for wing in [anchor.get("wing")] + [item.get("wing") for item in neighbors]
-                if wing
-            }
-        )
-        distinct_wings = len(wings)
-        neighbor_count = len(neighbors)
-        mean_sim = sum(sims) / len(sims)
-        score = 1.0 * (distinct_wings - 1) + 0.5 * min(neighbor_count, 3) + mean_sim
-        clusters.append(
-            {
-                "anchor_id": anchor["id"],
-                "anchor_wing": anchor.get("wing"),
-                "anchor_snippet": _snippet(anchor.get("text"), limit=120),
-                "wings": wings,
-                "cross_wing": distinct_wings >= 2,
-                "neighbor_ids": [item["id"] for item in neighbors],
-                "neighbor_snippets": [
-                    {"id": item["id"], "snippet": _snippet(item.get("text"), limit=120), "sim": item["sim"]}
-                    for item in neighbors
-                ],
-                "neighbor_count": neighbor_count,
-                "score": score,
-            }
-        )
+    for group in groups.values():
+        similarities = _cosine_matrix([item["embedding"] for item in group])
+        ids = np.asarray([item["id"] for item in group], dtype=object)
+        for anchor_index, anchor in enumerate(group):
+            row = similarities[anchor_index]
+            mask = (float(min_sim) <= row) & (row <= float(max_sim)) & (ids != anchor["id"])
+            neighbor_indices = np.flatnonzero(mask)
+            if neighbor_limit <= 0 or len(neighbor_indices) == 0:
+                continue
+
+            sims = row[neighbor_indices]
+            if len(neighbor_indices) > neighbor_limit:
+                threshold = np.partition(sims, -neighbor_limit)[-neighbor_limit]
+                neighbor_indices = neighbor_indices[sims >= threshold]
+            order = np.lexsort((neighbor_indices, -row[neighbor_indices]))
+            neighbor_indices = neighbor_indices[order[:neighbor_limit]]
+            neighbors = [
+                {
+                    "id": group[int(candidate_index)]["id"],
+                    "text": group[int(candidate_index)]["text"],
+                    "wing": group[int(candidate_index)]["wing"],
+                    "sim": float(row[int(candidate_index)]),
+                }
+                for candidate_index in neighbor_indices
+            ]
+
+            sims = [float(item["sim"]) for item in neighbors]
+            wings = sorted(
+                {
+                    wing
+                    for wing in [anchor.get("wing")] + [item.get("wing") for item in neighbors]
+                    if wing
+                }
+            )
+            distinct_wings = len(wings)
+            neighbor_count = len(neighbors)
+            mean_sim = sum(sims) / len(sims)
+            score = 1.0 * (distinct_wings - 1) + 0.5 * min(neighbor_count, 3) + mean_sim
+            clusters.append(
+                {
+                    "anchor_id": anchor["id"],
+                    "anchor_wing": anchor.get("wing"),
+                    "anchor_snippet": _snippet(anchor.get("text"), limit=120),
+                    "wings": wings,
+                    "cross_wing": distinct_wings >= 2,
+                    "neighbor_ids": [item["id"] for item in neighbors],
+                    "neighbor_snippets": [
+                        {"id": item["id"], "snippet": _snippet(item.get("text"), limit=120), "sim": item["sim"]}
+                        for item in neighbors
+                    ],
+                    "neighbor_count": neighbor_count,
+                    "score": score,
+                }
+            )
 
     clusters.sort(key=lambda item: (-float(item["score"]), str(item["anchor_id"])))
     return clusters[: max(0, int(top_n))]
@@ -461,6 +476,7 @@ def survey_insight_clusters(
     max_sim=0.85,
     k=5,
     top_n=10,
+    max_drawers=5000,
 ) -> dict:
     """Load logical drawers once and rank read-only candidate insight seeds."""
     try:
@@ -468,6 +484,11 @@ def survey_insight_clusters(
     except Exception:
         drawers = []
     drawers = [drawer for drawer in drawers or [] if isinstance(drawer, dict) and not _is_insight_drawer(drawer)]
+    total_drawers = len(drawers)
+    drawer_limit = max(0, int(max_drawers))
+    scoped = bool(wing or room)
+    truncated = (not scoped) and total_drawers > drawer_limit
+    ranked_drawers = drawers[:drawer_limit] if truncated else drawers
     ranker_input = [
         {
             "id": str(drawer.get("id")),
@@ -476,7 +497,7 @@ def survey_insight_clusters(
             "wing": drawer.get("wing"),
             "room": drawer.get("room"),
         }
-        for drawer in drawers
+        for drawer in ranked_drawers
     ]
     clusters = rank_survey_clusters(
         ranker_input,
@@ -485,7 +506,20 @@ def survey_insight_clusters(
         k=k,
         top_n=top_n,
     )
-    return {"palace": palace_path, "total_drawers": len(drawers), "clusters": clusters}
+    result = {
+        "palace": palace_path,
+        "total_drawers": total_drawers,
+        "clusters": clusters,
+        "ranked_drawers": len(ranked_drawers),
+        "truncated": truncated,
+        "max_drawers": drawer_limit,
+    }
+    if truncated:
+        result["note"] = (
+            f"unscoped survey truncated to first {drawer_limit} of {total_drawers} drawers; "
+            "pass wing or room to survey a focused scope"
+        )
+    return result
 
 
 def _nfc(text) -> str:

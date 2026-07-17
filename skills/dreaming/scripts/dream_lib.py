@@ -1,8 +1,8 @@
-"""Pure, dependency-free core for the dreaming pipeline.
+"""Pure core for the dreaming pipeline.
 
-No mempalace / numpy imports so this module is unit-testable in isolation. All
-palace I/O lives in ``dream_palace.py``; orchestration in ``dream_harvest.py``
-and ``dream_adopt.py``.
+No mempalace imports so this module is unit-testable in isolation. All palace
+I/O lives in ``dream_palace.py``; orchestration in ``dream_harvest.py`` and
+``dream_adopt.py``.
 
 The dreaming pipeline consolidates near-duplicate drawers. This module owns the
 deterministic ("mechanical") half: similarity, clustering, worklist assembly,
@@ -18,6 +18,8 @@ import json
 import math
 import re
 from typing import Any
+
+import numpy as np
 
 WORKLIST_VERSION = 1
 DEG_CAP = 5
@@ -58,6 +60,32 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
     if na == 0.0 or nb == 0.0:
         return 0.0
     return dot / (na * nb)
+
+
+def _cosine_matrix(vectors) -> np.ndarray:
+    """Return all-pairs cosine similarities, zeroing empty/zero/mismatched rows."""
+    n = len(vectors)
+    sims = np.zeros((n, n), dtype=float)
+    if n == 0:
+        return sims
+
+    by_dim: dict[int, list[int]] = {}
+    for i, vector in enumerate(vectors):
+        if vector is None or len(vector) == 0:
+            continue
+        by_dim.setdefault(len(vector), []).append(i)
+
+    for indexes in by_dim.values():
+        matrix = np.asarray([vectors[i] for i in indexes], dtype=float)
+        norms = np.linalg.norm(matrix, axis=1)
+        nonzero = norms != 0.0
+        if not np.any(nonzero):
+            continue
+        normalised = np.zeros_like(matrix, dtype=float)
+        normalised[nonzero] = matrix[nonzero] / norms[nonzero, np.newaxis]
+        sims[np.ix_(indexes, indexes)] = normalised @ normalised.T
+
+    return sims
 
 
 def _mean_vectors(vectors: list[list[float]]) -> list[float]:
@@ -135,12 +163,14 @@ def cluster_duplicates(drawers: list[dict[str, Any]], tau: float) -> list[dict[s
     n = len(drawers)
     uf = _UnionFind(n)
     sims: dict[tuple[int, int], float] = {}
-    for i in range(n):
-        for j in range(i + 1, n):
-            s = cosine_similarity(drawers[i]["embedding"], drawers[j]["embedding"])
-            if s >= tau:
-                uf.union(i, j)
-                sims[(i, j)] = s
+    sim_matrix = _cosine_matrix([d.get("embedding") or [] for d in drawers])
+    rows, cols = np.triu_indices(n, k=1)
+    matches = sim_matrix[rows, cols] >= tau
+    for i_np, j_np, s_np in zip(rows[matches], cols[matches], sim_matrix[rows[matches], cols[matches]]):
+        i, j = int(i_np), int(j_np)
+        s = float(s_np)
+        uf.union(i, j)
+        sims[(i, j)] = s
 
     comps: dict[int, list[int]] = {}
     for i in range(n):
@@ -164,12 +194,14 @@ def cluster_duplicates(drawers: list[dict[str, Any]], tau: float) -> list[dict[s
 def compute_redundancy(drawers: list[dict[str, Any]]) -> dict[str, float]:
     """Return each drawer's maximum cosine similarity to any other drawer."""
     scores = {d["id"]: 0.0 for d in drawers}
-    for i in range(len(drawers)):
-        for j in range(i + 1, len(drawers)):
-            s = cosine_similarity(drawers[i].get("embedding") or [], drawers[j].get("embedding") or [])
-            s = max(0.0, s)
-            scores[drawers[i]["id"]] = max(scores[drawers[i]["id"]], s)
-            scores[drawers[j]["id"]] = max(scores[drawers[j]["id"]], s)
+    n = len(drawers)
+    if n < 2:
+        return scores
+    sim_matrix = _cosine_matrix([d.get("embedding") or [] for d in drawers])
+    np.fill_diagonal(sim_matrix, 0.0)
+    row_max = np.maximum(sim_matrix, 0.0).max(axis=1)
+    for i, d in enumerate(drawers):
+        scores[d["id"]] = float(row_max[i])
     return scores
 
 
@@ -333,12 +365,14 @@ def group_observation_themes(
     n = len(entries)
     uf = _UnionFind(n)
     sims: dict[tuple[int, int], float] = {}
-    for i in range(n):
-        for j in range(i + 1, n):
-            s = cosine_similarity(entries[i]["embedding"], entries[j]["embedding"])
-            if s >= tau:
-                uf.union(i, j)
-                sims[(i, j)] = s
+    sim_matrix = _cosine_matrix([e.get("embedding") or [] for e in entries])
+    rows, cols = np.triu_indices(n, k=1)
+    matches = sim_matrix[rows, cols] >= tau
+    for i_np, j_np, s_np in zip(rows[matches], cols[matches], sim_matrix[rows[matches], cols[matches]]):
+        i, j = int(i_np), int(j_np)
+        s = float(s_np)
+        uf.union(i, j)
+        sims[(i, j)] = s
 
     comps: dict[int, list[int]] = {}
     for i in range(n):

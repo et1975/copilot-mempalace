@@ -183,6 +183,121 @@ class SurveyRankerTests(unittest.TestCase):
             {"id": "z", "text": "totally unrelated", "embedding": [0.0, 0.0, 1.0], "wing": "W3", "room": "r"},
         ]
 
+    def _reference_rank_survey_clusters(self, drawers, *, min_sim=0.25, max_sim=0.85, k=5, top_n=10):
+        prepared = []
+        for drawer in drawers or []:
+            if not isinstance(drawer, dict):
+                continue
+            embedding = drawer.get("embedding") or []
+            if not embedding:
+                continue
+            try:
+                vector = [float(value) for value in embedding]
+            except (TypeError, ValueError):
+                continue
+            if not vector:
+                continue
+            norm = sum(value * value for value in vector) ** 0.5
+            if norm == 0.0:
+                continue
+            prepared.append(
+                {
+                    "id": str(drawer.get("id")),
+                    "text": str(drawer.get("text") or ""),
+                    "embedding": vector,
+                    "norm": norm,
+                    "wing": drawer.get("wing"),
+                    "room": drawer.get("room"),
+                }
+            )
+
+        clusters = []
+        neighbor_limit = max(0, int(k))
+        for anchor in prepared:
+            neighbors = []
+            for candidate in prepared:
+                if candidate["id"] == anchor["id"]:
+                    continue
+                if len(anchor["embedding"]) != len(candidate["embedding"]):
+                    continue
+                sim = sum(
+                    a * b
+                    for a, b in zip(anchor["embedding"], candidate["embedding"])
+                ) / (anchor["norm"] * candidate["norm"])
+                if float(min_sim) <= sim <= float(max_sim):
+                    neighbors.append(
+                        {
+                            "id": candidate["id"],
+                            "text": candidate["text"],
+                            "wing": candidate["wing"],
+                            "sim": sim,
+                        }
+                    )
+            neighbors.sort(key=lambda item: item["sim"], reverse=True)
+            neighbors = neighbors[:neighbor_limit]
+            if not neighbors:
+                continue
+
+            sims = [float(item["sim"]) for item in neighbors]
+            wings = sorted(
+                {
+                    wing
+                    for wing in [anchor.get("wing")] + [item.get("wing") for item in neighbors]
+                    if wing
+                }
+            )
+            distinct_wings = len(wings)
+            neighbor_count = len(neighbors)
+            mean_sim = sum(sims) / len(sims)
+            score = 1.0 * (distinct_wings - 1) + 0.5 * min(neighbor_count, 3) + mean_sim
+            clusters.append(
+                {
+                    "anchor_id": anchor["id"],
+                    "anchor_wing": anchor.get("wing"),
+                    "anchor_snippet": dream_insight._snippet(anchor.get("text"), limit=120),
+                    "wings": wings,
+                    "cross_wing": distinct_wings >= 2,
+                    "neighbor_ids": [item["id"] for item in neighbors],
+                    "neighbor_snippets": [
+                        {"id": item["id"], "snippet": dream_insight._snippet(item.get("text"), limit=120), "sim": item["sim"]}
+                        for item in neighbors
+                    ],
+                    "neighbor_count": neighbor_count,
+                    "score": score,
+                }
+            )
+
+        clusters.sort(key=lambda item: (-float(item["score"]), str(item["anchor_id"])))
+        return clusters[: max(0, int(top_n))]
+
+    def _assert_clusters_close(self, actual, expected):
+        self.assertEqual(len(actual), len(expected))
+        for actual_cluster, expected_cluster in zip(actual, expected):
+            for key in ("score",):
+                self.assertAlmostEqual(actual_cluster[key], expected_cluster[key], places=6)
+            comparable_actual = {k: v for k, v in actual_cluster.items() if k != "score"}
+            comparable_expected = {k: v for k, v in expected_cluster.items() if k != "score"}
+            self.assertEqual(len(comparable_actual["neighbor_snippets"]), len(comparable_expected["neighbor_snippets"]))
+            for actual_neighbor, expected_neighbor in zip(comparable_actual["neighbor_snippets"], comparable_expected["neighbor_snippets"]):
+                self.assertEqual(
+                    {k: v for k, v in actual_neighbor.items() if k != "sim"},
+                    {k: v for k, v in expected_neighbor.items() if k != "sim"},
+                )
+                self.assertAlmostEqual(actual_neighbor["sim"], expected_neighbor["sim"], places=6)
+            comparable_actual["neighbor_snippets"] = [
+                {k: v for k, v in item.items() if k != "sim"}
+                for item in comparable_actual["neighbor_snippets"]
+            ]
+            comparable_expected["neighbor_snippets"] = [
+                {k: v for k, v in item.items() if k != "sim"}
+                for item in comparable_expected["neighbor_snippets"]
+            ]
+            self.assertEqual(comparable_actual, comparable_expected)
+
+    def test_empty_input_returns_no_clusters(self):
+        self.assertEqual(dream_insight.rank_survey_clusters([], min_sim=0.25, max_sim=0.85), [])
+        self.assertEqual(dream_insight.rank_survey_clusters(None, min_sim=0.25, max_sim=0.85), [])
+
     def test_returns_clusters_with_neighbors_in_band(self):
         clusters = dream_insight.rank_survey_clusters(self._drawers(), min_sim=0.25, max_sim=0.85, k=5, top_n=10)
         self.assertTrue(clusters)
@@ -217,6 +332,13 @@ class SurveyRankerTests(unittest.TestCase):
         clusters = dream_insight.rank_survey_clusters(self._drawers(), min_sim=0.25, max_sim=0.85, k=5, top_n=1)
         self.assertEqual(len(clusters), 1)
 
+    def test_top_k_truncates_neighbors_after_similarity_sort(self):
+        clusters = dream_insight.rank_survey_clusters(self._drawers(), min_sim=0.25, max_sim=0.85, k=1, top_n=10)
+        self.assertTrue(clusters)
+        for cluster in clusters:
+            self.assertEqual(cluster["neighbor_count"], 1)
+            self.assertEqual(len(cluster["neighbor_ids"]), 1)
+
     def test_missing_embedding_skipped_no_raise(self):
         drawers = [
             {"id": "a", "text": "x", "embedding": [1.0, 0.0], "wing": "W1"},
@@ -236,79 +358,54 @@ class SurveyRankerTests(unittest.TestCase):
 
     def test_matches_reference_pairwise_ranking(self):
         drawers = [
+            "not a drawer",
             *self._drawers(),
+            {"id": "bad", "text": "bad vector", "embedding": ["na"], "wing": "W4", "room": "r"},
+            {"id": "empty", "text": "empty vector", "embedding": [], "wing": "W4", "room": "r"},
             {"id": "zero", "text": "empty norm", "embedding": [0.0, 0.0, 0.0], "wing": "W4", "room": "r"},
+            {"id": "short_a", "text": "short vector a", "embedding": [1.0, 0.0], "wing": "W5", "room": "r"},
+            {"id": "short_b", "text": "short vector b", "embedding": [0.5, 0.5], "wing": "W6", "room": "r"},
         ]
+        actual = dream_insight.rank_survey_clusters(drawers, min_sim=0.25, max_sim=0.85, k=2, top_n=10)
+        expected = self._reference_rank_survey_clusters(drawers, min_sim=0.25, max_sim=0.85, k=2, top_n=10)
+        self._assert_clusters_close(actual, expected)
 
-        def reference_ranker():
-            prepared = []
-            for drawer in drawers:
-                vector = [float(value) for value in drawer["embedding"]]
-                prepared.append(
-                    {
-                        "id": str(drawer.get("id")),
-                        "text": str(drawer.get("text") or ""),
-                        "embedding": vector,
-                        "wing": drawer.get("wing"),
-                        "room": drawer.get("room"),
-                    }
-                )
-            clusters = []
-            for anchor in prepared:
-                neighbors = []
-                for candidate in prepared:
-                    if candidate["id"] == anchor["id"]:
-                        continue
-                    try:
-                        sim = dream_insight.cosine_similarity(anchor["embedding"], candidate["embedding"])
-                    except ValueError:
-                        continue
-                    if 0.25 <= sim <= 0.85:
-                        neighbors.append(
-                            {
-                                "id": candidate["id"],
-                                "text": candidate["text"],
-                                "wing": candidate["wing"],
-                                "sim": sim,
-                            }
-                        )
-                neighbors.sort(key=lambda item: item["sim"], reverse=True)
-                neighbors = neighbors[:5]
-                if not neighbors:
-                    continue
-                sims = [float(item["sim"]) for item in neighbors]
-                wings = sorted(
-                    {
-                        wing
-                        for wing in [anchor.get("wing")] + [item.get("wing") for item in neighbors]
-                        if wing
-                    }
-                )
-                distinct_wings = len(wings)
-                neighbor_count = len(neighbors)
-                clusters.append(
-                    {
-                        "anchor_id": anchor["id"],
-                        "anchor_wing": anchor.get("wing"),
-                        "anchor_snippet": dream_insight._snippet(anchor.get("text"), limit=120),
-                        "wings": wings,
-                        "cross_wing": distinct_wings >= 2,
-                        "neighbor_ids": [item["id"] for item in neighbors],
-                        "neighbor_snippets": [
-                            {"id": item["id"], "snippet": dream_insight._snippet(item.get("text"), limit=120), "sim": item["sim"]}
-                            for item in neighbors
-                        ],
-                        "neighbor_count": neighbor_count,
-                        "score": 1.0 * (distinct_wings - 1) + 0.5 * min(neighbor_count, 3) + (sum(sims) / len(sims)),
-                    }
-                )
-            clusters.sort(key=lambda item: (-float(item["score"]), str(item["anchor_id"])))
-            return clusters[:10]
+    def test_top_n_tie_breaks_by_anchor_id(self):
+        drawers = [
+            {"id": "c", "text": "first pair c", "embedding": [0.0, 0.0, 1.0, 0.0], "wing": "W1"},
+            {"id": "d", "text": "first pair d", "embedding": [0.0, 0.0, 0.5, 0.8660254037844386], "wing": "W2"},
+            {"id": "b", "text": "second pair b", "embedding": [0.5, 0.8660254037844386, 0.0, 0.0], "wing": "W2"},
+            {"id": "a", "text": "second pair a", "embedding": [1.0, 0.0, 0.0, 0.0], "wing": "W1"},
+        ]
+        clusters = dream_insight.rank_survey_clusters(drawers, min_sim=0.49, max_sim=0.51, k=1, top_n=2)
+        self.assertEqual([cluster["anchor_id"] for cluster in clusters], ["a", "b"])
 
-        self.assertEqual(
-            dream_insight.rank_survey_clusters(drawers, min_sim=0.25, max_sim=0.85, k=5, top_n=10),
-            reference_ranker(),
-        )
+    def test_survey_insight_clusters_caps_unscoped_drawers_but_not_scoped(self):
+        drawers = [
+            {"id": "a", "text": "a", "embedding": [1.0, 0.0], "wing": "W1", "room": "r"},
+            {"id": "b", "text": "b", "embedding": [0.5, 0.5], "wing": "W2", "room": "r"},
+            {"id": "c", "text": "c", "embedding": [0.0, 1.0], "wing": "W3", "room": "r"},
+            {"id": "d", "text": "d", "embedding": [0.5, -0.5], "wing": "W4", "room": "r"},
+        ]
+        with mock.patch.object(dream_insight, "load_logical_drawers", return_value=drawers):
+            unscoped = dream_insight.survey_insight_clusters(
+                "palace", min_sim=0.0, max_sim=1.0, k=5, top_n=10, max_drawers=2
+            )
+            scoped = dream_insight.survey_insight_clusters(
+                "palace", wing="W1", min_sim=0.0, max_sim=1.0, k=5, top_n=10, max_drawers=2
+            )
+
+        self.assertEqual(unscoped["total_drawers"], 4)
+        self.assertEqual(unscoped["ranked_drawers"], 2)
+        self.assertTrue(unscoped["truncated"])
+        self.assertEqual(unscoped["max_drawers"], 2)
+        self.assertIn("truncated", unscoped["note"])
+        self.assertEqual({cluster["anchor_id"] for cluster in unscoped["clusters"]}, {"a", "b"})
+
+        self.assertEqual(scoped["total_drawers"], 4)
+        self.assertEqual(scoped["ranked_drawers"], 4)
+        self.assertFalse(scoped["truncated"])
+        self.assertEqual(scoped["max_drawers"], 2)
 
 
 class InsightFlowPersistenceTests(unittest.TestCase):
