@@ -38,8 +38,11 @@ from dream_lib import (
     apply_merge_decisions,
     apply_pattern_decisions,
     apply_prune_decisions,
+    apply_reflect_decisions,
     skip_markers_for_rejected_rules,
 )
+from dream_palace import load_logical_drawers, _palace_embed
+from dream_reflect import validate_reflect, is_novel
 
 
 def _resolve_decisions(worklist: dict[str, Any]) -> list[dict[str, Any]]:
@@ -205,6 +208,65 @@ def _resolve_derive_decisions(worklist: dict[str, Any]) -> list[dict[str, Any]]:
     return resolved
 
 
+def _resolve_reflect_decisions(worklist):
+    """Extract concrete reflect surface/skip decisions from an adjudicated worklist."""
+    resolved = []
+    scope = worklist.get("scope", {})
+    for item in worklist.get("items", []):
+        decision = item.get("decision")
+        if not decision or decision.get("action") != "surface":
+            resolved.append({"action": "skip"})
+            continue
+        conclusion = decision.get("conclusion") or {}
+        resolved.append({
+            "action": "surface",
+            "reflect_kind": decision.get("reflect_kind") or conclusion.get("kind"),
+            "text": conclusion.get("text", ""),
+            "conclusion": conclusion,
+            "premises": list(decision.get("premises") or []),
+            "member_ids": list(item.get("member_ids") or []),
+            "evidence": item.get("evidence"),
+            "wing": decision.get("wing") or scope.get("wing") or "copilot-mempalace",
+            "room": decision.get("room") or "reflections",
+            "tunnel": decision.get("tunnel"),
+        })
+    return resolved
+
+
+def _preflight_reflect_decisions(path, decisions):
+    """Validate reflect decisions: grounding + novelty. Fail-closed."""
+    drawers = load_logical_drawers(path)
+    full_by_id = {str(d["id"]): d.get("text", "") for d in drawers}
+    existing_vecs = [d.get("embedding") or [] for d in drawers]
+    kept, errors = [], []
+    for dec in decisions:
+        if dec.get("action") != "surface":
+            kept.append(dec)
+            continue
+        if dec.get("reflect_kind") == "converge":
+            support_ids = ((dec.get("evidence") or {}).get("support_ids")) or []
+            if len(set(support_ids)) < 2:
+                errors.append({"reason": "weak_recurrence", "support_ids": support_ids})
+                kept.append({"action": "skip"})
+                continue
+        else:
+            allowed = {str(mid) for mid in (dec.get("member_ids") or [])}
+            members_by_id = {mid: full_by_id[mid] for mid in allowed if mid in full_by_id}
+            candidate = {"conclusion": dec.get("conclusion"), "premises": dec.get("premises")}
+            v = validate_reflect(candidate, members_by_id)
+            if not v["ok"]:
+                errors.append({"reason": "invalid_reflect", "rejects": v["rejects"]})
+                kept.append({"action": "skip"})
+                continue
+        vec = _palace_embed(path, [dec.get("text", "")])[0]
+        if not is_novel(vec, existing_vecs):
+            errors.append({"reason": "not_novel", "text": dec.get("text")})
+            kept.append({"action": "skip"})
+            continue
+        kept.append(dec)
+    return kept, errors
+
+
 def _task_from_worklist(worklist: dict[str, Any]) -> str:
     """Derive the task key used for dispatch from the worklist.
 
@@ -256,6 +318,15 @@ class _DryRunWriter:
     def delete_drawer(self, drawer_id: str) -> Any:
         self.planned.append(f"DEL  {drawer_id}")
         return {"success": True}
+
+
+class _DryRunTunneler:
+    def __init__(self) -> None:
+        self.planned: list[str] = []
+    def create_tunnel(self, source_wing, source_room, target_wing, target_room, label):
+        self.planned.append(f"[dry-run] tunnel {source_wing}/{source_room} -> "
+                            f"{target_wing}/{target_room} ({label})")
+        return {"ok": True}
 
 
 class _DryRunKgWriter:
@@ -463,7 +534,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--palace", default=None, help="Path to the mempalace palace directory")
     ap.add_argument("--decisions", required=True, help="Path to the adjudicated decisions.json")
     ap.add_argument("--task", default=None,
-                    choices=["merge", "contradiction", "pattern", "prune", "derive"],
+                    choices=["merge", "contradiction", "pattern", "prune", "derive", "reflect"],
                     help="Override task (default: derived from worklist)")
     ap.add_argument("--archive-file", default=None,
                     help="Append-only archive JSONL path for merge/prune deletes (default: <palace>/dream-archive.jsonl)")
@@ -582,6 +653,25 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 1 if report["errors"] else 0
 
+        if task == "reflect":
+            decisions = _resolve_reflect_decisions(worklist)
+            decisions, errs = _preflight_reflect_decisions(path, decisions)
+            writer = _DryRunWriter()
+            tunneler = _DryRunTunneler()
+            report = _add_preflight_errors(
+                apply_reflect_decisions(decisions, writer, tunneler=tunneler), errs)
+            for line in writer.planned:
+                print(line)
+            for line in tunneler.planned:
+                print(line)
+            _print_errors(report)
+            print(
+                f"[dry-run] would surface {report['surfaced']}, skip {report['skipped']}, "
+                f"errors {len(report['errors'])}",
+                file=sys.stderr,
+            )
+            return 1 if report["errors"] else 0
+
         print(f"unknown dreaming task: {task}", file=sys.stderr)
         return 2
 
@@ -664,6 +754,18 @@ def main(argv: list[str] | None = None) -> int:
             if args.strict and residual:
                 return 1
         return 1 if report["errors"] else 0
+    elif task == "reflect":
+        decisions = _resolve_reflect_decisions(worklist)
+        decisions, errs = _preflight_reflect_decisions(path, decisions)
+        report = _add_preflight_errors(
+            apply_reflect_decisions(decisions, dream_palace.MempalaceWriter(),
+                                    tunneler=dream_palace.MempalaceTunneler()), errs)
+        _print_errors(report)
+        print(
+            f"adopted (reflect): surfaced {report['surfaced']}, skipped {report['skipped']}, "
+            f"errors {len(report['errors'])}",
+            file=sys.stderr,
+        )
     else:
         print(f"unknown dreaming task: {task}", file=sys.stderr)
         return 2

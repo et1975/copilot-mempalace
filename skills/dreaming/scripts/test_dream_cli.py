@@ -1586,5 +1586,140 @@ class TestHarvestReflectTask(unittest.TestCase):
             dream_reflect.gather_reflect_seeds = orig
 
 
+from dream_lib import apply_reflect_decisions
+
+
+class _FakeWriter:
+    def __init__(self):
+        self.calls = []
+        self.deleted = []
+    def add_drawer(self, wing, room, content, added_by="dreaming", metadata=None):
+        self.calls.append((wing, room, content, metadata))
+        return {"id": "drw"}
+    def delete_drawer(self, drawer_id):
+        self.deleted.append(drawer_id)
+
+
+class _FakeTunneler:
+    def __init__(self):
+        self.tunnels = []
+    def create_tunnel(self, source_wing, source_room, target_wing, target_room, label):
+        self.tunnels.append((source_wing, source_room, target_wing, target_room, label))
+        return {"ok": True}
+
+
+class _FailingTunneler:
+    def create_tunnel(self, *a, **k):
+        raise RuntimeError("tunnel down")
+
+
+class ApplyReflectDecisionsTests(unittest.TestCase):
+    def _dec(self, **o):
+        d = {"action": "surface", "reflect_kind": "generalize", "text": "alpha relies on gamma",
+             "conclusion": {"text": "alpha relies on gamma", "kind": "generalize",
+                            "decision_or_prediction": "track gamma"},
+             "premises": [{"drawer_id": "d1", "quote": "a"}, {"drawer_id": "d2", "quote": "b"}],
+             "wing": "copilot-mempalace", "room": "reflections"}
+        d.update(o)
+        return d
+
+    def test_surface_writes_drawer_with_reflect_metadata(self):
+        w = _FakeWriter()
+        report = apply_reflect_decisions([self._dec()], w)
+        self.assertEqual(report["surfaced"], 1)
+        self.assertEqual(report["errors"], [])
+        _, _, _, meta = w.calls[0]
+        self.assertEqual(meta["kind"], "reflect")
+        self.assertEqual(meta["reflect_kind"], "generalize")
+        self.assertEqual(meta["supported_by"], ["d1", "d2"])
+
+    def test_skip_writes_nothing(self):
+        w = _FakeWriter()
+        report = apply_reflect_decisions([{"action": "skip"}], w)
+        self.assertEqual(report["surfaced"], 0)
+        self.assertEqual(w.calls, [])
+
+    def test_connect_creates_room_tunnel(self):
+        w = _FakeWriter()
+        t = _FakeTunneler()
+        dec = self._dec(reflect_kind="connect",
+                        conclusion={"text": "link", "kind": "connect", "decision_or_prediction": "x"},
+                        tunnel={"source_wing": "wa", "source_room": "ra", "target_wing": "wb",
+                                "target_room": "rb", "label": "relates-to"})
+        report = apply_reflect_decisions([dec], w, tunneler=t)
+        self.assertEqual(t.tunnels, [("wa", "ra", "wb", "rb", "relates-to")])
+        self.assertEqual(report["surfaced"], 1)
+
+    def test_connect_tunnel_failure_rolls_back_drawer(self):
+        w = _FakeWriter()
+        dec = self._dec(reflect_kind="connect",
+                        conclusion={"text": "link", "kind": "connect", "decision_or_prediction": "x"},
+                        tunnel={"source_wing": "wa", "source_room": "ra", "target_wing": "wb",
+                                "target_room": "rb", "label": "relates-to"})
+        report = apply_reflect_decisions([dec], w, tunneler=_FailingTunneler())
+        self.assertEqual(report["surfaced"], 0)
+        self.assertEqual(w.deleted, ["drw"])
+        self.assertEqual(report["errors"][0]["reason"], "tunnel_failed")
+
+    def test_converge_supported_by_from_recurrence(self):
+        w = _FakeWriter()
+        dec = {"action": "surface", "reflect_kind": "converge", "text": "team converges on farmer",
+               "conclusion": {"text": "team converges on farmer", "kind": "converge",
+                              "decision_or_prediction": "standardize"},
+               "premises": [], "evidence": {"support_ids": ["s1", "s2"]},
+               "member_ids": ["session:s1", "session:s2"], "wing": "w", "room": "reflections"}
+        apply_reflect_decisions([dec], w)
+        self.assertEqual(w.calls[0][3]["supported_by"], ["s1", "s2"])
+
+
+class PreflightReflectTests(unittest.TestCase):
+    def _wl(self, quote):
+        return {"task": "reflect", "scope": {}, "items": [{
+            "kind": "reflect", "member_ids": ["d1", "d2"], "decision": {
+                "action": "surface", "reflect_kind": "generalize",
+                "conclusion": {"text": "alpha relies on gamma", "kind": "generalize",
+                               "decision_or_prediction": "track gamma"},
+                "premises": [{"drawer_id": "d1", "quote": quote},
+                             {"drawer_id": "d2", "quote": "gamma crypto"}],
+                "wing": "w", "room": "reflections"}}]}
+
+    def _patch_palace(self):
+        drawers = [{"id": "d1", "text": "alpha depends on beta", "embedding": [1.0, 0.0]},
+                   {"id": "d2", "text": "beta wraps gamma crypto", "embedding": [0.0, 1.0]}]
+        for target, repl in (("load_logical_drawers", lambda p, wing=None, room=None: drawers),
+                             ("_palace_embed", lambda p, texts: [[0.7, 0.7]])):
+            patcher = mock.patch.object(dream_adopt, target, repl)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_ungrounded_decision_becomes_error_and_skip(self):
+        self._patch_palace()
+        decisions = dream_adopt._resolve_reflect_decisions(self._wl("NOT IN DRAWER"))
+        kept, errors = dream_adopt._preflight_reflect_decisions("P", decisions)
+        self.assertTrue(errors)
+        self.assertTrue(all(d.get("action") == "skip" for d in kept))
+
+    def test_grounded_novel_decision_survives(self):
+        self._patch_palace()
+        decisions = dream_adopt._resolve_reflect_decisions(self._wl("depends on beta"))
+        kept, errors = dream_adopt._preflight_reflect_decisions("P", decisions)
+        self.assertEqual(errors, [])
+        self.assertEqual(kept[0]["action"], "surface")
+
+    def test_converge_grounded_by_recurrence_not_quotes(self):
+        self._patch_palace()
+        wl = {"task": "reflect", "scope": {}, "items": [{
+            "kind": "reflect", "member_ids": ["session:s1", "session:s2"],
+            "evidence": {"support": 2, "support_ids": ["s1", "s2"]},
+            "decision": {"action": "surface", "reflect_kind": "converge",
+                         "conclusion": {"text": "team converges on farmer deploys", "kind": "converge",
+                                        "decision_or_prediction": "standardize"},
+                         "premises": [], "wing": "w", "room": "reflections"}}]}
+        decisions = dream_adopt._resolve_reflect_decisions(wl)
+        kept, errors = dream_adopt._preflight_reflect_decisions("P", decisions)
+        self.assertEqual(errors, [])
+        self.assertEqual(kept[0]["action"], "surface")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1625,6 +1625,17 @@ class MempalaceWriter:
         return self._tools["mempalace_delete_drawer"]["handler"](drawer_id=drawer_id)
 
 
+class MempalaceTunneler:
+    """Creates room-to-room tunnels via the sanctioned MCP handler."""
+    def __init__(self) -> None:
+        from mempalace.mcp_server import TOOLS  # lazy
+        self._tools = TOOLS
+    def create_tunnel(self, source_wing, source_room, target_wing, target_room, label):
+        return self._tools["mempalace_create_tunnel"]["handler"](
+            source_wing=source_wing, source_room=source_room,
+            target_wing=target_wing, target_room=target_room, label=label)
+
+
 class Archiver:
     """Archive-before-delete guarantees reversibility.
 
