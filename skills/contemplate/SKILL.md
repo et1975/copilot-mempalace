@@ -5,10 +5,28 @@ description: Use when the user wants deliberate, on-demand deductive reasoning o
 
 # Contemplate
 
-On-demand reasoning for a mempalace palace. Where `dreaming` is unattended
-off-hours consolidation, `contemplate` is deliberate inline cognition: derive
-what follows from the active KG under explicitly-approved rules, then decide
-which entailed facts are worth materializing.
+On-demand **read-only** reasoning for a mempalace palace. Where `dreaming` is
+unattended off-hours consolidation, `contemplate` is deliberate inline
+cognition: derive what follows from the active KG under explicitly-approved
+rules, query for relevant past sessions, propose ontology rules, and report
+knowledge gaps — **without writing KG facts or materializing drawers**.
+
+**Scope:**
+
+- `--task derive` — bounded deductive closure over active KG facts under
+  explicitly enabled ontology rules (read-only reconnaissance; adjudication +
+  materialization use the 5-phase `dream_harvest.py` / `dream_adopt.py` flow).
+- `--recall` — relevance-ranked past-session reconnaissance for inline
+  grounding; retrieves top-k most relevant Copilot host sessions by embedding
+  cosine similarity (read-only, does not materialize anything).
+- `--task gaps` — standalone read-only gap reconnaissance; ranks missing KG
+  edges but does not retrieve sources or assert facts.
+- `--propose` / `--enable-rule` / `--disable-rule` — ontology proposal review
+  and deliberate rule toggling.
+
+**Constructive synthesis** (distill, generalize, name_gap, connect, tension,
+shared_constraint) is **not** part of contemplate. Use the dreaming skill's
+`reflect` task for on-demand meditation or scheduled generative consolidation.
 
 > **Run this when reasoning is the user's current task.**
 > Do not dispatch it as an off-hours dream: this skill is allowed to run inline
@@ -111,69 +129,13 @@ Each `gap` item carries a `hypothesis` (the missing edge), the `rule`, and
 asserts no facts. It just tells the agent *which* missing fact is worth
 investigating separately.
 
-## Insight synthesis driver (drawer-text-only)
-
-Use the insight modes when the task is to synthesize **one new insight** from
-existing drawer text. This workflow is agent-in-the-loop: the script gathers an
-anchor plus related-but-not-near-duplicate neighbors, the agent proposes a
-candidate JSON, the script validates it with fail-closed gates, then a blind
-critic verdict and explicit accept materialize it.
-
-Design principles:
-
-- **Drawer text only** — no KG/controller premises.
-- **Abstain over slop** — failed grounding, weak novelty, or missing decision /
-  prediction means `abstained`, not "best effort".
-- **Gates certify the insight, not presentation** — every premise quote must be
-  an exact substring of its cited drawer; at least two distinct drawers must be
-  indispensable; the candidate must name a changed decision or falsifiable
-  prediction; and `kind` must be `tension` or `shared_constraint`.
-
-Survey first to choose a promising anchor:
-
-```bash
-/home/eugene/.local/share/uv/tools/mempalace/bin/python skills/dreaming/scripts/dream_contemplate.py \
-  --palace <p> --insight-survey [--wing <w>] [--room <r>] [--k 5] [--top-n 10]
-```
-
-`--insight-survey` is read-only and ranks palace-wide candidate seed clusters of
-complementary drawers: related, but not near-duplicates. It prints each cluster's
-anchor, neighbors, and score so you can choose an `--anchor-drawer`.
-
-Then run the resumable synthesis loop:
-
-```bash
-/home/eugene/.local/share/uv/tools/mempalace/bin/python skills/dreaming/scripts/dream_contemplate.py \
-  --palace <p> --insight-start --anchor-drawer <drawer-id> [--wing <w>] [--room <r>] [--k 5] [--run-id <id>]
-# or seed by query instead of anchor; --insight-start requires exactly one:
-/home/eugene/.local/share/uv/tools/mempalace/bin/python skills/dreaming/scripts/dream_contemplate.py \
-  --palace <p> --insight-start --insight-query "<seed query>" [--wing <w>] [--room <r>] [--k 5] [--run-id <id>]
-
-# Agent writes the instructed candidate JSON to candidate.json, then:
-/home/eugene/.local/share/uv/tools/mempalace/bin/python skills/dreaming/scripts/dream_contemplate.py \
-  --palace <p> --insight-resume --run-id <id> --candidate-file candidate.json
-/home/eugene/.local/share/uv/tools/mempalace/bin/python skills/dreaming/scripts/dream_contemplate.py \
-  --palace <p> --insight-critique --run-id <id> --verdict supported
-/home/eugene/.local/share/uv/tools/mempalace/bin/python skills/dreaming/scripts/dream_contemplate.py \
-  --palace <p> --insight-accept --run-id <id> [--wing <w>] [--room <r>]
-```
-
-`--insight-start` gathers the anchor plus neighbor drawers in the complementary
-cosine band `[0.25, 0.85]`, pauses at `awaiting_synthesis`, and returns the
-anchor/neighbors plus a JSON schema instruction for the agent. `--insight-resume`
-moves to `awaiting_critic` only when validation and dedupe pass; otherwise it
-returns `abstained` with reject reasons. `--insight-critique --verdict supported`
-moves to `awaiting_approval` with a nearest-existing advisory; `insufficient` or
-`contradicted` abstains. `--insight-accept` materializes the approved result as a
-`kind=insight` drawer, defaulting to wing/room `copilot-mempalace`/`insights`.
-
 ## Focused inquiry (instruction-only deep-dive)
 
 When the user wants to **focus** contemplation on a topic/question and go
 **deeper than a single shallow search**, do not reach for a script — the depth
 comes from *you issuing better queries*, not from machinery. This is a
-cognition-only protocol: run it inline with `mempalace_search`, then reuse the
-`--insight-*` gates above to promote anything load-bearing.
+cognition-only protocol: run it inline with `mempalace_search`, then use the
+dreaming skill's `reflect` task to promote any load-bearing findings.
 
 A by-hand benchmark (structured inquiry vs a plain-search baseline) showed the
 value is created almost entirely by **agent-driven query expansion** —
@@ -202,12 +164,10 @@ Steps:
    set of hypotheses, not conclusions. If grounding is thin, **abstain** rather
    than pad it.
 6. **Promote the load-bearing findings.** For any finding that names a changed
-   decision or a falsifiable prediction and *requires ≥2 distinct drawers*, run
-   it through the `--insight-*` pipeline above (`--insight-start` seeded by that
-   finding, then `--insight-resume`/`--insight-critique`/`--insight-accept`) so
-   the existing anti-slop gates certify it before it becomes a `kind=insight`
-   drawer. Findings that are mere connections or open questions stay in the
-   brief; they are not insights.
+   decision or a falsifiable prediction and *requires ≥2 distinct drawers*,
+   materialize it via the dreaming skill's `reflect` task (invoke that skill
+   and follow its `--task reflect` flow: harvest → adjudicate → adopt). Only
+   gate-passing insights get written to the palace.
 
 The brief itself is a **session artifact** — keep it in context or the session
 workspace; do not materialize it as a drawer. Only gate-passing insights get
@@ -349,10 +309,12 @@ rules are never auto-enabled.
 
 ## Scope limits
 
-`contemplate` has four retained KG/reconnaissance surfaces:
+`contemplate` is **strictly read-only**. It has four retained KG/reconnaissance
+surfaces:
 
 - `--task derive` — bounded deductive closure over active KG facts under
-  explicitly enabled ontology rules.
+  explicitly enabled ontology rules (read-only reconnaissance; adjudication +
+  materialization use the 5-phase `dream_harvest.py` / `dream_adopt.py` flow).
 - `--task gaps` — standalone read-only gap reconnaissance; it ranks missing KG
   edges but does not retrieve sources or assert facts.
 - `--recall` — relevance-ranked past-session reconnaissance for inline
@@ -360,8 +322,10 @@ rules are never auto-enabled.
 - `--propose` / `--enable-rule` / `--disable-rule` — ontology proposal review
   and deliberate rule toggling.
 
-Insight synthesis is separate from KG derivation: it creates drawer-text-grounded
-`kind=insight` drawers only after validation, critique, and explicit acceptance.
+**Constructive synthesis** (distill, generalize, name_gap, connect, tension,
+shared_constraint, converge) is **not** part of contemplate. Use the dreaming
+skill's `reflect` task for on-demand meditation or scheduled generative
+consolidation.
 
 See [`references/derive.md`](references/derive.md) for the contract, schemas,
 and guardrails.

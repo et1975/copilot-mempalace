@@ -318,5 +318,18 @@ class TestCliSmoke(unittest.TestCase):
         self.assertEqual(json.loads(stdout.getvalue())["derive_candidate_count"], 0)
 
 
+class TestContemplateReadOnly(unittest.TestCase):
+    def test_insight_flags_removed(self):
+        """Verify contemplate is now read-only: insight-synthesis flags are rejected."""
+        with _test_tmpdir() as td:
+            palace = TestCliSmoke._palace_with_kg(TestCliSmoke(), td)
+            with contextlib.redirect_stderr(io.StringIO()) as stderr:
+                try:
+                    rc = dc.main(["--palace", palace, "--insight-start"])
+                except SystemExit as e:
+                    rc = e.code
+            self.assertEqual(rc, 2)
+
+
 if __name__ == "__main__":
     unittest.main()
