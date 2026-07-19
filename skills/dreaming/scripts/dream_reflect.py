@@ -8,8 +8,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from dream_insight import validate_insight
+from dream_insight import validate_insight, rank_survey_clusters
 from dream_lib import cosine_similarity
+from dream_palace import load_logical_drawers
 
 REFLECT_KINDS = {"distill", "generalize", "name_gap", "connect",
                  "converge", "tension", "shared_constraint"}
@@ -63,3 +64,30 @@ def admit_structural(candidates, *, min_coverage: int = 2, top_k: int = 10) -> l
     kept = [c for c in (candidates or []) if int(c.get("coverage", 0)) >= int(min_coverage)]
     kept.sort(key=lambda c: (-float(c.get("score", 0.0)), str(c.get("id", ""))))
     return kept[: max(0, int(top_k))]
+
+
+def gather_reflect_seeds(palace_path, *, wing=None, room=None, k=5, top_n=10) -> list[dict]:
+    """Return ranked >=2-drawer seed clusters (anchor + neighbors) for the
+    cluster reflect kinds, reusing the insight survey ranker. Each seed carries
+    full member text so the agent can quote-ground during adjudication."""
+    drawers = load_logical_drawers(palace_path, wing=wing, room=room)
+    by_id = {str(d.get("id")): d for d in drawers}
+    clusters = rank_survey_clusters(drawers, k=k, top_n=top_n)
+    seeds = []
+    for cluster in clusters:
+        member_ids = [cluster["anchor_id"]] + list(cluster.get("neighbor_ids") or [])
+        if len(member_ids) < 2:
+            continue
+        members = [{"id": str(mid), "text": (by_id.get(str(mid)) or {}).get("text", "")}
+                   for mid in member_ids]
+        seeds.append({
+            "anchor_id": cluster["anchor_id"],
+            "member_ids": member_ids,
+            "members": members,
+            "snippets": [{"id": cluster["anchor_id"], "snippet": cluster.get("anchor_snippet")}]
+                        + list(cluster.get("neighbor_snippets") or []),
+            "wings": cluster.get("wings"),
+            "coverage": len(member_ids),
+            "score": float(cluster.get("score", 0.0)),
+        })
+    return seeds

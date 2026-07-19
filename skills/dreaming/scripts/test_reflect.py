@@ -1,4 +1,5 @@
 import unittest
+import dream_reflect
 from dream_reflect import (
     REFLECT_KINDS, validate_reflect, nearest_drawer_distance, is_novel,
     admit_structural,
@@ -79,6 +80,33 @@ class AdmitStructuralTests(unittest.TestCase):
         cands = [{"id": "a", "coverage": 2, "score": 0.2},
                  {"id": "b", "coverage": 2, "score": 0.8}]
         self.assertEqual([c["id"] for c in admit_structural(cands, top_k=5)], ["b", "a"])
+
+class GatherReflectSeedsTests(unittest.TestCase):
+    def test_builds_cluster_seeds_with_full_member_text(self):
+        fake_drawers = [
+            {"id": "d1", "text": "alpha depends on beta", "embedding": [1.0, 0.0, 0.0],
+             "wing": "w", "room": "r"},
+            {"id": "d2", "text": "beta wraps gamma", "embedding": [0.6, 0.4, 0.0],
+             "wing": "w", "room": "r"},
+            {"id": "d3", "text": "unrelated note", "embedding": [0.0, 0.0, 1.0],
+             "wing": "w", "room": "r"},
+        ]
+        orig = dream_reflect.load_logical_drawers
+        dream_reflect.load_logical_drawers = lambda p, wing=None, room=None: fake_drawers
+        try:
+            seeds = dream_reflect.gather_reflect_seeds("P", k=5, top_n=10)
+        finally:
+            dream_reflect.load_logical_drawers = orig
+        self.assertTrue(seeds)
+        seed = seeds[0]
+        self.assertIn("anchor_id", seed)
+        self.assertGreaterEqual(len(seed["member_ids"]), 2)          # anchor + >=1 neighbor
+        self.assertIn(seed["anchor_id"], seed["member_ids"])
+        # members must carry FULL drawer text (not just truncated snippets) so the
+        # adjudicating agent can produce exact-substring quotes:
+        self.assertEqual(len(seed["members"]), len(seed["member_ids"]))
+        self.assertTrue(all(isinstance(m["text"], str) and m["text"] for m in seed["members"]))
+        self.assertGreaterEqual(seed["coverage"], 2)
 
 if __name__ == "__main__":
     unittest.main()
