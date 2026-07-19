@@ -53,6 +53,18 @@ class NoveltyTests(unittest.TestCase):
     def test_orthogonal_is_novel(self):
         self.assertTrue(is_novel([1.0, 0.0], [[0.0, 1.0]], margin=0.15))
 
+    def test_empty_cand_vec_is_not_novel(self):
+        self.assertFalse(is_novel([], [[1.0, 0.0]], margin=0.15))
+        self.assertFalse(is_novel(None, [[1.0, 0.0]], margin=0.15))
+
+    def test_empty_cand_vec_distance_is_zero(self):
+        self.assertEqual(nearest_drawer_distance([], [[1.0, 0.0]]), 0.0)
+
+    def test_mismatched_dim_existing_vectors_are_skipped(self):
+        # cand is 1-D, only existing vec is 2-D -> no comparable vector -> distance 1.0
+        self.assertEqual(nearest_drawer_distance([1.0], [[1.0, 0.0]]), 1.0)
+        self.assertTrue(is_novel([1.0], [[1.0, 0.0]], margin=0.15))
+
 class AdmitStructuralTests(unittest.TestCase):
     def test_filters_low_coverage_and_caps(self):
         cands = [

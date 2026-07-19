@@ -33,18 +33,27 @@ def validate_reflect(candidate: Any, members_by_id: Any) -> dict:
 
 def nearest_drawer_distance(cand_vec, existing_vecs) -> float:
     """Minimum cosine DISTANCE (1 - cosine) from cand_vec to any existing vector.
-    Returns 1.0 when there are no existing vectors."""
+    Returns 1.0 when there are no comparable existing vectors; returns 0.0 for an
+    un-embeddable (falsy) cand_vec (fail-closed: treated as NOT novel)."""
+    if not cand_vec:
+        return 0.0
     best = 1.0
     for vec in existing_vecs or []:
         if not vec:
             continue
-        dist = 1.0 - cosine_similarity(cand_vec, vec)
+        try:
+            sim = cosine_similarity(cand_vec, vec)
+        except ValueError:
+            continue  # skip existing vectors of a different embedding dimension
+        dist = 1.0 - sim
         if dist < best:
             best = dist
     return best
 
 
 def is_novel(cand_vec, existing_vecs, *, margin: float = 0.15) -> bool:
+    if not cand_vec:
+        return False  # fail-closed: a candidate we cannot embed is NOT admitted
     return nearest_drawer_distance(cand_vec, existing_vecs) >= float(margin)
 
 
