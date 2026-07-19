@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import Any
 
 from dream_insight import validate_insight, rank_survey_clusters
-from dream_lib import cosine_similarity
+from dream_lib import cosine_similarity, group_observation_themes
 from dream_palace import load_logical_drawers
 
 REFLECT_KINDS = {"distill", "generalize", "name_gap", "connect",
@@ -89,5 +89,28 @@ def gather_reflect_seeds(palace_path, *, wing=None, room=None, k=5, top_n=10) ->
             "wings": cluster.get("wings"),
             "coverage": len(member_ids),
             "score": float(cluster.get("score", 0.0)),
+        })
+    return seeds
+
+
+def converge_seeds_from_recurrence(entries, *, tau, min_support) -> list[dict]:
+    themes = group_observation_themes(entries, tau, min_support, support_key="session_id")
+    seeds = []
+    for theme in themes:
+        members = theme.get("members", [])
+        member_ids = [m["id"] for m in members]
+        support = int(theme.get("support", 0))
+        seeds.append({
+            "anchor_id": member_ids[0] if member_ids else None,
+            "member_ids": member_ids,
+            "members": [{"id": m["id"], "text": m.get("text", ""),
+                         "session_id": m.get("session_id"), "date": m.get("date"),
+                         "topic": m.get("topic")} for m in members],
+            "reflect_kind": "converge",
+            "evidence": {"support": support,
+                         "support_ids": theme.get("support_ids", []),
+                         "pair_sims": theme.get("pair_sims", [])},
+            "coverage": max(support, len(set(member_ids))),
+            "score": float(support),
         })
     return seeds

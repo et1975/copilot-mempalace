@@ -110,7 +110,7 @@ def main(argv: list[str] | None = None) -> int:
                         "Comma-separated rooms for pattern observation harvest (default diary). "
                         "Put surfaced lessons in a non-mined room so future pattern harvests ignore them."
                     ))
-    ap.add_argument("--source", choices=["diary", "sessions", "both"], default="diary",
+    ap.add_argument("--source", choices=["diary", "sessions", "both"], default=None,
                     help=(
                         "Observation source for the pattern task: diary rooms (default), raw Copilot "
                         "host sessions, or both unioned. 'sessions'/'both' mine raw session turns."
@@ -158,47 +158,6 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"harvested {len(triples)} active triples -> {len(worklist['items'])} "
             f"contradiction candidate group(s) -> {args.out}",
-            file=sys.stderr,
-        )
-        return 0
-
-    if args.task == "pattern":
-        tau = args.tau if args.tau is not None else 0.75
-        rooms = tuple(room.strip() for room in args.rooms.split(",") if room.strip())
-        entries = []
-        if args.source in ("diary", "both"):
-            entries.extend(
-                entry for entry in dream_palace.load_observation_entries(path, wing=args.wing, rooms=rooms)
-                if not _is_surfaced_lesson(entry)
-            )
-        if args.source in ("sessions", "both"):
-            entries.extend(
-                dream_palace.load_session_observation_entries(
-                    path,
-                    repository=args.repository,
-                    since=args.since,
-                    limit_sessions=args.limit_sessions,
-                )
-            )
-        min_support = args.min_support if args.min_support is not None else 3
-        themes = group_observation_themes(entries, tau=tau, min_support=min_support)
-        worklist = build_pattern_worklist(
-            themes,
-            scope={
-                "palace": path,
-                "wing": args.wing,
-                "rooms": list(rooms),
-                "source": args.source,
-                "task": "pattern",
-            },
-            params={"tau": tau, "min_support": min_support},
-            instructions=args.instructions,
-        )
-        with open(args.out, "w", encoding="utf-8") as fh:
-            json.dump(worklist, fh, indent=2, ensure_ascii=False)
-        print(
-            f"harvested {len(entries)} observation entries ({args.source}) -> {len(worklist['items'])} "
-            f"pattern theme(s) spanning >= {min_support} sessions -> {args.out}",
             file=sys.stderr,
         )
         return 0
@@ -332,11 +291,35 @@ def main(argv: list[str] | None = None) -> int:
         print(f"gaps: {len(gaps)} gap(s) ({onto_ver}) -> {args.out}", file=sys.stderr)
         return 0
 
+    if args.task == "pattern":            # legacy alias: pattern == reflect/converge
+        args.task = "reflect"
+        args.source = args.source or "diary"
+
     if args.task == "reflect":
         import dream_reflect
-        seeds = dream_reflect.gather_reflect_seeds(
-            path, wing=args.wing, room=args.room, k=args.min_support or 5,
-            top_n=args.max_candidates or 10)
+        if args.source:  # recurrence / converge path (also the pattern alias)
+            tau = args.tau if args.tau is not None else 0.75
+            rooms = tuple(room.strip() for room in args.rooms.split(",") if room.strip())
+            entries = []
+            if args.source in ("diary", "both"):
+                entries.extend(
+                    e for e in dream_palace.load_observation_entries(path, wing=args.wing, rooms=rooms)
+                    if not _is_surfaced_lesson(e)
+                )
+            if args.source in ("sessions", "both"):
+                entries.extend(
+                    dream_palace.load_session_observation_entries(
+                        path, repository=args.repository, since=args.since,
+                        limit_sessions=args.limit_sessions)
+                )
+            min_support = args.min_support if args.min_support is not None else 3
+            seeds = dream_reflect.converge_seeds_from_recurrence(entries, tau=tau, min_support=min_support)
+            params = {"tau": tau, "min_support": min_support, "top_k": args.max_candidates or 10, "min_coverage": 2}
+        else:            # cluster path
+            seeds = dream_reflect.gather_reflect_seeds(
+                path, wing=args.wing, room=args.room, k=args.min_support or 5,
+                top_n=args.max_candidates or 10)
+            params = {"top_k": args.max_candidates or 10, "min_coverage": 2}
         admitted = dream_reflect.admit_structural(
             seeds, min_coverage=2, top_k=args.max_candidates or 10)
         items = [{
@@ -347,8 +330,8 @@ def main(argv: list[str] | None = None) -> int:
             "decision": None,
         } for s in admitted]
         worklist = build_reflect_worklist(
-            items, scope={"wing": args.wing, "room": args.room},
-            params={"top_k": args.max_candidates or 10, "min_coverage": 2})
+            items, scope={"wing": args.wing, "room": args.room, "source": args.source},
+            params=params)
         with open(args.out, "w", encoding="utf-8") as fh:
             json.dump(worklist, fh, indent=2, ensure_ascii=False)
         return 0

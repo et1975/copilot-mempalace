@@ -108,5 +108,36 @@ class GatherReflectSeedsTests(unittest.TestCase):
         self.assertTrue(all(isinstance(m["text"], str) and m["text"] for m in seed["members"]))
         self.assertGreaterEqual(seed["coverage"], 2)
 
+class ConvergeSeedsFromRecurrenceTests(unittest.TestCase):
+    def test_converge_builds_seeds_with_support_and_reflect_kind(self):
+        entries = [
+            {
+                "id": "entry-1",
+                "text": "repeated observation across sessions",
+                "embedding": [1.0, 0.0],
+                "session_id": "session-a",
+                "date": "2026-07-01",
+                "topic": "test",
+            },
+            {
+                "id": "entry-2",
+                "text": "repeated observation across sessions again",
+                "embedding": [1.0, 0.0],
+                "session_id": "session-b",
+                "date": "2026-07-02",
+                "topic": "test",
+            },
+        ]
+        seeds = dream_reflect.converge_seeds_from_recurrence(entries, tau=0.9, min_support=2)
+        self.assertEqual(len(seeds), 1)
+        seed = seeds[0]
+        self.assertEqual(seed["reflect_kind"], "converge")
+        self.assertEqual(seed["evidence"]["support"], 2)
+        self.assertGreaterEqual(seed["coverage"], 2)
+        self.assertEqual(len(seed["members"]), 2)
+        self.assertTrue(all("text" in m and m["text"] for m in seed["members"]))
+        self.assertTrue(all("session_id" in m for m in seed["members"]))
+        self.assertEqual(seed["evidence"]["support_ids"], ["session-a", "session-b"])
+
 if __name__ == "__main__":
     unittest.main()

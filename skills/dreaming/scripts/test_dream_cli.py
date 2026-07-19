@@ -115,17 +115,17 @@ class TestHarvestPatternTask(unittest.TestCase):
             )
             with open(out, encoding="utf-8") as fh:
                 worklist = json.load(fh)
-            self.assertEqual(worklist["task"], "pattern")
+            # pattern is now aliased to reflect, produces reflect worklist
+            self.assertEqual(worklist["task"], "reflect")
             self.assertEqual(
                 worklist["scope"],
-                {"palace": "/bound", "wing": "wing_copilot-cli", "rooms": ["diary", "signals"], "source": "diary", "task": "pattern"},
+                {"wing": "wing_copilot-cli", "room": None, "source": "diary"},
             )
-            self.assertEqual(worklist["params"], {"tau": 0.8, "min_support": 2})
-            self.assertEqual(worklist["items"][0]["kind"], "pattern")
-            self.assertIn(
-                "harvested 2 observation entries (diary) -> 1 pattern theme(s) spanning >= 2 sessions",
-                stderr.getvalue(),
-            )
+            self.assertEqual(worklist["params"], {"tau": 0.8, "min_support": 2, "top_k": 500, "min_coverage": 2})
+            # items now use reflect envelope with reflect_kind=converge
+            self.assertEqual(worklist["items"][0]["kind"], "reflect")
+            self.assertEqual(worklist["items"][0]["reflect_kind"], "converge")
+            self.assertEqual(worklist["items"][0]["evidence"]["support"], 2)
 
     def test_pattern_task_excludes_already_surfaced_lessons(self):
         entries = [
@@ -172,8 +172,8 @@ class TestHarvestPatternTask(unittest.TestCase):
             self.assertEqual(rc, 0)
             with open(out, encoding="utf-8") as fh:
                 worklist = json.load(fh)
+            # surfaced lessons (s3, s4) excluded => only s1, s2 remain
             self.assertEqual(worklist["items"][0]["evidence"]["support_ids"], ["s1", "s2"])
-            self.assertIn("harvested 2 observation entries (diary) -> 1 pattern theme(s)", stderr.getvalue())
 
 
     def test_pattern_task_sessions_source_uses_host_sessions(self):
@@ -224,9 +224,10 @@ class TestHarvestPatternTask(unittest.TestCase):
             )
             worklist = _load_json(out)
             self.assertEqual(worklist["scope"]["source"], "sessions")
-            self.assertEqual(worklist["items"][0]["kind"], "pattern")
+            # now produces reflect items with converge kind
+            self.assertEqual(worklist["items"][0]["kind"], "reflect")
+            self.assertEqual(worklist["items"][0]["reflect_kind"], "converge")
             self.assertEqual(worklist["items"][0]["evidence"]["support_ids"], ["s1", "s2"])
-            self.assertIn("harvested 2 observation entries (sessions)", stderr.getvalue())
 
     def test_pattern_task_both_source_unions_diary_and_sessions(self):
         diary_entries = [
@@ -269,7 +270,6 @@ class TestHarvestPatternTask(unittest.TestCase):
             self.assertEqual(worklist["scope"]["source"], "both")
             # theme spans one diary session (d1) and one host session (s2) => support 2
             self.assertEqual(worklist["items"][0]["evidence"]["support_ids"], ["d1", "s2"])
-            self.assertIn("harvested 2 observation entries (both)", stderr.getvalue())
 
 
 class TestHarvestPruneTask(unittest.TestCase):
