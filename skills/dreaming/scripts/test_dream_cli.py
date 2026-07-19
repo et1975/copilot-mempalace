@@ -1564,5 +1564,27 @@ class B11RewireCliTests(unittest.TestCase):
             self.assertIn("transitive:depends_on", {rule["id"] for rule in rules})
 
 
+class TestHarvestReflectTask(unittest.TestCase):
+    def test_reflect_task_writes_reflect_worklist(self):
+        import dream_reflect
+        seeds = [{"anchor_id": "d1", "member_ids": ["d1", "d2"], "members": [], "snippets": [],
+                  "coverage": 2, "score": 0.9},
+                 {"anchor_id": "d3", "member_ids": ["d3"], "members": [], "snippets": [],
+                  "coverage": 1, "score": 0.99}]  # dropped: coverage<2
+        orig = dream_reflect.gather_reflect_seeds
+        dream_reflect.gather_reflect_seeds = lambda p, **kw: seeds
+        try:
+            with _test_tmpdir() as td:
+                out = os.path.join(td, "wl.json")
+                rc = dream_harvest.main(["--palace", td, "--task", "reflect",
+                                         "--max-candidates", "10", "--out", out])
+                self.assertEqual(rc, 0)
+                wl = json.load(open(out))
+                self.assertEqual(wl["task"], "reflect")
+                self.assertEqual([i["seed_id"] for i in wl["items"]], ["d1"])  # coverage gate
+        finally:
+            dream_reflect.gather_reflect_seeds = orig
+
+
 if __name__ == "__main__":
     unittest.main()

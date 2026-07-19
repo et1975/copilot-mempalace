@@ -28,6 +28,7 @@ from dream_lib import (
     build_gap_worklist,
     build_pattern_worklist,
     build_prune_worklist,
+    build_reflect_worklist,
     build_worklist,
     compute_redundancy,
     deductive_closure,
@@ -91,7 +92,7 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--palace", help="Path to the mempalace palace directory (default: mempalace config)")
     ap.add_argument("--task", choices=[
-        "merge", "contradiction", "pattern", "prune", "derive", "gaps", "suggest-rules", "induce-rules"
+        "merge", "contradiction", "pattern", "prune", "derive", "gaps", "suggest-rules", "induce-rules", "reflect"
     ], default="merge",
                     help="Dreaming task to harvest (default merge)")
     ap.add_argument("--wing", help="Scope merge harvest to this wing (ignored for contradiction)")
@@ -329,6 +330,27 @@ def main(argv: list[str] | None = None) -> int:
         with open(args.out, "w", encoding="utf-8") as fh:
             json.dump(worklist, fh, indent=2, ensure_ascii=False)
         print(f"gaps: {len(gaps)} gap(s) ({onto_ver}) -> {args.out}", file=sys.stderr)
+        return 0
+
+    if args.task == "reflect":
+        import dream_reflect
+        seeds = dream_reflect.gather_reflect_seeds(
+            path, wing=args.wing, room=args.room, k=args.min_support or 5,
+            top_n=args.max_candidates or 10)
+        admitted = dream_reflect.admit_structural(
+            seeds, min_coverage=2, top_k=args.max_candidates or 10)
+        items = [{
+            "kind": "reflect", "seed_id": s["anchor_id"], "member_ids": s["member_ids"],
+            "members": s.get("members"), "snippets": s.get("snippets"),
+            "coverage": s["coverage"], "score": s["score"],
+            "evidence": s.get("evidence"), "reflect_kind": s.get("reflect_kind"),
+            "decision": None,
+        } for s in admitted]
+        worklist = build_reflect_worklist(
+            items, scope={"wing": args.wing, "room": args.room},
+            params={"top_k": args.max_candidates or 10, "min_coverage": 2})
+        with open(args.out, "w", encoding="utf-8") as fh:
+            json.dump(worklist, fh, indent=2)
         return 0
 
     tau = args.tau if args.tau is not None else 0.9

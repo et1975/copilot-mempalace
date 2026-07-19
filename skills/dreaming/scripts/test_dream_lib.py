@@ -1661,3 +1661,14 @@ class FindTransitiveGapsTests(unittest.TestCase):
         gaps = dream_lib.find_transitive_gaps(triples, TRANS_RULES, max_candidates=5)
         self.assertLessEqual(len(gaps), 5)
         self.assertTrue(all(g.get("truncated") for g in gaps))
+
+
+class TestBuildReflectWorklist(unittest.TestCase):
+    def test_envelope_and_items(self):
+        items = [{"kind": "reflect", "seed_id": "d1", "member_ids": ["d1", "d2"],
+                  "coverage": 2, "score": 0.8, "decision": None}]
+        wl = dl.build_reflect_worklist(items, scope={"wing": None}, params={"top_k": 10})
+        self.assertEqual(wl["task"], "reflect")
+        self.assertEqual(wl["items"], items)
+        for key in ("version", "scope", "params", "instructions", "items"):
+            self.assertIn(key, wl)
