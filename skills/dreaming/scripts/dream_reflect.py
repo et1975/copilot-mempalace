@@ -14,8 +14,6 @@ from dream_palace import load_logical_drawers
 
 REFLECT_KINDS = {"distill", "generalize", "name_gap", "connect",
                  "converge", "tension", "shared_constraint"}
-CLUSTER_KINDS = {"distill", "generalize", "connect", "tension", "shared_constraint"}
-RECURRENCE_KINDS = {"converge"}
 
 
 def validate_reflect(candidate: Any, members_by_id: Any) -> dict:

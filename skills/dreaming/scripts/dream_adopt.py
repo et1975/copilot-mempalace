@@ -258,6 +258,13 @@ def _preflight_reflect_decisions(path, decisions):
                 errors.append({"reason": "invalid_reflect", "rejects": v["rejects"]})
                 kept.append({"action": "skip"})
                 continue
+            if dec.get("reflect_kind") == "connect":
+                tunnel = dec.get("tunnel") or {}
+                if not all(tunnel.get(k) for k in
+                           ("source_wing", "source_room", "target_wing", "target_room")):
+                    errors.append({"reason": "connect_missing_tunnel"})
+                    kept.append({"action": "skip"})
+                    continue
         vec = _palace_embed(path, [dec.get("text", "")])[0]
         if not is_novel(vec, existing_vecs):
             errors.append({"reason": "not_novel", "text": dec.get("text")})

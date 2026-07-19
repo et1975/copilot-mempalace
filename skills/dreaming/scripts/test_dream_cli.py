@@ -1720,6 +1720,21 @@ class PreflightReflectTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(kept[0]["action"], "surface")
 
+    def test_connect_without_tunnel_is_skipped(self):
+        self._patch_palace()
+        wl = {"task": "reflect", "scope": {}, "items": [{
+            "kind": "reflect", "member_ids": ["d1", "d2"],
+            "decision": {"action": "surface", "reflect_kind": "connect",
+                         "conclusion": {"text": "alpha relies on beta", "kind": "connect",
+                                        "decision_or_prediction": "link them"},
+                         "premises": [{"drawer_id": "d1", "quote": "depends on beta"},
+                                      {"drawer_id": "d2", "quote": "wraps gamma crypto"}],
+                         "wing": "w", "room": "reflections"}}]}  # no tunnel
+        decisions = dream_adopt._resolve_reflect_decisions(wl)
+        kept, errors = dream_adopt._preflight_reflect_decisions("P", decisions)
+        self.assertEqual(errors[0]["reason"], "connect_missing_tunnel")
+        self.assertEqual(kept[0]["action"], "skip")
+
 
 if __name__ == "__main__":
     unittest.main()
