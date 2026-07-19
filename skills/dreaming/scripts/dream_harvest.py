@@ -350,7 +350,7 @@ def main(argv: list[str] | None = None) -> int:
             items, scope={"wing": args.wing, "room": args.room},
             params={"top_k": args.max_candidates or 10, "min_coverage": 2})
         with open(args.out, "w", encoding="utf-8") as fh:
-            json.dump(worklist, fh, indent=2)
+            json.dump(worklist, fh, indent=2, ensure_ascii=False)
         return 0
 
     tau = args.tau if args.tau is not None else 0.9
