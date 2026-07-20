@@ -78,8 +78,8 @@ Artifacts go in the session workspace — never commit them.
 
 | # | Phase | Who | Command / action |
 |---|-------|-----|------------------|
-| 0 | Scope | you | pick task: merge (`--wing`, optional `--room`, `--tau`), contradiction (`--task contradiction`), pattern (`--task pattern`, `--wing`, `--rooms`, `--min-support`, `--source {diary,sessions,both}`), rule induction (`--task induce-rules`, `--min-support`, `--ontology-out`), or prune (`--task prune`, `--wing`, optional `--room`, `--v-min`, `--age-floor-days`) + optional `--instructions` |
-| 1 | Harvest | script | merge: `dream_harvest.py --palace <p> --wing <w> --tau 0.9 --out worklist.json`; contradiction: `dream_harvest.py --palace <p> --task contradiction --out worklist.json`; pattern: `dream_harvest.py --palace <p> --task pattern --wing <w> --rooms diary --min-support 3 --out worklist.json`; rule induction: `dream_harvest.py --palace <p> --task induce-rules --min-support 2 --ontology-out <p>/ontology.json`; prune: `dream_harvest.py --palace <p> --task prune --wing <w> --room <r> --v-min 0.35 --age-floor-days 30 --out worklist.json` (READ-ONLY except ontology candidate writes for `induce-rules`) |
+| 0 | Scope | you | pick task: merge (`--wing`, optional `--room`, `--tau`), contradiction (`--task contradiction`), pattern (`--task pattern`, `--wing`, `--rooms`, `--min-support`, `--source {diary,sessions,both}`), reflect (`--task reflect`, `--source {diary,sessions,both}`, `--wing`, `--rooms`, `--min-support`), rule induction (`--task induce-rules`, `--min-support`, `--ontology-out`), or prune (`--task prune`, `--wing`, optional `--room`, `--v-min`, `--age-floor-days`) + optional `--instructions` |
+| 1 | Harvest | script | merge: `dream_harvest.py --palace <p> --wing <w> --tau 0.9 --out worklist.json`; contradiction: `dream_harvest.py --palace <p> --task contradiction --out worklist.json`; pattern: `dream_harvest.py --palace <p> --task pattern --wing <w> --rooms diary --min-support 3 --out worklist.json`; reflect: `dream_harvest.py --palace <p> --task reflect --wing <w> --rooms diary --source diary --min-support 2 --out worklist.json`; rule induction: `dream_harvest.py --palace <p> --task induce-rules --min-support 2 --ontology-out <p>/ontology.json`; prune: `dream_harvest.py --palace <p> --task prune --wing <w> --room <r> --v-min 0.35 --age-floor-days 30 --out worklist.json` (READ-ONLY except ontology candidate writes for `induce-rules`) |
 | 2 | Adjudicate | **you** | fill each `worklist.json` item's `decision`; save as `decisions.json` |
 | 3 | Review | human/auto | diff proposed merge text vs the originals; approve a subset |
 | 4 | Adopt | script | `dream_adopt.py --palace <p> --decisions decisions.json [--verify]` (merge: add merged/delete originals; contradiction: soft-invalidate stale KG facts; pattern: add surfaced lessons only; prune: archive to JSONL then delete) |
@@ -290,12 +290,76 @@ Implemented tasks:
   Source is selectable with `--source {diary,sessions,both}` (default `diary`):
   `sessions`/`both` mine raw Copilot host-session turns, not just journaled diary
   entries.
+- `reflect`: the constructive/generative lobe of dreaming. Synthesizes new
+  drawer-level insights, generalizations, and connections from existing palace
+  content under structural admission and novelty gates. Kinds: `distill`,
+  `generalize`, `name_gap`, `connect`, `converge`, `tension`,
+  `shared_constraint`. See "Reflect step" below for detail.
 - `induce-rules`: pattern-family ontology induction over observed base KG
   triples. It writes disabled transitive/inverse/symmetric rule candidates to
   `--ontology-out` and never auto-enables them.
 - `prune` / `forget`: low-salience drawer candidates selected by a conservative
   multi-gate AND (`v < v_min`, age floor, `kg_degree == 0`, not pinned). Adoption
   archives to JSONL before deleting through the sanctioned handler.
+
+## Reflect step — constructive synthesis
+
+The `reflect` task is the **constructive/generative lobe** of dreaming. Where
+`merge` consolidates duplicates and `pattern` induces recurring lessons, reflect
+**synthesizes new drawer-level insights** — distillations, generalizations,
+named gaps, connections, tensions, and shared constraints — from existing palace
+content under structural admission and novelty gates.
+
+**Flow:**
+
+```bash
+MPY=$(head -1 "$(command -v mempalace)" | sed 's/^#!//')
+"$MPY" dream_harvest.py --palace <p> --task reflect --source diary \
+  --wing <w> --rooms diary --min-support 2 --out worklist.json
+# adjudicate worklist (fill `decision` per item)
+"$MPY" dream_adopt.py --palace <p> --decisions decisions.json --task reflect --verify
+```
+
+`--task pattern` still works as an alias for the `converge` kind specifically
+(recurrence-gated generalization). **Meditation** is invoking reflect on demand;
+there is no separate skill.
+
+**Kinds:**
+
+- `distill` — compress complementary premises into a single high-signal fact.
+- `generalize` — lift a specific observation to a broader rule with explicit scope.
+- `name_gap` — articulate a question or missing fact grounded by existing context.
+- `connect` — bridge two drawers with an explicit relationship claim.
+- `converge` — induce a general lesson from recurrence across `>=min_support`
+  distinct sessions (the former `pattern` task).
+- `tension` — surface a contradiction or tradeoff between premises.
+- `shared_constraint` — identify a common constraint or limiting factor across premises.
+
+**Grounding discipline (kind-specific):**
+
+- All kinds **except** `converge`: each candidate must have >=2 member drawers
+  with exact-substring quote premises (`evidence.premises[].quote` is a literal
+  substring of `evidence.premises[].drawer_id`'s text). No quotes ⇒ reject.
+- `converge` only: grounding is **recurrence** over >=2 distinct
+  `session_id`s counted from `evidence.support_ids`. No support ⇒ reject.
+
+**Admission gates:**
+
+1. **Structural**: coverage (at least 2 premises, kind-appropriate grounding) +
+   top-K cap per seed cluster.
+2. **Novelty**: cosine distance to nearest existing drawer ≥ threshold (default
+   0.15). Merge handles near-duplicates; reflect must add something net-new.
+3. **Review-before-adopt**: every reflect candidate is adjudicated by the agent
+   before materialization (same as pattern/merge). No auto-adopt.
+
+**Read-only and KG-free:**
+
+- Reflect is **generative** (adds new drawers) but does **not** fetch external
+  sources, query APIs, or write KG facts. It works purely from existing palace
+  drawers and session-store observations.
+- `--verify` does **not** apply to reflect the way it does to merge/pattern. The
+  novelty gate and review-before-adopt are the anti-resurfacing mechanisms; a
+  re-harvest naturally produces different clusters and is not a fixpoint test.
 
 Future `kind`s are reserved — see [`references/pipeline.md`](references/pipeline.md)
 for the full contract, formal task formulations, and the mempalace API facts the

@@ -12,9 +12,7 @@ import argparse
 import json
 import os
 import sys
-import uuid
 
-import dream_insight
 import dream_ontology
 import dream_palace
 from dream_lib import (
@@ -566,145 +564,6 @@ def run_recall(
     return build_recall_report(query, k, path, hits)
 
 
-def run_insight_start(
-    palace: str,
-    *,
-    anchor_drawer_id: str | None,
-    seed_query: str | None,
-    wing: str | None,
-    room: str | None,
-    k: int,
-    run_id: str | None,
-    now=None,
-) -> dict:
-    path = dream_palace.bind_palace(palace)
-    return dream_insight.insight_start(
-        path,
-        anchor_drawer_id=anchor_drawer_id,
-        seed_query=seed_query,
-        wing=wing,
-        room=room,
-        k=k,
-        run_id=run_id or str(uuid.uuid4()),
-        now=now,
-    )
-
-
-def run_insight_survey(
-    palace: str,
-    *,
-    wing: str | None,
-    room: str | None,
-    k: int,
-    top_n: int,
-) -> dict:
-    path = dream_palace.bind_palace(palace)
-    return dream_insight.survey_insight_clusters(path, wing=wing, room=room, k=k, top_n=top_n)
-
-
-def run_insight_resume(
-    palace: str,
-    *,
-    run_id: str,
-    candidate_file: str,
-    now=None,
-) -> dict:
-    path = dream_palace.bind_palace(palace)
-    with open(candidate_file, encoding="utf-8") as fh:
-        candidate = json.load(fh)
-    if not isinstance(candidate, dict):
-        raise ValueError("--candidate-file must contain a JSON object")
-    return dream_insight.insight_resume(path, run_id, candidate=candidate, now=now)
-
-
-def run_insight_critique(
-    palace: str,
-    *,
-    run_id: str,
-    verdict: str,
-    now=None,
-) -> dict:
-    path = dream_palace.bind_palace(palace)
-    return dream_insight.insight_critique(path, run_id, verdict=verdict, now=now)
-
-
-def run_insight_accept(
-    palace: str,
-    *,
-    run_id: str,
-    wing: str | None,
-    room: str | None,
-    now=None,
-) -> dict:
-    path = dream_palace.bind_palace(palace)
-    return dream_insight.insight_accept(
-        path,
-        run_id,
-        wing=wing or "copilot-mempalace",
-        room=room or "insights",
-        now=now,
-    )
-
-
-def summarize_insight_result(result: dict) -> str:
-    lines = [
-        f"status: {result.get('status')}",
-        f"run_id: {result.get('run_id')}",
-    ]
-    if result.get("reason"):
-        lines.append(f"reason: {result.get('reason')}")
-    if result.get("rejects"):
-        lines.append("rejects: " + ", ".join(result.get("rejects") or []))
-    if result.get("anchor"):
-        lines.append(f"anchor: {result['anchor'].get('id')}")
-    neighbors = result.get("neighbors") or []
-    if neighbors:
-        lines.append(f"neighbors: {len(neighbors)}")
-    if result.get("candidate"):
-        conclusion = (result["candidate"].get("conclusion") or {}).get("text")
-        if conclusion:
-            lines.append(f"candidate: {_recall_snippet(conclusion, limit=160)}")
-    nearest = result.get("nearest_existing")
-    if nearest:
-        try:
-            sim = f"{float(nearest.get('sim')):.4f}"
-        except (TypeError, ValueError):
-            sim = "nan"
-        lines.append(f"nearest_existing: {sim} {nearest.get('id')}")
-    if result.get("insight_drawer_id"):
-        lines.append(f"insight_drawer_id: {result.get('insight_drawer_id')}")
-    if result.get("instruction"):
-        lines.append(f"instruction: {result.get('instruction')}")
-    if result.get("critic_instruction"):
-        lines.append(f"critic_instruction: {result.get('critic_instruction')}")
-    return "\n".join(lines)
-
-
-def summarize_insight_survey(report: dict) -> str:
-    clusters = report.get("clusters") or []
-    lines = [
-        f"insight survey: total drawers {report.get('total_drawers')}; clusters found {len(clusters)}"
-    ]
-    if not clusters:
-        lines.append("no candidate insight clusters found")
-        return "\n".join(lines)
-    palace = report.get("palace")
-    for index, cluster in enumerate(clusters, start=1):
-        wings = cluster.get("wings") or []
-        wing_text = ", ".join(str(wing) for wing in wings) if wings else "(none)"
-        cross = " (cross-wing)" if cluster.get("cross_wing") else ""
-        anchor_id = cluster.get("anchor_id")
-        lines.extend(
-            [
-                f"{index}. {cluster.get('anchor_snippet')}",
-                f"   spans wings: {wing_text}{cross}",
-                f"   neighbors: {cluster.get('neighbor_count')}",
-                f"   to pursue: contemplate --palace {palace} --insight-start --anchor-drawer {anchor_id}",
-            ]
-        )
-    return "\n".join(lines)
-
-
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--palace", help="Path to the mempalace palace directory (default: mempalace config)")
@@ -721,24 +580,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument("--format", choices=["summary", "json"], default="summary", help="Output format (default summary)")
     ap.add_argument("--recall", default=None, help="Reasoning query for relevance-ranked past session recall")
-    ap.add_argument("--k", type=int, default=5, help="Maximum relevant sessions/neighbors to return (default 5)")
-    ap.add_argument("--top-n", type=int, default=10, help="Maximum --insight-survey clusters to return (default 10)")
+    ap.add_argument("--k", type=int, default=5, help="Maximum relevant sessions to return (default 5)")
     ap.add_argument("--repository", default=None, help="Repository filter passed through to --recall retrieval")
     ap.add_argument("--since", default=None, help="Lower date/time bound passed through to --recall retrieval")
     ap.add_argument("--limit-sessions", type=int, default=None, help="Maximum sessions to inspect for --recall")
     ap.add_argument("--min-similarity", type=float, default=0.0, help="Minimum similarity for --recall (default 0.0)")
-    ap.add_argument("--insight-start", action="store_true", help="Start drawer-only insight synthesis")
-    ap.add_argument("--insight-survey", action="store_true", help="Read-only survey of candidate insight seed clusters")
-    ap.add_argument("--insight-resume", action="store_true", help="Resume insight synthesis with --candidate-file")
-    ap.add_argument("--insight-critique", action="store_true", help="Resume insight synthesis with --verdict")
-    ap.add_argument("--insight-accept", action="store_true", help="Accept and materialize a supported insight drawer")
-    ap.add_argument("--anchor-drawer", default=None, help="Anchor drawer id for --insight-start")
-    ap.add_argument("--insight-query", default=None, help="Seed query for --insight-start")
-    ap.add_argument("--candidate-file", default=None, help="JSON Candidate object for --insight-resume")
-    ap.add_argument("--verdict", choices=["supported", "insufficient", "contradicted"], default=None, help="Critic verdict for --insight-critique")
-    ap.add_argument("--wing", default=None, help="Wing scope for insight modes or target wing for --insight-accept")
-    ap.add_argument("--room", default=None, help="Room scope for insight modes or target room for --insight-accept")
-    ap.add_argument("--run-id", default=None, help="Controlled run id for resumable insight modes (default: generated UUID)")
     ap.add_argument("--skips", default=None, help="Path to skip-markers file (default: <palace>/dream-derive-skips.jsonl)")
     ap.add_argument("--max-depth", type=int, default=3, help="Maximum derivation depth (default 3)")
     ap.add_argument("--max-iterations", type=int, default=10, help="Maximum closure iterations (default 10)")
@@ -765,96 +611,6 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(report, indent=2, ensure_ascii=False))
         else:
             print(summarize_recall_report(report))
-        return 0
-
-    contemplate_modes = [
-        args.insight_start,
-        args.insight_survey,
-        args.insight_resume,
-        args.insight_critique,
-        args.insight_accept,
-    ]
-    if sum(1 for enabled in contemplate_modes if enabled) > 1:
-        print("error: choose only one contemplate mode", file=sys.stderr)
-        return 2
-
-    if args.insight_start:
-        if bool(args.anchor_drawer) == bool(args.insight_query):
-            print("error: --insight-start requires exactly one of --anchor-drawer or --insight-query", file=sys.stderr)
-            return 2
-        report = run_insight_start(
-            effective_palace,
-            anchor_drawer_id=args.anchor_drawer,
-            seed_query=args.insight_query,
-            wing=args.wing,
-            room=args.room,
-            k=args.k,
-            run_id=args.run_id,
-        )
-        if args.format == "json":
-            print(json.dumps(report, indent=2, ensure_ascii=False))
-        else:
-            print(summarize_insight_result(report))
-        return 0
-
-    if args.insight_survey:
-        report = run_insight_survey(
-            effective_palace,
-            wing=args.wing,
-            room=args.room,
-            k=args.k,
-            top_n=args.top_n,
-        )
-        if args.format == "json":
-            print(json.dumps(report, indent=2, ensure_ascii=False))
-        else:
-            print(summarize_insight_survey(report))
-        return 0
-
-    if args.insight_resume:
-        missing = [
-            name
-            for name, value in (
-                ("--run-id", args.run_id),
-                ("--candidate-file", args.candidate_file),
-            )
-            if not value
-        ]
-        if missing:
-            print(f"error: --insight-resume requires {', '.join(missing)}", file=sys.stderr)
-            return 2
-        report = run_insight_resume(effective_palace, run_id=args.run_id, candidate_file=args.candidate_file)
-        if args.format == "json":
-            print(json.dumps(report, indent=2, ensure_ascii=False))
-        else:
-            print(summarize_insight_result(report))
-        return 0
-
-    if args.insight_critique:
-        missing = [
-            name
-            for name, value in (("--run-id", args.run_id), ("--verdict", args.verdict))
-            if not value
-        ]
-        if missing:
-            print(f"error: --insight-critique requires {', '.join(missing)}", file=sys.stderr)
-            return 2
-        report = run_insight_critique(effective_palace, run_id=args.run_id, verdict=args.verdict)
-        if args.format == "json":
-            print(json.dumps(report, indent=2, ensure_ascii=False))
-        else:
-            print(summarize_insight_result(report))
-        return 0
-
-    if args.insight_accept:
-        if not args.run_id:
-            print("error: --insight-accept requires --run-id", file=sys.stderr)
-            return 2
-        report = run_insight_accept(effective_palace, run_id=args.run_id, wing=args.wing, room=args.room)
-        if args.format == "json":
-            print(json.dumps(report, indent=2, ensure_ascii=False))
-        else:
-            print(summarize_insight_result(report))
         return 0
 
     if args.propose:
