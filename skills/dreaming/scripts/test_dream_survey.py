@@ -80,6 +80,17 @@ class TestExamples(unittest.TestCase):
         self.assertEqual(ex[0]["support"], 3)
         self.assertIn("observation", ex[0]["sample"])
 
+    def test_reflect_example(self):
+        wl = {"task": "reflect", "items": [{
+            "kind": "reflect", "reflect_kind": "generalize", "coverage": 3, "score": 0.82,
+            "members": [{"text": "alpha depends on beta for tls"}],
+        }]}
+        ex = ds.examples("reflect", wl, n=3)
+        self.assertEqual(ex[0]["reflect_kind"], "generalize")
+        self.assertEqual(ex[0]["coverage"], 3)
+        self.assertAlmostEqual(ex[0]["score"], 0.82)
+        self.assertIn("alpha depends", ex[0]["sample"])
+
     def test_prune_example(self):
         ex = ds.examples("prune", _prune_worklist(n=1), n=3)
         self.assertEqual(ex[0]["wing"], "icm_automation")

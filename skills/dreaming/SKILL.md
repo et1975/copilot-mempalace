@@ -74,7 +74,10 @@ Artifacts go in the session workspace — never commit them.
 > Use it to decide *which* task/wing is worth the full 5-phase pipeline below.
 > `dream_survey.py` is read-only: `induce-rules` candidates go to a throwaway
 > ontology, and it never adopts. Adjudication/adopt still use the per-task
-> `dream_harvest.py` + `dream_adopt.py` flow.
+> `dream_harvest.py` + `dream_adopt.py` flow. The default task set is
+> `contradiction, induce-rules, pattern, reflect, merge, prune` — so a default
+> survey now includes the constructive **reflect** pass (bounded cluster seeds,
+> read-only) alongside the consolidation tasks.
 
 | # | Phase | Who | Command / action |
 |---|-------|-----|------------------|
