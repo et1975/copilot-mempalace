@@ -18,11 +18,11 @@ from datetime import datetime
 import hashlib
 import json
 import os
-import re
 import sys
 
 import dream_ontology
 import dream_palace
+from dream_metadata import is_generated_observation
 from dream_lib import (
     build_contradiction_worklist,
     build_gap_worklist,
@@ -41,12 +41,6 @@ from dream_lib import (
     select_prune_candidates,
 )
 
-_LESSON_TRAILER_RE = re.compile(
-    r"<!--dreaming-meta:\s*\{[^}]*[\"']kind[\"']\s*:\s*[\"']lesson[\"'][^}]*\}\s*-->",
-    re.IGNORECASE,
-)
-
-
 def _content_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
@@ -64,8 +58,7 @@ def _default_palace() -> str | None:
 
 
 def _is_surfaced_lesson(entry: dict) -> bool:
-    metadata = entry.get("metadata") or {}
-    return metadata.get("kind") == "lesson" or _LESSON_TRAILER_RE.search(entry.get("text", "")) is not None
+    return is_generated_observation(entry)
 
 
 def _stamp_merge_hashes(worklist: dict) -> None:

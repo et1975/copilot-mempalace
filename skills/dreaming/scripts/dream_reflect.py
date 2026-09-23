@@ -11,6 +11,7 @@ from typing import Any
 from dream_insight import validate_insight, rank_survey_clusters
 from dream_lib import cosine_similarity, group_observation_themes
 from dream_palace import load_logical_drawers
+from dream_metadata import content_hash, is_generated_observation, is_procedural_record
 
 REFLECT_KINDS = {"distill", "generalize", "name_gap", "connect",
                  "converge", "tension", "shared_constraint"}
@@ -21,6 +22,11 @@ def validate_reflect(candidate: Any, members_by_id: Any) -> dict:
     widens the accepted kind set to REFLECT_KINDS."""
     base = validate_insight(candidate, members_by_id)
     rejects = [r for r in base.get("rejects", []) if r != "bad_kind"]
+    if isinstance(candidate, dict) and isinstance(candidate.get("premises"), list):
+        if any(isinstance(p, dict) and isinstance(p.get("quote"), str)
+               and not p["quote"].strip() for p in candidate["premises"]):
+            if "ungrounded" not in rejects:
+                rejects.append("ungrounded")
     try:
         kind = ((candidate or {}).get("conclusion") or {}).get("kind")
     except Exception:
@@ -68,7 +74,8 @@ def gather_reflect_seeds(palace_path, *, wing=None, room=None, k=5, top_n=10) ->
     """Return ranked >=2-drawer seed clusters (anchor + neighbors) for the
     cluster reflect kinds, reusing the insight survey ranker. Each seed carries
     full member text so the agent can quote-ground during adjudication."""
-    drawers = load_logical_drawers(palace_path, wing=wing, room=room)
+    drawers = [d for d in load_logical_drawers(palace_path, wing=wing, room=room)
+               if not is_procedural_record(d)]
     by_id = {str(d.get("id")): d for d in drawers}
     clusters = rank_survey_clusters(drawers, k=k, top_n=top_n)
     seeds = []
@@ -92,6 +99,7 @@ def gather_reflect_seeds(palace_path, *, wing=None, room=None, k=5, top_n=10) ->
 
 
 def converge_seeds_from_recurrence(entries, *, tau, min_support) -> list[dict]:
+    entries = [e for e in entries if not is_generated_observation(e)]
     themes = group_observation_themes(entries, tau, min_support, support_key="session_id")
     seeds = []
     for theme in themes:
@@ -103,6 +111,8 @@ def converge_seeds_from_recurrence(entries, *, tau, min_support) -> list[dict]:
             "member_ids": member_ids,
             "members": [{"id": m["id"], "text": m.get("text", ""),
                          "session_id": m.get("session_id"), "date": m.get("date"),
+                         "content_hash": content_hash(m.get("text", "")),
+                         "metadata": m.get("metadata") or {},
                          "topic": m.get("topic")} for m in members],
             "reflect_kind": "converge",
             "evidence": {"support": support,

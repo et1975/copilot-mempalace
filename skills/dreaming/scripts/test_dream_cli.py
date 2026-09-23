@@ -1707,16 +1707,24 @@ class PreflightReflectTests(unittest.TestCase):
         self.assertEqual(kept[0]["action"], "surface")
 
     def test_converge_grounded_by_recurrence_not_quotes(self):
+        from dream_metadata import content_hash
+        import dream_sessions
         self._patch_palace()
-        wl = {"task": "reflect", "scope": {}, "items": [{
+        wl = {"task": "reflect", "scope": {}, "params": {"min_support": 2}, "items": [{
             "kind": "reflect", "member_ids": ["session:s1", "session:s2"],
+            "members": [{"id": f"session:{sid}", "session_id": sid,
+                         "content_hash": content_hash(f"deploy with farmer {sid}")}
+                        for sid in ("s1", "s2")],
             "evidence": {"support": 2, "support_ids": ["s1", "s2"]},
             "decision": {"action": "surface", "reflect_kind": "converge",
                          "conclusion": {"text": "team converges on farmer deploys", "kind": "converge",
                                         "decision_or_prediction": "standardize"},
                          "premises": [], "wing": "w", "room": "reflections"}}]}
         decisions = dream_adopt._resolve_reflect_decisions(wl)
-        kept, errors = dream_adopt._preflight_reflect_decisions("P", decisions)
+        with mock.patch.object(dream_sessions, "load_session_turns", side_effect=lambda sid: [
+                {"turn_index": 0, "user_message": f"deploy with farmer {sid}",
+                 "assistant_response": "", "timestamp": "2026-09-01T00:00:00Z"}]):
+            kept, errors = dream_adopt._preflight_reflect_decisions("P", decisions)
         self.assertEqual(errors, [])
         self.assertEqual(kept[0]["action"], "surface")
 

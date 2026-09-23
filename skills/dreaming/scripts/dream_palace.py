@@ -957,7 +957,8 @@ def load_observation_entries(
 
     entries = []
     for logical in _group_by_parent(rows, ("parent_entry_id", "parent_drawer_id")):
-        meta = logical.get("metadata") or {}
+        from dream_metadata import decode_dream_metadata, content_hash
+        meta = decode_dream_metadata(logical)
         text = logical["text"]
         session_id, ambiguous = _session_id_state(text)
         entry = {
@@ -971,6 +972,8 @@ def load_observation_entries(
             "topic": meta.get("topic"),
             "wing": meta.get("wing"),
             "room": meta.get("room"),
+            "metadata": meta,
+            "content_hash": content_hash(text),
         }
         if ambiguous:
             entry["ambiguous"] = True
@@ -1026,6 +1029,8 @@ def load_session_observation_entries(
                 "topic": obs.get("summary"),
                 "wing": None,
                 "room": "__session__",
+                "metadata": {"source_kind": "session"},
+                "content_hash": hashlib.sha256(text.encode("utf-8")).hexdigest(),
             }
         )
     return entries
