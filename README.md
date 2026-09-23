@@ -13,16 +13,27 @@ audit hook that nags when an external tool is about to run without a prior `memp
   proactive vs reactive use, mining hygiene, HNSW drift recovery, auto-save hook notes.
 - **[skills/dreaming/SKILL.md](skills/dreaming/SKILL.md)** — offline consolidation ("dreaming"): a 5-phase
   pipeline (harvest → adjudicate → review → adopt → verify) that merges near-duplicate drawers and resolves
-  adjudicated KG contradiction/staleness candidates between sessions, plus `pattern` / `induce` for surfacing
-  grounded cross-session lessons from stamped diary observations, and `prune` / `forget` for reversible
+  adjudicated KG contradiction/staleness candidates between sessions, plus constructive `reflect`
+  (distillations, connections, tensions and generalizations); `pattern` aliases its recurrence-gated
+  `converge` kind over original diary/session observations. `prune` / `forget` provides reversible
   archive-before-delete cleanup of low-salience drawers.
   Cognition stays in the agent, mechanics in Python scripts
   ([`skills/dreaming/scripts/`](skills/dreaming/scripts/)), storage in mempalace. The optional read-only
-  `dream_sessions.py` adapter uses Copilot's host session store as a richer pattern substrate. Non-destructive
-  (nothing writes the live palace until an approved `decisions.json` is adopted; prune writes a lossless JSONL
-  archive before sanctioned delete) with a fixpoint re-harvest as the verify oracle. Native drawer usage-frequency
+  `dream_sessions.py` adapter uses Copilot's host session store as a richer pattern substrate.
+  Both merge and prune archive full originals before sanctioned deletion; semantic preservation still
+  requires review. Re-harvest measures residual work, not a guaranteed global fixpoint. Existing KG
+  premise loading can reconcile legacy provenance and ontology candidate commands explicitly write,
+  so the whole pipeline is not strictly read-only. Native drawer usage-frequency
   is proposed upstream as MemPalace/mempalace#1921.
   See [`skills/dreaming/references/pipeline.md`](skills/dreaming/references/pipeline.md) for the contract.
+- **[Drawer-backed procedural learning](skills/dreaming/references/procedural.md)** — an optional
+  `dream_procedure.py` CLI (`propose`, `validate`, `review`, `outcome`, `guidance`, `explain`).
+  Immutable event drawers retain original evidence, explicit reviewed outcomes and full lineage;
+  deterministic decay/maturity is observed usefulness, never KG authority or logical truth.
+  Guidance is exact-repository, read-only and bounded to five combined items / 6,000 serialized
+  characters. No automatic enrollment, inferred feedback, textual inversion, new database or model
+  download. Supported boundary: existing SQLite-exact palace, installed local MiniLM; strict reads
+  require clean storage without WAL/SHM sidecars. Other backends/loaders are refused, not converted.
 - **[skills/contemplate/SKILL.md](skills/contemplate/SKILL.md)** — on-demand deductive reasoning over the
   MemPalace KG: run `derive` inline when the user asks what follows, then adjudicate
   `materialize` / `skip` / `reject_rule` candidates. It shares the same Python mechanics in
@@ -72,6 +83,33 @@ audit hook that nags when an external tool is about to run without a prior `memp
 - Python 3 on `PATH` (for the hook). The hook fails silently if Python is missing.
 - For the backup/restore skills only: [`restic`](https://restic.net/) on `PATH`
   (`zypper in restic`, `apt install restic`, `brew install restic`, …).
+
+## Opt-in procedural rollout
+
+Ordinary recall remains the baseline. First run the deterministic procedural
+tests on throwaway storage, using the already installed MemPalace interpreter:
+
+```bash
+cd skills/dreaming/scripts
+PYTHONDONTWRITEBYTECODE=1 DREAMING_TEST_TMPDIR="$SESSION_FILES" TMPDIR="$SESSION_FILES" \
+  "$MPY" -m unittest test_dream_procedure test_procedural_replay -q
+```
+
+After separate user approval, enroll a small set of repository-specific rules
+with three distinct original supporting sessions. Retrieve a bounded support/
+contrast packet, explicitly review each item, then try approved candidates only
+with `guidance --include-candidates` on safely bounded work. Record specific
+attributed outcomes, not task-success or retrieval counts. Default guidance
+waits for eligible established/proven maturity; use `explain` for abstention.
+The [reference](skills/dreaming/references/procedural.md) includes executable
+commands, exact artifact schemas and `--prepare` digest handling.
+
+Chronological synthetic replay checks no lookahead, unsafe delivery, feedback
+inflation or output-budget violations. It reports coverage/abstention against
+an unscored evidence-only baseline, **not production superiority or CASS parity**.
+Stop using procedural commands to roll back behavior; retain events and protected
+source drawers, including retired rules and counterexamples. External deletion
+is not prevented and no cross-drawer transaction/global snapshot is claimed.
 
 ## Install
 

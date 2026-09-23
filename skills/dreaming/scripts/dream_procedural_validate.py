@@ -191,6 +191,8 @@ def build_validation_packet(rule, *, queries, source_reader, limits: ValidationL
 def preflight_event(event, *, projection, evidence_reader: EvidenceReader,
                     as_of: datetime) -> PreflightResult:
     """Shared dry-run/locked-append gate. Invoke only after the exact retry gate."""
+    from dream_procedural_palace import record_data
+    record_data(event)
     as_of = utc_datetime(as_of)
     if projection.errors:
         raise ValueError("invalid current projection")

@@ -27,8 +27,7 @@ normal administration workflow. Do not delete WAL/SHM files. A shared directory
 lock excludes this package's mutations during the read without taking a write
 lock; unrelated external writers are not coordinated.
 
-The
-installed Chroma backend does not honor read-only opening; commands refuse it
+The installed Chroma backend does not honor read-only opening; commands refuse it
 rather than silently migrate/initialize storage. There is no automatic backend
 conversion. Legacy dreaming operations still use their ordinary backend;
 their live procedural protection lookup reuses that backend and does not claim
@@ -40,8 +39,9 @@ palace's **already installed MiniLM** model, with a complete local ONNX cache.
 Remote embedding configurations and other unverified model loaders are refused.
 The read path calls the existing MiniLM forward pass, not its download bootstrap
 (HF offline flags alone do not disable that bootstrap). Configured/stored model
-identity is checked by the palace backend; unavailable/invalid embeddings are
-explicit errors. A separate local
+identity is checked by the palace backend; procedural embedding also rejects
+unknown stored identity and dimension mismatches. Unavailable/invalid embeddings
+are explicit errors. A separate local
 Copilot session store supplies original repository/session authority. New paths
 open it read-only, without creating a missing file.
 
@@ -343,3 +343,42 @@ snapshot isolation or tamper-proof storage. External tools can delete/change
 drawers without taking this lock. Revalidation catches missing references;
 deletion of an unreferenced leaf event cannot always be detected without an
 external ledger. Backup remains the palace's existing backup responsibility.
+
+## Manual rollout and deterministic evaluation
+
+1. **Disabled by convention:** no procedural command use means no procedural
+   writes or advice. Keep normal evidence recall and ordinary reflect unchanged.
+2. **Throwaway smoke test:** use the package-owning interpreter and a session
+   directory for `DREAMING_TEST_TMPDIR`/`TMPDIR`. Run `test_dream_procedure` and
+   `test_procedural_replay`; the former exercises all six commands with actual
+   installed handlers, SQLite-exact storage and an isolated local session store.
+   Only fixtures explicitly checkpoint their own writer between strict reads.
+   No test targets the user's live palace or installs dependencies.
+3. **Separate opt-in:** after user approval enroll a small set for one exact
+   repository. Keep original sources available. Do not bulk reinterpret old
+   diary prose as instructions, fabricate historical observation stamps, or
+   infer support from generated reflections.
+4. **Safe cold start:** approve only after inspecting both support and contrast
+   evidence; deliberately select bounded candidate trials. Record what following
+   the rule changed, including neutral/harmful results. Never manufacture
+   supportive trials by repeating a source session or refreshing timestamps.
+5. **Inspect before expanding:** check `explain`, abstention, attribution
+   quality, counterexamples and source retention before adding more rules.
+   Stop command use to roll back behavior; don't remove audit history.
+
+The chronological useful-advice fixture has six daily tasks. Retrieval sees
+only strictly earlier events; each task's outcome is appended afterward.
+Default useful guidance is delivered on **2/6** tasks, with **4/6** abstentions;
+an unscored evidence-only baseline retrieves the source on **6/6** tasks.
+Six duplicate retry copies add zero credit. Other scenarios cover misleading
+correlation, harm, repository drift, stale reviews, mirrored generated text,
+concurrent reviewers and reviewed attribution corrections. Assertions require
+zero unsafe-rule deliveries, feedback inflation or serialized-budget violations.
+Storage integration separately compares palace/source-store file bytes across
+strict guidance/explain and verifies writer/schema helpers are not called.
+
+These are synthetic correctness/coverage diagnostics, not a production
+accuracy target, a causal experiment, CASS parity, or measured superiority.
+Agent instruction wording has not been statistically pressure-tested by this
+fixture suite; the executable authority boundaries, not model compliance
+claims, are its oracle.

@@ -65,9 +65,14 @@ def embed_texts(collection, texts: list[str]) -> list[list[float]]:
     # Set before lazy embedder resolution. No fallback model or installation.
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    dimension = None
     try:
         from mempalace.backends.embedding_wrapper import EmbeddingCollection
         if isinstance(collection, EmbeddingCollection):
+            identity = collection.get_stored_embedder_identity()
+            if identity is None or identity.model_name != "minilm":
+                raise RuntimeError("palace embedding identity is unknown or unsupported")
+            dimension = identity.dimension or None
             embedder = local_embedder()
             # MiniLM's __call__ includes a download/extract path even with HF
             # offline set. Use its existing forward pass, never that bootstrap.
@@ -76,7 +81,10 @@ def embed_texts(collection, texts: list[str]) -> list[list[float]]:
             vectors = dream_palace._resolve_embed_fn(collection)(texts)
     except Exception as exc:
         raise RuntimeError(f"installed palace embedder unavailable: {exc}") from exc
-    return checked_vectors(vectors, len(texts))
+    vectors = checked_vectors(vectors, len(texts))
+    if dimension is not None and len(vectors[0]) != dimension:
+        raise RuntimeError("palace embedding identity dimension mismatch")
+    return vectors
 
 
 def local_embedder():
@@ -285,6 +293,15 @@ def _record_body(event: ProceduralEvent) -> str:
             f"\nEvent ID: {event.event_id}\nDigest: {event.digest}\n{escape(detail, quote=False)}")
 
 
+def record_data(event: ProceduralEvent) -> tuple[str, dict]:
+    """One size gate for dry-run and append, including worst-case trailer."""
+    body = _record_body(event)
+    metadata = {"kind": "procedural_event", "schema_version": 1, "event": event_to_data(event)}
+    if len(f"{body}\n\n<!--dreaming-meta: {canonical_json(metadata)}-->".encode("utf-8")) > 32 * 1024:
+        raise ValueError("encoded procedural drawer exceeds 32 KiB")
+    return body, metadata
+
+
 def _wing(wing: str) -> str:
     if not isinstance(wing, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", wing):
         raise ValueError("an explicit canonical project wing is required")
@@ -491,10 +508,7 @@ def append_event(palace: str, wing: str, event: ProceduralEvent, *,
             raise ValueError("event would create invalid procedural history")
         if preflight is not None:
             preflight(event, projection)
-        body = _record_body(event)
-        metadata = {"kind": "procedural_event", "schema_version": 1, "event": event_to_data(event)}
-        if len((body + canonical_json(metadata)).encode("utf-8")) + 32 > 32 * 1024:
-            raise ValueError("encoded procedural drawer exceeds 32 KiB")
+        body, metadata = record_data(event)
         result = writer.add_drawer(wing, "procedural", body, added_by="dream-procedure", metadata=metadata)
         if not isinstance(result, dict) or result.get("success") is False:
             raise RuntimeError(f"procedural append failed: {result}")

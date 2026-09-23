@@ -11,7 +11,7 @@ from pathlib import Path
 import sys
 
 import dream_palace
-from dream_metadata import canonical_json, content_hash
+from dream_metadata import canonical_json, content_hash, strict_json
 from dream_procedural import (
     Policy, ProposalPayload, canonical_rule_id, event_to_data, parse_definition, parse_event,
     project_rules, to_data,
@@ -112,7 +112,7 @@ def _execute(args):
         if bool(args.prepare) != bool(args.out):
             raise RequestError("--prepare requires --out; --out is only for preparation")
         try:
-            data = json.loads(Path(args.input).read_text(encoding="utf-8"))
+            data = strict_json(Path(args.input).read_text(encoding="utf-8"))
             event = parse_event(_prepare(data, reader) if args.prepare else data)
         except (KeyError, TypeError, json.JSONDecodeError) as exc:
             raise RequestError(f"invalid event artifact: {exc}") from exc
@@ -192,7 +192,7 @@ def main(argv=None) -> int:
         print(canonical_json({"status": "error", "kind": "invalid_request", "error": str(exc)}))
         print(f"invalid request: {exc}", file=sys.stderr)
         return 2
-    except (RuntimeError, OSError) as exc:
+    except Exception as exc:
         kind = "evidence_unavailable" if isinstance(exc, EvidenceUnavailable) else "storage_integrity"
         print(canonical_json({"status": "error", "kind": kind, "error": str(exc)}))
         print(f"{kind}: {exc}", file=sys.stderr)

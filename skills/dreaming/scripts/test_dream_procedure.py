@@ -194,6 +194,38 @@ class CommandTests(GroundedFixture):
             with self.assertRaisesRegex(RuntimeError, "never download"):
                 local_embedder()
 
+    def test_unknown_palace_embedding_identity_cannot_be_invented(self):
+        from mempalace.backends.embedding_wrapper import EmbeddingCollection
+        from dream_procedural_palace import embed_texts
+        inner = SimpleNamespace(get_stored_embedder_identity=lambda: None)
+        with self.assertRaisesRegex(RuntimeError, "identity"):
+            embed_texts(EmbeddingCollection(inner), ["some task"])
+
+    def test_dry_run_rejects_oversized_record_body_like_real_append(self):
+        self.invoke("propose", self.proposal())
+        oversized = self.review(reason="r" * 16000)
+        code, result, err = self.invoke("review", oversized, "--dry-run")
+        self.assertEqual(code, 2, err)
+        self.assertIn("32 KiB", result["error"])
+        self.assertEqual(self.invoke("review", oversized)[0], 2)
+
+    def test_duplicate_json_keys_and_backend_exceptions_have_explicit_failure_results(self):
+        from dream_procedure import main
+        data = json.dumps(event_to_data(self.proposal()))
+        path = Path(self.tmp.name, "ambiguous.json")
+        path.write_text(data.replace('"schema_version": 1', '"schema_version": 2, "schema_version": 1'))
+        args = ["propose", "--palace", self.path, "--wing", "w", "--input", str(path), "--dry-run"]
+        out, err = StringIO(), StringIO()
+        with redirect_stdout(out), redirect_stderr(err), patch("dream_procedure.now_utc", return_value=NOW):
+            self.assertEqual(main(args), 2)
+        self.assertIn("duplicate", json.loads(out.getvalue())["error"])
+        path.write_text(data)
+        out, err = StringIO(), StringIO()
+        with redirect_stdout(out), redirect_stderr(err), \
+             patch("dream_procedure.read_events", side_effect=sqlite3.DatabaseError("damaged backing store")):
+            self.assertEqual(main(args), 1)
+        self.assertEqual(json.loads(out.getvalue())["kind"], "storage_integrity")
+
 
 def guidance_events(rule=None, base=1, count=3):
     rule = rule or definition()
