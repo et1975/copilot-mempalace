@@ -143,10 +143,12 @@ def _execute(args):
         dream_palace.bind_palace(palace)
         from dream_procedural_palace import local_embedder
         local_embedder()
-        result = append_event(palace, args.wing, event, writer=dream_palace.MempalaceWriter(),
-            clock=now_utc,
-            preflight=lambda ev, live: preflight_event(
-                ev, projection=live, evidence_reader=reader, as_of=now_utc()))
+        writer = dream_palace.MempalaceWriter()
+        with writer.mutation():
+            result = append_event(palace, args.wing, event, writer=writer,
+                clock=now_utc,
+                preflight=lambda ev, live: preflight_event(
+                    ev, projection=live, evidence_reader=reader, as_of=now_utc()))
         return to_data(result)
     state = next((s for s in projection.rules if s.rule_id == getattr(args, "rule_id", None)), None)
     if args.command == "validate":

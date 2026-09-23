@@ -9,17 +9,17 @@ from unittest.mock import patch
 import dream_palace
 from dream_procedural import event_to_data, parse_event
 from test_dream_procedural import NOW, event_data, resign, sha, stamp
-from test_dream_procedural_palace import sanctioned_writer
+from test_dream_procedural_palace import installed_palace, sanctioned_writer
 from test_dream_procedural_validate import GroundedFixture
 from test_dream_procedural import definition, parsed
 from dream_procedural import Policy, project_rules
 from datetime import timedelta
 import math
 import unittest
-import hashlib
 import os
 import sys
 import sqlite3
+import subprocess
 from types import SimpleNamespace
 
 
@@ -161,7 +161,7 @@ class CommandTests(GroundedFixture):
         self.assertEqual(code, 1, err)
         self.assertIn("evidence_unavailable", result["rule"]["suppression_reasons"])
 
-    def test_strict_read_refuses_wal_sidecars_before_any_backend_open(self):
+    def test_strict_read_refuses_incomplete_wal_sidecars_before_any_backend_open(self):
         wal = Path(self.path, "sqlite_exact.sqlite3-wal")
         wal.write_bytes(b"uncheckpointed state")
         before = wal.read_bytes()
@@ -330,31 +330,73 @@ class GuidanceTests(unittest.TestCase):
 
 
 class InstalledCommandTests(GroundedFixture):
-    def test_real_sqlite_commands_source_store_and_read_paths_are_byte_unchanged(self):
+    def run_cli(self, command, event, *, env=None):
+        artifact = Path(self.tmp.name, f"{command}.json")
+        artifact.write_text(json.dumps(event_to_data(event)), encoding="utf-8")
+        return subprocess.run([sys.executable, str(Path(__file__).with_name("dream_procedure.py")),
+            command, "--palace", self.path, "--wing", "w", "--session-store", self.store,
+            "--input", str(artifact)], capture_output=True, text=True, timeout=90, env=env)
+
+    def test_fresh_cli_subprocess_propose_review_outcome_persist_without_opener_patch(self):
+        from dream_procedural_palace import read_events
+        self.storage_patch.stop()
+        with installed_palace(self.path) as server:
+            ok, reason = server._acquire_mcp_writer_lock()
+            self.assertTrue(ok, reason)
+            for ref in self.refs:
+                source = server.TOOLS["mempalace_add_drawer"]["handler"](
+                    wing="w", room="diary", content=ref["quote"])
+                self.assertTrue(source["success"], source)
+                ref["source_id"] = source["drawer_id"]
+            server._release_mcp_writer_lock()
+            events = [self.proposal(), self.review(), parse_event(event_data(
+                "outcome", 3, source_session_id=self.refs[0]["session_id"], evidence=[self.refs[0]]))]
+            for command, event in zip(("propose", "review", "outcome"), events):
+                completed = self.run_cli(command, event)
+                self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+                result = json.loads(completed.stdout)
+                self.assertEqual(result["status"], "appended")
+                self.assertEqual(result["event_id"], event.event_id)
+            self.assertEqual(set(read_events(self.path, "w")), set(events))
+            state = project_rules(read_events(self.path, "w"), as_of=NOW, policy=Policy()).rules[0]
+            self.assertEqual(state.review_heads, (events[1].event_id,))
+            self.assertEqual(state.score.helpful, 1)
+
+    def test_cli_refuses_other_writer_and_operator_readonly_without_appending(self):
+        from dream_procedural_palace import read_events
+        self.storage_patch.stop()
+        with installed_palace(self.path) as server:
+            ok, reason = server._acquire_mcp_writer_lock()
+            self.assertTrue(ok, reason)
+            for ref in self.refs:
+                result = server.tool_add_drawer("w", "diary", ref["quote"])
+                self.assertTrue(result["success"], result)
+                ref["source_id"] = result["drawer_id"]
+            owner = server._MCP_WRITER_LOCK_CM
+            before = tuple(server._get_collection()._handle.conn.iterdump())
+            refused = self.run_cli("propose", self.proposal())
+            self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+            self.assertIn("writer", json.loads(refused.stdout)["error"])
+            self.assertEqual(read_events(self.path, "w"), [])
+            self.assertEqual(tuple(server._get_collection()._handle.conn.iterdump()), before)
+            self.assertIs(server._MCP_WRITER_LOCK_CM, owner)
+            server._release_mcp_writer_lock()
+            refused = self.run_cli("propose", self.proposal(),
+                                   env={**os.environ, "MEMPALACE_MCP_READ_ONLY": "1"})
+            self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+            self.assertIn("read-only", json.loads(refused.stdout)["error"])
+            self.assertEqual(read_events(self.path, "w"), [])
+
+    def test_real_sqlite_commands_keep_live_writer_and_read_application_state_unchanged(self):
         from dream_procedure import main
         self.storage_patch.stop()
-        with patch.dict(os.environ, {"MEMPALACE_PALACE_PATH": self.path,
-                "MEMPALACE_BACKEND": "sqlite_exact", "MEMPALACE_BACKEND_EXPLICIT": "sqlite_exact",
-                "MEMPALACE_EMBEDDING_MODEL": "minilm", "HF_HUB_OFFLINE": "1",
-                "TRANSFORMERS_OFFLINE": "1"}), patch.object(sys, "argv", ["procedure-integration"]):
-            from mempalace.palace import get_collection, get_backend_for_palace
-            from mempalace import mcp_server
-            col = get_collection(self.path, backend="sqlite_exact", create=True)
-            self.addCleanup(get_backend_for_palace(self.path).close_palace, self.path)
-            with patch.object(mcp_server, "_config", SimpleNamespace(palace_path=self.path, chunk_size=512)), \
-                 patch.object(mcp_server, "_get_collection",
-                              side_effect=lambda **kwargs: get_collection(self.path, create=False)), \
-                 patch.object(mcp_server, "_wal_log", return_value=None):
-                writer = dream_palace.MempalaceWriter()
+        with installed_palace(self.path) as server:
+            writer = dream_palace.MempalaceWriter()
+            with writer.mutation():
                 for ref in self.refs:
                     ref["source_id"] = writer.add_drawer("w", "diary", ref["quote"])["drawer_id"]
 
                 def run(command, event=None, *extra):
-                    if command == "validate":
-                        get_backend_for_palace(self.path).close_palace(self.path)
-                        with sqlite3.connect(str(Path(self.path, "sqlite_exact.sqlite3"))) as checkpoint:
-                            checkpoint.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                        checkpoint.close()
                     args = [command, "--palace", self.path, "--wing", "w", "--session-store", self.store]
                     if event is not None:
                         path = Path(self.tmp.name, "event.json")
@@ -385,25 +427,26 @@ class InstalledCommandTests(GroundedFixture):
                 for i, ref in enumerate(self.refs[:3]):
                     run("outcome", parse_event(event_data("outcome", 10 + i,
                         source_session_id=ref["session_id"], evidence=[ref])))
-            get_backend_for_palace(self.path).close_palace(self.path)
-            # Fixture-only explicit writer checkpoint. Read commands must refuse
-            # an active WAL rather than changing SQLite's shared-memory bytes.
-            with sqlite3.connect(str(Path(self.path, "sqlite_exact.sqlite3"))) as con:
-                con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            con.close()
-            before = {p.name: p.read_bytes() for p in Path(self.path).iterdir() if p.is_file()}
-            source_before = Path(self.store).read_bytes()
-            with patch.object(dream_palace, "MempalaceWriter", side_effect=AssertionError("writer")), \
-                 patch.object(dream_palace, "ensure_firewall_schema", side_effect=AssertionError("schema")):
-                guidance, text = run("guidance", None, "--task", self.proposal().payload.definition.statement,
-                                     "--repository", "owner/repo")
-                self.assertEqual(guidance["item_count"], 1)
-                self.assertEqual(guidance["rules"][0]["maturity"], "established")
-                self.assertLessEqual(len(text), 6000)
-                explained, _ = run("explain", None, "--rule-id", self.proposal().rule_id)
-                self.assertEqual(explained["rule"]["score"]["helpful"], 3)
-                self.assertEqual(len(explained["rule"]["events"]), 5)
-            after = {p.name: p.read_bytes() for p in Path(self.path).iterdir() if p.is_file()}
-            self.assertEqual({name: hashlib.sha256(data).hexdigest() for name, data in before.items()},
-                             {name: hashlib.sha256(data).hexdigest() for name, data in after.items()})
-            self.assertEqual(source_before, Path(self.store).read_bytes())
+                col = server._get_collection()
+                owner = server._MCP_WRITER_LOCK_CM
+                before_state = tuple(col._handle.conn.iterdump())
+                before = {p.name: p.read_bytes() for p in Path(self.path).iterdir()
+                          if p.is_file() and not p.name.endswith("-shm")}
+                source_before = Path(self.store).read_bytes()
+                with patch.object(dream_palace, "MempalaceWriter", side_effect=AssertionError("writer")), \
+                     patch.object(dream_palace, "ensure_firewall_schema", side_effect=AssertionError("schema")):
+                    guidance, text = run("guidance", None, "--task", self.proposal().payload.definition.statement,
+                                         "--repository", "owner/repo")
+                    self.assertEqual(guidance["item_count"], 1)
+                    self.assertEqual(guidance["rules"][0]["maturity"], "established")
+                    self.assertLessEqual(len(text), 6000)
+                    explained, _ = run("explain", None, "--rule-id", self.proposal().rule_id)
+                    self.assertEqual(explained["rule"]["score"]["helpful"], 3)
+                    self.assertEqual(len(explained["rule"]["events"]), 5)
+                after = {p.name: p.read_bytes() for p in Path(self.path).iterdir()
+                         if p.is_file() and not p.name.endswith("-shm")}
+                self.assertEqual(after, before)
+                self.assertEqual(tuple(col._handle.conn.iterdump()), before_state)
+                self.assertIs(server._MCP_WRITER_LOCK_CM, owner)
+                self.assertFalse(col._handle.closed)
+                self.assertEqual(source_before, Path(self.store).read_bytes())

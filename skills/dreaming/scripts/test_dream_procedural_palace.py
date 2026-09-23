@@ -1,9 +1,9 @@
 """Sanctioned-handler boundary, readback, evidence protection and POSIX races."""
 from copy import deepcopy
+from contextlib import contextmanager, nullcontext
 from datetime import timedelta
 import errno
 from functools import wraps
-import hashlib
 import json
 import multiprocessing
 from multiprocessing.managers import SyncManager
@@ -13,7 +13,6 @@ import sqlite3
 import sys
 import tempfile
 import time
-from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -26,6 +25,46 @@ from test_dream_procedural import NOW, event_data, evidence, resign
 
 SESSION = "11111111-1111-4111-8111-111111111111"
 SOURCE_TEXT = f"SESSION_ID: {SESSION}\nobserved result"
+
+
+@contextmanager
+def installed_palace(path):
+    """Isolate installed MCP config, audit log and lease files, not storage I/O."""
+    from chromadb.utils.embedding_functions.onnx_mini_lm_l6_v2 import ONNXMiniLM_L6_V2
+    cache = Path(ONNXMiniLM_L6_V2.DOWNLOAD_PATH).resolve()
+    required = ("config.json", "model.onnx", "special_tokens_map.json",
+                "tokenizer_config.json", "tokenizer.json", "vocab.txt")
+    if not all((cache / "onnx" / name).is_file() for name in required):
+        raise RuntimeError("integration requires the already installed MiniLM cache; no downloads")
+    with tempfile.TemporaryDirectory(dir=os.environ["DREAMING_TEST_TMPDIR"]) as home, \
+         patch.dict(os.environ, {"HOME": home, "MEMPALACE_PALACE_PATH": path,
+                    "MEMPALACE_BACKEND": "sqlite_exact", "MEMPALACE_BACKEND_EXPLICIT": "sqlite_exact",
+                    "MEMPALACE_EMBEDDING_MODEL": "minilm", "MEMPALACE_MCP_READ_ONLY": "0",
+                    "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1",
+                    "ANONYMIZED_TELEMETRY": "False"}), \
+         patch.object(sys, "argv", ["dreaming-integration"]), \
+         patch.object(ONNXMiniLM_L6_V2, "_download", side_effect=AssertionError("model download")):
+        child_cache = Path(home, ".cache/chroma/onnx_models/all-MiniLM-L6-v2")
+        child_cache.parent.mkdir(parents=True)
+        child_cache.symlink_to(cache, target_is_directory=True)
+        stdout, fd = sys.stdout, os.dup(1)
+        try:
+            from mempalace import mcp_server, wal
+        finally:
+            os.dup2(fd, 1)
+            os.close(fd)
+            sys.stdout = stdout
+        from mempalace.config import MempalaceConfig
+        from mempalace.palace import get_backend_for_palace
+        with patch.object(mcp_server, "_config", MempalaceConfig()), \
+             patch.object(mcp_server, "_READ_ONLY", False), \
+             patch.object(wal, "_WAL_FILE", Path(home, ".mempalace/wal/write_log.jsonl")):
+            try:
+                yield mcp_server
+            finally:
+                mcp_server._release_mcp_writer_lock()
+                mcp_server._discard_mcp_storage_handles()
+                get_backend_for_palace(path).close_palace(path)
 
 
 def proposal(number=1):
@@ -83,6 +122,7 @@ class DrawerCollection:
 def sanctioned_writer(path, collection, *, native=False, chunk_size=100000):
     writer = dream_palace.MempalaceWriter.__new__(dream_palace.MempalaceWriter)
     writer.palace_path = path
+    writer.mutation = lambda *args: nullcontext()
     if native:
         def add(wing, room, content, added_by, metadata):
             return collection.add(wing, room, content, added_by, metadata, chunk_size)
@@ -439,29 +479,113 @@ class StorageTests(unittest.TestCase):
 
 
 class InstalledPalaceTests(unittest.TestCase):
-    def test_throwaway_palace_roundtrip_reopen_no_schema_growth_and_read_only_bytes(self):
+    def test_read_scope_sees_live_uncheckpointed_wal_without_application_writes(self):
+        from dream_procedural_palace import nonmutating_read
+        with tempfile.TemporaryDirectory(dir=os.environ["DREAMING_TEST_TMPDIR"]) as path, \
+             installed_palace(path) as server:
+            ok, reason = server._acquire_mcp_writer_lock()
+            self.assertTrue(ok, reason)
+            writer = server._get_collection(create=True)
+            writer._handle.conn.execute("PRAGMA wal_autocheckpoint=0")
+            result = server.tool_add_drawer("w", "diary", SOURCE_TEXT)
+            self.assertTrue(result["success"], result)
+            db = Path(path, "sqlite_exact.sqlite3")
+            wal = Path(str(db) + "-wal")
+            self.assertGreater(wal.stat().st_size, 32)
+            before = (db.read_bytes(), wal.read_bytes(), tuple(writer._handle.conn.iterdump()))
+            owner = server._MCP_WRITER_LOCK_CM
+            with nonmutating_read(path):
+                reader = dream_palace.procedural_collection(path)
+                self.assertFalse(reader._handle.immutable)
+                self.assertEqual(dream_palace.load_source_drawer(
+                    path, result["drawer_id"])["text"], SOURCE_TEXT)
+                for sql in ("DELETE FROM documents", "CREATE TABLE forbidden(x)",
+                            "CREATE TEMP TABLE forbidden_temp(x)"):
+                    with self.subTest(sql=sql), self.assertRaises(sqlite3.OperationalError):
+                        reader._handle.conn.execute(sql)
+            self.assertEqual((db.read_bytes(), wal.read_bytes(),
+                              tuple(writer._handle.conn.iterdump())), before)
+            self.assertIs(server._MCP_WRITER_LOCK_CM, owner)
+            self.assertFalse(writer._handle.closed)
+            latest = server.tool_add_drawer("w", "diary", "committed after the first read")
+            self.assertTrue(latest["success"], latest)
+            with nonmutating_read(path):
+                self.assertEqual(dream_palace.load_source_drawer(path, latest["drawer_id"])["text"],
+                                 "committed after the first read")
+
+    def test_read_scope_rejects_incomplete_wal_pair_even_after_clean_reader_cached(self):
+        from dream_procedural_palace import nonmutating_read
+        from mempalace.palace import get_collection, get_backend_for_palace
+        with tempfile.TemporaryDirectory(dir=os.environ["DREAMING_TEST_TMPDIR"]) as path, \
+             installed_palace(path):
+            get_collection(path, backend="sqlite_exact", create=True)
+            get_backend_for_palace(path).close_palace(path)
+            dream_palace.procedural_collection(path)
+            wal = Path(path, "sqlite_exact.sqlite3-wal")
+            wal.write_bytes(b"incomplete WAL fixture")
+            with self.assertRaisesRegex(RuntimeError, "incomplete WAL"):
+                with nonmutating_read(path):
+                    dream_palace.procedural_collection(path)
+            with self.assertRaisesRegex(RuntimeError, "incomplete WAL"):
+                dream_palace.procedural_collection(path)
+            self.assertEqual(wal.read_bytes(), b"incomplete WAL fixture")
+
+    def test_writer_promotes_cached_reader_and_releases_ownership_after_each_call(self):
+        from mempalace.palace import get_collection, get_backend_for_palace
+        with tempfile.TemporaryDirectory(dir=os.environ["DREAMING_TEST_TMPDIR"]) as path, \
+             installed_palace(path) as server:
+            get_collection(path, backend="sqlite_exact", create=True)
+            get_backend_for_palace(path).close_palace(path)
+            self.assertIsNotNone(server._get_collection())
+            writer = dream_palace.MempalaceWriter()
+            result = writer.add_drawer("w", "diary", SOURCE_TEXT)
+            self.assertEqual(dream_palace.load_source_drawer(path, result["drawer_id"])["text"], SOURCE_TEXT)
+            self.assertIsNone(server._MCP_WRITER_LOCK_CM)
+            writer.delete_drawer(result["drawer_id"])
+            self.assertIsNone(dream_palace.load_source_drawer(path, result["drawer_id"]))
+            self.assertIsNone(server._MCP_WRITER_LOCK_CM)
+
+    def test_writer_failure_releases_new_lease_but_preserves_borrowed_owner(self):
+        with tempfile.TemporaryDirectory(dir=os.environ["DREAMING_TEST_TMPDIR"]) as path, \
+             installed_palace(path) as server:
+            writer = dream_palace.MempalaceWriter()
+            with self.assertRaisesRegex(RuntimeError, "add_drawer failed"):
+                writer.add_drawer("", "diary", SOURCE_TEXT)
+            self.assertIsNone(server._MCP_WRITER_LOCK_CM)
+            with writer.mutation():
+                owner = server._MCP_WRITER_LOCK_CM
+                with self.assertRaisesRegex(RuntimeError, "add_drawer failed"):
+                    writer.add_drawer("", "diary", SOURCE_TEXT)
+                self.assertIs(server._MCP_WRITER_LOCK_CM, owner)
+            self.assertIsNone(server._MCP_WRITER_LOCK_CM)
+
+    def test_archiver_readback_survives_writer_handle_retirement_between_calls(self):
+        with tempfile.TemporaryDirectory(dir=os.environ["DREAMING_TEST_TMPDIR"]) as path, \
+             installed_palace(path) as server:
+            writer = dream_palace.MempalaceWriter()
+            ids = [writer.add_drawer("w", "diary", text)["drawer_id"]
+                   for text in ("first original observation", "second original observation")]
+            archiver = dream_palace.Archiver(path, writer=writer)
+            for source_id in ids:
+                self.assertEqual(archiver.archive_then_delete({"id": source_id})["deleted"], [source_id])
+                self.assertIsNone(server._MCP_WRITER_LOCK_CM)
+                self.assertIsNone(dream_palace.load_source_drawer(path, source_id))
+            archive = [json.loads(line) for line in Path(path, "dream-archive.jsonl").read_text().splitlines()]
+            self.assertEqual([item["id"] for item in archive], ids)
+
+    def test_throwaway_palace_roundtrip_reopen_without_application_schema_growth(self):
         from dream_procedural_palace import append_event, read_events
         with tempfile.TemporaryDirectory(dir=os.environ["DREAMING_TEST_TMPDIR"]) as path, \
-             patch.dict(os.environ, {"MEMPALACE_PALACE_PATH": path,
-                        "MEMPALACE_BACKEND": "sqlite_exact", "MEMPALACE_BACKEND_EXPLICIT": "sqlite_exact",
-                        "MEMPALACE_EMBEDDING_MODEL": "minilm", "HF_HUB_OFFLINE": "1",
-                        "TRANSFORMERS_OFFLINE": "1"}), \
-             patch.object(sys, "argv", ["procedural-storage-integration"]):
+             installed_palace(path):
             from mempalace.palace import get_collection, get_backend_for_palace
-            from mempalace import mcp_server
-
-            collection = get_collection(path, backend="sqlite_exact", create=True)
-            db = Path(path, "sqlite_exact.sqlite3")
+            get_collection(path, backend="sqlite_exact", create=True)
             def schema():
-                with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as con:
-                    return con.execute("SELECT type,name,sql FROM sqlite_master ORDER BY type,name").fetchall()
+                col = dream_palace.procedural_collection(path)
+                return col._handle.conn.execute(
+                    "SELECT type,name,sql FROM sqlite_master ORDER BY type,name").fetchall()
             before_schema = schema()
-            # Actual installed tool handlers, actual installed embedder and drawer
-            # backend; isolate only process-global MCP routing/WAL from the user.
-            with patch.object(mcp_server, "_config", SimpleNamespace(palace_path=path, chunk_size=512)), \
-                 patch.object(mcp_server, "_get_collection", return_value=collection), \
-                 patch.object(mcp_server, "_wal_log", return_value=None):
-                writer = dream_palace.MempalaceWriter()
+            writer = dream_palace.MempalaceWriter()
+            with writer.mutation():
                 source = writer.add_drawer("w", "diary", SOURCE_TEXT)["drawer_id"]
                 event = parse_event(event_data(origin_drawer_ids=[],
                                     evidence=[evidence(source, SESSION, SOURCE_TEXT)]))
@@ -475,11 +599,13 @@ class InstalledPalaceTests(unittest.TestCase):
             self.assertEqual(schema(), before_schema)
             backend = get_backend_for_palace(path)
             backend.close_palace(path)
-            before_files = {p.name: p.read_bytes() for p in Path(path).iterdir() if p.is_file()}
+            before_files = {p.name: p.read_bytes() for p in Path(path).iterdir()
+                            if p.is_file() and not p.name.endswith("-shm")}
             reopened = read_events(path, "w")
             self.assertEqual(project_rules(events, as_of=NOW, policy=Policy()),
                              project_rules(reopened, as_of=NOW, policy=Policy()))
-            after_files = {p.name: p.read_bytes() for p in Path(path).iterdir() if p.is_file()}
+            after_files = {p.name: p.read_bytes() for p in Path(path).iterdir()
+                           if p.is_file() and not p.name.endswith("-shm")}
             self.assertEqual(after_files, before_files)
             backend.close_palace(path)
 

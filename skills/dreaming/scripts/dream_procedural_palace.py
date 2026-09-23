@@ -31,10 +31,10 @@ RECORD_HEADER = (
 
 @contextmanager
 def nonmutating_read(palace: str):
-    """Shared (not write) directory lock and a clean SQLite snapshot boundary.
+    """Shared directory lock; no application, schema or data mutations.
 
-    SQLite mode=ro may change WAL shared-memory bytes. Refuse those states;
-    never checkpoint, copy a partial database or ignore uncommitted WAL data.
+    The installed mode=ro backend reads committed WAL data and may coordinate
+    readers through SHM. Never checkpoint or ignore an incomplete WAL pair.
     """
     import fcntl
     path = os.path.realpath(os.path.expanduser(palace))
@@ -49,13 +49,9 @@ def nonmutating_read(palace: str):
                 if time.monotonic() >= deadline:
                     raise TimeoutError("procedural read lock timeout") from None
                 time.sleep(.01)
-        def check():
-            if any(Path(path, "sqlite_exact.sqlite3" + suffix).exists() for suffix in ("-wal", "-shm")):
-                raise RuntimeError("strict read requires a clean SQLite palace without WAL/SHM sidecars; "
-                                   "close/checkpoint the owning writer separately, never via guidance")
-        check()
+        dream_palace._check_read_sidecars(path)
         yield
-        check()
+        dream_palace._check_read_sidecars(path)
     finally:
         os.close(fd)
 

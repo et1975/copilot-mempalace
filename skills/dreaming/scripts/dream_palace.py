@@ -208,6 +208,14 @@ def palace_mutation_lock(palace: str, *, timeout_seconds: float = 5) -> Iterator
             os.close(fd)
 
 
+def _check_read_sidecars(palace: str) -> None:
+    """Do not let a cached immutable reader conceal an incomplete live WAL."""
+    sidecars = [os.path.join(palace, "sqlite_exact.sqlite3" + suffix) for suffix in ("-wal", "-shm")]
+    present = [os.path.lexists(path) for path in sidecars]
+    if any(present) and (not all(present) or not all(os.path.isfile(path) for path in sidecars)):
+        raise RuntimeError("incomplete WAL sidecar set; read requires coherent existing -wal and -shm files")
+
+
 def procedural_collection(palace: str):
     """Open existing drawer storage without schema, KG, or embedder writes.
 
@@ -223,6 +231,7 @@ def procedural_collection(palace: str):
     backend = get_backend_for_palace(path)
     if backend.name != "sqlite_exact":
         raise RuntimeError(f"procedural read-only storage unsupported by backend: {backend.name}")
+    _check_read_sidecars(path)
     return get_collection(path, create=False, read_only=True)
 
 
@@ -247,6 +256,22 @@ def load_source_drawer(palace: str, drawer_id: str, *, collection=None) -> dict[
     if not rows:
         return None
     logical = _group_by_parent(list(rows.values()), ("parent_drawer_id",))[0]
+    members = [rows[member_id] for member_id in logical["member_ids"]]
+    # MCP add_drawer slices verbatim characters; mined chunks retain the
+    # legacy newline convention. Recipe/author alone are shared by both.
+    handler_chunks = all(
+        (meta := row.get("metadata") or {}).get("id_recipe") in {"v2", "v3"}
+        and isinstance(meta.get("added_by"), str) and meta["added_by"].strip()
+        and "normalize_version" not in meta and "ingest_mode" not in meta
+        and meta.get("parent_drawer_id") == parent
+        and type(meta.get("chunk_index")) is int
+        and row["id"] == f"{parent}_chunk_{meta['chunk_index']:06d}"
+        for row in members
+    )
+    if handler_chunks:
+        if [row["metadata"]["chunk_index"] for row in members] != list(range(len(members))):
+            raise ValueError(f"incomplete source drawer chunks: {parent}")
+        logical["text"] = "".join(row["text"] for row in members)
     logical["content_hash"] = hashlib.sha256(logical["text"].encode("utf-8")).hexdigest()
     return logical
 
@@ -1692,10 +1717,35 @@ class MempalaceWriter:
     """Writes through the sanctioned MCP tool handlers against the bound palace."""
 
     def __init__(self) -> None:
-        from mempalace.mcp_server import TOOLS, _config  # lazy
+        # Importing the MCP server redirects Python and native stdout for its
+        # own protocol loop. Embedded callers do not run that restoration loop.
+        stdout, fd = sys.stdout, os.dup(1)
+        try:
+            from mempalace import mcp_server  # lazy
+        finally:
+            os.dup2(fd, 1)
+            os.close(fd)
+            sys.stdout = stdout
 
-        self._tools = TOOLS
-        self.palace_path = os.path.realpath(os.path.expanduser(_config.palace_path))
+        self._server = mcp_server
+        self._tools = mcp_server.TOOLS
+        self.palace_path = os.path.realpath(os.path.expanduser(mcp_server._config.palace_path))
+
+    @contextmanager
+    def mutation(self, tool_name: str = "mempalace_add_drawer") -> Iterator[None]:
+        """Honor MCP preflight and release only ownership acquired by this scope."""
+        server = self._server
+        if os.path.realpath(os.path.expanduser(server._config.palace_path)) != self.palace_path:
+            raise RuntimeError("MCP palace binding changed after writer construction")
+        already_owned = server._MCP_WRITER_LOCK_CM is not None
+        try:
+            refusal = server._mcp_tool_preflight_refusal(None, tool_name)
+            if refusal is not None:
+                raise RuntimeError(f"MCP mutation refused: {refusal['error']}")
+            yield
+        finally:
+            if not already_owned:
+                server._release_mcp_writer_lock()
 
     def add_drawer(
         self,
@@ -1722,7 +1772,8 @@ class MempalaceWriter:
                 # provenance reversible by appending a machine-readable trailer.
                 meta_json = json.dumps(metadata, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
                 kwargs["content"] = f"{content}\n\n<!--dreaming-meta: {meta_json}-->"
-        result = handler(**kwargs)
+        with self.mutation():
+            result = handler(**kwargs)
         if isinstance(result, dict) and result.get("success") is False:
             raise RuntimeError(f"add_drawer failed: {result.get('error', result)}")
         return result
@@ -1730,7 +1781,7 @@ class MempalaceWriter:
     def delete_drawer(self, drawer_id: str) -> Any:
         from dream_procedural_palace import live_protected_drawer_ids
 
-        with palace_mutation_lock(self.palace_path):
+        with self.mutation("mempalace_delete_drawer"), palace_mutation_lock(self.palace_path):
             col = protection_collection(self.palace_path)
             if drawer_id in live_protected_drawer_ids(self.palace_path, collection=col):
                 raise ValueError("procedural evidence/event drawer is protected")
@@ -1777,7 +1828,8 @@ class Archiver:
         if self._collection is None:
             from mempalace.palace import get_collection  # lazy: heavy import
 
-            self._collection = get_collection(self.palace_path)
+            # The backend caches handles and retires them at lease boundaries.
+            return get_collection(self.palace_path)
         return self._collection
 
     def _reload_rows(self, member_ids: list[str]) -> list[dict[str, Any]]:

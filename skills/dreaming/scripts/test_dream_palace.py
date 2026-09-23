@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import hashlib
 import json
 import sqlite3
 import sys
@@ -10,7 +11,7 @@ import types
 import unittest
 
 import dream_palace
-from test_dream_procedural_palace import DrawerCollection
+from test_dream_procedural_palace import DrawerCollection, installed_palace
 
 
 def _test_tmpdir():
@@ -721,6 +722,9 @@ class TestMempalaceWriter(unittest.TestCase):
         mempalace_module = types.ModuleType("mempalace")
         mcp_module = types.ModuleType("mempalace.mcp_server")
         mcp_module._config = types.SimpleNamespace(palace_path="/palace")
+        mcp_module._MCP_WRITER_LOCK_CM = None
+        mcp_module._mcp_tool_preflight_refusal = lambda *args: None
+        mcp_module._release_mcp_writer_lock = lambda: None
         mcp_module.TOOLS = {
             "mempalace_add_drawer": {"handler": handler},
             "mempalace_delete_drawer": {"handler": lambda drawer_id: {"deleted": drawer_id}},
@@ -775,6 +779,48 @@ class TestMempalaceWriter(unittest.TestCase):
         self.assertEqual(calls[0][0:2], ("wing", "room"))
         self.assertTrue(calls[0][2].startswith("content\n\n<!--dreaming-meta: "))
         self.assertIn('"supersedes":["old"]', calls[0][2])
+
+
+class TestLoadSourceDrawer(unittest.TestCase):
+    def test_installed_handler_chunks_preserve_cross_boundary_quote_and_logical_hash(self):
+        from dream_procedural_palace import verify_event_sources
+        from dream_procedural import parse_event
+        from test_dream_procedural import event_data, evidence
+        from test_dream_procedural_palace import SESSION
+        with _test_tmpdir() as path, installed_palace(path) as server:
+            boundary = server._config.chunk_size
+            prefix = f"SESSION_ID: {SESSION}\n"
+            text = prefix + "x" * (boundary - 3 - len(prefix)) + "regression was caught.\n" + "tail" * 80
+            writer = dream_palace.MempalaceWriter()
+            written = writer.add_drawer("w", "diary", text, added_by="copilot-cli")
+            self.assertGreater(written["chunks"], 1)
+            physical = dream_palace.procedural_collection(path).get(
+                ids=written["chunk_ids"], include=["documents"])
+            self.assertTrue(physical["documents"][0].endswith("reg"))
+            self.assertTrue(physical["documents"][1].startswith("ression"))
+            logical = server.tool_get_drawer(written["drawer_id"])
+            self.assertEqual(logical["content"], text)
+            for source_id in (written["drawer_id"], written["chunk_ids"][1]):
+                with self.subTest(source_id=source_id):
+                    source = dream_palace.load_source_drawer(path, source_id)
+                    self.assertEqual(source["text"], text)
+                    self.assertEqual(source["content_hash"], hashlib.sha256(text.encode()).hexdigest())
+                    ref = evidence(source_id, SESSION, text)
+                    ref["quote"] = "regression was caught."
+                    verify_event_sources(path, parse_event(event_data(
+                        origin_drawer_ids=[], evidence=[ref])))
+
+    def test_legacy_mined_chunks_keep_newline_reconstruction(self):
+        collection = DrawerCollection({
+            "legacy-0": {"id": "legacy-0", "text": "first", "metadata": {
+                "parent_drawer_id": "legacy", "chunk_index": 0, "added_by": "copilot-cli",
+                "id_recipe": "v3", "normalize_version": 1}},
+            "legacy-1": {"id": "legacy-1", "text": "second", "metadata": {
+                "parent_drawer_id": "legacy", "chunk_index": 1, "added_by": "copilot-cli",
+                "id_recipe": "v3", "normalize_version": 1}},
+        })
+        source = dream_palace.load_source_drawer("/unused", "legacy", collection=collection)
+        self.assertEqual(source["text"], "first\nsecond")
 
 
 class TestLoadDrawerById(unittest.TestCase):
