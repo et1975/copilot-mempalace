@@ -13,6 +13,7 @@ from unittest import mock
 
 import dream_adopt
 import dream_harvest
+from test_dream_procedural_palace import DrawerCollection
 
 try:
     from mempalace.knowledge_graph import KnowledgeGraph as _RealKG
@@ -273,6 +274,10 @@ class TestHarvestPatternTask(unittest.TestCase):
 
 
 class TestHarvestPruneTask(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(mock.patch.object(dream_harvest.dream_palace, "procedural_collection",
+                                           return_value=DrawerCollection()))
+
     def test_prune_task_writes_prune_worklist(self):
         drawers = [
             {
@@ -702,7 +707,7 @@ class TestAdoptMergeArchiveAndVerify(unittest.TestCase):
             with open(decisions_path, "w", encoding="utf-8") as fh:
                 json.dump(self._merge_decisions(), fh)
             archive_path = os.path.join(td, "custom-archive.jsonl")
-            with mock.patch.object(dream_adopt.dream_palace, "bind_palace", return_value="/bound"), \
+            with mock.patch.object(dream_adopt.dream_palace, "bind_palace", return_value=td), \
                  mock.patch.object(dream_adopt.dream_palace, "MempalaceWriter", return_value=mock.MagicMock()), \
                  mock.patch.object(dream_adopt.dream_palace, "Archiver") as archiver_cls, \
                  mock.patch.object(dream_adopt, "_preflight_merge_decisions", side_effect=lambda p, d: (d, [])), \
@@ -750,6 +755,10 @@ class TestAdoptMergeArchiveAndVerify(unittest.TestCase):
 
 
 class TestAdoptMergeTask(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(mock.patch.object(dream_adopt.dream_palace, "procedural_collection",
+                                           return_value=DrawerCollection()))
+
     def test_adopt_uses_mempalace_config_when_palace_is_omitted(self):
         with _test_tmpdir() as td:
             configured_palace = os.path.join(td, "configured-palace")
@@ -832,6 +841,10 @@ class TestAdoptMergeTask(unittest.TestCase):
 
 
 class TestAdoptPruneTask(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(mock.patch.object(dream_adopt.dream_palace, "procedural_collection",
+                                           return_value=DrawerCollection()))
+
     def test_resolve_prune_decisions_defaults_to_item_fields_and_keeps_by_default(self):
         salience = {"v": 0.12, "age_days": 400, "kg_degree": 0}
         worklist = {

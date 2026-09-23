@@ -10,6 +10,7 @@ import types
 import unittest
 
 import dream_palace
+from test_dream_procedural_palace import DrawerCollection
 
 
 def _test_tmpdir():
@@ -256,15 +257,12 @@ class TestArchiver(unittest.TestCase):
                 "reason": "prune",
             }
 
-            class FakeCollection:
-                def get(self, **kwargs):
-                    self.last_get = kwargs
-                    return {
-                        "ids": ["chunk-1", "chunk-2"],
-                        "documents": ["first chunk", "second chunk"],
-                        "metadatas": [{"chunk_index": 0}, {"chunk_index": 1}],
-                        "embeddings": [[1.0, 2.0], [3.0, 4.0]],
-                    }
+            collection = DrawerCollection({
+                "chunk-1": {"id": "chunk-1", "text": "first chunk",
+                            "metadata": {"chunk_index": 0}, "embedding": [1.0, 2.0]},
+                "chunk-2": {"id": "chunk-2", "text": "second chunk",
+                            "metadata": {"chunk_index": 1}, "embedding": [3.0, 4.0]},
+            })
 
             class FakeWriter:
                 def __init__(self):
@@ -275,9 +273,9 @@ class TestArchiver(unittest.TestCase):
                     with open(archive_path, encoding="utf-8") as fh:
                         self.archive_seen_at_delete.append(fh.read())
                     self.deleted.append(drawer_id)
+                    collection.delete(drawer_id)
                     return {"deleted": drawer_id}
 
-            collection = FakeCollection()
             writer = FakeWriter()
             result = dream_palace.Archiver(
                 td, archive_path=archive_path, writer=writer, collection=collection
@@ -317,14 +315,7 @@ class TestArchiver(unittest.TestCase):
             archive_path = os.path.join(td, "archive-dir")
             os.mkdir(archive_path)
 
-            class FakeCollection:
-                def get(self, **kwargs):
-                    return {
-                        "ids": ["d1"],
-                        "documents": ["doc"],
-                        "metadatas": [{}],
-                        "embeddings": [[]],
-                    }
+            collection = DrawerCollection({"d1": {"id": "d1", "text": "doc", "metadata": {}}})
 
             class FakeWriter:
                 def __init__(self):
@@ -334,7 +325,7 @@ class TestArchiver(unittest.TestCase):
                     self.deleted.append(drawer_id)
 
             writer = FakeWriter()
-            archiver = dream_palace.Archiver(td, archive_path=archive_path, writer=writer, collection=FakeCollection())
+            archiver = dream_palace.Archiver(td, archive_path=archive_path, writer=writer, collection=collection)
 
             with self.assertRaises(IsADirectoryError):
                 archiver.archive_then_delete({"id": "d1", "member_ids": ["d1"]})
@@ -342,14 +333,7 @@ class TestArchiver(unittest.TestCase):
 
     def test_archive_defaults_to_palace_local_path(self):
         with _test_tmpdir() as palace:
-            class FakeCollection:
-                def get(self, **kwargs):
-                    return {
-                        "ids": ["d1"],
-                        "documents": ["doc"],
-                        "metadatas": [{}],
-                        "embeddings": [[]],
-                    }
+            collection = DrawerCollection({"d1": {"id": "d1", "text": "doc", "metadata": {}}})
 
             class FakeWriter:
                 def __init__(self):
@@ -357,9 +341,10 @@ class TestArchiver(unittest.TestCase):
 
                 def delete_drawer(self, drawer_id):
                     self.deleted.append(drawer_id)
+                    return collection.delete(drawer_id)
 
             writer = FakeWriter()
-            dream_palace.Archiver(palace, writer=writer, collection=FakeCollection()).archive_then_delete(
+            dream_palace.Archiver(palace, writer=writer, collection=collection).archive_then_delete(
                 {"id": "d1", "member_ids": ["d1"]}
             )
             self.assertTrue(os.path.exists(os.path.join(palace, "dream-archive.jsonl")))
@@ -368,14 +353,8 @@ class TestArchiver(unittest.TestCase):
         with _test_tmpdir() as palace:
             archive_path = os.path.join(palace, "archive.jsonl")
 
-            class FakeCollection:
-                def get(self, **kwargs):
-                    return {
-                        "ids": ["chunk-1"],
-                        "documents": ["first chunk"],
-                        "metadatas": [{}],
-                        "embeddings": [[]],
-                    }
+            collection = DrawerCollection({
+                "chunk-1": {"id": "chunk-1", "text": "first chunk", "metadata": {}}})
 
             class FakeWriter:
                 def __init__(self):
@@ -386,10 +365,10 @@ class TestArchiver(unittest.TestCase):
 
             writer = FakeWriter()
             archiver = dream_palace.Archiver(
-                palace, archive_path=archive_path, writer=writer, collection=FakeCollection()
+                palace, archive_path=archive_path, writer=writer, collection=collection
             )
 
-            with self.assertRaises(ValueError):
+            with self.assertRaisesRegex(ValueError, "missing drawer ids"):
                 archiver.archive_then_delete({"id": "logical-1", "member_ids": ["chunk-1", "chunk-2"]})
             self.assertEqual(writer.deleted, [])
             self.assertFalse(os.path.exists(archive_path))
@@ -741,6 +720,7 @@ class TestMempalaceWriter(unittest.TestCase):
         original_mcp_module = sys.modules.get("mempalace.mcp_server")
         mempalace_module = types.ModuleType("mempalace")
         mcp_module = types.ModuleType("mempalace.mcp_server")
+        mcp_module._config = types.SimpleNamespace(palace_path="/palace")
         mcp_module.TOOLS = {
             "mempalace_add_drawer": {"handler": handler},
             "mempalace_delete_drawer": {"handler": lambda drawer_id: {"deleted": drawer_id}},

@@ -465,11 +465,17 @@ def _merge_drift_errors(path: str, decision: dict[str, Any]) -> list[dict[str, A
 
 
 def _preflight_merge_decisions(path: str, decisions: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    from dream_procedural_palace import live_protected_drawer_ids
+    protected = live_protected_drawer_ids(path)
     filtered = []
     errors = []
     for decision in decisions:
         if decision.get("action") != "merge":
             filtered.append(decision)
+            continue
+        if protected.intersection(decision.get("supersedes") or []):
+            errors.append({"stage": "protected", "error": "procedural evidence/event drawer", "decision": decision})
+            filtered.append({"action": "skip"})
             continue
         drift_errors = _merge_drift_errors(path, decision)
         if drift_errors:
@@ -481,6 +487,8 @@ def _preflight_merge_decisions(path: str, decisions: list[dict[str, Any]]) -> tu
 
 
 def _preflight_prune_decisions(path: str, decisions: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    from dream_procedural_palace import live_protected_drawer_ids
+    protected = live_protected_drawer_ids(path)
     try:
         degrees = dream_palace.kg_protection_degree(path)
     except Exception as exc:  # noqa: BLE001
@@ -496,6 +504,10 @@ def _preflight_prune_decisions(path: str, decisions: list[dict[str, Any]]) -> tu
             filtered.append(decision)
             continue
         drawer_id = decision["id"]
+        if protected.intersection([drawer_id, *decision.get("member_ids", [])]):
+            errors.append({"stage": "protected", "error": "procedural evidence/event drawer", "decision": decision})
+            filtered.append({"action": "keep"})
+            continue
         try:
             live = dream_palace.load_drawer_by_id(path, drawer_id)
         except Exception as exc:  # noqa: BLE001
@@ -743,13 +755,14 @@ def main(argv: list[str] | None = None) -> int:
         )
     elif task == "merge":
         decisions = _resolve_decisions(worklist)
-        decisions, preflight_errors = _preflight_merge_decisions(path, decisions)
-        writer = dream_palace.MempalaceWriter()
-        archiver = dream_palace.Archiver(path, writer=writer, archive_path=args.archive_file)
-        report = _add_preflight_errors(
-            apply_merge_decisions(decisions, writer, archiver),
-            preflight_errors,
-        )
+        with dream_palace.palace_mutation_lock(path):
+            decisions, preflight_errors = _preflight_merge_decisions(path, decisions)
+            writer = dream_palace.MempalaceWriter()
+            archiver = dream_palace.Archiver(path, writer=writer, archive_path=args.archive_file)
+            report = _add_preflight_errors(
+                apply_merge_decisions(decisions, writer, archiver),
+                preflight_errors,
+            )
         print(
             f"adopted: merged {report['merged']}, skipped {report['skipped']}, "
             f"deleted {len(report['deleted'])}, errors {len(report['errors'])}",
@@ -757,11 +770,12 @@ def main(argv: list[str] | None = None) -> int:
         )
     elif task == "prune":
         decisions = _resolve_prune_decisions(worklist)
-        decisions, preflight_errors = _preflight_prune_decisions(path, decisions)
-        report = _add_preflight_errors(
-            apply_prune_decisions(decisions, dream_palace.Archiver(path, archive_path=args.archive_file)),
-            preflight_errors,
-        )
+        with dream_palace.palace_mutation_lock(path):
+            decisions, preflight_errors = _preflight_prune_decisions(path, decisions)
+            report = _add_preflight_errors(
+                apply_prune_decisions(decisions, dream_palace.Archiver(path, archive_path=args.archive_file)),
+                preflight_errors,
+            )
         print(
             f"adopted (prune): pruned {report['pruned']}, kept {report['kept']}, "
             f"errors {len(report['errors'])}",

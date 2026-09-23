@@ -30,6 +30,9 @@ class MetadataTests(unittest.TestCase):
                      '<!--dreaming-meta: {"kind":"lesson","kind":"reflect"}-->'):
             with self.subTest(text=text), self.assertRaises(ValueError):
                 decode_dream_metadata({"text": text})
+        for metadata in ([], "", {"kind": []}, {"source_kind": {}}):
+            with self.subTest(metadata=metadata), self.assertRaises(ValueError):
+                decode_dream_metadata({"metadata": metadata})
 
     def test_generated_classification_native_trailer_and_summary(self):
         from dream_metadata import is_generated_observation, is_procedural_record

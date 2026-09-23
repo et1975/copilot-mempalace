@@ -23,6 +23,7 @@ import sys
 import dream_ontology
 import dream_palace
 from dream_metadata import is_generated_observation
+from dream_procedural_palace import exclude_protected_drawers
 from dream_lib import (
     build_contradiction_worklist,
     build_gap_worklist,
@@ -157,6 +158,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.task == "prune":
         drawers = dream_palace.load_logical_drawers(path, wing=args.wing, room=args.room)
+        drawers = exclude_protected_drawers(path, drawers)
         degrees = dream_palace.kg_protection_degree(path)
         redundancy = compute_redundancy(drawers)
         now = datetime.now()
@@ -331,6 +333,7 @@ def main(argv: list[str] | None = None) -> int:
 
     tau = args.tau if args.tau is not None else 0.9
     drawers = dream_palace.load_logical_drawers(path, args.wing, args.room)
+    drawers = exclude_protected_drawers(path, drawers)
     worklist = build_worklist(
         drawers,
         tau=tau,

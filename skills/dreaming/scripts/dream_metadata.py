@@ -37,7 +37,9 @@ def strict_json(text: str) -> Any:
 
 def decode_dream_metadata(drawer: dict) -> dict:
     """Merge native/trailer metadata; malformed or disagreeing encodings raise."""
-    native = drawer.get("metadata") or {}
+    native = drawer.get("metadata")
+    if native is None:
+        native = {}
     if not isinstance(native, dict):
         raise ValueError("drawer metadata must be an object")
     result = dict(native)
@@ -56,6 +58,9 @@ def decode_dream_metadata(drawer: dict) -> dict:
                 raise ValueError(f"conflicting dreaming metadata: {key}")
             result[key] = value
         offset = len(text) - len(body) + end
+    for key in ("kind", "source_kind", "generated_from", "added_by"):
+        if key in result and (not isinstance(result[key], str) or not result[key].strip()):
+            raise ValueError(f"invalid dreaming metadata field: {key}")
     return result
 
 
