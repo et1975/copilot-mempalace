@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import redirect_stdout
+from contextlib import redirect_stdout, nullcontext
 from datetime import datetime, timezone
 import json
 import os
@@ -141,6 +141,8 @@ def _execute(args):
         if args.dry_run:
             return {"status": "dry_run", "event_id": event.event_id, "projection": to_data(projection)}
         dream_palace.bind_palace(palace)
+        from dream_procedural_palace import local_embedder
+        local_embedder()
         result = append_event(palace, args.wing, event, writer=dream_palace.MempalaceWriter(),
             clock=now_utc,
             preflight=lambda ev, live: preflight_event(
@@ -159,17 +161,33 @@ def _execute(args):
                   "notice": "No counterexample found means none within this bounded search, not none exist."}
         _write_artifact(_artifact_path(args.out, palace), result)
         return result
-    raise RequestError("guidance/explain implementation unavailable")
+    from dream_procedural import repository_key
+    from dream_procedural_palace import (
+        GuidanceLimits, embed_texts, explain_rule, get_task_guidance, revalidate_sources,
+    )
+    repository = repository_key(args.repository) if args.command == "guidance" else None
+    projection, diagnostics = revalidate_sources(projection, evidence_reader=reader,
+                                                 as_of=as_of, repository=repository)
+    if args.command == "explain":
+        return explain_rule(projection, args.rule_id, as_of=as_of, source_diagnostics=diagnostics)
+    result = get_task_guidance(projection, task=args.task, repository=repository,
+        embedder=lambda texts: embed_texts(dream_palace.procedural_collection(palace), texts),
+        limits=GuidanceLimits(args.max_items, args.max_chars), as_of=as_of,
+        include_candidates=args.include_candidates)
+    return result.data
 
 
 def main(argv=None) -> int:
     try:
         args = _parser().parse_args(argv)
+        from dream_procedural_palace import nonmutating_read
+        read_only = args.command in {"validate", "guidance", "explain"} or \
+            getattr(args, "dry_run", False) or getattr(args, "prepare", False)
         # Imported handlers/models may print; keep the command's stdout strictly JSON.
-        with redirect_stdout(sys.stderr):
+        with redirect_stdout(sys.stderr), (nonmutating_read(args.palace) if read_only else nullcontext()):
             result = _execute(args)
         print(canonical_json(result))
-        return 0
+        return 1 if result.get("status") == "evidence_unavailable" else 0
     except (ValueError, TypeError) as exc:
         print(canonical_json({"status": "error", "kind": "invalid_request", "error": str(exc)}))
         print(f"invalid request: {exc}", file=sys.stderr)

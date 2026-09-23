@@ -11,6 +11,16 @@ from dream_procedural import event_to_data, parse_event
 from test_dream_procedural import NOW, event_data, resign, sha, stamp
 from test_dream_procedural_palace import sanctioned_writer
 from test_dream_procedural_validate import GroundedFixture
+from test_dream_procedural import definition, parsed
+from dream_procedural import Policy, project_rules
+from datetime import timedelta
+import math
+import unittest
+import hashlib
+import os
+import sys
+import sqlite3
+from types import SimpleNamespace
 
 
 class CommandTests(GroundedFixture):
@@ -123,3 +133,245 @@ class CommandTests(GroundedFixture):
         code, result, err = self.invoke("review", resign(review))
         self.assertEqual(code, 0, err)
         self.assertEqual(result["projection"]["rules"][0]["score"]["harmful"], 0)
+
+    def test_read_commands_recheck_sources_never_construct_writer_and_explain_retains_lineage(self):
+        from dream_procedure import main
+        self.invoke("propose", self.proposal())
+        self.invoke("review", self.review())
+        self.collection.embedding_function = lambda texts: [[1., 0.] for t in texts]
+        before = deepcopy(self.collection.rows)
+        out = StringIO()
+        with patch.object(dream_palace, "MempalaceWriter", side_effect=AssertionError("writer")), \
+             patch.object(dream_palace, "ensure_firewall_schema", side_effect=AssertionError("schema")), \
+             patch("dream_procedure.now_utc", return_value=NOW), redirect_stdout(out):
+            code = main(["guidance", "--palace", self.path, "--wing", "w",
+                         "--repository", "owner/repo", "--task", "regression", "--include-candidates"])
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out.getvalue())["trials"][0]["rule_id"], self.proposal().rule_id)
+        self.assertEqual(self.collection.rows, before)
+        code, result, err = self.invoke("explain", None, "--rule-id", self.proposal().rule_id)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(result["rule"]["events"]), 2)
+        self.assertEqual(result["rule"]["score"]["helpful"], 0)
+        self.collection.rows["source-1"]["text"] = "drifted"
+        code, result, err = self.invoke("guidance", None, "--repository", "owner/repo",
+                                       "--task", "regression", "--include-candidates")
+        self.assertEqual((code, result["kind"]), (1, "evidence_unavailable"), err)
+        code, result, err = self.invoke("explain", None, "--rule-id", self.proposal().rule_id)
+        self.assertEqual(code, 1, err)
+        self.assertIn("evidence_unavailable", result["rule"]["suppression_reasons"])
+
+    def test_strict_read_refuses_wal_sidecars_before_any_backend_open(self):
+        wal = Path(self.path, "sqlite_exact.sqlite3-wal")
+        wal.write_bytes(b"uncheckpointed state")
+        before = wal.read_bytes()
+        code, result, err = self.invoke("guidance", None, "--task", "test", "--repository", "owner/repo")
+        self.assertEqual(code, 1, err)
+        self.assertIn("WAL", result["error"])
+        self.assertEqual(wal.read_bytes(), before)
+
+    def test_read_does_not_trust_externally_filed_review_without_dispositions(self):
+        from dream_procedural_palace import _record_body
+        self.invoke("propose", self.proposal())
+        review = self.review(dispositions=[])
+        self.collection.add("w", "procedural", _record_body(review), "dream-procedure",
+            {"kind": "procedural_event", "schema_version": 1, "event": event_to_data(review)})
+        self.collection.embedding_function = lambda texts: [[1., 0.] for t in texts]
+        code, result, err = self.invoke("guidance", None, "--repository", "owner/repo",
+                                       "--task", "regression", "--include-candidates")
+        self.assertEqual((code, result["kind"]), (1, "evidence_unavailable"), err)
+
+    def test_missing_local_model_fails_without_bootstrap_or_remote_embedder(self):
+        from dream_procedural_palace import local_embedder
+        with patch("mempalace.embedding.current_model_name", return_value="openai-compat"), \
+             patch("mempalace.embedding.get_embedding_function", side_effect=AssertionError("remote")):
+            with self.assertRaisesRegex(RuntimeError, "installed minilm"):
+                local_embedder()
+        with patch("mempalace.embedding.current_model_name", return_value="minilm"), \
+             patch("chromadb.utils.embedding_functions.onnx_mini_lm_l6_v2.ONNXMiniLM_L6_V2.DOWNLOAD_PATH",
+                   Path(self.tmp.name, "absent-cache")), \
+             patch("mempalace.embedding.get_embedding_function", side_effect=AssertionError("bootstrap")):
+            with self.assertRaisesRegex(RuntimeError, "never download"):
+                local_embedder()
+
+
+def guidance_events(rule=None, base=1, count=3):
+    rule = rule or definition()
+    review = event_data("review", base + 1, rule=rule)
+    review["payload"]["validation_packet"]["repository"] = rule["scope"]["key"]
+    review["payload"]["validation_digest"] = sha(review["payload"]["validation_packet"])
+    return [parsed("proposal", base, rule=rule), parse_event(resign(review)),
+            *[parsed("outcome", base + i + 2, rule=rule, repository=rule["scope"]["key"])
+              for i in range(count)]]
+
+
+class GuidanceTests(unittest.TestCase):
+    def guidance(self, events, *, embedder=None, at=NOW, **kwargs):
+        from dream_procedural_palace import get_task_guidance, GuidanceLimits
+        limits = kwargs.pop("limits", GuidanceLimits())
+        return get_task_guidance(project_rules(events, as_of=at, policy=Policy()),
+            task="Fix regression", repository="owner/repo",
+            embedder=embedder or (lambda texts: [[1., 0.] for t in texts]),
+            limits=limits, as_of=at, **kwargs)
+
+    def test_exact_scope_and_maturity_filter_before_embedding(self):
+        good = guidance_events()
+        wrong = guidance_events(definition(scope={"kind": "repository", "key": "owner/repo2"}), 10)
+        candidate = guidance_events(definition(statement="Candidate advice."), 20, 0)
+        seen = []
+        def embed(texts):
+            seen.extend(texts)
+            return [[1., 0.] for t in texts]
+        result = self.guidance(good + wrong + candidate, embedder=embed)
+        self.assertEqual([r["rule_id"] for r in result.data["rules"]], [good[0].rule_id])
+        self.assertEqual(len(seen), 2)
+        self.assertEqual(result.data["trials"], [])
+        trials = self.guidance(good + wrong + candidate, include_candidates=True)
+        self.assertEqual([r["rule_id"] for r in trials.data["trials"]], [candidate[0].rule_id])
+        self.assertEqual(trials.data["trials"][0]["delivery"], "approved_candidate_trial")
+
+    def test_stale_harm_conflict_retirement_replacement_are_never_delivered(self):
+        base = guidance_events()
+        rid = base[0].rule_id
+        variants = [
+            (base, NOW + timedelta(days=90)),
+            (base + [parsed("outcome", 50, outcome="harmful")], NOW),
+            (base + [parsed("review", 50)], NOW),
+            (base + [parsed("review", 50, verdict="retire", parent_review_ids=[base[1].event_id])], NOW),
+        ]
+        other = definition(statement="Alternative reviewed statement.")
+        variants.append((base + [parsed("proposal", 80, rule=other),
+                         parsed("review", 50, verdict="replace", parent_review_ids=[base[1].event_id],
+                                replacement_rule_id=parsed(rule=other).rule_id)], NOW))
+        for events, at in variants:
+            with self.subTest(at=at, events=len(events)):
+                result = self.guidance(events, at=at, include_candidates=True)
+                self.assertEqual(result.data["item_count"], 0)
+
+    def test_cosine_boundary_stable_ties_and_invalid_vectors(self):
+        base = guidance_events()
+        self.assertEqual(self.guidance(base,
+            embedder=lambda texts: [[1., 0.], [1., math.sqrt(15)]]).data["item_count"], 1)
+        self.assertEqual(self.guidance(base,
+            embedder=lambda texts: [[1., 0.], [.249, math.sqrt(1 - .249 ** 2)]]).data["item_count"], 0)
+        for vectors in ([], [[0., 0.], [1., 0.]], [[1., 0.], [float("nan"), 0.]],
+                        [[1., 0.], [1.]], [[1., 0.], [float("inf"), 1.]]):
+            with self.subTest(vectors=vectors), self.assertRaises(RuntimeError):
+                self.guidance(base, embedder=lambda texts: vectors)
+        other = guidance_events(definition(statement="Another rule."), 20)
+        result = self.guidance(list(reversed(base + other)))
+        self.assertEqual([r["rule_id"] for r in result.data["rules"]], sorted([base[0].rule_id, other[0].rule_id]))
+
+    def test_combined_five_items_exact_serialized_budget_preserves_exceptions(self):
+        from dream_procedural_palace import GuidanceLimits
+        events = []
+        exceptions = [('quote " slash \\ newline\n café 漢字 ' * 10).strip()]
+        for i in range(8):
+            rule = definition(statement=f"Rule {i}.",
+                              rule_type="rule" if i % 2 else "anti_pattern", exceptions=exceptions)
+            events.extend(guidance_events(rule, 1 + 20 * i, 0 if i == 7 else 3))
+        result = self.guidance(events, include_candidates=True)
+        self.assertLessEqual(result.data["item_count"], 5)
+        self.assertLessEqual(len(result.serialized), 6000)
+        self.assertEqual(result.serialized, json.dumps(result.data, sort_keys=True,
+                          separators=(",", ":"), ensure_ascii=False) + "\n")
+        for item in result.data["rules"] + result.data["anti_patterns"] + result.data["trials"]:
+            self.assertEqual(item["exceptions"], exceptions)
+            self.assertEqual(item["applies_when"], "Fixing a reproducible defect.")
+        small = self.guidance(events, include_candidates=True, limits=GuidanceLimits(max_chars=512))
+        self.assertEqual(small.data["item_count"], 0)
+        self.assertLessEqual(len(small.serialized), 512)
+        with self.assertRaises(ValueError):
+            GuidanceLimits(max_chars=10)
+        with self.assertRaises(ValueError):
+            GuidanceLimits(max_items=6)
+
+    def test_no_rules_no_eligible_and_invalid_projection_are_distinct(self):
+        self.assertEqual(self.guidance([]).data["status"], "no_rules")
+        self.assertEqual(self.guidance([parsed()]).data["status"], "no_eligible_rules")
+        with self.assertRaises(RuntimeError):
+            self.guidance([parsed()] * 5001)
+        with self.assertRaises(RuntimeError):
+            self.guidance([parsed("proposal", i+1, rule=definition(statement=f"Rule {i}.")) for i in range(101)])
+        with self.assertRaises(RuntimeError):
+            self.guidance([parsed("review", 2)])
+
+
+class InstalledCommandTests(GroundedFixture):
+    def test_real_sqlite_commands_source_store_and_read_paths_are_byte_unchanged(self):
+        from dream_procedure import main
+        self.storage_patch.stop()
+        with patch.dict(os.environ, {"MEMPALACE_PALACE_PATH": self.path,
+                "MEMPALACE_BACKEND": "sqlite_exact", "MEMPALACE_BACKEND_EXPLICIT": "sqlite_exact",
+                "MEMPALACE_EMBEDDING_MODEL": "minilm", "HF_HUB_OFFLINE": "1",
+                "TRANSFORMERS_OFFLINE": "1"}), patch.object(sys, "argv", ["procedure-integration"]):
+            from mempalace.palace import get_collection, get_backend_for_palace
+            from mempalace import mcp_server
+            col = get_collection(self.path, backend="sqlite_exact", create=True)
+            self.addCleanup(get_backend_for_palace(self.path).close_palace, self.path)
+            with patch.object(mcp_server, "_config", SimpleNamespace(palace_path=self.path, chunk_size=512)), \
+                 patch.object(mcp_server, "_get_collection",
+                              side_effect=lambda **kwargs: get_collection(self.path, create=False)), \
+                 patch.object(mcp_server, "_wal_log", return_value=None):
+                writer = dream_palace.MempalaceWriter()
+                for ref in self.refs:
+                    ref["source_id"] = writer.add_drawer("w", "diary", ref["quote"])["drawer_id"]
+
+                def run(command, event=None, *extra):
+                    if command == "validate":
+                        get_backend_for_palace(self.path).close_palace(self.path)
+                        with sqlite3.connect(str(Path(self.path, "sqlite_exact.sqlite3"))) as checkpoint:
+                            checkpoint.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                        checkpoint.close()
+                    args = [command, "--palace", self.path, "--wing", "w", "--session-store", self.store]
+                    if event is not None:
+                        path = Path(self.tmp.name, "event.json")
+                        path.write_text(json.dumps(event_to_data(event)))
+                        args += ["--input", str(path)]
+                    out, err = StringIO(), StringIO()
+                    with redirect_stdout(out), redirect_stderr(err), patch("dream_procedure.now_utc", return_value=NOW):
+                        code = main([*args, *extra])
+                    self.assertEqual(code, 0, err.getvalue())
+                    return json.loads(out.getvalue()), out.getvalue()
+
+                run("propose", self.proposal())
+                packet_path = Path(self.tmp.name, "packet.json")
+                packet, _ = run("validate", None, "--rule-id", self.proposal().rule_id,
+                                 "--contrast-query", "focused regression test harmful misleading",
+                                 "--out", str(packet_path))
+                self.assertGreaterEqual(len(packet["validation_packet"]["evidence"]), 3)
+                review = event_to_data(self.review())
+                review["payload"]["validation_packet"] = packet["validation_packet"]
+                review["payload"]["validation_digest"] = packet["validation_digest"]
+                review["payload"]["dispositions"] = [
+                    {"evidence_id": r["source_id"], "disposition": "supports",
+                     "reason": "Reviewed original regression observation.", "evidence": [r]}
+                    for r in packet["validation_packet"]["evidence"]]
+                review = parse_event(resign(review))
+                run("review", review)
+                self.assertEqual(run("review", review)[0]["status"], "already_exists")
+                for i, ref in enumerate(self.refs[:3]):
+                    run("outcome", parse_event(event_data("outcome", 10 + i,
+                        source_session_id=ref["session_id"], evidence=[ref])))
+            get_backend_for_palace(self.path).close_palace(self.path)
+            # Fixture-only explicit writer checkpoint. Read commands must refuse
+            # an active WAL rather than changing SQLite's shared-memory bytes.
+            with sqlite3.connect(str(Path(self.path, "sqlite_exact.sqlite3"))) as con:
+                con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            con.close()
+            before = {p.name: p.read_bytes() for p in Path(self.path).iterdir() if p.is_file()}
+            source_before = Path(self.store).read_bytes()
+            with patch.object(dream_palace, "MempalaceWriter", side_effect=AssertionError("writer")), \
+                 patch.object(dream_palace, "ensure_firewall_schema", side_effect=AssertionError("schema")):
+                guidance, text = run("guidance", None, "--task", self.proposal().payload.definition.statement,
+                                     "--repository", "owner/repo")
+                self.assertEqual(guidance["item_count"], 1)
+                self.assertEqual(guidance["rules"][0]["maturity"], "established")
+                self.assertLessEqual(len(text), 6000)
+                explained, _ = run("explain", None, "--rule-id", self.proposal().rule_id)
+                self.assertEqual(explained["rule"]["score"]["helpful"], 3)
+                self.assertEqual(len(explained["rule"]["events"]), 5)
+            after = {p.name: p.read_bytes() for p in Path(self.path).iterdir() if p.is_file()}
+            self.assertEqual({name: hashlib.sha256(data).hexdigest() for name, data in before.items()},
+                             {name: hashlib.sha256(data).hexdigest() for name, data in after.items()})
+            self.assertEqual(source_before, Path(self.store).read_bytes())

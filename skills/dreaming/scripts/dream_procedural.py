@@ -604,11 +604,13 @@ def project_rules(events: Iterable[ProceduralEvent], *, as_of: datetime,
         ack = set(head.payload.acknowledged_evidence_ids) if approved else set()
         if any(d.disposition == "contradicts" and d.evidence_id not in ack for d in dispositions):
             suppressed.add("unacknowledged_conflict")
+        if any(d.disposition == "contradicts" for d in dispositions):
+            suppressed.add("unresolved_conflict")
         # Only the current explicit approval can invalidate an adverse attribution.
         dismissed = {d.evidence_id for d in dispositions
                      if approved and d.evidence_id in ack and d.disposition in {"invalid", "not_applicable"}}
         harmful = [e for e in outcomes if e.payload.outcome == "harmful"]
-        if any(e.event_id not in ack or (head and e.recorded_at > head.recorded_at) for e in harmful):
+        if any(e.event_id not in dismissed or (head and e.recorded_at > head.recorded_at) for e in harmful):
             suppressed.add("unresolved_harm")
         eligible_outcomes = [e for e in outcomes if e.event_id not in dismissed and e.recorded_at <= as_of]
         score = score_outcomes(eligible_outcomes, as_of=as_of, policy=policy)

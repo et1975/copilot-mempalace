@@ -16,7 +16,18 @@ metadata, natively or in the existing `<!--dreaming-meta: ...-->` trailer.
 Event chunks are reassembled without inserted delimiters. Records are historic,
 not instructions: resolve them through `guidance`/`explain` before use.
 
-New procedural commands support **existing SQLite-exact palaces only**. The
+New procedural commands support **existing SQLite-exact palaces only**. Strict
+read commands (`validate`, `guidance`, `explain`, and write-command preparation/
+dry-run) additionally require a **clean database without WAL/SHM sidecars**.
+SQLite's `mode=ro` can change shared-memory bytes when WAL sidecars exist.
+These commands therefore refuse that state *before opening the backend*; they
+never checkpoint it, ignore its WAL, or return a partial snapshot. Close and,
+where necessary, explicitly checkpoint the owning writer separately using its
+normal administration workflow. Do not delete WAL/SHM files. A shared directory
+lock excludes this package's mutations during the read without taking a write
+lock; unrelated external writers are not coordinated.
+
+The
 installed Chroma backend does not honor read-only opening; commands refuse it
 rather than silently migrate/initialize storage. There is no automatic backend
 conversion. Legacy dreaming operations still use their ordinary backend;
@@ -24,8 +35,13 @@ their live procedural protection lookup reuses that backend and does not claim
 strict nonmutation. Legacy contemplation may reconcile provenance on premise
 loading and explicit ontology commands can write; it is not uniformly read-only.
 
-No packages/models are downloaded. The installed palace embedding space is
-required; unavailable/invalid embeddings are explicit errors. A separate local
+No packages/models are downloaded. The verified embedding path requires the
+palace's **already installed MiniLM** model, with a complete local ONNX cache.
+Remote embedding configurations and other unverified model loaders are refused.
+The read path calls the existing MiniLM forward pass, not its download bootstrap
+(HF offline flags alone do not disable that bootstrap). Configured/stored model
+identity is checked by the palace backend; unavailable/invalid embeddings are
+explicit errors. A separate local
 Copilot session store supplies original repository/session authority. New paths
 open it read-only, without creating a missing file.
 
@@ -223,6 +239,83 @@ not filing/retry time. Outcomes from one session count at most once; harmful
 dominates helpful. The earliest timestamp for the winning polarity anchors
 decay. Later submissions cannot refresh weight. Correctness of causal wording
 remains the reviewer's responsibility: code does not prove causality.
+
+## Guidance and explanation
+
+After ordinary evidence recall, explicitly opt into repository-scoped advice:
+
+```bash
+"$MPY" dream_procedure.py guidance --palace "$PALACE" --wing project \
+  --session-store "$STORE" --task 'Fix the reproducible parser regression' \
+  --repository owner/repository
+"$MPY" dream_procedure.py guidance --palace "$PALACE" --wing project \
+  --session-store "$STORE" --task 'A bounded regression-test trial' \
+  --repository owner/repository --include-candidates
+"$MPY" dream_procedure.py explain --palace "$PALACE" --wing project \
+  --session-store "$STORE" --rule-id 'proc:SHA256'
+```
+
+Guidance returns `policy_version`, `as_of`, `repository`, `status`,
+`item_count`, `omitted_count`, `rules`, `anti_patterns`, and `trials`. Items
+include immutable ID/type/statement, applicability, **all** exceptions,
+maturity, effective score, cosine relevance, latest validation and up to three
+compact original source references. Trial items carry
+`delivery="approved_candidate_trial"`. `explain` includes all retained events,
+review heads, dispositions, score terms/decay anchors, duplicate count,
+suppression reasons and live source diagnostics. It is not a historical
+snapshot query: missing live evidence is reported even for retired rules.
+
+Exact repository matching and eligibility precede embedding/ranking. Results
+sort by cosine descending, then effective score descending, then rule ID;
+cosine must be at least 0.25. Similarity is not usefulness. No valid embedding
+means an error, not an invented confidence. Default delivery excludes
+candidates. `--include-candidates` admits only eligible, explicitly approved
+candidates into labeled trials, never unsafe/unapproved rules.
+
+The default and absolute ceiling are **five combined items and 6,000 Unicode
+characters of actual serialized JSON including escaping, envelope and newline**,
+not a token guarantee. `--max-items 1..5` and `--max-chars 512..6000` can lower
+these bounds. Whole lowest-ranked items are dropped until output fits;
+conditions/exceptions are never truncated. `omitted_count` counts scoped
+definitions not delivered (safety, maturity, relevance and budget omissions).
+`no_rules` differs from `no_eligible_rules` (also used when relevance/budget
+filters withhold all items). Scoped missing/drifted sources produce exit 1
+`evidence_unavailable`, never success-shaped empty guidance. Explain still
+returns lineage and source diagnostics with that nonzero exit.
+
+Read paths perform no drawer/KG/schema/reconciliation writes, persistent
+score cache or automatic feedback. They load complete bounded history:
+5,000 event drawers per wing, 100 rule definitions, 32 KiB encoded event/
+record. Overflow, malformed encodings and incomplete history fail explicitly.
+Source availability is rechecked, including evidence later dismissed or from a
+retired rule; evidence is audit history, not disposable state.
+
+### Versioned usefulness policy
+
+For at most one eligible outcome per original source session:
+
+```text
+weight = 2 ** (-age_days / 90)
+H = sum(helpful weights)
+B = sum(harmful weights)
+effective_score = H - 4 * B
+```
+
+`candidate` is the default. `established` requires at least three helpful
+sessions, `H >= 3`, and positive effective score; `proven` requires at least ten
+helpful sessions, `H >= 10`, and positive effective score. Because weights decay,
+exactly three/ten older observations are slightly below their numeric boundary:
+do not round them into maturity. More independent observations can cross it.
+Neutral contributes zero. These are uncalibrated `procedural-v1` constants,
+not probabilities or logical proof. Every score is projected at explicit UTC
+time, never persisted as an active/proven badge.
+
+Maturity does not imply eligibility. Unapproved, stale (90 days), conflicted,
+retired, replaced, malformed or missing-source rules are withheld. Merely
+acknowledging **valid** harmful/contradictory evidence does not authorize a
+trial: harm/conflict remains suppressed until explicitly and groundingly
+dismissed as invalid or outside scope. Changing applicability requires a new
+definition. Decay cannot silently dismiss harm.
 
 ## Retry, locking and retention
 

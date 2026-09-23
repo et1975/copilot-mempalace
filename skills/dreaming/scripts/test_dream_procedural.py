@@ -300,6 +300,14 @@ class ProjectionTests(unittest.TestCase):
         self.assertFalse(self.state(review).eligible)
         self.assertIn("unacknowledged_conflict", self.state(review).suppression_reasons)
 
+    def test_acknowledging_valid_harm_is_not_a_license_for_unsafe_trials(self):
+        harm = parsed("outcome", 3, outcome="harmful")
+        review = parsed("review", 4, acknowledged_evidence_ids=[harm.event_id],
+                        dispositions=[{"evidence_id": harm.event_id, "disposition": "contradicts",
+                                       "reason": "The harm is real.", "evidence": [evidence()]}])
+        self.assertFalse(self.state(harm, review).eligible)
+        self.assertIn("unresolved_harm", self.state(harm, review).suppression_reasons)
+
     def test_missing_evidence_in_ancestor_cannot_be_hidden_by_new_head(self):
         bad = parsed("review", 2, acknowledged_evidence_ids=["missing"])
         join = parsed("review", 3, parent_review_ids=[bad.event_id])

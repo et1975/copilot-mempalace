@@ -133,13 +133,17 @@ class EvidenceReader:
         col = dream_palace.procedural_collection(self.palace)
         vector = embed_texts(col, [query])[0]
         result = col.query(query_embeddings=[vector], n_results=limit,
-                           where={"wing": wing}, include=["documents", "metadatas"])
+                           where={"$and": [{"wing": wing}, {"room": {"$ne": "procedural"}}]},
+                           include=["documents", "metadatas"])
         ids = result.get("ids")
         if not isinstance(ids, list) or len(ids) != 1 or len(ids[0]) > limit:
             raise RuntimeError("invalid bounded search response")
         refs = []
         seen = set()
-        for source_id in ids[0]:
+        for index, source_id in enumerate(ids[0]):
+            meta = result["metadatas"][0][index] or {}
+            if meta.get("room") == "procedural" or meta.get("kind") == "procedural_event":
+                continue
             source = dream_palace.load_source_drawer(self.palace, source_id)
             if source is None:
                 raise EvidenceUnavailable(f"search source vanished: {source_id}")

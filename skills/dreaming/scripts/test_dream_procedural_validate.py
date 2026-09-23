@@ -40,10 +40,9 @@ class GroundedFixture(unittest.TestCase):
                 self.collection.rows[source] = {"id": source, "text": text,
                     "metadata": {"wing": "w", "room": "diary", "repository": "owner/repo"}}
                 self.refs.append(evidence(source, session, text))
-        for name in ("procedural_collection",):
-            p = patch.object(dream_palace, name, return_value=self.collection)
-            p.start()
-            self.addCleanup(p.stop)
+        self.storage_patch = patch.object(dream_palace, "procedural_collection", return_value=self.collection)
+        self.storage_patch.start()
+        self.addCleanup(self.storage_patch.stop)
         p = patch.dict(os.environ, {"COPILOT_SESSION_STORE": self.store})
         p.start()
         self.addCleanup(p.stop)
