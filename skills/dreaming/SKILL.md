@@ -407,9 +407,9 @@ Read [the exact artifact/CLI contract](references/procedural.md) first.
    evidence, or promote maturity labels to ontology/KG authority.
 
 All commands require explicit `--palace` and `--wing`. These commands need an
-existing SQLite-exact palace and installed local MiniLM; strict reads additionally
-require clean storage without WAL/SHM sidecars. They fail explicitly otherwise,
-never download, convert backends or checkpoint storage. Guidance is at most
+existing SQLite-exact palace and installed local MiniLM. WAL-aware read-only
+access supports an open writer; incomplete WAL/SHM states fail explicitly.
+Commands never download, convert backends or checkpoint storage. Guidance is at most
 five combined items / 6,000 serialized characters, not tokens. Retained events
 protect source drawers at harvest and locked apply even after retirement.
 External deletion is still possible; never claim tamper-proof storage.

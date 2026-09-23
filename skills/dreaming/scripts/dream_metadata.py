@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from typing import Any
 
 MARKER = "<!--dreaming-meta:"
@@ -46,18 +47,29 @@ def decode_dream_metadata(drawer: dict) -> dict:
     text = drawer.get("text", "")
     if not isinstance(text, str):
         raise ValueError("drawer text must be a string")
-    decoder = json.JSONDecoder(object_pairs_hook=_unique_pairs, parse_constant=_invalid_constant)
-    offset = 0
-    while (start := text.find(MARKER, offset)) >= 0:
-        body = text[start + len(MARKER):].lstrip()
+    lines = text.rstrip().split("\n")
+    fence = None
+    for line in lines[:-1]:
+        match = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line)
+        if match:
+            delimiter, suffix = match.groups()
+            if fence is None:
+                fence = delimiter
+            elif delimiter[0] == fence[0] and len(delimiter) >= len(fence) and not suffix.strip():
+                fence = None
+    # Writers append one canonical JSON line. Inline examples and quoted code
+    # are content, not provenance, even when they contain the marker.
+    generated_writer = native.get("added_by") in {"dreaming", "dream-reflect", "dream-procedure"}
+    if lines and (fence is None or generated_writer) and lines[-1].startswith(MARKER):
+        decoder = json.JSONDecoder(object_pairs_hook=_unique_pairs, parse_constant=_invalid_constant)
+        body = lines[-1][len(MARKER):].lstrip()
         metadata, end = decoder.raw_decode(body)
-        if not isinstance(metadata, dict) or not body[end:].lstrip().startswith("-->"):
+        if not isinstance(metadata, dict) or body[end:].strip() != "-->":
             raise ValueError("invalid dreaming metadata trailer")
         for key, value in metadata.items():
             if key in result and result[key] != value:
                 raise ValueError(f"conflicting dreaming metadata: {key}")
             result[key] = value
-        offset = len(text) - len(body) + end
     for key in ("kind", "source_kind", "generated_from", "added_by"):
         if key in result and (not isinstance(result[key], str) or not result[key].strip()):
             raise ValueError(f"invalid dreaming metadata field: {key}")

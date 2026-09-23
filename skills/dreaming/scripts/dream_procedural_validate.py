@@ -1,18 +1,21 @@
 """Grounding and review admission, not an oracle for causal or logical truth."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
+from itertools import zip_longest
 from pathlib import Path
 import re
 import sqlite3
+import sys
 
 import dream_palace
 import dream_sessions
-from dream_metadata import content_hash, decode_dream_metadata, is_generated_observation
+from dream_metadata import canonical_json, content_hash, decode_dream_metadata, is_generated_observation
 from dream_procedural import (
     EvidenceReference, OutcomePayload, Policy, ProposalPayload, ReviewPayload,
-    ValidationPacket, canonical_rule_id, event_evidence, project_rules, repository_key, utc_datetime,
+    ValidationPacket, adverse_evidence_ids, canonical_rule_id, event_evidence, project_rules,
+    repository_key, to_data, utc_datetime,
 )
 
 
@@ -167,25 +170,65 @@ class EvidenceReader:
         return refs
 
 
+def _review_packet_bytes(packet: ValidationPacket) -> int:
+    data = to_data(packet)
+    # Reserve reviewed reasoning, head IDs, and the drawer envelope as well as
+    # the exact reference repeated in every disposition. This is a wire-byte
+    # budget, not a character/token estimate.
+    review = {
+        "validation_packet": data,
+        "validation_digest": "0" * 64,
+        "parent_review_ids": ["0" * 36] * 4,
+        "acknowledged_evidence_ids": [ref["source_id"] for ref in data["evidence"]],
+        "dispositions": [
+            {"evidence_id": ref["source_id"], "disposition": "not_applicable",
+             "reason": "x" * 256, "evidence": [ref]} for ref in data["evidence"]
+        ],
+        "reason": "x" * 1024,
+    }
+    return len(canonical_json(review).encode("utf-8")) + 2048
+
+
 def build_validation_packet(rule, *, queries, source_reader, limits: ValidationLimits,
                             as_of: datetime) -> ValidationPacket:
     queries = tuple(queries)
     if len(queries) != 2 or queries[0] != rule.statement or \
             any(not isinstance(q, str) or not q.strip() for q in queries) or queries[0] == queries[1]:
         raise ValueError("validation requires the statement and one explicit distinct contrast query")
-    refs = {}
+    results = []
     for query in queries:
         hits = list(source_reader(query, limits.hits_per_query))
         if len(hits) > limits.hits_per_query:
             raise ValueError("source reader exceeded validation search bound")
-        for ref in hits:
+        results.append(hits)
+    refs = {}
+    for pair in zip_longest(*results):
+        for ref in pair:
+            if ref is None:
+                continue
             key = (ref.source_kind, ref.source_id)
             if key not in refs:
                 refs[key] = ref
     if not refs:
         raise EvidenceUnavailable("no original evidence found within the bounded search")
-    return ValidationPacket(canonical_rule_id(rule), rule.scope.key, utc_datetime(as_of),
-                            queries, tuple(refs[key] for key in sorted(refs)))
+    packet = ValidationPacket(canonical_rule_id(rule), rule.scope.key, utc_datetime(as_of),
+                              queries, ())
+    shortened = 0
+    for ref in refs.values():
+        bounded = replace(ref, quote=ref.quote[:256])
+        if not bounded.quote.strip():
+            continue
+        candidate = replace(packet, evidence=(*packet.evidence, bounded))
+        if _review_packet_bytes(candidate) <= 24 * 1024:
+            packet = candidate
+            shortened += bounded.quote != ref.quote
+    omitted = len(refs) - len(packet.evidence)
+    if not packet.evidence:
+        raise EvidenceUnavailable("validation evidence cannot fit the review encoding budget")
+    if shortened or omitted:
+        print(f"validation budget: shortened {shortened} quotes; omitted {omitted} "
+              f"of {len(refs)} distinct sources", file=sys.stderr)
+    return packet
 
 
 def preflight_event(event, *, projection, evidence_reader: EvidenceReader,
@@ -258,13 +301,12 @@ def preflight_event(event, *, projection, evidence_reader: EvidenceReader,
         supports = [r for r in packet.evidence if by_id[r.source_id].disposition == "supports"]
         if payload.verdict == "approve":
             count = support(supports, packet.validated_at)
-            adverse = {e.event_id for e in state.events if isinstance(e.payload, OutcomePayload)
-                       and e.payload.outcome == "harmful"}
-            adverse |= {d.evidence_id for d in payload.dispositions if d.disposition == "contradicts"}
+            adverse = adverse_evidence_ids((*state.events, event))
             if not adverse <= set(payload.acknowledged_evidence_ids) or not adverse <= by_id.keys():
                 raise ValueError("approval requires explicit adverse evidence acknowledgment/disposition")
             for prior in state.events:
-                if prior.event_id in adverse:
+                if prior.event_id in adverse or (isinstance(prior.payload, ReviewPayload) and
+                        any(d.evidence_id in adverse for d in prior.payload.dispositions)):
                     grounded(event_evidence(prior), packet.validated_at)
     else:
         if payload.repository != repository:

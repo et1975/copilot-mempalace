@@ -32,8 +32,8 @@ audit hook that nags when an external tool is about to run without a prior `memp
   deterministic decay/maturity is observed usefulness, never KG authority or logical truth.
   Guidance is exact-repository, read-only and bounded to five combined items / 6,000 serialized
   characters. No automatic enrollment, inferred feedback, textual inversion, new database or model
-  download. Supported boundary: existing SQLite-exact palace, installed local MiniLM; strict reads
-  require clean storage without WAL/SHM sidecars. Other backends/loaders are refused, not converted.
+  download. Supported boundary: existing SQLite-exact palace, installed local MiniLM; WAL-aware
+  read-only access works with an open writer. Other backends/loaders are refused, not converted.
 - **[skills/contemplate/SKILL.md](skills/contemplate/SKILL.md)** — on-demand deductive reasoning over the
   MemPalace KG: run `derive` inline when the user asks what follows, then adjudicate
   `materialize` / `skip` / `reject_rule` candidates. It shares the same Python mechanics in

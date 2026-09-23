@@ -498,8 +498,6 @@ def _review_dispositions(reviews: dict[str, ProceduralEvent], head: str
     candidates: dict[str, list[tuple[str, EvidenceDisposition]]] = {}
     for eid in ancestors[head] | {head}:
         event = reviews[eid]
-        if event.payload.verdict != "approve":
-            continue
         for disposition in event.payload.dispositions:
             candidates.setdefault(disposition.evidence_id, []).append((eid, disposition))
     result = []
@@ -512,6 +510,18 @@ def _review_dispositions(reviews: dict[str, ProceduralEvent], head: str
         elif maximal:
             result.append(min(maximal, key=lambda item: item[0])[1])
     return tuple(result), conflicted
+
+
+def adverse_evidence_ids(events: Iterable[ProceduralEvent]) -> set[str]:
+    """Adverse history survives later review verdicts and relabeling."""
+    adverse = set()
+    for event in events:
+        if isinstance(event.payload, OutcomePayload) and event.payload.outcome == "harmful":
+            adverse.add(event.event_id)
+        elif isinstance(event.payload, ReviewPayload):
+            adverse.update(d.evidence_id for d in event.payload.dispositions
+                           if d.disposition == "contradicts")
+    return adverse
 
 
 def project_rules(events: Iterable[ProceduralEvent], *, as_of: datetime,
@@ -602,7 +612,7 @@ def project_rules(events: Iterable[ProceduralEvent], *, as_of: datetime,
                     e.payload.validation_packet.repository != definition.scope.key for e in reviews.values()):
                 suppressed.add("scope_mismatch")
         ack = set(head.payload.acknowledged_evidence_ids) if approved else set()
-        if any(d.disposition == "contradicts" and d.evidence_id not in ack for d in dispositions):
+        if adverse_evidence_ids(group) - ack:
             suppressed.add("unacknowledged_conflict")
         if any(d.disposition == "contradicts" for d in dispositions):
             suppressed.add("unresolved_conflict")

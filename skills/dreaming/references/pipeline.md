@@ -183,9 +183,9 @@ Default guidance delivers only eligible established/proven rules in the exact
 repository. Approved candidates require deliberately requested labeled trials.
 Guidance has a combined five-item / 6,000-character serialized ceiling; explain
 retains full score terms, review dispositions and lineage. No retrieval creates
-feedback and no read writes scores. Unsupported read-only backends, active
-WAL/SHM sidecars, missing models/evidence and incomplete histories fail explicitly.
-Verified support is clean SQLite-exact storage and an installed local MiniLM
+feedback and no read writes scores. Unsupported read-only backends, incomplete
+WAL/SHM states, missing models/evidence and incomplete histories fail explicitly.
+Verified support is WAL-aware SQLite-exact storage and an installed local MiniLM
 cache; legacy destructive safety lookups keep their existing backend semantics.
 
 ## Artifacts (session workspace — never commit)

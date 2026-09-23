@@ -300,6 +300,22 @@ class ProjectionTests(unittest.TestCase):
         self.assertFalse(self.state(review).eligible)
         self.assertIn("unacknowledged_conflict", self.state(review).suppression_reasons)
 
+    def test_hold_counterevidence_cannot_disappear_on_approval(self):
+        adverse = {"evidence_id": "source", "disposition": "contradicts",
+                   "reason": "Observed counterexample.", "evidence": [evidence()]}
+        held = parsed("review", 2, verdict="hold", dispositions=[adverse])
+        approval = parsed("review", 3, parent_review_ids=[held.event_id])
+        state = self.state(held, approval)
+        self.assertFalse(state.eligible)
+        self.assertIn("unresolved_conflict", state.suppression_reasons)
+        changed_label = parsed("review", 4, parent_review_ids=[held.event_id],
+                               dispositions=[dict(adverse, disposition="not_applicable")])
+        self.assertFalse(self.state(held, changed_label).eligible)
+        resolved = parsed("review", 5, parent_review_ids=[held.event_id],
+                          acknowledged_evidence_ids=["source"],
+                          dispositions=[dict(adverse, disposition="not_applicable")])
+        self.assertTrue(self.state(held, resolved).eligible)
+
     def test_acknowledging_valid_harm_is_not_a_license_for_unsafe_trials(self):
         harm = parsed("outcome", 3, outcome="harmful")
         review = parsed("review", 4, acknowledged_evidence_ids=[harm.event_id],

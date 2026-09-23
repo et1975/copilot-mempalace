@@ -14,6 +14,30 @@ def digest(text):
 
 
 class MetadataTests(unittest.TestCase):
+    def test_quoted_or_inline_markers_are_not_provenance(self):
+        from dream_metadata import decode_dream_metadata, is_generated_observation
+        examples = (
+            "Example: <!--dreaming-meta: ...-->",
+            'A source string contains <!--dreaming-meta: {"kind":"reflect"}-->.',
+            "```markdown\n<!--dreaming-meta: ...-->\n```",
+            '```markdown\n<!--dreaming-meta: {"kind":"reflect"}-->',
+        )
+        for text in examples:
+            with self.subTest(text=text):
+                self.assertEqual(decode_dream_metadata({"text": text}), {})
+                self.assertFalse(is_generated_observation({"text": text}))
+        text = examples[0] + '\n\n<!--dreaming-meta: {"kind":"reflect"}-->'
+        self.assertEqual(decode_dream_metadata({"text": text}), {"kind": "reflect"})
+
+    def test_writer_trailer_survives_code_fences_and_unicode_separators(self):
+        from dream_metadata import decode_dream_metadata
+        meta = {"kind": "reflect", "quote": "alpha\u2028beta"}
+        text = "```text\nan unfinished example\n\n<!--dreaming-meta: " + json.dumps(
+            meta, ensure_ascii=False) + "-->"
+        result = decode_dream_metadata({"text": text, "metadata": {"added_by": "dreaming"}})
+        self.assertEqual(result["kind"], "reflect")
+        self.assertEqual(result["quote"], meta["quote"])
+
     def test_native_and_trailer_agree_and_preserve_source_metadata(self):
         from dream_metadata import decode_dream_metadata
         meta = {"kind": "reflect", "supported_by": ["s1"]}

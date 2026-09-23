@@ -18,14 +18,16 @@ not instructions: resolve them through `guidance`/`explain` before use.
 
 New procedural commands support **existing SQLite-exact palaces only**. Strict
 read commands (`validate`, `guidance`, `explain`, and write-command preparation/
-dry-run) additionally require a **clean database without WAL/SHM sidecars**.
-SQLite's `mode=ro` can change shared-memory bytes when WAL sidecars exist.
-These commands therefore refuse that state *before opening the backend*; they
-never checkpoint it, ignore its WAL, or return a partial snapshot. Close and,
-where necessary, explicitly checkpoint the owning writer separately using its
-normal administration workflow. Do not delete WAL/SHM files. A shared directory
-lock excludes this package's mutations during the read without taking a write
-lock; unrelated external writers are not coordinated.
+dry-run) use WAL-aware read-only connections, including while a writer remains
+open. They observe committed, uncheckpointed data and prohibit application-data
+and schema writes. SQLite may update SHM reader-coordination bytes; those are
+not procedural state changes. Incomplete WAL/SHM pairs fail explicitly before
+opening the backend. Reads never checkpoint, ignore pending WAL, or require
+writer shutdown. Do not delete WAL/SHM files. A shared directory lock excludes
+this package's mutations during the read without taking a write lock;
+unrelated external writers are not coordinated. Write commands acquire and
+release the installed MCP writer lease as well as the package's directory lock;
+ownership refusals are errors, not an invitation to bypass the owning writer.
 
 The installed Chroma backend does not honor read-only opening; commands refuse it
 rather than silently migrate/initialize storage. There is no automatic backend
@@ -163,7 +165,15 @@ independently authored and reviewed.
 contrast query, at most ten palace hits each, deduplicated by source ID. Marked
 generated/unattributed text is not admitted as original evidence. The current
 search is wing-local palace retrieval; raw turns can be supplied as grounded
-references but are not an additional unbounded search. It emits:
+references but are not an additional unbounded search. Results from the two
+queries are interleaved before applying the storage budget, so large supporting
+results do not automatically crowd out counterevidence. Exact quotations are
+limited to 256 characters, and selected references must fit a 24-KiB review
+encoding estimate that includes duplicated disposition references and reserves
+reasoning/envelope space beneath the 32-KiB event limit. Stderr explicitly
+reports shortened quotations and omitted sources. Longer review rationale or
+many additional adverse dispositions can still require a smaller packet; the
+final write always enforces the actual encoded limit. It emits:
 
 ```json
 {
@@ -211,7 +221,9 @@ current review heads (empty only before the first review). Concurrent heads
 suppress guidance until explicitly joined. Harmful outcome IDs and conflicting
 evidence require acknowledgment and grounded dispositions. `invalid` and
 `not_applicable` dispositions can dismiss a harmful attribution; the original
-event remains visible. `replacement_rule_id` is required only for `replace`,
+event remains visible. Counterevidence from a `hold` or any other prior verdict
+also persists: a later approval cannot restore eligibility by omitting it or
+relabeling it without explicit acknowledgment. `replacement_rule_id` is required only for `replace`,
 must refer to an existing proposal, and cannot create a cycle. Retired/replaced
 identities cannot be revived by later/concurrent approval. Review validation
 stales after 90 days; silence does not refresh it.
@@ -352,8 +364,9 @@ external ledger. Backup remains the palace's existing backup responsibility.
    directory for `DREAMING_TEST_TMPDIR`/`TMPDIR`. Run `test_dream_procedure` and
    `test_procedural_replay`; the former exercises all six commands with actual
    installed handlers, SQLite-exact storage and an isolated local session store.
-   Only fixtures explicitly checkpoint their own writer between strict reads.
-   No test targets the user's live palace or installs dependencies.
+   A subprocess test exercises write commands through the actual MCP opener;
+   live-WAL tests retain an open writer and read its committed data without
+   checkpointing. No test targets the user's live palace or installs dependencies.
 3. **Separate opt-in:** after user approval enroll a small set for one exact
    repository. Keep original sources available. Do not bulk reinterpret old
    diary prose as instructions, fabricate historical observation stamps, or
@@ -374,8 +387,10 @@ Six duplicate retry copies add zero credit. Other scenarios cover misleading
 correlation, harm, repository drift, stale reviews, mirrored generated text,
 concurrent reviewers and reviewed attribution corrections. Assertions require
 zero unsafe-rule deliveries, feedback inflation or serialized-budget violations.
-Storage integration separately compares palace/source-store file bytes across
-strict guidance/explain and verifies writer/schema helpers are not called.
+Storage integration separately compares application state across strict
+guidance/explain and verifies writer/schema helpers are not called. Clean-store
+tests also compare file bytes; live-WAL tests allow SQLite's SHM coordination
+while rejecting SQL/schema mutations.
 
 These are synthetic correctness/coverage diagnostics, not a production
 accuracy target, a causal experiment, CASS parity, or measured superiority.

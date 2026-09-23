@@ -1,6 +1,8 @@
 """Grounding uses real local session stores and original drawer text."""
 from copy import deepcopy
+from contextlib import redirect_stderr
 from datetime import timedelta
+import io
 import os
 from pathlib import Path
 import sqlite3
@@ -137,6 +139,49 @@ class GroundingTests(GroundedFixture):
         self.collection.rows["source-1"]["text"] = "changed"
         with self.assertRaises((ValueError, RuntimeError)):
             self.preflight(review, self.proposal())
+
+    def test_approval_must_resolve_counterevidence_from_prior_hold(self):
+        adverse_ref = self.refs[3]
+        held = self.review(verdict="hold", dispositions=[
+            *event_to_data(self.review())["payload"]["dispositions"],
+            {"evidence_id": adverse_ref["source_id"], "disposition": "contradicts",
+             "reason": "A contrary outcome in this context.", "evidence": [adverse_ref]}])
+        self.preflight(held, self.proposal())
+        approval = self.review(3, parent_review_ids=[held.event_id])
+        with self.assertRaisesRegex(ValueError, "adverse"):
+            self.preflight(approval, self.proposal(), held)
+        dispositions = event_to_data(approval)["payload"]["dispositions"] + [{
+            "evidence_id": adverse_ref["source_id"], "disposition": "not_applicable",
+            "reason": "Original counterexample falls under the documented exception.",
+            "evidence": [adverse_ref]}]
+        resolved = self.review(4, parent_review_ids=[held.event_id],
+            dispositions=dispositions, acknowledged_evidence_ids=[adverse_ref["source_id"]])
+        self.preflight(resolved, self.proposal(), held)
+
+    def test_validation_packet_fits_a_storable_review_with_dispositions(self):
+        from dream_procedural import EvidenceReference, to_data
+        from dream_procedural_palace import record_data
+        from dream_procedural_validate import build_validation_packet, ValidationLimits
+        for character in ("x", "\U0001f50e"):
+            refs = [EvidenceReference("drawer", f"large-source-{i}", f"session-{i}",
+                                      character * 800, "a" * 64) for i in range(20)]
+            queries = [definition()["statement"], "When does this fail?"]
+            errors = io.StringIO()
+            with redirect_stderr(errors):
+                packet = build_validation_packet(self.proposal().payload.definition,
+                    queries=queries, source_reader=lambda q, n: refs[:10] if q == queries[0] else refs[10:],
+                    limits=ValidationLimits(), as_of=NOW)
+            packet_data = to_data(packet)
+            dispositions = [{"evidence_id": ref["source_id"], "disposition": "supports",
+                             "reason": "Reviewed applicability.", "evidence": [ref]}
+                            for ref in packet_data["evidence"]]
+            review = parse_event(event_data("review", 2, validation_packet=packet_data,
+                validation_digest=sha(packet_data), dispositions=dispositions))
+            record_data(review)
+            self.assertTrue(packet.evidence)
+            self.assertTrue(any(ref.source_id == "large-source-10" for ref in packet.evidence))
+            self.assertTrue(all(ref.quote and ref.quote in character * 800 for ref in packet.evidence))
+            self.assertRegex(errors.getvalue(), "budget|shorten")
 
     def test_support_and_contrast_execute_top_ten_and_deduplicate_sources(self):
         from dream_procedural_validate import build_validation_packet, ValidationLimits
