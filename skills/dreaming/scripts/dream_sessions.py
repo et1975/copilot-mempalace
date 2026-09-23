@@ -25,11 +25,9 @@ def default_store_path() -> str:
 
 
 def _connect_ro(db_path: str) -> sqlite3.Connection:
-    """Open ``db_path`` for read-only queries, falling back for test fixtures."""
-    try:
-        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    except sqlite3.OperationalError:
-        con = sqlite3.connect(db_path)
+    """Open only existing stores; failed read-only access must never create one."""
+    from pathlib import Path
+    con = sqlite3.connect(Path(db_path).expanduser().resolve().as_uri() + "?mode=ro", uri=True)
     con.row_factory = sqlite3.Row
     return con
 

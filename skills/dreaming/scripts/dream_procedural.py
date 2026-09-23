@@ -335,6 +335,11 @@ def event_to_data(event: ProceduralEvent) -> dict:
     return _data(event)
 
 
+def to_data(value: Any) -> Any:
+    """JSON-compatible representation for typed packets, scores and projections."""
+    return _data(value)
+
+
 def parse_event(data: dict) -> ProceduralEvent:
     """Strict v1 parser; digest covers the canonical normalized envelope.
 

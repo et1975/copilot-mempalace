@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from html import escape
 import os
 import re
+import math
 from typing import Callable, Iterable, Literal
 
 import dream_palace
@@ -22,6 +23,22 @@ from dream_procedural import (ProceduralEvent, Projection, Policy, ProposalPaylo
 RECORD_HEADER = (
     "Procedural memory record; not an active instruction. Resolve current status with guidance/explain."
 )
+
+
+def embed_texts(collection, texts: list[str]) -> list[list[float]]:
+    """Existing palace embedding space, offline only; reject unusable vectors."""
+    # Set before lazy embedder resolution. No fallback model or installation.
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    try:
+        vectors = [list(map(float, v)) for v in dream_palace._resolve_embed_fn(collection)(texts)]
+    except Exception as exc:
+        raise RuntimeError(f"installed palace embedder unavailable: {exc}") from exc
+    if len(vectors) != len(texts) or not vectors or not vectors[0] or any(
+            len(v) != len(vectors[0]) or not all(math.isfinite(x) for x in v)
+            or not math.isfinite(math.hypot(*v)) or math.hypot(*v) == 0 for v in vectors):
+        raise RuntimeError("invalid embedding dimensions, values or norm")
+    return vectors
 
 
 @dataclass(frozen=True)
@@ -124,8 +141,8 @@ def protected_drawer_ids(events: Iterable[ProceduralEvent]) -> set[str]:
 
 
 def live_protected_drawer_ids(palace: str, *, collection=None) -> set[str]:
-    """Palace-wide live protection, including every logical and physical alias."""
-    col = collection if collection is not None else dream_palace.procedural_collection(palace)
+    """Legacy destructive-path safety lookup, not a strict read-only command."""
+    col = collection if collection is not None else dream_palace.protection_collection(palace)
     drawers = _event_drawers(palace, None, collection=col)
     protected = protected_drawer_ids(parse_event(d["metadata"]["event"]) for d in drawers)
     for drawer in drawers:
@@ -202,7 +219,8 @@ def _scope_check(event: ProceduralEvent, existing: list[ProceduralEvent]) -> Non
 
 def append_event(palace: str, wing: str, event: ProceduralEvent, *,
                  writer: dream_palace.MempalaceWriter,
-                 preflight: Callable[[ProceduralEvent, Projection], None] | None = None) -> AppendResult:
+                 preflight: Callable[[ProceduralEvent, Projection], None] | None = None,
+                 clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)) -> AppendResult:
     """Append through sanctioned handlers, then verify exact committed readback.
 
     The optional Task-4 preflight hook runs *inside* the mutation lock and only
@@ -218,7 +236,7 @@ def append_event(palace: str, wing: str, event: ProceduralEvent, *,
         drawers = _event_drawers(palace, wing)
         events = [parse_event(d["metadata"]["event"]) for d in drawers]
         _scope_check(event, events)
-        as_of = datetime.now(timezone.utc)
+        as_of = clock()
         projection = project_rules(events, as_of=as_of, policy=Policy())
         prior = [d for d in drawers if d["metadata"]["event"]["event_id"] == event.event_id]
         if prior:
@@ -240,7 +258,8 @@ def append_event(palace: str, wing: str, event: ProceduralEvent, *,
             if state and event.payload.verdict == "approve" \
                     and {"retired", "replaced"}.intersection(state.suppression_reasons):
                 raise ValueError("terminal rule identity cannot be approved again")
-        verify_event_sources(palace, event)
+        if preflight is None:
+            verify_event_sources(palace, event)
         prospective = project_rules([*events, event], as_of=as_of, policy=Policy())
         invalid = {"missing_review_parent", "review_cycle", "review_time_order", "replacement_cycle",
                    "missing_replacement", "definition_conflict", "missing_declared_evidence"}

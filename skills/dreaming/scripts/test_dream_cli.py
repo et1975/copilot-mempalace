@@ -275,7 +275,7 @@ class TestHarvestPatternTask(unittest.TestCase):
 
 class TestHarvestPruneTask(unittest.TestCase):
     def setUp(self):
-        self.enterContext(mock.patch.object(dream_harvest.dream_palace, "procedural_collection",
+        self.enterContext(mock.patch.object(dream_harvest.dream_palace, "protection_collection",
                                            return_value=DrawerCollection()))
 
     def test_prune_task_writes_prune_worklist(self):
@@ -756,7 +756,7 @@ class TestAdoptMergeArchiveAndVerify(unittest.TestCase):
 
 class TestAdoptMergeTask(unittest.TestCase):
     def setUp(self):
-        self.enterContext(mock.patch.object(dream_adopt.dream_palace, "procedural_collection",
+        self.enterContext(mock.patch.object(dream_adopt.dream_palace, "protection_collection",
                                            return_value=DrawerCollection()))
 
     def test_adopt_uses_mempalace_config_when_palace_is_omitted(self):
@@ -842,7 +842,7 @@ class TestAdoptMergeTask(unittest.TestCase):
 
 class TestAdoptPruneTask(unittest.TestCase):
     def setUp(self):
-        self.enterContext(mock.patch.object(dream_adopt.dream_palace, "procedural_collection",
+        self.enterContext(mock.patch.object(dream_adopt.dream_palace, "protection_collection",
                                            return_value=DrawerCollection()))
 
     def test_resolve_prune_decisions_defaults_to_item_fields_and_keeps_by_default(self):

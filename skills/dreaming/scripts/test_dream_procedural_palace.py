@@ -110,6 +110,9 @@ class StorageTests(unittest.TestCase):
                                          return_value=self.collection, create=True)
         self.reader_patch.start()
         self.addCleanup(self.reader_patch.stop)
+        legacy = patch.object(dream_palace, "protection_collection", return_value=self.collection)
+        legacy.start()
+        self.addCleanup(legacy.stop)
 
     def append(self, event=None, **kwargs):
         from dream_procedural_palace import append_event
@@ -132,6 +135,19 @@ class StorageTests(unittest.TestCase):
                 text = "".join(r["text"] for r in sorted(rows, key=lambda r: r["metadata"]["chunk_index"]))
                 self.assertTrue(text.startswith("Procedural memory record; not an active instruction."))
                 self.assertNotIn("proven", text)
+
+    def test_legacy_chroma_safety_lookup_does_not_require_readonly_backend(self):
+        from dream_procedural_palace import live_protected_drawer_ids
+        with patch.object(dream_palace, "procedural_collection",
+                          side_effect=RuntimeError("Chroma cannot be opened strictly read-only")), \
+             patch.object(dream_palace, "protection_collection",
+                          wraps=lambda path: __import__("mempalace.palace", fromlist=["get_collection"]).get_collection(path)), \
+             patch("mempalace.palace.get_collection", return_value=self.collection):
+            self.assertEqual(live_protected_drawer_ids(self.path), set())
+            kept, errors = dream_adopt._preflight_merge_decisions(self.path, [{"action": "skip"}])
+            self.assertEqual(errors, [])
+            writer = sanctioned_writer(self.path, self.collection)
+            self.assertTrue(writer.delete_drawer("source")["success"])
 
     def test_retry_before_changed_sources_freshness_and_current_heads(self):
         from dream_procedural_palace import append_event, read_events
@@ -474,7 +490,8 @@ def _race_worker(path, rows, action, ready, release, queue, first):
     collection = DrawerCollection(rows)
     writer = sanctioned_writer(path, collection)
     try:
-        with patch.object(dream_palace, "procedural_collection", return_value=collection):
+        with patch.object(dream_palace, "procedural_collection", return_value=collection), \
+             patch.object(dream_palace, "protection_collection", return_value=collection):
             if first:
                 with dream_palace.palace_mutation_lock(path):
                     ready.set()

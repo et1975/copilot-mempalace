@@ -226,9 +226,19 @@ def procedural_collection(palace: str):
     return get_collection(path, create=False, read_only=True)
 
 
-def load_source_drawer(palace: str, drawer_id: str) -> dict[str, Any] | None:
+def protection_collection(palace: str):
+    """Reuse legacy storage semantics solely for existing destructive paths.
+
+    These operations already open the backend for mutation. This is not a
+    read-only guarantee; new procedural commands must use procedural_collection.
+    """
+    from mempalace.palace import get_collection
+    return get_collection(palace)
+
+
+def load_source_drawer(palace: str, drawer_id: str, *, collection=None) -> dict[str, Any] | None:
     """Read a complete original drawer by either logical or physical ID."""
-    col = procedural_collection(palace)
+    col = collection if collection is not None else procedural_collection(palace)
     include = ["documents", "metadatas"]
     exact = _rows_from_collection_result(col.get(ids=[drawer_id], include=include))
     parent = ((exact[0].get("metadata") or {}).get("parent_drawer_id") if exact else None) or drawer_id
@@ -1721,12 +1731,13 @@ class MempalaceWriter:
         from dream_procedural_palace import live_protected_drawer_ids
 
         with palace_mutation_lock(self.palace_path):
-            if drawer_id in live_protected_drawer_ids(self.palace_path):
+            col = protection_collection(self.palace_path)
+            if drawer_id in live_protected_drawer_ids(self.palace_path, collection=col):
                 raise ValueError("procedural evidence/event drawer is protected")
             result = self._tools["mempalace_delete_drawer"]["handler"](drawer_id=drawer_id)
             if isinstance(result, dict) and result.get("success") is False:
                 raise RuntimeError(f"delete_drawer failed: {result.get('error', result)}")
-            if load_source_drawer(self.palace_path, drawer_id) is not None:
+            if load_source_drawer(self.palace_path, drawer_id, collection=col) is not None:
                 raise RuntimeError(f"delete_drawer readback failed: {drawer_id}")
             return result
 
