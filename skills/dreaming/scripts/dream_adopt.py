@@ -43,6 +43,7 @@ from dream_lib import (
 )
 from dream_palace import load_logical_drawers, _palace_embed
 from dream_reflect import validate_reflect, is_novel
+from dream_metadata import content_hash, is_generated_observation, is_procedural_record
 
 
 def _resolve_decisions(worklist: dict[str, Any]) -> list[dict[str, Any]]:
@@ -225,6 +226,8 @@ def _resolve_reflect_decisions(worklist):
             "conclusion": conclusion,
             "premises": list(decision.get("premises") or []),
             "member_ids": list(item.get("member_ids") or []),
+            "members": list(item.get("members") or []),
+            "min_support": max(2, int((worklist.get("params") or {}).get("min_support", 3))),
             "evidence": item.get("evidence"),
             "wing": decision.get("wing") or scope.get("wing") or "copilot-mempalace",
             "room": decision.get("room") or "reflections",
@@ -233,9 +236,44 @@ def _resolve_reflect_decisions(worklist):
     return resolved
 
 
+def _recurrence_error(dec, live_by_id):
+    import dream_sessions
+    sessions = set()
+    members = dec.get("members") or []
+    if not members or {m["id"] for m in members} != set(dec.get("member_ids") or []):
+        return "missing_recurrence_sources"
+    for member in members:
+        source_id = member["id"]
+        if source_id.startswith("session:"):
+            session_id = source_id[len("session:"):]
+            turns = dream_sessions.load_session_turns(session_id)
+            text = dream_palace._strip_context_boilerplate(dream_sessions._bounded_text([
+                turn["user_message"] for turn in turns
+                if isinstance(turn.get("user_message"), str) and turn["user_message"]]))
+            if not turns or not text:
+                return "missing_recurrence_source"
+        else:
+            live = live_by_id.get(source_id)
+            if live is None or is_generated_observation(live):
+                return "invalid_recurrence_source"
+            text = live.get("text", "")
+            session_id, ambiguous = dream_palace._session_id_state(text)
+            if ambiguous or not session_id:
+                return "invalid_recurrence_session"
+        if member.get("session_id") != session_id or member.get("content_hash") != content_hash(text):
+            return "recurrence_source_drift"
+        sessions.add(session_id)
+    if sessions != set((dec.get("evidence") or {}).get("support_ids") or []):
+        return "forged_recurrence_support"
+    if len(sessions) < dec["min_support"]:
+        return "weak_recurrence"
+    return None
+
+
 def _preflight_reflect_decisions(path, decisions):
     """Validate reflect decisions: grounding + novelty. Fail-closed."""
     drawers = load_logical_drawers(path)
+    live_by_id = {str(d["id"]): d for d in drawers}
     full_by_id = {str(d["id"]): d.get("text", "") for d in drawers}
     existing_vecs = [d.get("embedding") or [] for d in drawers]
     kept, errors = [], []
@@ -244,14 +282,15 @@ def _preflight_reflect_decisions(path, decisions):
             kept.append(dec)
             continue
         if dec.get("reflect_kind") == "converge":
-            support_ids = ((dec.get("evidence") or {}).get("support_ids")) or []
-            if len(set(support_ids)) < 2:
-                errors.append({"reason": "weak_recurrence", "support_ids": support_ids})
+            reason = _recurrence_error(dec, live_by_id)
+            if reason:
+                errors.append({"reason": reason})
                 kept.append({"action": "skip"})
                 continue
         else:
             allowed = {str(mid) for mid in (dec.get("member_ids") or [])}
-            members_by_id = {mid: full_by_id[mid] for mid in allowed if mid in full_by_id}
+            members_by_id = {mid: full_by_id[mid] for mid in allowed if mid in full_by_id
+                             and not is_procedural_record(live_by_id[mid])}
             candidate = {"conclusion": dec.get("conclusion"), "premises": dec.get("premises")}
             v = validate_reflect(candidate, members_by_id)
             if not v["ok"]:
@@ -426,11 +465,17 @@ def _merge_drift_errors(path: str, decision: dict[str, Any]) -> list[dict[str, A
 
 
 def _preflight_merge_decisions(path: str, decisions: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    from dream_procedural_palace import live_protected_drawer_ids
+    protected = live_protected_drawer_ids(path)
     filtered = []
     errors = []
     for decision in decisions:
         if decision.get("action") != "merge":
             filtered.append(decision)
+            continue
+        if protected.intersection(decision.get("supersedes") or []):
+            errors.append({"stage": "protected", "error": "procedural evidence/event drawer", "decision": decision})
+            filtered.append({"action": "skip"})
             continue
         drift_errors = _merge_drift_errors(path, decision)
         if drift_errors:
@@ -442,6 +487,8 @@ def _preflight_merge_decisions(path: str, decisions: list[dict[str, Any]]) -> tu
 
 
 def _preflight_prune_decisions(path: str, decisions: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    from dream_procedural_palace import live_protected_drawer_ids
+    protected = live_protected_drawer_ids(path)
     try:
         degrees = dream_palace.kg_protection_degree(path)
     except Exception as exc:  # noqa: BLE001
@@ -457,6 +504,10 @@ def _preflight_prune_decisions(path: str, decisions: list[dict[str, Any]]) -> tu
             filtered.append(decision)
             continue
         drawer_id = decision["id"]
+        if protected.intersection([drawer_id, *decision.get("member_ids", [])]):
+            errors.append({"stage": "protected", "error": "procedural evidence/event drawer", "decision": decision})
+            filtered.append({"action": "keep"})
+            continue
         try:
             live = dream_palace.load_drawer_by_id(path, drawer_id)
         except Exception as exc:  # noqa: BLE001
@@ -704,13 +755,14 @@ def main(argv: list[str] | None = None) -> int:
         )
     elif task == "merge":
         decisions = _resolve_decisions(worklist)
-        decisions, preflight_errors = _preflight_merge_decisions(path, decisions)
-        writer = dream_palace.MempalaceWriter()
-        archiver = dream_palace.Archiver(path, writer=writer, archive_path=args.archive_file)
-        report = _add_preflight_errors(
-            apply_merge_decisions(decisions, writer, archiver),
-            preflight_errors,
-        )
+        with dream_palace.palace_mutation_lock(path):
+            decisions, preflight_errors = _preflight_merge_decisions(path, decisions)
+            writer = dream_palace.MempalaceWriter()
+            archiver = dream_palace.Archiver(path, writer=writer, archive_path=args.archive_file)
+            report = _add_preflight_errors(
+                apply_merge_decisions(decisions, writer, archiver),
+                preflight_errors,
+            )
         print(
             f"adopted: merged {report['merged']}, skipped {report['skipped']}, "
             f"deleted {len(report['deleted'])}, errors {len(report['errors'])}",
@@ -718,11 +770,12 @@ def main(argv: list[str] | None = None) -> int:
         )
     elif task == "prune":
         decisions = _resolve_prune_decisions(worklist)
-        decisions, preflight_errors = _preflight_prune_decisions(path, decisions)
-        report = _add_preflight_errors(
-            apply_prune_decisions(decisions, dream_palace.Archiver(path, archive_path=args.archive_file)),
-            preflight_errors,
-        )
+        with dream_palace.palace_mutation_lock(path):
+            decisions, preflight_errors = _preflight_prune_decisions(path, decisions)
+            report = _add_preflight_errors(
+                apply_prune_decisions(decisions, dream_palace.Archiver(path, archive_path=args.archive_file)),
+                preflight_errors,
+            )
         print(
             f"adopted (prune): pruned {report['pruned']}, kept {report['kept']}, "
             f"errors {len(report['errors'])}",

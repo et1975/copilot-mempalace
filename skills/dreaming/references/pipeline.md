@@ -15,6 +15,10 @@ Design basis for the dreaming scripts. Filed in the palace under wing
 
 `Δ : (M_in, S, θ) ↦ M_out`, with `M_in` immutable. The store `M` includes
 logical drawers in a wing/room and the palace-local temporal KG.
+This is a reasoning model, not a transactional snapshot guarantee. Legacy
+collection opening/KG premise loading may initialize or reconcile storage;
+ontology proposal commands explicitly write candidates. "No adoption" is not
+equivalent to "no filesystem writes."
 
 ### Task: dedup / merge (v1)
 
@@ -23,6 +27,11 @@ logical drawers in a wing/room and the palace-local temporal KG.
   clusters are connected components of the `~_τ` graph (union-find).
 - Fold `μ(C)` = one synthesised drawer per cluster (the agent's job, Phase 2).
 - Soundness constraint: `μ(C)` must preserve every atomic fact in `C`.
+  This is an agent review obligation, not proved by cosine similarity.
+- Both merge and prune archive full original records to fsynced JSONL before
+  sanctioned deletion. A successful add or an archive alone does not establish
+  semantic preservation. Re-harvest is a residual-work measurement; skipped
+  groups and concurrent changes mean zero clusters is not guaranteed.
 
 ### Task: contradiction / staleness
 
@@ -50,11 +59,12 @@ logical drawers in a wing/room and the palace-local temporal KG.
 > `KnowledgeGraph(db_path=os.path.join(palace_path, "knowledge_graph.sqlite3"))`
 > directly and calls `.invalidate(...)`.
 
-### Task: pattern / induce
+### Task: reflect / pattern
 
-- This is the **net-new-knowledge** task. `merge` compresses existing memory;
-  `contradiction` retires stale beliefs; `pattern` induces a new lesson/rule
-  from repeated observations.
+- Constructive `reflect` is the **net-new-insight** task: `distill`, `generalize`,
+  `name_gap`, `connect`, `converge`, `tension`, `shared_constraint`.
+  Current `--task pattern` aliases `reflect/converge` for recurrence-gated
+  generalization; it is not the only constructive operation.
 - Adoption is **ADD-ONLY**: approved decisions add a surfaced lesson drawer and
   never delete drawers or invalidate KG facts.
 - Detection is mechanical: a theme is a connected component of the `≥ τ`
@@ -62,9 +72,17 @@ logical drawers in a wing/room and the palace-local temporal KG.
 - Observation extraction and rule synthesis are cognitive: the agent reads the
   theme members, extracts atomic observations, judges whether a generalizable
   rule exists, and writes the final lesson.
-- Groundedness invariant: a surfaced rule must cite at least `min_support`
-  **distinct sessions** via `support_ids` (default `3`). `apply_pattern_decisions`
-  rejects `surface` decisions with empty `supported_by`.
+- Groundedness invariant: converge must cite the worklist's declared
+  `min_support` **distinct original sessions** (at least two; the pattern
+  examples use three). Adoption re-reads original text/hashes and rejects
+  missing/drifted sources or forged session IDs. A diary/raw mirror is one
+  session, not two. `lesson`, `reflect`, procedural and marked generated
+  summaries are not independent recurrence support. Legacy pattern adoption
+  still rejects empty `supported_by`; newly harvested worklists use reflect.
+- Other ordinary reflect kinds retain at least two quote-grounded member
+  drawers. Exact quotes establish provenance, not entailment. Separate optional
+  procedural enrollment always needs three original sessions, never just two
+  reflections or a derived summary.
 - `session_id` is the join key. Session identity is host-owned and orthogonal to
   mempalace; it is stamped onto diary entries at write time because a diary entry
   is a memory **about** a host session. `extract_session_id` parses a
@@ -95,7 +113,7 @@ MPY=$(head -1 "$(command -v mempalace)" | sed 's/^#!//')
 
 ### Task: prune / forget
 
-- This is the **FORGETTING** task and the only destructive one. Its safety model
+- This is the **FORGETTING** task. Its safety model
   is therefore inverted: **remove carefully, reversibly**. `merge` preserves
   source facts by add-then-delete, `contradiction` soft-invalidates KG facts,
   and `pattern` is add-only; `prune` may delete drawers after approval.
@@ -110,13 +128,17 @@ MPY=$(head -1 "$(command -v mempalace)" | sed 's/^#!//')
   drawer is proposed only when `v < v_min` AND `age_days >= age_floor_days` AND
   `kg_degree == 0` AND it is not pinned. The `kg_degree == 0` gate also means the
   pruned drawer sourced no KG triples, so deletion cannot orphan the graph.
-- Adoption is archive-not-delete: each pruned drawer is appended as a full record
-  (including `salience` and `pruned_at`) to an append-only JSONL cold store,
+- Adoption is archive-**before**-delete: each pruned drawer is appended as a full record
+  (including `salience` and `archived_at`) to an append-only JSONL cold store,
   flushed and `fsync`ed, and only then deleted through the sanctioned
   `mempalace_delete_drawer` handler, which purges the closet/AAAK index. A
   failed archive deletes nothing; the archive is lossless and reversible.
 - Apply has a protected re-check: drawers with `kg_degree > 0` or `pinned` are
   refused even if adjudication said `prune`.
+- All retained procedural events and their original source/lineage drawers
+  are excluded at harvest and checked live under the shared mutation lock at
+  apply, including logical/physical chunk IDs. Terminal/out-of-scope history
+  does not release protection; old worklists cannot bypass it.
 - Steering-sensitive: this is where steering `θ` bites hardest. "Focus on X"
   reweights salience; "preserve X" pins a fixed point that should not be pruned.
 - Fixpoint is a maintenance loop, not one-shot convergence: re-harvest should
@@ -143,6 +165,28 @@ Adopt:
 ### Future task shape
 
 Additional worklist `kind`s should keep the same harvest/adjudicate/adopt shape.
+
+### Optional procedural lifecycle (separate CLI)
+
+`dream_procedure.py` owns `propose`, `validate`, `review`, `outcome`, `guidance`,
+and `explain`. It does not add a harvest task, migrate old reflections, enable
+ontology rules, update KG schemas or infer task outcomes. The existing dreaming
+skill reviews normative statements; mechanics project immutable drawer events.
+
+The [procedural contract](procedural.md) specifies exact JSON schemas, digest
+preparation/retries, three-session grounding, support/contrast dispositions,
+explicit rule-specific attribution, review-head joins and source retention.
+Usefulness decay/maturity never grants logical authority. Anti-patterns require
+independently reviewed wording, not automatic inversion.
+
+Default guidance delivers only eligible established/proven rules in the exact
+repository. Approved candidates require deliberately requested labeled trials.
+Guidance has a combined five-item / 6,000-character serialized ceiling; explain
+retains full score terms, review dispositions and lineage. No retrieval creates
+feedback and no read writes scores. Unsupported read-only backends, incomplete
+WAL/SHM states, missing models/evidence and incomplete histories fail explicitly.
+Verified support is WAL-aware SQLite-exact storage and an installed local MiniLM
+cache; legacy destructive safety lookups keep their existing backend semantics.
 
 ## Artifacts (session workspace — never commit)
 
@@ -209,7 +253,8 @@ Contradiction worklist:
 }
 ```
 
-Pattern worklist:
+Legacy pattern worklist (retained for older artifacts; current `--task pattern`
+produces `reflect/converge`, as described in the skill):
 
 ```jsonc
 {
@@ -333,7 +378,7 @@ If `invalidate` is omitted, adoption invalidates every candidate object except
 `keep`. Use this only after judging that the predicate is functional and the kept
 object is authoritative.
 
-Pattern:
+Legacy pattern:
 
 ```jsonc
 {"action": "surface", "wing": "<w>", "room": "<r>",
@@ -389,7 +434,12 @@ For derive items, write the decision into `item["decision"]`. The subject,
 predicate, and object remain nested under `item["conclusion"]`; adoption relies
 on that shape when materializing approved facts.
 
-## Verified mempalace API facts (mempalace 3.5.0)
+## Historical mempalace API facts (mempalace 3.5.0)
+
+These are version-specific legacy notes, not the new procedural backend
+contract. The installed SQLite-exact adapter also supports comparison filters
+such as `$ne`; the procedural integration tests exercise its real handlers,
+exact chunk reads and strict nonmutation boundary.
 
 - **Read**: `from mempalace.palace import get_collection;
   col = get_collection(palace_path)`. `col.get(include=["documents",
@@ -421,13 +471,14 @@ on that shape when materializing approved facts.
 
 | Invariant | Enforced by |
 |-----------|-------------|
-| Non-destructiveness / reversibility | harvest read-only; live writes only in adopt, only on approved decisions; failed add skips delete; prune archives full records before delete and a failed archive deletes nothing |
+| Approved mutations / reversibility | no implicit adoption; legacy initialization/reconciliation and explicit ontology candidates are read-only exceptions; failed add skips delete; merge/prune archive full records before delete; failed archive deletes nothing |
 | Provenance | `supersedes` on every merge |
-| Groundedness | pattern `support_ids` must cover ≥ `min_support` distinct sessions; empty `supported_by` is rejected |
+| Groundedness | converge revalidates declared `min_support`, original session IDs and hashes; mirrors/generated records cannot inflate support; quotes do not prove semantic entailment |
 | Salience-gated protected classes | prune requires `v < v_min` AND age floor AND `kg_degree == 0` AND not pinned; apply refuses KG-connected or pinned drawers |
-| Auditability | prune archive records include drawer text, member ids, salience components, and `pruned_at` |
-| Idempotence / fixpoint | Phase 5 re-harvest → 0 merge clusters / resolved functional contradictions; pattern and prune are maintenance loops rather than one-shot convergence |
+| Auditability | merge/prune archives retain drawer text, physical members and `archived_at`; procedural events retain all original evidence even after retirement |
+| Operational verification | Phase 5 measures remaining candidates, not a universal zero-cluster guarantee; reflection/pattern/prune are maintenance loops |
 | Bounded cost | scope by wing/room; `tau` gates the pairwise graph |
+| Procedural authority | optional reviewed advice only; explicit attributed outcomes, no feedback from retrieval and no automatic KG/ontology authority |
 
 ## Upstream evolution (why harvest imports mempalace)
 

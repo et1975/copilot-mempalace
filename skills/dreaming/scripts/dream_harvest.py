@@ -18,11 +18,12 @@ from datetime import datetime
 import hashlib
 import json
 import os
-import re
 import sys
 
 import dream_ontology
 import dream_palace
+from dream_metadata import is_generated_observation
+from dream_procedural_palace import exclude_protected_drawers
 from dream_lib import (
     build_contradiction_worklist,
     build_gap_worklist,
@@ -41,12 +42,6 @@ from dream_lib import (
     select_prune_candidates,
 )
 
-_LESSON_TRAILER_RE = re.compile(
-    r"<!--dreaming-meta:\s*\{[^}]*[\"']kind[\"']\s*:\s*[\"']lesson[\"'][^}]*\}\s*-->",
-    re.IGNORECASE,
-)
-
-
 def _content_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
@@ -64,8 +59,7 @@ def _default_palace() -> str | None:
 
 
 def _is_surfaced_lesson(entry: dict) -> bool:
-    metadata = entry.get("metadata") or {}
-    return metadata.get("kind") == "lesson" or _LESSON_TRAILER_RE.search(entry.get("text", "")) is not None
+    return is_generated_observation(entry)
 
 
 def _stamp_merge_hashes(worklist: dict) -> None:
@@ -164,6 +158,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.task == "prune":
         drawers = dream_palace.load_logical_drawers(path, wing=args.wing, room=args.room)
+        drawers = exclude_protected_drawers(path, drawers)
         degrees = dream_palace.kg_protection_degree(path)
         redundancy = compute_redundancy(drawers)
         now = datetime.now()
@@ -338,6 +333,7 @@ def main(argv: list[str] | None = None) -> int:
 
     tau = args.tau if args.tau is not None else 0.9
     drawers = dream_palace.load_logical_drawers(path, args.wing, args.room)
+    drawers = exclude_protected_drawers(path, drawers)
     worklist = build_worklist(
         drawers,
         tau=tau,

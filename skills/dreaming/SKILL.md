@@ -8,7 +8,8 @@ description: Use when the user wants to consolidate, deduplicate, clean up, forg
 Offline consolidation for a mempalace palace, modelled on Anthropic's Claude
 "dreaming": between sessions, review the store, merge duplicates, surface KG
 contradiction/staleness candidates, induce recurring cross-session lessons, and
-prune stale low-salience drawers to keep it high-signal — **without** the palace
+construct new quote-grounded reflections, then prune stale low-salience drawers
+to keep it high-signal — **without** the palace
 itself needing any model. Cognition lives here (in you, the agent);
 mechanics live in Python scripts; storage stays in mempalace.
 
@@ -78,6 +79,12 @@ Artifacts go in the session workspace — never commit them.
 > `contradiction, induce-rules, pattern, reflect, merge, prune` — so a default
 > survey now includes the constructive **reflect** pass (bounded cluster seeds,
 > read-only) alongside the consolidation tasks.
+>
+> **Legacy read boundary:** "read-only" here means no adoption, not a universal
+> filesystem guarantee. Existing collection opens and KG premise loading can
+> initialize/reconcile legacy state; ontology candidate commands write explicit
+> artifacts. The new procedural read commands have a separate strict contract
+> ([procedural reference](references/procedural.md)).
 
 | # | Phase | Who | Command / action |
 |---|-------|-----|------------------|
@@ -181,7 +188,7 @@ Examples: `lives_in` and `status_is` are usually functional; `knows` and
 `depends_on` may be multi-valued. Use the worklist's `newest_object` as a hint,
 not as an automatic decision.
 
-For each `"kind": "pattern"` item, read the theme's `members[]` entries and
+For legacy `"kind": "pattern"` worklists, read the theme's `members[]` entries and
 extract the atomic observations they share. Decide whether those observations
 support a generalizable rule across at least `min_support` **distinct**
 `session_id`s (`evidence.support_ids`).
@@ -201,8 +208,9 @@ support a generalizable rule across at least `min_support` **distinct**
   ```
 
 Anti-proliferation discipline: never surface an unsupported generalization, and
-never re-surface a lesson that already exists. Pattern is the only net-new
-knowledge task; keep it high-signal.
+never re-surface a lesson that already exists. Current `--task pattern` routes
+to `reflect/converge`; other reflect kinds also construct net-new insights.
+Use the reflect contract below for newly harvested worklists.
 
 For `--task induce-rules`, the pattern-family induction target is
 `ontology.json`, not drawer text. It scans observed base KG triples for
@@ -258,17 +266,22 @@ entries without it contribute no pattern support.
 
 ## Guarantees (why this is safe)
 
-- **Safe writes** — nothing touches the live palace until Phase 4, and only on
-  approved decisions. Harvest is read-only; a failed add never deletes; KG
+- **Approved adoption** — ordinary worklists do not adopt until Phase 4;
+  existing collection/KG reconciliation and explicit ontology candidate writes
+  are exceptions to a blanket read-only claim. A failed add never deletes; KG
   contradiction adoption sets `valid_to` instead of deleting facts; pattern
-  adoption is add-only. Prune is the only destructive task, but it archives the
-  full record to append-only JSONL (fsynced) before sanctioned delete, and a
-  failed archive deletes nothing.
+  and reflect adoption are add-only. Both merge and prune delete originals
+  only after full-record JSONL archival (fsynced); a failed archive deletes
+  nothing. Semantic fact preservation is a review obligation, not proved by
+  an archive or an embedding.
 - **Provenance** — every merge carries `supersedes` (the ids it replaces).
-- **Groundedness** — pattern lessons cite exact supporting session ids; empty
-  support is rejected.
-- **Fixpoint** — re-harvesting an adopted wing yields 0 clusters. Use it as a
-  test oracle. Pattern's fixpoint is weaker: exclude adopted lessons from mining
+- **Groundedness** — recurrence admission re-reads original sources, hashes,
+  session attribution and the declared minimum; diary/raw mirrors count once.
+  Generated reflections/lessons/procedural records cannot increase independent
+  support. Exact quotes establish provenance, not semantic entailment.
+- **Operational verification** — re-harvest measures residual work, not a
+  guaranteed global fixpoint. Skipped groups, thresholds and concurrent edits
+  can leave candidates. Pattern's fixpoint is weaker: exclude adopted lessons from mining
   and dedup during adjudication so covered themes stop producing new lessons.
   Prune's fixpoint is a maintenance loop: approved candidates disappear from the
   current pass, but new low-salience drawers can appear over time.
@@ -343,8 +356,10 @@ there is no separate skill.
 - All kinds **except** `converge`: each candidate must have >=2 member drawers
   with exact-substring quote premises (`evidence.premises[].quote` is a literal
   substring of `evidence.premises[].drawer_id`'s text). No quotes ⇒ reject.
-- `converge` only: grounding is **recurrence** over >=2 distinct
-  `session_id`s counted from `evidence.support_ids`. No support ⇒ reject.
+- `converge` only: grounding is **recurrence** over the worklist's declared
+  `min_support` distinct original sessions (at least two); adoption re-reads
+  those sources and hashes. Three is required for separate procedural
+  enrollment even when an ordinary reflection legitimately used two drawers.
 
 **Admission gates:**
 
@@ -355,7 +370,7 @@ there is no separate skill.
 3. **Review-before-adopt**: every reflect candidate is adjudicated by the agent
    before materialization (same as pattern/merge). No auto-adopt.
 
-**Read-only and KG-free:**
+**No automatic KG authority:**
 
 - Reflect is **generative** (adds new drawers) but does **not** fetch external
   sources, query APIs, or write KG facts. It works purely from existing palace
@@ -363,6 +378,41 @@ there is no separate skill.
 - `--verify` does **not** apply to reflect the way it does to merge/pattern. The
   novelty gate and review-before-adopt are the anti-resurfacing mechanisms; a
   re-harvest naturally produces different clusters and is not a fixpoint test.
+
+## Optional procedural enrollment — empirical advice, not proof
+
+**Only when the user opts into procedural learning for one repository**, use
+`scripts/dream_procedure.py`; normal reflect, pattern, survey and recall must
+not implicitly enroll rules or record feedback. No new skill/agent is required.
+Read [the exact artifact/CLI contract](references/procedural.md) first.
+
+1. **Propose:** explicitly author a scoped rule/anti-pattern, applicability and
+   exceptions. Cite at least three independent original source sessions.
+   A reflection is lineage, never a fourth replication. Prepare immutable
+   digests with `propose --prepare --out`, then `propose --input`.
+2. **Validate/review:** run `validate --rule-id --contrast-query --out`; label
+   every bounded support/contrast result with a reason and exact reference.
+   Resolve all current review heads and adverse evidence. No counterexample
+   found means none within this search. Approval is not helpful feedback.
+3. **Cold start:** at task start, after ordinary recall, `guidance --task
+   --repository` returns eligible established/proven advice only.
+   `--include-candidates` deliberately opts into labeled approved trials;
+   choose a safe bounded task, never expose harm just to gather data.
+4. **Outcome:** at task end, record `helpful`, `harmful` or `neutral` **only**
+   with original evidence and a specific attribution of what following that
+   rule changed. Overall success, a passing test and repeated retrieval are
+   not feedback. Use the source's observation time, not filing time.
+5. **Explain/retain:** use `explain --rule-id` for suppression, scores and full
+   lineage. Do not negate harmful wording automatically, delete adverse
+   evidence, or promote maturity labels to ontology/KG authority.
+
+All commands require explicit `--palace` and `--wing`. These commands need an
+existing SQLite-exact palace and installed local MiniLM. WAL-aware read-only
+access supports an open writer; incomplete WAL/SHM states fail explicitly.
+Commands never download, convert backends or checkpoint storage. Guidance is at most
+five combined items / 6,000 serialized characters, not tokens. Retained events
+protect source drawers at harvest and locked apply even after retirement.
+External deletion is still possible; never claim tamper-proof storage.
 
 Future `kind`s are reserved — see [`references/pipeline.md`](references/pipeline.md)
 for the full contract, formal task formulations, and the mempalace API facts the
@@ -373,8 +423,12 @@ documented future enhancements.
 ## Tests
 
 ```
-cd skills/dreaming/scripts && python3 -m unittest -v
+cd skills/dreaming/scripts
+PYTHONDONTWRITEBYTECODE=1 DREAMING_TEST_TMPDIR="$SESSION_FILES" TMPDIR="$SESSION_FILES" \
+  "$MPY" -m unittest discover -s . -p 'test_*.py' -q
 ```
 
 The pure core (`dream_lib.py`) is dependency-free and fully unit-tested; the
-mempalace-facing adapter is validated by an end-to-end run on a throwaway palace.
+mempalace-facing adapter and procedural CLI are validated on throwaway palaces.
+Use the already installed package-owning interpreter and session artifact
+directory; tests never target a user's live palace.

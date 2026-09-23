@@ -13,6 +13,7 @@ from unittest import mock
 
 import dream_adopt
 import dream_harvest
+from test_dream_procedural_palace import DrawerCollection
 
 try:
     from mempalace.knowledge_graph import KnowledgeGraph as _RealKG
@@ -273,6 +274,10 @@ class TestHarvestPatternTask(unittest.TestCase):
 
 
 class TestHarvestPruneTask(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(mock.patch.object(dream_harvest.dream_palace, "protection_collection",
+                                           return_value=DrawerCollection()))
+
     def test_prune_task_writes_prune_worklist(self):
         drawers = [
             {
@@ -702,7 +707,7 @@ class TestAdoptMergeArchiveAndVerify(unittest.TestCase):
             with open(decisions_path, "w", encoding="utf-8") as fh:
                 json.dump(self._merge_decisions(), fh)
             archive_path = os.path.join(td, "custom-archive.jsonl")
-            with mock.patch.object(dream_adopt.dream_palace, "bind_palace", return_value="/bound"), \
+            with mock.patch.object(dream_adopt.dream_palace, "bind_palace", return_value=td), \
                  mock.patch.object(dream_adopt.dream_palace, "MempalaceWriter", return_value=mock.MagicMock()), \
                  mock.patch.object(dream_adopt.dream_palace, "Archiver") as archiver_cls, \
                  mock.patch.object(dream_adopt, "_preflight_merge_decisions", side_effect=lambda p, d: (d, [])), \
@@ -750,6 +755,10 @@ class TestAdoptMergeArchiveAndVerify(unittest.TestCase):
 
 
 class TestAdoptMergeTask(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(mock.patch.object(dream_adopt.dream_palace, "protection_collection",
+                                           return_value=DrawerCollection()))
+
     def test_adopt_uses_mempalace_config_when_palace_is_omitted(self):
         with _test_tmpdir() as td:
             configured_palace = os.path.join(td, "configured-palace")
@@ -832,6 +841,10 @@ class TestAdoptMergeTask(unittest.TestCase):
 
 
 class TestAdoptPruneTask(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(mock.patch.object(dream_adopt.dream_palace, "protection_collection",
+                                           return_value=DrawerCollection()))
+
     def test_resolve_prune_decisions_defaults_to_item_fields_and_keeps_by_default(self):
         salience = {"v": 0.12, "age_days": 400, "kg_degree": 0}
         worklist = {
@@ -1707,16 +1720,24 @@ class PreflightReflectTests(unittest.TestCase):
         self.assertEqual(kept[0]["action"], "surface")
 
     def test_converge_grounded_by_recurrence_not_quotes(self):
+        from dream_metadata import content_hash
+        import dream_sessions
         self._patch_palace()
-        wl = {"task": "reflect", "scope": {}, "items": [{
+        wl = {"task": "reflect", "scope": {}, "params": {"min_support": 2}, "items": [{
             "kind": "reflect", "member_ids": ["session:s1", "session:s2"],
+            "members": [{"id": f"session:{sid}", "session_id": sid,
+                         "content_hash": content_hash(f"deploy with farmer {sid}")}
+                        for sid in ("s1", "s2")],
             "evidence": {"support": 2, "support_ids": ["s1", "s2"]},
             "decision": {"action": "surface", "reflect_kind": "converge",
                          "conclusion": {"text": "team converges on farmer deploys", "kind": "converge",
                                         "decision_or_prediction": "standardize"},
                          "premises": [], "wing": "w", "room": "reflections"}}]}
         decisions = dream_adopt._resolve_reflect_decisions(wl)
-        kept, errors = dream_adopt._preflight_reflect_decisions("P", decisions)
+        with mock.patch.object(dream_sessions, "load_session_turns", side_effect=lambda sid: [
+                {"turn_index": 0, "user_message": f"deploy with farmer {sid}",
+                 "assistant_response": "", "timestamp": "2026-09-01T00:00:00Z"}]):
+            kept, errors = dream_adopt._preflight_reflect_decisions("P", decisions)
         self.assertEqual(errors, [])
         self.assertEqual(kept[0]["action"], "surface")
 

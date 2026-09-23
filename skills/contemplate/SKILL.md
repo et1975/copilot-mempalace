@@ -5,11 +5,14 @@ description: Use when the user wants deliberate, on-demand deductive reasoning o
 
 # Contemplate
 
-On-demand **read-only** reasoning for a mempalace palace. Where `dreaming` is
+On-demand reasoning for a mempalace palace. Where `dreaming` is
 unattended off-hours consolidation, `contemplate` is deliberate inline
 cognition: derive what follows from the active KG under explicitly-approved
 rules, query for relevant past sessions, propose ontology rules, and report
-knowledge gaps — **without writing KG facts or materializing drawers**.
+knowledge gaps — without automatically adopting new KG conclusions/drawers.
+This is **not a universal read-only guarantee**: existing premise loading may
+reconcile legacy KG provenance, and explicit ontology bootstrap/enable/disable
+commands write configuration. Approved adoption is a separate write step.
 
 **Scope:**
 
@@ -55,7 +58,7 @@ MPY=$(head -1 "$(command -v mempalace)" | sed 's/^#!//')
 "$MPY" skills/dreaming/scripts/dream_contemplate.py --palace <p> --bootstrap
 ```
 
-`dream_contemplate.py` runs the read-only derive scan in one in-process call
+`dream_contemplate.py` runs the derive scan (without adopting conclusions) in one in-process call
 instead of the multi-command harvest flow, minimizing per-command approval
 prompts. `--bootstrap` only writes disabled ontology rule candidates for review;
 it never enables rules and never adopts derived KG facts. For a fully
@@ -80,7 +83,7 @@ cosine similarity in the palace's own embedding space. It is read-only
 reconnaissance: it surfaces session context for the agent to use as
 grounding/premises while reasoning inline. It does **not** materialize anything
 and does **not** run the deductive derive scan; the no-`--recall` driver remains
-the read-only derive path.
+the derive path with the legacy reconciliation caveat above.
 
 Summary output is intentionally skim-friendly, for example:
 
@@ -186,7 +189,7 @@ MPY=$(head -1 "$(command -v mempalace)" | sed 's/^#!//')
 
 | # | Phase | Who | Command / action |
 |---|-------|-----|------------------|
-| 1 | Harvest | script | Read active KG triples and `ontology.json`; compute bounded closure; write `worklist.json`. **Read-only**: writes nothing to the palace |
+| 1 | Harvest | script | Read active KG triples and `ontology.json`; compute bounded closure; write `worklist.json`. No new conclusions adopted; legacy premise loading may reconcile provenance |
 | 2 | Adjudicate | **you** | For each `derive` item, choose `materialize`, `skip`, or `reject_rule` |
 | 3 | Approve rules | human/config | If a rule is wrong, do not trust the candidate. `reject_rule` suppresses this worklist under the current ontology; edit `ontology.json` for the durable fix |
 | 4 | Adopt | script | Materialize approved facts and lineage, append skip-markers for skips/rejected rules |
@@ -309,7 +312,9 @@ rules are never auto-enabled.
 
 ## Scope limits
 
-`contemplate` is **strictly read-only**. It has four retained KG/reconnaissance
+`contemplate` does not automatically materialize conclusions. Explicit ontology
+changes and legacy premise reconciliation can write; do not call the whole
+surface strictly read-only. It has four retained KG/reconnaissance
 surfaces:
 
 - `--task derive` — bounded deductive closure over active KG facts under
@@ -326,6 +331,26 @@ surfaces:
 shared_constraint, converge) is **not** part of contemplate. Use the dreaming
 skill's `reflect` task for on-demand meditation or scheduled generative
 consolidation.
+
+## Optional procedural advice: no authority transfer
+
+When the user has opted into repository-scoped procedural learning, you may
+consult `dream_procedure.py guidance --palace <p> --wing <w> --repository
+owner/repository --task "<question>"` after ordinary recall. Inspect `explain`
+and the original sources before applying advice. This separate CLI has strict
+read-only/budget/source gates; it is not the legacy premise loader.
+
+**Invariant:** a procedural statement, relevance score, helpful outcome or
+`proven` maturity label is never an enabled ontology rule or durable KG premise.
+Do not feed procedural event drawers or their summaries back as independent
+observations. Quote grounding proves neither semantic entailment nor causality.
+Consulting advice supplies no helpful feedback. Candidate trials require
+explicit `--include-candidates` and deliberate safe selection; unresolved
+harm/conflicts remain suppressed. Structural KG proofs and reviewed empirical
+usefulness are separate authority domains.
+
+For exact schemas, model/backend/read-only limitations and examples, see
+[`../dreaming/references/procedural.md`](../dreaming/references/procedural.md).
 
 See [`references/derive.md`](references/derive.md) for the contract, schemas,
 and guardrails.
