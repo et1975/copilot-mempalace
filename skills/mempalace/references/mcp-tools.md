@@ -66,6 +66,23 @@ The fix for all three is the same: run tool-search first and read the real schem
 | `mempalace_diary_write` | Persist a diary entry (per-agent journal) |
 | `mempalace_diary_read` | Read prior diary entries |
 
+## Native coordination versus tracked tasks
+
+| Native tool | Purpose |
+|---|---|
+| `mempalace_task_create` | Immutable addressed delegation request and handoff |
+| `mempalace_event_append` | Append a coordination event |
+| `mempalace_event_list` | Read coordination events; negotiate append-order cursor behavior |
+| `mempalace_event_ack` | Append an acknowledgment; does not enforce exclusive ownership |
+| `mempalace_artifact_put` / `mempalace_artifact_get` | Store/retrieve exact supporting artifacts |
+
+The optional **task sidecar** is a separate MCP registration with `mptask_*`
+tools. It adds authoritative lifecycle, graph publication, claim/lease and
+recovery invariants over a reserved logstream. Do not substitute the native
+delegation/ack tools for sidecar claims, or infer readiness from semantic search.
+Discover the sidecar's live schemas and invoke its `mempalace-tasks` safety skill.
+Read-only human inspection is available through the sidecar CLI.
+
 ## Maintenance
 
 | Tool | Purpose |

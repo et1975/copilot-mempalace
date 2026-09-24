@@ -1,0 +1,3 @@
+include README.md
+include requirements.lock
+recursive-include tests *.py

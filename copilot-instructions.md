@@ -92,6 +92,21 @@ For deeper workflow docs (init, mine, full search/status walkthrough), invoke th
 - Use `contemplate` when the user asks to derive, infer, reason, contemplate, or asks "what follows from this?" / "what can we conclude?" It runs on-demand/inline over the active KG with explicit rules and approved materialization.
 - Use `dreaming` for unattended offline consolidation: merge duplicates, resolve contradiction/staleness candidates, induce repeated patterns, or prune low-salience drawers. It should run in a fresh/off-hours session, not inline during feature work.
 
+## Optional durable task coordination
+
+For an explicitly tracked sidecar task or a requested durable task workflow,
+invoke the `mempalace-tasks` safety skill and use the separately configured
+`mptask_*` tools. Native memory/delegation acknowledgments, drawers, diaries and
+KG projections are not task ownership or current operational state.
+
+Use current owner/attempt/generation and authorization, atomic expand/yield for
+new prerequisites, and confirmed goal closure rather than an empty ready list.
+Worker dispatch and physical supervision remain host responsibilities; do not
+claim native `/fleet` wiring merely because the sidecar is connected. Human
+status/history/watch are read-only observations. If the service is missing,
+report that boundary without creating a replacement writer. Ordinary memory
+filing and ephemeral session todos do not require durable task creation.
+
 ## Optional repository procedural advice (disabled by convention)
 
 Only after explicit user opt-in for one repository, supplement ordinary

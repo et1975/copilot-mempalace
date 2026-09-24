@@ -11,6 +11,14 @@ Design basis for the dreaming scripts. Filed in the palace under wing
   (mempalace adapter), `dream_harvest.py`, `dream_adopt.py`.
 - **Cognition — the dreaming skill**: the agent, in its own fresh context.
 
+Task-sidecar drawers and revision-scoped KG facts, when enabled, are historical
+derived views. The reserved task logstream and its sidecar reducer own task
+state. Consolidation must not claim/release/complete work or infer current
+ownership/readiness from these views. Cite source task/event IDs when retaining
+evidence; use the sidecar for current state. An explicit projection rebuild may
+restore derived output after maintenance, but must not fight intentional cleanup
+through automatic repeated re-creation.
+
 ## The dream as a function
 
 `Δ : (M_in, S, θ) ↦ M_out`, with `M_in` immutable. The store `M` includes
