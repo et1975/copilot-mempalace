@@ -11,6 +11,14 @@ audit hook that nags when an external tool is about to run without a prior `memp
   checkup" workflow. Drop into your home or repo `copilot-instructions.md` (concatenate or replace).
 - **[skills/mempalace/SKILL.md](skills/mempalace/SKILL.md)** — full skill: 30 MCP tools (read/write/tunnels/KG/diary),
   proactive vs reactive use, mining hygiene, HNSW drift recovery, auto-save hook notes.
+- **[MemPalace Tasks sidecar](sidecar/README.md)** — optional, separately installed
+  Python MCP service for durable tasks, dependencies, atomic claims/discoveries,
+  renewable fenced leases and recovery over the MemPalace logstream. Includes
+  read-only `status` / `list` / `show` / `history` / bounded `watch`, a
+  [task-safety skill](skills/mempalace-tasks/SKILL.md), and an opt-in
+  [workflow agent](agents/palace-task-workflow.agent.md). Worker dispatch remains
+  a host responsibility; connecting MCP does not automatically wire native `/fleet`.
+  Ordinary memory filing does not require this optional service.
 - **[skills/dreaming/SKILL.md](skills/dreaming/SKILL.md)** — offline consolidation ("dreaming"): a 5-phase
   pipeline (harvest → adjudicate → review → adopt → verify) that merges near-duplicate drawers and resolves
   adjudicated KG contradiction/staleness candidates between sessions, plus constructive `reflect`

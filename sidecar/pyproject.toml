@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mempalace-tasks"
+version = "0.1.0"
+description = "Single-host, event-sourced task coordination over a MemPalace hub"
+requires-python = ">=3.11"
+dependencies = ["mcp==1.30.0"]
+
+[project.scripts]
+mempalace-tasks = "mempalace_tasks.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

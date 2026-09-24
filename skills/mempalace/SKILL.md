@@ -38,6 +38,20 @@ Different harnesses register the same server binary in different files. Full tab
 
 The MCP server exposes ~30 tools prefixed `mempalace_*`, grouped as read / write / tunnels / knowledge graph / diary / maintenance. Full catalog in [references/mcp-tools.md](references/mcp-tools.md). The current toolset is discoverable via MCP `list-tools`.
 
+## Optional tracked tasks
+
+When a host supplies a tracked sidecar task or the user requests durable task
+coordination, invoke `mempalace-tasks` for its ownership/publication invariants.
+The separately configured `mptask_*` service owns task state, readiness, claims
+and generations. Native `mempalace_task_create` / `mempalace_event_ack` are
+delegation records, not exclusive sidecar claims.
+
+Keep ordinary recall, evidence filing and session diaries on the existing memory
+tools. Cite task IDs in those records, but do not change task state with diary,
+drawer or KG writes. Historical projections require `mptask_get` for current
+state. If the sidecar is absent, report the setup boundary rather than start an
+alternate writer; ordinary memory workflows still work.
+
 ## When to use this skill — proactive vs reactive
 
 ### Proactive (no explicit request, agent's own initiative)
