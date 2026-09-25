@@ -77,7 +77,7 @@ Read service health and list owned tasks with `mptask_snapshot` using
 check its derived authorization, live lease, profile readiness, checkpoint,
 blockers and resources. A freshly evaluated receipt can also establish current
 authorization; historical `mptask_outcome` lookup and preparing-time `input.json`
-cannot. In journal mode, read the current `epoch_id` and supply `expected_epoch`
+cannot. Read the current `epoch_id` and supply `expected_epoch`
 on each new mutation. Freeze authority/epoch/command ID/payload together;
 reconnection must not upgrade an ambiguous request's epoch. A new epoch requires
 fresh task authorization even when owner/attempt/generation appear unchanged.
@@ -165,8 +165,8 @@ version, summary and evidence only when execution-class completion requirements
 are met.
 Integration failures are evidence for bounded follow-up work, not fabricated
 success. Resolve uncertain command outcomes using the skill's same-scoped-request
-versus terminal-abandoned/new-ID rules. In journal mode use `mptask_outcome` with
-the original `epoch_id` (`null` for legacy history) and `command_id`; a historical
+versus terminal-abandoned/new-ID rules. Use `mptask_outcome` with
+the original epoch UUID and `command_id`; a historical
 receipt or `not_recorded` result is not current authorization or effect proof.
 
 Respect task backoff, deadlines and retry budget. A quarantined branch is a

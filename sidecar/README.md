@@ -19,22 +19,21 @@ External host/coordinator --> claims, optional supervision and result delivery
 ## What is authoritative
 
 The reserved `mptask/<authority_id>` logstream contains commands, settlement
-records and, in journal mode, accepted startup epochs. `JournalAuthority`
+records and accepted startup epochs. `TaskAuthority`
 reconstructs tasks, dependencies, generations, resource reservations and scoped
 command outcomes from that journal.
 
-| Configuration | Recovery and hosting contract |
-|---|---|
-| Schema 2 | `runtime_dir`; journal-only task recovery; `lifecycle` is `external` (default) or `launcher`; fixed loopback port or `0` for dynamic binding |
-| Schema 1 (legacy compatibility) | `state_dir`; original matching local pending/head/clock recovery contract; fixed port; no launcher consent |
+There is one authority implementation and one supported configuration contract:
+schema 2 with `runtime_dir`, journal-only recovery, and `lifecycle` set to
+`external` (default) or `launcher`. A fixed loopback port or `0` for dynamic
+binding is supported. There is no recovery-mode selector or file-backed
+authority alternative.
 
-`recovery_mode` is derived from the schema, **not a JSON configuration field**.
-Schema 2 ignores old `pending.json`, `head.json`, `clock.json` and projection
-checkpoint files. Runtime locks, registry and launch logs are disposable
+Runtime locks, registry and launch logs are disposable
 coordination, not a matching task-recovery backup set. Config and credentials
 are reprovisionable local inputs, not versioned task state.
 
-Every journal-mode owner startup accepts a fresh epoch before readiness,
+Every owner startup accepts a fresh epoch before readiness,
 including exclusive administration, not just machine reboots. It fences old
 attempt authorization immediately and records inherited attempts as requiring
 recovery in bounded batches. Execution is not automatically resumed. Effective
@@ -53,7 +52,7 @@ Goal bootstrap creates the root and planning task together; goal closure checks
 unfinished/proposed work and seals intake. An empty ready list is not completion.
 
 This is a **cooperative, single-host** deployment. All clients use one configured
-hub, one authority and one canonical runtime directory (legacy: state directory).
+hub, one authority and one canonical runtime directory.
 Never move/delete that directory or its stable lock files while an owner can
 still run; using another directory bypasses local exclusion. The lock is not a
 distributed fence or hub-enforced compare-and-swap. The private bearer token
@@ -106,9 +105,10 @@ through a command that fetches packages on every MCP connection.
 Create a private credential/config directory using your normal administration
 tools. Credential and runtime parents must already exist. For a **new authority**,
 choose a new UUID and a dedicated runtime directory; do not reuse a repository
-or another application's directory. For an existing authority, follow
-[explicit migration](#legacy-compatibility-and-explicit-migration), retaining its
-UUID and accepted genesis instead of initializing replacement task history.
+or another application's directory. Reopening a current-format authority retains
+its UUID and accepted genesis; it does not initialize replacement task history.
+Older experimental configurations and journal formats are not supported or
+automatically migrated.
 
 The configuration below is synthetic, not a deployment. Replace the UUID and
 `/srv/...` paths with absolute native paths without symlinks/reparse points.
@@ -146,8 +146,7 @@ never paste a token into a task, repository, chat or log.
     }
   },
   "maintenance_actor": "system",
-  "recovery_actor": "operator",
-  "projections_enabled": false
+  "recovery_actor": "operator"
 }
 ```
 
@@ -163,12 +162,12 @@ Add `--generate-token` to exclusively create a missing private service token;
 it never displays or overwrites the token or replaces accepted configuration.
 Initialization is idempotent for the same normalized genesis, but opens an owner
 and is **not** read-only inspection or the restore procedure. Actors, supervisors
-and declared capabilities are fixed by that genesis; changing JSON later is not
-an implicit authorization migration.
+and declared capabilities are fixed by that genesis; changing JSON later does
+not change accepted authorization.
 
 ### Foreground and launcher lifecycle
 
-The following is command syntax, not an automatic deployment/migration sequence.
+The following is command syntax, not an automatic deployment sequence.
 `CONFIG` is an absolute configuration path; alternatively set `MPTASK_CONFIG`.
 
 | Command | Behavior |
@@ -177,7 +176,7 @@ The following is command syntax, not an automatic deployment/migration sequence.
 | `mempalace-tasks start --config CONFIG --timeout 10s` | Explicit start/reuse; requires schema 2 and `lifecycle: "launcher"`. No implicit init. |
 | `mempalace-tasks connect --config CONFIG --timeout 10s` | Read-only discovery of an authenticated, ready owner; never starts one. |
 | `mempalace-tasks connect --config CONFIG --start --timeout 10s` | Explicit launcher start/reuse, under the same configured consent as `start`. |
-| `mempalace-tasks stop --config CONFIG --instance-id UUID --timeout 10s` | Drain exactly the previously observed journal-mode instance, then confirm listener closure and ownership release. |
+| `mempalace-tasks stop --config CONFIG --instance-id UUID --timeout 10s` | Drain exactly the previously observed instance, then confirm listener closure and ownership release. |
 
 For `start`, `connect` and `stop`, timeout defaults to ten seconds, accepts a positive
 `s`/`m`/`h` duration, and is bounded to 300 seconds. Stop requires the actual
@@ -237,13 +236,13 @@ Discover actual `tools/list` schemas instead of copying argument guesses.
 | Lifecycle | `mptask_create`, `update`, `claim`, `renew`, `checkpoint`, `attempt_report`, `release`, `recover`, `transition`, `note` |
 | Graph and goals | `mptask_add_dependency`, `remove_dependency`, `bootstrap`, `expand`, `goal_close` |
 | Read/observe | `mptask_get`, `snapshot`, `list`, `ready`, `history`, `health`, `wait_ready` |
-| Journal-mode historical resolution | `mptask_outcome` |
+| Historical resolution | `mptask_outcome` |
 
 Every short name in the table has the `mptask_` prefix. Public mutations require
-`actor` and `command_id`; **journal-mode mutations also require `expected_epoch`**
+`actor`, `command_id`, and **`expected_epoch`**
 from the current read/health response's `epoch_id`. Clients do not pass
 `operation`. Missing or stale epochs are rejected before mutation, even for a
-known command ID. Legacy tool schemas remain separate. Internal genesis and
+known command ID. Internal genesis and
 expiry commands are not exposed as public MCP tools.
 
 Freeze **authority + epoch + command ID + exact payload** for a logical request.
@@ -252,8 +251,8 @@ Its journal identity is `(authority_id, epoch_id, command_id)`. Do not refresh
 from a timeout. The client performs no automatic mutation retries.
 
 Resolve historical requests with
-`mptask_outcome(epoch_id=ORIGINAL_EPOCH, command_id=ORIGINAL_ID)`; use
-`epoch_id=null` for a legacy request when querying a journal-mode service.
+`mptask_outcome(epoch_id=ORIGINAL_EPOCH, command_id=ORIGINAL_ID)`.
+The original epoch UUID is required; a null or newly substituted epoch is invalid.
 The lookup is read-only and can return `resolution="not_recorded"` with no receipt;
 absence is not confirmed abandonment or evidence of absent external effects.
 Only a confirmed terminal-abandoned outcome permits a new ID for a still-needed
@@ -338,7 +337,7 @@ storage loss/corruption, unsupported upstream contracts, or unknown external
 effects remain explicit barriers; the software does not guess that an absent
 record or dead local process proves safety.
 
-Journal mode checks the live, in-memory verified prefix on refresh. Prefix
+The authority checks the live, in-memory verified prefix on refresh. Prefix
 rollback/corruption or a superseding epoch fences that owner closed. There is
 **no independent cross-process rollback anchor**: after process death, a
 self-consistent older snapshot cannot by itself prove whether rollback was
@@ -367,53 +366,24 @@ and its current platform/refusal limits. At a high level:
 
 The snapshot retains the task IDs, edges, holds and source-plan/artifact content
 it actually contains; post-snapshot work may be absent. Do not replay pending
-commands or restore matching legacy sidecar files from a discarded future.
+commands or restore sidecar cache files from a discarded future.
 Reprovision config/tokens as needed and rebuild disposable discovery/runtime
 state only while owners are quiescent. Neither palace restore nor task fencing
 undoes Git/cloud effects or target-side fence counters; reconcile those before
 unsafe work can be repeated.
 
-### Legacy compatibility and explicit migration
+### Supported data and administration
 
-Schema 1 remains usable under its original local recovery contract **only until
-the stream has an accepted v2 epoch**. The current legacy implementation then
-fails startup/refresh with `migration_required`; changing the JSON back to
-schema 1 is not a downgrade procedure.
-
-Moving to schema 2 is an explicit configuration/hosting decision, never an
-automatic deployment migration. Quiesce the existing owner and execution,
-preserve the existing palace stream, **authority/task IDs, source-plan notes and
-accepted genesis**, and explicitly choose `runtime_dir` and lifecycle. Journal
-mode replays accepted legacy history and creates a fresh epoch; it does not
-reimport tasks or require converting old head/pending/clock files. Do not run
-destructive init, mint a replacement authority or change hub/MCP registrations
-as a shortcut. A schema-1 recovery-file requirement is not a schema-2
-palace-restore requirement.
+Only the current schema-2 configuration and epoch-bound journal envelopes are
+accepted. The original experimental authority, schema-1 configuration and
+pre-epoch journal formats have no compatibility or migration path. Unsupported
+records fail explicitly; they are never silently skipped or replaced with a new
+authority. Removing this code does not delete stored palace records.
 
 With all other owners stopped, `mempalace-tasks reconcile --config CONFIG`
-is exclusive **mutating** administration, not inspection; in journal mode it
-also opens a new epoch. Package replacement likewise requires quiescence.
+is exclusive **mutating** administration, not inspection; it also opens a new
+epoch. Package replacement likewise requires quiescence.
 Removing the package must not delete the accepted palace records.
-
-### Projections: legacy only
-
-**Journal-mode projections are currently unsupported.** `project`, or `serve`
-with `projections_enabled: true`, fails with `projection_unsupported`; journal
-mode never reuses an old external projection checkpoint.
-
-In schema 1, projection remains off by default. When enabled it uses a separate
-client outside the authority lock. Only accepted domain records are projected;
-heartbeats are not embedded. Delivery is explicitly at least once. Large source
-records are losslessly partitioned; immutable revision nodes preserve provenance.
-MemPalace's legacy KG validity is whole-second: derived boundaries use a
-conservative ceiling while exact source timestamps remain in content/`source_at`.
-Historical KG/drawers are never current task authority.
-
-A failed legacy projection pauses visibly without rolling back tasks. With the
-owner stopped, `project --config CONFIG --resume --max-batches 10` or
-`project --config CONFIG --rebuild --max-batches 10` provides bounded
-administration; rebuild resets only its derived checkpoint, not task history.
-These optional legacy features do not silently carry over to journal mode.
 
 No log compaction, distributed failover, native `/fleet` dispatch or Beads
 CLI/Dolt/formula compatibility is claimed.
@@ -437,5 +407,5 @@ MPTASK_LIVE_HUB=1 MPTASK_TEST_TMPDIR="$SESSION_FILES" PYTHONPATH=sidecar/src \
 
 The real-hub fixture isolates HOME and palace storage, binds port zero, validates
 its child-owned registry before connecting, and stops only its own processes.
-It never registers a service or writes task/projection records into the user's
+It never registers a service or writes task records into the user's
 existing palace.

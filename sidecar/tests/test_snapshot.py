@@ -69,9 +69,8 @@ def create(number, **fields):
 def raw_record(payload, number):
     authority = payload["authority_id"]
     identity = "activation_id" if payload["record_type"] == "mptask.epoch" else "command_id"
-    metadata = {"authority_id": authority, identity: payload[identity]}
-    if payload["schema_version"] == 2:
-        metadata["epoch_id"] = payload["epoch_id"]
+    metadata = {"authority_id": authority, identity: payload[identity],
+                "epoch_id": payload["epoch_id"]}
     return {
         "id": f"evt-{number:06}", "seq": number, "type": payload["record_type"],
         "stream": f"mptask/{authority}", "room": "tasks", "from_agent": "mempalace-tasks",
@@ -131,6 +130,8 @@ class SnapshotTests(unittest.TestCase):
 
     def send(self, cmd, *, log=None):
         log = self.log if log is None else log
+        if log.epoch_id is None:
+            self.append(make_epoch(log, uid(9001), uid(9002), NOW), log=log)
         return self.append(make_proposal(log, cmd, NOW), log=log)
 
     def graph(self):
@@ -163,7 +164,7 @@ class SnapshotTests(unittest.TestCase):
         return {str(p.relative_to(data)): (p.read_bytes(), p.stat().st_mode)
                 for p in data.iterdir() if p.is_file()}
 
-    def test_legacy_graph_configuration_ids_status_holds_and_edges(self):
+    def test_current_graph_configuration_ids_status_holds_and_edges(self):
         first, second = self.graph()
         result = self.verify(expected_authorities=[AUTHORITY], require_logstream=True)
         self.assertEqual(result["status"], "valid")
@@ -172,9 +173,9 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(result["replica_id"], REPLICA)
         authority = result["authorities"][AUTHORITY]
         self.assertIs(authority["initialized"], True)
-        self.assertIsNone(authority["epoch_id"])
+        self.assertEqual(authority["epoch_id"], uid(9001))
         self.assertEqual(authority["domain_ordinal"], 5)
-        self.assertEqual(authority["domain_head"], "evt-000005")
+        self.assertEqual(authority["domain_head"], "evt-000006")
         self.assertEqual(authority["task_count"], 4)
         self.assertEqual(authority["goal_count"], 1)
         self.assertEqual(authority["configuration"]["actors"], {"operator": "operator"})
@@ -207,7 +208,7 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(authority["activation_id"], uid(200))
         self.assertEqual(authority["activation_at"], NOW)
         self.assertEqual(authority["domain_ordinal"], 6)
-        self.assertEqual(authority["raw_record_count"], 10)
+        self.assertEqual(authority["raw_record_count"], 11)
         self.assertEqual(authority["stale_record_count"], 2)
         self.assertEqual(authority["task_count"], 4)
         self.assertEqual(authority["tasks"][second]["title"], "Current epoch task")
@@ -223,7 +224,7 @@ class SnapshotTests(unittest.TestCase):
                                     references=["file:/original/plan", "git:abc", "https://example.test"]))
         notes = self.verify()["authorities"][AUTHORITY]["notes"]
         self.assertEqual(notes, [{
-            "event_id": "evt-000006", "ordinal": 6, "epoch_id": None,
+            "event_id": "evt-000007", "ordinal": 6, "epoch_id": uid(9001),
             "command_id": uid(6), "task_id": first, "tag": tag, "text": text,
             "text_sha256": digest, "payload_hash": payload["payload_hash"],
             "references": ["file:/original/plan", "git:abc", "https://example.test"],
@@ -261,8 +262,8 @@ class SnapshotTests(unittest.TestCase):
         self.next_row += 1
         self.send(create(2), log=other)
         result = self.verify(expected_authorities=[AUTHORITY, OTHER])
-        self.assertEqual(result["event_count"], 4)
-        self.assertEqual(result["task_event_count"], 3)
+        self.assertEqual(result["event_count"], 6)
+        self.assertEqual(result["task_event_count"], 5)
         self.assertEqual(result["authorities"][AUTHORITY]["task_count"], 0)
         self.assertEqual(result["authorities"][OTHER]["task_count"], 1)
 
@@ -326,10 +327,10 @@ class SnapshotTests(unittest.TestCase):
                 payload[field] = value
                 if field != "payload_hash":
                     payload["payload_hash"] = payload_hash(payload)
-                event = raw_record(payload, 2)
+                event = raw_record(payload, 3)
                 self.store(event)
                 self.error("invalid_protocol")
-                self.sql("DELETE FROM events WHERE id = 'evt-000002'")
+                self.sql("DELETE FROM events WHERE id = 'evt-000003'")
 
     def test_domain_snapshot_forgery_fails_even_with_valid_payload_hash(self):
         self.send(genesis())
@@ -337,7 +338,7 @@ class SnapshotTests(unittest.TestCase):
         payload["event"]["tasks"][0]["title"] = "forged"
         payload["event"]["response"]["tasks"][0]["title"] = "forged"
         payload["payload_hash"] = payload_hash(payload)
-        self.store(raw_record(payload, 2))
+        self.store(raw_record(payload, 3))
         self.error("invalid_protocol")
 
     def test_malformed_reserved_route_and_metadata_are_errors(self):
@@ -497,7 +498,7 @@ class SnapshotTests(unittest.TestCase):
         self.append(proposal)
         authority = self.verify()["authorities"][AUTHORITY]
         self.assertEqual(authority["domain_ordinal"], 1)
-        self.assertEqual(authority["raw_record_count"], 3)
+        self.assertEqual(authority["raw_record_count"], 4)
         self.assertEqual(authority["tasks"], {})
 
     def test_closed_wal_mode_database_does_not_get_new_sidecars(self):

@@ -24,9 +24,9 @@ audit hook that nags when an external tool is about to run without a prior `memp
   a host responsibility; connecting MCP does not automatically wire native `/fleet`.
   No native `/fleet` execution adapter is shipped. Linux process supervision is
   optional and separate; macOS/Windows hosting code exists but native
-  certification remains unrun. Legacy schema-1 recovery/projections stay
-  separate; journal-mode projections are explicitly unsupported. Ordinary memory
-  filing does not require this service. See its [migration and recovery
+  certification remains unrun. Only the current journal-backed authority is
+  supported; there is no original-runtime or old-format compatibility mode.
+  Ordinary memory filing does not require this service. See its [recovery
   contract](sidecar/README.md#recovery-and-coherent-palace-backuprestore) before
   changing an existing deployment.
 - **[skills/dreaming/SKILL.md](skills/dreaming/SKILL.md)** — offline consolidation ("dreaming"): a 5-phase

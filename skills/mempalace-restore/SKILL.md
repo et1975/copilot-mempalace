@@ -73,7 +73,7 @@ The default target is a unique sibling of HOME; explicit targets must be disjoin
 and empty. Custom DATA layout comes from the snapshot's manifest/staged config,
 not old live config or ambient path variables. Global `--data-path` can select
 an in-HOME layout for old snapshots. Task history is replayed with the shared
-v1/v2 protocol, and replica, artifact hashes/sizes and links are verified.
+current epoch-bound protocol, and replica, artifact hashes/sizes and links are verified.
 Use repeatable `--expected-authority <uuid>` when no captured manifest declares
 the expected authorities. Missing required task data is never a legacy fallback.
 Required membership comes from the selected snapshot and explicit requirements,
@@ -118,10 +118,10 @@ automatically, including repair, a hub, daemon, worker or service.
 
 ### 5. Deliberately reopen and recover
 
-After publication, an epoch-aware sidecar starts with another fresh successor
-and fences/reconciles inherited attempts before execution admission. Old v1
-sidecars cannot serve the new journal. Old pending/head/clock files, whether
-missing or from a discarded future, are ignored; never replay them into the
+After publication, the sidecar starts with another fresh successor
+and fences/reconciles inherited attempts before execution admission. Unsupported
+experimental journal formats are rejected rather than migrated. Disposable
+runtime files are not recovery inputs; never replay cached commands into the
 restored palace. Reconnect is not a restore barrier or permission to leave an old
 hub running through publication.
 

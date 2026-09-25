@@ -1,4 +1,4 @@
-"""Exact task-log transport fixture; domain and local persistence stay real."""
+"""Current epoch task-log transport fixture; no local authority recovery store."""
 
 from copy import deepcopy
 import os
@@ -8,10 +8,12 @@ from uuid import UUID
 
 from mempalace_tasks.codec import canonical_json
 from mempalace_tasks.palace import PalaceError
+from mempalace_tasks.model import instant, utc
 
 
 AUTHORITY = "11111111-1111-1111-1111-111111111111"
 NOW = "2026-09-23T00:00:00Z"
+EPOCH = "00000000-0000-0000-0000-0000000003e8"
 
 
 def uid(number):
@@ -38,22 +40,33 @@ def create(number=2, **fields):
 
 
 def raw(payload, index):
+    identity = "activation_id" if payload["record_type"] == "mptask.epoch" else "command_id"
     return {"id": f"evt-{index:06}", "stream": f"mptask/{AUTHORITY}",
             "room": "tasks", "type": payload["record_type"],
             "from_agent": "mempalace-tasks", "to_agent": "*",
-            "correlation_id": payload["command_id"], "body": canonical_json(payload),
-            "metadata": {"authority_id": AUTHORITY, "command_id": payload["command_id"]},
+            "correlation_id": payload[identity], "body": canonical_json(payload),
+            "metadata": {"authority_id": AUTHORITY, identity: payload[identity],
+                         "epoch_id": payload["epoch_id"]},
             "artifact_ids": [], "branch": None, "base_commit": None, "status": None,
             "created_at": NOW}
+
+def activate(log, *, index=0):
+    from mempalace_tasks.protocol import fold_record, make_epoch
+    marker = make_epoch(log, EPOCH, uid(2000), NOW)
+    fold_record(log, raw(marker, index))
+    return marker
 
 
 class Clock:
     def __init__(self):
         self.value = NOW
-        self.pending_reboot = False
+        self._observed = NOW
 
     def now(self):
-        return self.value
+        return utc(max(instant(self.value), instant(self._observed)))
+
+    def observe(self, timestamp):
+        self._observed = utc(max(instant(timestamp), instant(self._observed)))
 
     __call__ = now
 

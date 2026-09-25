@@ -1,9 +1,7 @@
 """Explicit deployment configuration; loading never starts a writer or service.
 
-Schema 1 retains the legacy recovery-directory contract for explicit migration.
 Schema 2 uses the palace journal for recovery; its runtime directory is only
-disposable coordination. Launcher consent is explicit and never inferred from
-legacy configuration.
+disposable coordination. Launcher consent is explicit.
 """
 
 from copy import deepcopy
@@ -114,12 +112,12 @@ def _endpoint(value):
 
 @dataclass(frozen=True)
 class ServiceConfig:
-    """Keep ``state_dir`` constructor compatibility; v2 uses it only as runtime."""
+    """Current deployment inputs and disposable runtime coordination."""
 
     authority_id: str
     hub_url: str
     service_token_file: Path
-    state_dir: Path
+    runtime_dir: Path
     genesis: dict = field(repr=False)
     configuration: dict = field(repr=False)
     maintenance_actor: str
@@ -127,22 +125,10 @@ class ServiceConfig:
     host: str = "127.0.0.1"
     port: int = 8766
     hub_token_file: Path | None = None
-    project_wings: dict = field(default_factory=dict)
-    projections_enabled: bool = False
     service_token: str | None = field(default=None, repr=False)
     hub_token: str | None = field(default=None, repr=False)
-    schema_version: int = 1
+    schema_version: int = field(default=2, init=False)
     lifecycle: str = "external"
-
-    @property
-    def runtime_dir(self):
-        return self.state_dir
-
-    @property
-    def recovery_mode(self):
-        if type(self.schema_version) is not int or self.schema_version not in (1, 2):
-            raise ConfigError("Unsupported configuration schema version")
-        return "legacy" if self.schema_version == 1 else "journal"
 
     @property
     def service_url(self):
@@ -164,14 +150,11 @@ def load_config(path=None, *, environ=None, allow_missing_service_token=False):
     if type(document) is not dict:
         raise ConfigError("Configuration has missing or unknown fields")
     version = document.get("schema_version")
-    if type(version) is not int or version not in (1, 2):
+    if type(version) is not int or version != 2:
         raise ConfigError("Unsupported configuration schema version")
-    directory_field = "state_dir" if version == 1 else "runtime_dir"
     required = {"schema_version", "authority_id", "hub_url", "service_token_file",
-                directory_field, "genesis", "maintenance_actor", "recovery_actor"}
-    allowed = required | {"host", "port", "hub_token_file", "project_wings", "projections_enabled"}
-    if version == 2:
-        allowed.add("lifecycle")
+                "runtime_dir", "genesis", "maintenance_actor", "recovery_actor"}
+    allowed = required | {"host", "port", "hub_token_file", "lifecycle"}
     if document.keys() - allowed or required - document.keys():
         raise ConfigError("Configuration has missing or unknown fields")
     lifecycle = document.get("lifecycle", "external")
@@ -184,11 +167,11 @@ def load_config(path=None, *, environ=None, allow_missing_service_token=False):
     except (ValueError, AttributeError):
         raise ConfigError("Authority identity must be a canonical UUID") from None
     host, port = document.get("host", "127.0.0.1"), document.get("port", 8766)
-    validate_binding(host, port, allow_dynamic=version == 2)
+    validate_binding(host, port, allow_dynamic=True)
     hub_url = _endpoint(document["hub_url"])
-    state_dir = real_path(document[directory_field])
-    if state_dir.exists() and not state_dir.is_dir():
-        raise ConfigError("Runtime/state path must be a directory")
+    runtime_dir = real_path(document["runtime_dir"])
+    if runtime_dir.exists() and not runtime_dir.is_dir():
+        raise ConfigError("Runtime path must be a directory")
     genesis = document["genesis"]
     if (type(genesis) is not dict or set(genesis) - {
             "actor", "actors", "execution_profiles", "supervisors", "policy"}):
@@ -206,14 +189,6 @@ def load_config(path=None, *, environ=None, allow_missing_service_token=False):
             or normalized["actors"].get(system) != "system"
             or normalized["actors"].get(recovery) != "operator"):
         raise ConfigError("Distinct registered system and operator maintenance identities required")
-    wings = document.get("project_wings", {})
-    if (type(wings) is not dict or any(type(k) is not str or not k.strip()
-                                     or type(v) is not str or not v.strip()
-                                     for k, v in wings.items())):
-        raise ConfigError("Project wings must be explicit nonblank string mappings")
-    enabled = document.get("projections_enabled", False)
-    if type(enabled) is not bool:
-        raise ConfigError("projections_enabled must be a boolean")
     service_path = real_path(document["service_token_file"])
     service_token = (None if allow_missing_service_token and not service_path.exists()
                      else read_token(service_path))
@@ -222,9 +197,9 @@ def load_config(path=None, *, environ=None, allow_missing_service_token=False):
     hub_token = read_token(hub_path) if hub_path is not None else None
     return ServiceConfig(
         authority_id=identity, hub_url=hub_url, service_token_file=service_path,
-        state_dir=state_dir, genesis=deepcopy(genesis), configuration=normalized,
+        runtime_dir=runtime_dir, genesis=deepcopy(genesis), configuration=normalized,
         maintenance_actor=system, recovery_actor=recovery, host=host, port=port,
-        hub_token_file=hub_path, project_wings=deepcopy(wings), projections_enabled=enabled,
+        hub_token_file=hub_path,
         service_token=service_token, hub_token=hub_token,
-        schema_version=version, lifecycle=lifecycle,
+        lifecycle=lifecycle,
     )

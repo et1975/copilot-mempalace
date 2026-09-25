@@ -15,14 +15,13 @@ from mempalace_tasks.config import ConfigError, load_config, create_service_toke
 def config_document(root):
     initial = genesis()
     return {
-        "schema_version": 1, "authority_id": AUTHORITY,
+        "schema_version": 2, "authority_id": AUTHORITY,
         "hub_url": "http://127.0.0.1:8765/mcp",
         "service_token_file": str(root / "service.token"),
-        "state_dir": str(root / "state"),
+        "runtime_dir": str(root / "runtime"),
         "genesis": {key: value for key, value in initial.items()
                     if key not in {"command_id", "operation"}},
         "maintenance_actor": "system", "recovery_actor": "operator",
-        "project_wings": {"demo": "owned-test-wing"},
     }
 
 
@@ -45,9 +44,8 @@ class ConfigTests(unittest.TestCase):
         config = load_config(self.path)
         self.assertEqual(config.service_url, "http://127.0.0.1:8766/mcp")
         self.assertEqual(config.service_token, "owned-service-token")
-        self.assertFalse(config.projections_enabled)
         self.assertEqual(config.configuration["policy"]["renewal_seconds"], 100)
-        self.assertFalse((self.root / "state").exists())
+        self.assertFalse((self.root / "runtime").exists())
         self.assertNotIn("owned-service-token", repr(config))
         self.assertEqual(load_config(environ={"MPTASK_CONFIG": str(self.path)}), config)
         with self.assertRaises(ConfigError):
@@ -72,7 +70,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual({path: stat.S_IMODE(path.stat().st_mode) for path in paths}, modes)
         self.assertEqual({path: path.read_bytes() for path in contents}, contents)
         self.assertEqual(set(self.root.iterdir()), entries)
-        self.assertFalse((self.root / "state").exists())
+        self.assertFalse((self.root / "runtime").exists())
 
         self.token.chmod(0o644)
         modes[self.token] = 0o644
@@ -88,10 +86,10 @@ class ConfigTests(unittest.TestCase):
 
     def test_unknown_fields_invalid_identity_roles_policy_and_ports_fail(self):
         variants = [
-            {"schema_version": True}, {"schema_version": 2}, {"extra": True},
-            {"authority_id": "not-a-uuid"}, {"port": 0}, {"port": True},
+            {"schema_version": True}, {"schema_version": 1}, {"extra": True},
+            {"authority_id": "not-a-uuid"}, {"port": -1}, {"port": True},
             {"port": 65536}, {"host": "localhost"}, {"host": "0.0.0.0"},
-            {"state_dir": "relative"}, {"state_dir": str(self.root / ".." / "state")},
+            {"runtime_dir": "relative"}, {"runtime_dir": str(self.root / ".." / "runtime")},
             {"hub_url": "http://user:secret@127.0.0.1:8765/mcp"},
             {"hub_url": "http://127.0.0.1:8765/mcp?token=secret"},
             {"hub_token": "secret"}, {"projections_enabled": "yes"},
@@ -111,7 +109,7 @@ class ConfigTests(unittest.TestCase):
         self.save()
         with self.assertRaises(ConfigError):
             load_config(self.path)
-        self.assertFalse((self.root / "state").exists())
+        self.assertFalse((self.root / "runtime").exists())
 
     def test_tokens_must_be_private_owned_regular_files_not_urls_or_links(self):
         for mode in (0o644, 0o640, 0o666):
@@ -132,16 +130,16 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaises(ConfigError):
             load_config(self.path)
 
-    def test_symlinked_ancestors_state_and_config_are_rejected(self):
+    def test_symlinked_ancestors_runtime_and_config_are_rejected(self):
         real = self.root / "real"
         real.mkdir()
         link = self.root / "alias"
         link.symlink_to(real, target_is_directory=True)
-        self.document["state_dir"] = str(link / "state")
+        self.document["runtime_dir"] = str(link / "runtime")
         self.save()
         with self.assertRaises(ConfigError):
             load_config(self.path)
-        self.document["state_dir"] = str(self.root / "state")
+        self.document["runtime_dir"] = str(self.root / "runtime")
         self.save()
         config_link = self.root / "config-link.json"
         config_link.symlink_to(self.path)
@@ -165,7 +163,7 @@ class ConfigTests(unittest.TestCase):
         self.assertIsNotNone(load_config(self.path).service_token)
 
     def test_malformed_duplicate_and_oversized_config_are_safe_errors(self):
-        for content in ('{"schema_version":1,"schema_version":1}', '{"x":NaN}',
+        for content in ('{"schema_version":2,"schema_version":2}', '{"x":NaN}',
                         '[]', "{", " " * (1024 * 1024 + 1)):
             self.path.write_text(content)
             with self.subTest(length=len(content)), self.assertRaises(ConfigError):

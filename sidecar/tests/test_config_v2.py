@@ -31,7 +31,6 @@ def portable_document(root):
         },
         "maintenance_actor": "system",
         "recovery_actor": "operator",
-        "project_wings": {"demo": "owned-test-wing"},
     }
 
 
@@ -54,40 +53,36 @@ class PortableConfigTests(unittest.TestCase):
         config = load_config(self.path)
         self.assertEqual(config.schema_version, 2)
         self.assertEqual(config.lifecycle, "external")
-        self.assertEqual(config.recovery_mode, "journal")
         self.assertEqual(config.runtime_dir, self.root / "runtime")
-        self.assertEqual(config.state_dir, config.runtime_dir)
+        self.assertNotIn("state_dir", config.__dataclass_fields__)
+        self.assertNotIn("recovery_mode", config.__dataclass_fields__)
         self.assertEqual(config.service_url, "http://127.0.0.1:8766/mcp")
         self.assertEqual(config.configuration["policy"]["renewal_seconds"], 100)
         self.assertEqual(config.service_token, "owned-service-token")
-        self.assertEqual(config.project_wings, {"demo": "owned-test-wing"})
-        self.assertFalse(config.projections_enabled)
         self.assertEqual(set(self.root.iterdir()), before)
         self.assertNotIn("owned-service-token", repr(config))
 
-    def test_v1_is_still_explicit_legacy_external_lifecycle(self):
+    def test_schema_one_is_explicitly_unsupported_before_credential_reads(self):
         self.document["schema_version"] = 1
         self.document["state_dir"] = self.document.pop("runtime_dir")
         self.save()
-        config = load_config(self.path)
-        self.assertEqual(config.schema_version, 1)
-        self.assertEqual(config.recovery_mode, "legacy")
-        self.assertEqual(config.lifecycle, "external")
-        self.assertEqual(config.runtime_dir, config.state_dir)
-        self.document["lifecycle"] = "launcher"
-        self.save()
-        with self.assertRaises(ConfigError):
-            load_config(self.path)
+        with patch("mempalace_tasks.config.read_token",
+                   side_effect=AssertionError("Unsupported config read credentials")):
+            with self.assertRaises(ConfigError) as caught:
+                load_config(self.path)
+        self.assertIn("Unsupported configuration schema", str(caught.exception))
+        self.assertFalse((self.root / "runtime").exists())
 
-    def test_existing_python_constructor_defaults_remain_legacy(self):
+    def test_constructor_has_only_current_runtime_fields(self):
         config = ServiceConfig(
             "11111111-1111-1111-1111-111111111111",
             "http://127.0.0.1:8765/mcp", self.root / "service.token",
-            self.root / "legacy-state", {}, {}, "system", "operator")
-        self.assertEqual(config.schema_version, 1)
+            self.root / "runtime", {}, {}, "system", "operator")
+        self.assertEqual(config.schema_version, 2)
         self.assertEqual(config.lifecycle, "external")
-        self.assertEqual(config.recovery_mode, "legacy")
-        self.assertEqual(config.runtime_dir, self.root / "legacy-state")
+        self.assertEqual(config.runtime_dir, self.root / "runtime")
+        self.assertFalse(hasattr(config, "state_dir"))
+        self.assertFalse(hasattr(config, "recovery_mode"))
         self.assertEqual(config.service_url, "http://127.0.0.1:8766/mcp")
 
     def test_launcher_consent_is_explicit_and_no_action_is_performed(self):
@@ -96,13 +91,13 @@ class PortableConfigTests(unittest.TestCase):
         before = set(self.root.iterdir())
         config = load_config(self.path)
         self.assertEqual(config.lifecycle, "launcher")
-        self.assertEqual(config.recovery_mode, "journal")
         self.assertEqual(set(self.root.iterdir()), before)
 
     def test_schema_two_rejects_legacy_storage_and_recovery_override_fields(self):
         original = deepcopy(self.document)
         for update in ({"state_dir": str(self.root / "legacy")}, {"recovery_mode": "legacy"},
                        {"recovery_mode": "journal"}, {"pending_file": "anything"},
+                       {"project_wings": {}}, {"projections_enabled": False},
                        {"lifecycle": "auto"}, {"lifecycle": True}, {"lifecycle": None},
                        {"schema_version": 3}, {"schema_version": True}):
             with self.subTest(update=update):
@@ -168,16 +163,15 @@ class PortableConfigTests(unittest.TestCase):
             with self.subTest(host=host), self.assertRaises(ConfigError):
                 validate_binding(host, 0, allow_dynamic=True)
 
-    def test_v2_preserves_explicit_hub_credentials_projections_and_environment_selection(self):
+    def test_v2_preserves_explicit_hub_credentials_and_environment_selection(self):
         hub = self.root / "hub.token"
         platform_support.create_private(hub, b"owned-hub-token\n")
-        self.document.update(hub_token_file=str(hub), projections_enabled=True)
+        self.document.update(hub_token_file=str(hub))
         self.save()
         config = load_config(environ={"MPTASK_CONFIG": str(self.path)})
         self.assertEqual(config.hub_url, "http://127.0.0.1:8765/mcp")
         self.assertEqual(config.hub_token_file, hub)
         self.assertEqual(config.hub_token, "owned-hub-token")
-        self.assertTrue(config.projections_enabled)
         self.assertNotIn("owned-hub-token", repr(config))
         self.assertEqual(load_config(self.path, environ={"MPTASK_CONFIG": "wrong"}), config)
         with self.assertRaises(ConfigError):

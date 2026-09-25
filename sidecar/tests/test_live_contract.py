@@ -35,6 +35,7 @@ class LiveContractTests(unittest.TestCase):
         self.palace = self.root / "palace"
         self.palace.mkdir()
         self.authority = str(uuid4())
+        self.transport_epoch = str(uuid4())
         self.stream = f"mptask/{self.authority}"
         self.process = None
         self.log = None
@@ -118,11 +119,11 @@ class LiveContractTests(unittest.TestCase):
     def test_journal_only_restore_over_real_hub_discards_future_local_state(self):
         from authority_fixture import command, create, genesis
         from mempalace_tasks.authority import AuthorityError
-        from mempalace_tasks.journal_authority import JournalAuthority
+        from mempalace_tasks.authority import TaskAuthority
 
         client = self.start_hub()
         runtime = self.root / "runtime"
-        owner = JournalAuthority(self.authority, client, runtime, initialize=True).start()
+        owner = TaskAuthority(self.authority, client, runtime, initialize=True).start()
         self.addCleanup(owner.close)
         owner.execute_current(genesis())
         created = owner.execute(create(), expected_epoch=owner.epoch_id)["tasks"][0]
@@ -151,7 +152,7 @@ class LiveContractTests(unittest.TestCase):
         replica = (self.palace / "replica.json").read_bytes()
 
         client = self.start_hub()
-        future = JournalAuthority(self.authority, client, runtime).start()
+        future = TaskAuthority(self.authority, client, runtime).start()
         self.addCleanup(future.close)
         current = future.get(task_id)["task"]
         note = command(5, "note", task_id=task_id, expected_version=current["version"],
@@ -170,7 +171,7 @@ class LiveContractTests(unittest.TestCase):
             (runtime / name).write_bytes(b"discarded future; deliberately invalid JSON")
 
         client = self.start_hub()
-        restored = JournalAuthority(self.authority, client, runtime).start()
+        restored = TaskAuthority(self.authority, client, runtime).start()
         self.addCleanup(restored.close)
         self.assertNotIn(restored.epoch_id, (original_epoch, future_epoch))
         self.assertEqual(set(restored.state.tasks), {task_id})
@@ -189,7 +190,7 @@ class LiveContractTests(unittest.TestCase):
         restored.close()
 
         fresh_runtime = self.root / "fresh-runtime"
-        fresh = JournalAuthority(self.authority, client, fresh_runtime).start()
+        fresh = TaskAuthority(self.authority, client, fresh_runtime).start()
         self.addCleanup(fresh.close)
         self.assertEqual(set(fresh.state.tasks), {task_id})
         self.assertFalse(fresh.get(task_id)["authorization"]["authorized"])
@@ -202,6 +203,8 @@ class LiveContractTests(unittest.TestCase):
     def payload(self, label):
         return {
             "record_type": "mptask.command",
+            "schema_version": 2,
+            "epoch_id": self.transport_epoch,
             "authority_id": self.authority,
             "command_id": str(uuid4()),
             "event": {"kind": "ContractFixture", "value": label},
@@ -222,8 +225,10 @@ class LiveContractTests(unittest.TestCase):
         from mempalace_tasks.cli import owned_authority
         from mempalace_tasks.client import TaskServiceClient
         from mempalace_tasks.config import load_config
+        from mempalace_tasks.lifecycle import HttpLifecycle
         from mempalace_tasks.maintenance import LeaseMaintenance
         from mempalace_tasks.server import create_app
+        from mempalace_tasks.server_identity import InstanceIdentity
         from service_fixture import SocketRunner
 
         runner = SocketRunner()
@@ -234,18 +239,29 @@ class LiveContractTests(unittest.TestCase):
         try:
             with owned_authority(configuration) as authority:
                 maintenance = LeaseMaintenance(
-                    authority, authority.clock_source,
+                    authority.bound_current(), authority.clock_source,
                     system_actor="system", recovery_actor="operator",
+                )
+                lifecycle = HttpLifecycle(
+                    configuration,
+                    InstanceIdentity(self.authority, authority.epoch_id,
+                                     f"http://127.0.0.1:{runner.port}/mcp"),
+                    shutdown=runner.stop,
                 )
                 app = create_app(
                     authority, maintenance, token=configuration.service_token,
-                    port=runner.port,
+                    port=runner.port, lifecycle=lifecycle,
                 )
                 thread = threading.Thread(target=runner.run, args=(app,))
                 thread.start()
                 try:
                     self.assertTrue(runner.ready.wait(8), "Task service did not start")
                     self.assertEqual([], runner.errors)
+                    deadline = time.monotonic() + 3
+                    while not runner.server.started and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    self.assertTrue(runner.server.started, "Task listener did not start")
+                    lifecycle.publish()
                     client = TaskServiceClient(
                         f"http://127.0.0.1:{runner.port}/mcp",
                         token=configuration.service_token,
@@ -257,6 +273,7 @@ class LiveContractTests(unittest.TestCase):
                     thread.join(10)
                     self.assertFalse(thread.is_alive(), "Task service did not stop")
                     self.assertEqual([], runner.errors)
+                    lifecycle.clear()
         finally:
             runner.socket.close()
 
@@ -269,12 +286,12 @@ class LiveContractTests(unittest.TestCase):
         hub_token.chmod(0o600)
         config_path = self.root / "tasks.json"
         configuration = {
-            "schema_version": 1,
+            "schema_version": 2,
             "authority_id": self.authority,
             "hub_url": self.hub_url,
             "hub_token_file": str(hub_token),
             "service_token_file": str(self.root / "service.token"),
-            "state_dir": str(self.root / "task-state"),
+            "runtime_dir": str(self.root / "task-runtime"),
             "host": "127.0.0.1",
             "port": 8766,
             "genesis": {
@@ -289,7 +306,6 @@ class LiveContractTests(unittest.TestCase):
             },
             "maintenance_actor": "system",
             "recovery_actor": "operator",
-            "projections_enabled": False,
         }
         config_path.write_text(json.dumps(configuration), encoding="utf-8")
         initialized = self.run_cli(config_path, "init", "--generate-token")
@@ -297,9 +313,12 @@ class LiveContractTests(unittest.TestCase):
         self.assertTrue(json.loads(initialized.stdout)["ok"])
 
         with self.task_service(config_path) as client:
+            epoch = client.call_tool("mptask_health", {})["epoch_id"]
+
             def send(operation, actor="worker", **fields):
                 return client.call_tool(f"mptask_{operation}", {
-                    "actor": actor, "command_id": str(uuid4()), **fields,
+                    "actor": actor, "command_id": str(uuid4()),
+                    "expected_epoch": epoch, **fields,
                 })
 
             def task(task_id):
@@ -393,10 +412,12 @@ class LiveContractTests(unittest.TestCase):
             with self.assertRaises(TaskClientError) as rejected:
                 client.call_tool("mptask_expand", {
                     "command_id": str(uuid4()), "actor": "coordinator",
+                    "expected_epoch": client.call_tool("mptask_health", {})["epoch_id"],
                     "goal_id": goal_id, "expected_graph_revision": goal["graph_revision"],
                     "tasks": [], "source_disposition": "continue",
                 })
             self.assertFalse(rejected.exception.ambiguous)
+            self.assertEqual("invalid_transition", rejected.exception.code)
 
     def test_append_order_cursor_and_exact_body_survive_hub_restart(self):
         client = self.start_hub()

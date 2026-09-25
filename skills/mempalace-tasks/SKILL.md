@@ -20,11 +20,11 @@ not a drawer, KG projection, local todo, or remembered assignment.
 
 Discover the sidecar's advertised `mptask_*` tools and argument schemas before
 calling them. Use the registered actor identity and actual fields; every mutation
-requires `command_id` and `actor`. Completion is `target="closed"`, not `"done"`.
-Journal-mode mutations additionally require `expected_epoch` from a current
+requires `command_id`, `actor`, and `expected_epoch`. Completion is
+`target="closed"`, not `"done"`. Obtain `expected_epoch` from a current
 read/health response's `epoch_id`. Freeze the authority, epoch, command ID and
 exact payload for each logical request; never update its epoch on retry.
-Legacy schemas remain separate. A new owner epoch revokes old execution
+A new owner epoch revokes old execution
 authorization, even if owner/attempt/generation fields otherwise match.
 Missing service/schema support blocks tracked mutations; report it rather than
 starting another writer or substituting direct KG, drawer, or event-log writes.
@@ -107,9 +107,9 @@ actor. Source-free admission is an explicit registered coordinator/operator acti
 | Committed, including a replay | Use the recorded result; independently revalidate current execution authorization. |
 | Confirmed terminal `outcome="abandoned"` | That ID is permanently resolved. Re-read state and authority; if the operation is still needed, submit a **new command ID**. Preserve the discovery's stable `intent_key`. |
 
-In journal mode, resolve old requests through
-`mptask_outcome(epoch_id=ORIGINAL_EPOCH, command_id=ORIGINAL_ID)`; `epoch_id=null`
-selects legacy history. Reconnecting can supply a new transport credential but
+Resolve historical requests through
+`mptask_outcome(epoch_id=ORIGINAL_EPOCH, command_id=ORIGINAL_ID)` using the original
+epoch UUID; null is invalid. Reconnecting can supply a new transport credential but
 must not upgrade the request's epoch. `resolution="not_recorded"` is not confirmed
 abandonment or proof that external effects did not occur. A historical receipt
 does not renew a lease or authorize execution; re-read current task authorization.
@@ -140,7 +140,7 @@ claim, renew, sweep, reconcile, or silently start a writer.
 Diagnostic config/token reads validate regular files and required permissions,
 then fail explicitly if invalid. They do not create or chmod files or parent
 directories. Only explicit init may create a missing service credential;
-journal-mode owner activation may create disposable runtime coordination.
+owner activation may create disposable runtime coordination.
 Neither is read-only inspection, and private storage helpers are not
 general-purpose config readers.
 

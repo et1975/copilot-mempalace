@@ -14,7 +14,7 @@ from mempalace_tasks.palace import PalaceError
 from mempalace_tasks.protocol import LogState, fold_record, make_epoch, make_proposal, make_settlement
 from mempalace_tasks.runtime_clock import RuntimeClock
 from authority_fixture import (
-    AUTHORITY, NOW, Clock, LogClient, command, create, genesis, state_directory, uid,
+    AUTHORITY, EPOCH, NOW, Clock, LogClient, activate, command, create, genesis, state_directory, uid,
 )
 from test_epochs import epoch_raw
 
@@ -39,12 +39,13 @@ def runtime_clock(at=NOW):
     return RuntimeClock(wall_time_ns=lambda: wall, continuous_time_ns=lambda: 0)
 
 
-class JournalAuthorityTests(unittest.TestCase):
+class AuthorityEpochTests(unittest.TestCase):
     def setUp(self):
         self.directory = state_directory()
         self.addCleanup(self.directory.cleanup)
         self.client = JournalClient()
         self.seed = LogState(AUTHORITY)
+        self.client.events.append(epoch_raw(activate(self.seed), 0))
         config = genesis()
         config["execution_profiles"]["shared"] = {"execution_class": "shared_unfenced",
                                                   "supports_reconciliation": True}
@@ -61,7 +62,7 @@ class JournalAuthorityTests(unittest.TestCase):
 
     def authority(self, *, start=True, **options):
         # Import through the consumer surface: missing implementation is a real RED.
-        cls = authority_module.JournalAuthority
+        cls = authority_module.TaskAuthority
         value = cls(AUTHORITY, self.client, self.directory.name,
                     clock=options.pop("clock", runtime_clock()),
                     backoff=self.delays.append, **options)
@@ -96,59 +97,13 @@ class JournalAuthorityTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, code)
         return caught.exception
 
-    def test_legacy_restart_cannot_borrow_an_accepted_journal_epoch(self):
-        legacy = TaskAuthority(AUTHORITY, self.client, self.directory.name,
-                               clock=Clock(), backoff=self.delays.append).start()
-        self.addCleanup(legacy.close)
-        created = legacy.execute(create())["tasks"][0]
-        legacy.close()
-        owner = self.authority()
-        claimed = self.send(owner, command(
-            3, "claim", "worker", task_id=created["id"], expected_version=1,
-            supervisor_id="supervisor"))["tasks"][0]
-        self.send(owner, command(
-            4, "attempt_report", "supervisor", task_id=created["id"],
-            expected_version=claimed["version"], attempt_id=claimed["attempt"]["id"],
-            claim_generation=claimed["claim_generation"], report_kind="started",
-            evidence={"references": ["artifact:prepared"], "prepared": True}))
-        owner.close()
-        head = Path(self.directory.name, "verified_head.json").read_bytes()
-        sent = len(self.client.sent)
-        stale = TaskAuthority(AUTHORITY, self.client, self.directory.name,
-                              clock=Clock(), backoff=self.delays.append)
-        self.addCleanup(stale.close)
-        self.assert_error("migration_required", stale.start)
-        self.assertEqual(len(self.client.sent), sent)
-        self.assertEqual(Path(self.directory.name, "verified_head.json").read_bytes(), head)
-        replacement = self.authority()
-        self.assertNotEqual(replacement.epoch_id, owner.epoch_id)
-        self.assertFalse(replacement.get(created["id"])["authorization"]["authorized"])
-
-    def test_legacy_refresh_fails_closed_before_writing_under_a_foreign_epoch(self):
-        legacy = TaskAuthority(AUTHORITY, self.client, self.directory.name,
-                               clock=Clock(), backoff=self.delays.append).start()
-        self.addCleanup(legacy.close)
-        head = Path(self.directory.name, "verified_head.json").read_bytes()
-        barrier = make_epoch(legacy.log, uid(100), uid(101), NOW)
-        self.client.events.append(epoch_raw(barrier, len(self.client.events) + 1))
-        self.assert_error("migration_required", legacy.refresh)
-        self.assertFalse(legacy.health()["fresh"])
-        self.assertEqual(legacy.health()["reason"], "migration_required")
-        self.assert_error("migration_required", lambda: legacy.execute(create()))
-        self.assertEqual(self.client.sent, [])
-        self.assertEqual(Path(self.directory.name, "verified_head.json").read_bytes(), head)
-
     def test_replay_and_execute_use_only_source_and_live_lock_not_legacy_stores(self):
         task = self.seed_command(create())["event"]["tasks"][0]
         self.seed_command(command(3, "note", task_id=task["id"], expected_version=1,
                                   tag="note", text="Source-backed note"))
         records = deepcopy(self.seed.accepted_records)
-        with patch("mempalace_tasks.authority.AuthorityLock",
-                   side_effect=AssertionError("legacy owner constructed")), patch(
-                       "mempalace_tasks.authority.PendingStore",
-                       side_effect=AssertionError("pending store constructed")), patch(
-                       "mempalace_tasks.authority.HeadStore",
-                       side_effect=AssertionError("head store constructed")):
+        with patch("mempalace_tasks.journal.JsonStore",
+                   side_effect=AssertionError("Worker artifact store constructed")):
             owner = self.authority(expected_configuration=self.seed.state.configuration)
             self.assertEqual(owner.accepted_records(), records)
             self.assertEqual(owner.state.tasks, self.seed.state.tasks)
@@ -157,7 +112,6 @@ class JournalAuthorityTests(unittest.TestCase):
             self.assertEqual(result["epoch_id"], owner.epoch_id)
             self.assertTrue(owner.health()["request_epoch_required"])
             self.assertEqual(owner.health()["schema_version"], 1)
-            self.assertEqual(owner.recovery_mode, "journal")
         self.assertEqual({p.name for p in Path(self.directory.name).iterdir()}, {"authority.lock"})
 
     def test_corrupt_future_pending_head_clock_and_projection_are_ignored_unchanged(self):
@@ -338,7 +292,7 @@ class JournalAuthorityTests(unittest.TestCase):
     def test_bounded_startup_remains_non_authorizing_until_all_inherited_attempts_revoked(self):
         a = self.active_task()
         b = self.active_task(10)
-        with patch.object(authority_module.JournalAuthority, "STARTUP_BATCH", 1):
+        with patch.object(authority_module.TaskAuthority, "STARTUP_BATCH", 1):
             owner = self.authority()
             self.assertTrue(owner.health()["startup_pending"])
             self.assertFalse(owner.health()["fresh"])
@@ -362,13 +316,13 @@ class JournalAuthorityTests(unittest.TestCase):
 
     def test_historical_committed_claim_cannot_authorize_restored_matching_attempt(self):
         task = self.active_task(running=True)
-        with patch.object(authority_module.JournalAuthority, "STARTUP_BATCH", 1):
+        with patch.object(authority_module.TaskAuthority, "STARTUP_BATCH", 1):
             # Two attempts ensure one inherited tuple can remain live in the projection.
             second = self.active_task(10, running=True)
             owner = self.authority()
         unresolved = next(t for t in owner.state.tasks.values() if t["status"] == "in_progress")
         number = 4 if unresolved["id"] == task["id"] else 12
-        result = owner.outcome(None, uid(number))
+        result = owner.outcome(EPOCH, uid(number))
         self.assertEqual(result["resolution"], "committed")
         self.assertFalse(result["authorization"]["authorized"])
         self.assertTrue(all(not row["authorized"]
@@ -419,15 +373,15 @@ class JournalAuthorityTests(unittest.TestCase):
         self.assertEqual(owner.epoch_id, own_epoch)
         self.assertEqual(len(self.client.sent), count)
 
-    def test_legacy_live_lock_excludes_journal_owner_without_replacing_inode(self):
-        legacy = TaskAuthority(AUTHORITY, self.client, self.directory.name, clock=Clock(),
+    def test_live_owner_excludes_contender_without_replacing_inode(self):
+        first = TaskAuthority(AUTHORITY, self.client, self.directory.name, clock=Clock(),
                                backoff=lambda _: None).start()
-        self.addCleanup(legacy.close)
+        self.addCleanup(first.close)
         path = Path(self.directory.name, "authority.lock")
         inode = path.stat().st_ino
         owner = self.authority(start=False)
         self.assert_error("authority_locked", owner.start)
-        legacy.close()
+        first.close()
         owner.start()
         self.assertEqual(path.stat().st_ino, inode)
 
@@ -497,8 +451,8 @@ class JournalAuthorityTests(unittest.TestCase):
             owner = self.authority()
         self.assertEqual(len(self.client.sent), 2)
         self.assertEqual(self.client.sent[0], self.client.sent[1])
-        self.assertEqual(owner.log.activation_event_id, "evt-000002")
-        self.assertEqual(owner.log.raw_cursor, "evt-000003")
+        self.assertEqual(owner.log.activation_event_id, "evt-000003")
+        self.assertEqual(owner.log.raw_cursor, "evt-000004")
         self.assertTrue(owner.health()["fresh"])
 
     def test_failed_startup_recovery_is_reconstructed_by_next_owner_not_local_pending(self):
@@ -554,7 +508,7 @@ class JournalAuthorityTests(unittest.TestCase):
 
     def test_clock_and_actor_configuration_fail_explicitly_before_acquiring_or_appending(self):
         for options in (
-            {"clock": Clock()}, {"clock": object()},
+            {"clock": lambda: NOW}, {"clock": object()},
             {"system_actor": []}, {"recovery_actor": ""}, {"initialize": 1},
         ):
             with self.subTest(options=options):

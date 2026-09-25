@@ -19,6 +19,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
+from uuid import UUID, uuid5
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import palace_backup as pb  # noqa: E402
@@ -75,10 +76,30 @@ def _make_logstream(data: Path) -> sqlite3.Connection:
     return con
 
 
+def _seed_task_authority(con, authority):
+    import test_snapshot as fixtures
+    from mempalace_tasks.protocol import LogState, fold_record, make_epoch, make_proposal
+    from mempalace_tasks.codec import canonical_json
+
+    log = LogState(authority)
+    index = con.execute("SELECT coalesce(max(rowid), 0) + 1 FROM events").fetchone()[0]
+    activation = make_epoch(
+        log, str(uuid5(UUID(authority), "backup-test-epoch")),
+        str(uuid5(UUID(authority), "backup-test-activation")), fixtures.NOW)
+    for command in (None, fixtures.genesis(), fixtures.create(2)):
+        payload = activation if command is None else make_proposal(log, command, fixtures.NOW)
+        raw = fixtures.raw_record(payload, index)
+        fold_record(log, raw)
+        con.execute("""INSERT INTO events VALUES (
+            :id, :type, :stream, :room, :from_agent, :to_agent, :correlation_id,
+            :branch, :base_commit, :status, :body, :created_at, :metadata_json,
+            :origin_replica, :origin_seq, :hlc)""",
+                    {**raw, "metadata_json": canonical_json(raw["metadata"])})
+        index += 1
+
+
 def _make_task_palace(home, data_name="palace", *, configured_home=None):
     import test_snapshot as fixtures
-    from mempalace_tasks.protocol import LogState, fold_record, make_proposal
-    from mempalace_tasks.codec import canonical_json
 
     data = home / data_name
     (data / ".mempalace").mkdir(parents=True)
@@ -87,39 +108,16 @@ def _make_task_palace(home, data_name="palace", *, configured_home=None):
         "palace_path": str((configured_home or home) / data_name)}), encoding="utf-8")
     (data / "replica.json").write_text(
         json.dumps({"replica_id": fixtures.REPLICA}), encoding="utf-8")
-    log = LogState(fixtures.AUTHORITY)
     with contextlib.closing(sqlite3.connect(data / "logstream.sqlite3")) as con:
         con.executescript(fixtures.SCHEMA)
-        for index, command in enumerate((fixtures.genesis(), fixtures.create(2)), start=1):
-            payload = make_proposal(log, command, fixtures.NOW)
-            raw = fixtures.raw_record(payload, index)
-            fold_record(log, raw)
-            con.execute("""INSERT INTO events VALUES (
-                :id, :type, :stream, :room, :from_agent, :to_agent, :correlation_id,
-                :branch, :base_commit, :status, :body, :created_at, :metadata_json,
-                :origin_replica, :origin_seq, :hlc)""",
-                        {**raw, "metadata_json": canonical_json(raw["metadata"])})
+        _seed_task_authority(con, fixtures.AUTHORITY)
         con.commit()
     return data
 
 
 def _add_task_authority(data, authority):
-    import test_snapshot as fixtures
-    from mempalace_tasks.protocol import LogState, fold_record, make_proposal
-    from mempalace_tasks.codec import canonical_json
-
-    log = LogState(authority)
     with contextlib.closing(sqlite3.connect(data / "logstream.sqlite3")) as con:
-        start = con.execute("SELECT coalesce(max(rowid), 0) + 1 FROM events").fetchone()[0]
-        for index, command in enumerate((fixtures.genesis(), fixtures.create(2)), start=start):
-            payload = make_proposal(log, command, fixtures.NOW)
-            raw = fixtures.raw_record(payload, index)
-            fold_record(log, raw)
-            con.execute("""INSERT INTO events VALUES (
-                :id, :type, :stream, :room, :from_agent, :to_agent, :correlation_id,
-                :branch, :base_commit, :status, :body, :created_at, :metadata_json,
-                :origin_replica, :origin_seq, :hlc)""",
-                        {**raw, "metadata_json": canonical_json(raw["metadata"])})
+        _seed_task_authority(con, authority)
         con.commit()
 
 
@@ -670,7 +668,7 @@ def test_wal_commit_between_checkpoint_and_guard_survives_one_root_restore(tmp_p
             clean = original_checkpoint(*args, **kwargs)
             log = restore.read_task_logs(data)[fixtures.AUTHORITY]
             payload = make_proposal(log, fixtures.create(3), fixtures.NOW)
-            raw = fixtures.raw_record(payload, 3)
+            raw = fixtures.raw_record(payload, 4)
             writer.execute("""INSERT INTO events VALUES (
                 :id, :type, :stream, :room, :from_agent, :to_agent, :correlation_id,
                 :branch, :base_commit, :status, :body, :created_at, :metadata_json,
@@ -680,7 +678,7 @@ def test_wal_commit_between_checkpoint_and_guard_survives_one_root_restore(tmp_p
                            "('artifact-in-cut', 'note', ?, 5, 'hello', 'operator', ?, '{}', ?)",
                            ("2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
                             fixtures.NOW, fixtures.REPLICA))
-            writer.execute("INSERT INTO event_artifacts VALUES ('evt-000003', 'artifact-in-cut')")
+            writer.execute("INSERT INTO event_artifacts VALUES ('evt-000004', 'artifact-in-cut')")
             writer.commit()
             return clean
 
@@ -829,7 +827,7 @@ def test_offline_restore_activates_before_publication_preserves_locks_and_never_
         assert pb.cmd_restore(args) == 0
     after = snapshot.validate_task_snapshot(data)
     authority = "11111111-1111-1111-1111-111111111111"
-    assert after["authorities"][authority]["epoch_id"] is not None
+    assert after["authorities"][authority]["epoch_id"] != before["authorities"][authority]["epoch_id"]
     assert before["authorities"][authority]["tasks"] == after["authorities"][authority]["tasks"]
     assert (lock.stat().st_ino, lock.read_bytes()) == (inode, content)
     assert not (home / "locks/stale.lock").exists()

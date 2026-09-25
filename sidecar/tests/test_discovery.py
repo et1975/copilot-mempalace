@@ -74,8 +74,8 @@ class DiscoveryTests(unittest.TestCase):
             replace(self.config, host="127.0.0.2"),
             replace(self.config, port=1),
             replace(self.config, lifecycle="external"),
-            replace(self.config, projections_enabled=True),
-            replace(self.config, project_wings={"another": "wing"}),
+            replace(self.config, hub_token_file=self.fixture.root / "another-hub.token"),
+            replace(self.config, configuration={**self.config.configuration, "extra": True}),
         ):
             with self.subTest(config=repr(updated)):
                 self.error("binding_mismatch", lambda: discovery.connect(updated))

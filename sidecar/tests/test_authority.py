@@ -10,8 +10,7 @@ import unittest
 from unittest.mock import patch
 
 from mempalace_tasks.authority import AuthorityError, TaskAuthority
-from mempalace_tasks.journal import AuthorityLock, JournalError, JsonStore
-from mempalace_tasks.leases import ClockError, EffectiveClock
+from mempalace_tasks.platform_support import LifetimeLock, PlatformError
 from mempalace_tasks.protocol import make_proposal, make_settlement
 from authority_fixture import (
     AUTHORITY, Clock, LogClient, command, create, genesis, state_directory, uid,
@@ -36,33 +35,36 @@ class AuthorityTests(unittest.TestCase):
         self.client = LogClient()
         self.clock = Clock()
         self.authority = TaskAuthority(AUTHORITY, self.client, self.directory.name,
-                                       clock=self.clock, backoff=lambda _: None)
+                                       clock=self.clock, backoff=lambda _: None, initialize=True)
         self.authority.start()
         self.addCleanup(self.authority.close)
-        self.authority.execute(genesis())
+        self.send(genesis())
+
+    def send(self, value):
+        return self.authority.execute(value, expected_epoch=self.authority.epoch_id)
 
     def task(self, number=2):
-        return self.authority.execute(create(number))["tasks"][0]
+        return self.send(create(number))["tasks"][0]
 
     def claim(self, task, number=3, worker="worker"):
         return command(number, "claim", worker, task_id=task["id"],
                        expected_version=task["version"], supervisor_id="supervisor")
 
     def test_committed_receipt_is_durable_and_retry_keeps_original_response(self):
-        result = self.authority.execute(create())
+        result = self.send(create())
         self.assertTrue(result["ok"])
         self.assertFalse(result["replayed"])
         self.assertEqual(result["ordinal"], 2)
-        self.assertEqual(result["event_id"], "evt-000002")
+        self.assertEqual(result["event_id"], "evt-000003")
         task = result["tasks"][0]
-        self.authority.execute(command(3, "update", task_id=task["id"],
+        self.send(command(3, "update", task_id=task["id"],
                                        expected_version=1, patch={"title": "New title"}))
-        replay = self.authority.execute(create())
+        replay = self.send(create())
         self.assertTrue(replay["replayed"])
         self.assertEqual(replay["response"], result["response"])
         self.assertEqual(replay["tasks"][0]["title"], "Task 2")
         self.assertEqual(self.authority.get(task["id"])["task"]["title"], "New title")
-        self.assertEqual(len(self.client.sent), 3)
+        self.assertEqual(len(self.client.sent), 4)
 
     def test_same_id_changed_content_and_stale_command_never_dispatch(self):
         task = self.task()
@@ -70,16 +72,16 @@ class AuthorityTests(unittest.TestCase):
         changed = create()
         changed["title"] = "Changed"
         with self.assertRaises(AuthorityError) as caught:
-            self.authority.execute(changed)
+            self.send(changed)
         self.assertEqual(caught.exception.code, "idempotency_conflict")
         with self.assertRaises(AuthorityError) as caught:
-            self.authority.execute(command(3, "update", task_id=task["id"],
+            self.send(command(3, "update", task_id=task["id"],
                                            expected_version=99, patch={"title": "Changed"}))
         self.assertEqual(caught.exception.code, "version_conflict")
         self.assertEqual(len(self.client.sent), before)
 
     def test_detached_state_log_receipts_and_snapshot_cannot_mutate_authority(self):
-        result = self.authority.execute(create())
+        result = self.send(create())
         tid = result["tasks"][0]["id"]
         result["tasks"][0]["title"] = "Receipt tamper"
         self.authority.state.tasks[tid]["title"] = "State tamper"
@@ -87,16 +89,16 @@ class AuthorityTests(unittest.TestCase):
         snapshot = self.authority.snapshot()
         snapshot["rows"][0]["title"] = "Snapshot tamper"
         self.assertEqual(self.authority.get(tid)["task"]["title"], "Task 2")
-        self.assertEqual(self.authority.execute(create())["tasks"][0]["title"], "Task 2")
+        self.assertEqual(self.send(create())["tasks"][0]["title"], "Task 2")
 
     def test_old_claim_receipt_does_not_authorize_expired_generation(self):
         task = self.task()
         original = self.claim(task)
-        result = self.authority.execute(original)
+        result = self.send(original)
         self.assertTrue(result["authorization"]["tasks"][0]["lease_live"])
         self.assertFalse(result["authorization"]["tasks"][0]["authorized"])
         self.clock.value = "2026-09-23T00:05:00Z"
-        retry = self.authority.execute(original)
+        retry = self.send(original)
         self.assertEqual(retry["response"], result["response"])
         self.assertFalse(retry["authorization"]["tasks"][0]["lease_live"])
         self.assertFalse(retry["authorization"]["tasks"][0]["authorized"])
@@ -110,7 +112,7 @@ class AuthorityTests(unittest.TestCase):
         def claim(number, worker):
             barrier.wait(timeout=5)
             try:
-                return self.authority.execute(self.claim(task, number, worker))
+                return self.send(self.claim(task, number, worker))
             except AuthorityError as error:
                 return error.code
 
@@ -121,7 +123,7 @@ class AuthorityTests(unittest.TestCase):
         self.assertEqual(sum(isinstance(result, dict) for result in results), 1)
         self.assertIn("version_conflict", results)
         self.assertEqual(self.authority.state.tasks[task["id"]]["claim_generation"], 1)
-        self.assertEqual(len(self.client.sent), 3)
+        self.assertEqual(len(self.client.sent), 4)
 
     def test_snapshots_are_stable_paginated_and_summary_covers_entire_scope(self):
         self.task(2)
@@ -167,18 +169,18 @@ class AuthorityTests(unittest.TestCase):
 
     def test_history_fixed_upper_raw_sequence_and_duplicate_labels(self):
         task = self.task()
-        self.authority.execute(command(3, "note", task_id=task["id"], expected_version=1,
+        self.send(command(3, "note", task_id=task["id"], expected_version=1,
                                        tag="note", text="Observed"))
-        self.client.append_event(self.client.sent[1])
+        self.client.append_event(self.client.sent[2])
         first = self.authority.history(task["id"], limit=1)
-        self.assertEqual(first["upper_record_seq"], 4)
-        self.authority.execute(command(4, "note", task_id=task["id"], expected_version=2,
+        self.assertEqual(first["upper_record_seq"], 5)
+        self.send(command(4, "note", task_id=task["id"], expected_version=2,
                                        tag="note", text="Later"))
         second = self.authority.history(task["id"], limit=100, cursor=first["next_cursor"])
-        self.assertEqual(second["upper_record_seq"], 4)
+        self.assertEqual(second["upper_record_seq"], 5)
         self.assertEqual([row["disposition"] for row in second["rows"]], ["accepted", "duplicate"])
-        bounded = self.authority.history(task["id"], after_record_seq=4)
-        self.assertEqual([row["record_seq"] for row in bounded["rows"]], [5])
+        bounded = self.authority.history(task["id"], after_record_seq=5)
+        self.assertEqual([row["record_seq"] for row in bounded["rows"]], [6])
 
     def test_unavailable_snapshot_is_noncurrent_but_ready_rejects(self):
         self.task()
@@ -189,37 +191,6 @@ class AuthorityTests(unittest.TestCase):
         self.assertEqual(snapshot["reason"], "upstream_unavailable")
         with self.assertRaises(AuthorityError):
             self.authority.ready()
-
-    def test_factory_runs_after_lock_and_failed_start_does_not_unlock_other_owner(self):
-        contender = TaskAuthority(AUTHORITY, self.client, self.directory.name, clock=self.clock)
-        called = []
-        with self.assertRaises(AuthorityError) as caught:
-            contender.start(clock_factory=lambda: called.append(True))
-        self.assertEqual(caught.exception.code, "authority_locked")
-        self.assertEqual(called, [])
-        contender.close()
-        with self.assertRaises(JournalError):
-            AuthorityLock(self.directory.name, AUTHORITY).acquire()
-
-    def test_clock_source_and_reboot_gate_allow_only_maintenance(self):
-        self.authority.close()
-        source = Clock()
-        source.pending_reboot = True
-
-        def factory():
-            with self.assertRaises(JournalError):
-                AuthorityLock(self.directory.name, AUTHORITY).acquire()
-            return source
-
-        self.authority.start(clock_factory=factory)
-        self.assertIs(self.authority.clock_source, source)
-        with self.assertRaises(AuthorityError) as caught:
-            self.task()
-        self.assertEqual(caught.exception.code, "reboot_pending")
-        with self.authority.serialized():
-            source.pending_reboot = False
-            self.assertEqual(self.authority.state.configuration["actors"]["system"], "system")
-        self.task()
 
     def test_payload_limit_is_checked_before_pending_or_append(self):
         before = len(self.client.sent)
@@ -233,6 +204,11 @@ class AuthorityTests(unittest.TestCase):
     def test_no_implicit_genesis_and_closed_authority_rejects_mutation(self):
         with state_directory() as directory:
             authority = TaskAuthority(AUTHORITY, LogClient(), directory, clock=self.clock)
+            with self.assertRaises(AuthorityError) as caught:
+                authority.start()
+            self.assertEqual(caught.exception.code, "not_initialized")
+            authority = TaskAuthority(AUTHORITY, LogClient(), directory, clock=self.clock,
+                                      initialize=True)
             with authority:
                 self.assertFalse(authority.health()["fresh"])
                 self.assertEqual(authority.health()["reason"], "uninitialized")
@@ -242,20 +218,6 @@ class AuthorityTests(unittest.TestCase):
             with self.assertRaises(AuthorityError) as caught:
                 authority.execute(genesis())
             self.assertEqual(caught.exception.code, "not_started")
-
-    def test_durable_clock_failure_is_a_structured_authority_error(self):
-        self.authority.close()
-        with self.assertRaises(AuthorityError) as caught:
-            self.authority.start(clock_factory=lambda: (_ for _ in ()).throw(
-                ClockError("missing_clock_state", "Clock missing")))
-        self.assertEqual(caught.exception.code, "missing_clock_state")
-        self.authority.start()
-
-    def test_malformed_clock_source_fails_before_discovery(self):
-        self.authority.close()
-        with self.assertRaises(AuthorityError) as caught:
-            self.authority.start(clock_factory=lambda: type("BadClock", (), {"now": self.clock})())
-        self.assertEqual(caught.exception.code, "clock_error")
 
     def test_forked_child_cannot_use_or_release_parent_authority(self):
         context = multiprocessing.get_context("fork")
@@ -268,8 +230,8 @@ class AuthorityTests(unittest.TestCase):
             self.assertEqual(parent.recv(), ["wrong_process"] * 3)
             process.join(timeout=5)
             self.assertEqual(process.exitcode, 0)
-            with self.assertRaises(JournalError):
-                AuthorityLock(self.directory.name, AUTHORITY).acquire()
+            with self.assertRaises(PlatformError):
+                LifetimeLock(Path(self.directory.name) / "authority.lock").acquire()
         finally:
             if process.is_alive():
                 process.kill()
@@ -290,41 +252,6 @@ class AuthorityTests(unittest.TestCase):
             self.authority.snapshot(cursor=first["next_cursor"])
         self.assertEqual(caught.exception.code, "snapshot_expired")
 
-    def test_reboot_recovery_revokes_inherited_attempt_without_new_grants(self):
-        task = self.task()
-        claim = self.claim(task)
-        task = self.authority.execute(claim)["tasks"][0]
-        self.authority.close()
-        source = Clock()
-        source.pending_reboot = True
-        self.authority.start(clock_factory=lambda: source)
-        renew = command(4, "renew", "supervisor", task_id=task["id"],
-                        attempt_id=task["attempt"]["id"], claim_generation=1,
-                        expected_lease_revision=1)
-        with self.assertRaises(AuthorityError) as caught:
-            self.authority.execute(renew)
-        self.assertEqual(caught.exception.code, "reboot_pending")
-        retry = self.authority.execute(claim)
-        self.assertFalse(retry["authorization"]["tasks"][0]["lease_live"])
-        revoked = self.authority.execute(command(
-            5, "attempt_report", "system", task_id=task["id"], expected_version=task["version"],
-            attempt_id=task["attempt"]["id"], claim_generation=1,
-            report_kind="recovery_started", reason="Host reboot",
-            evidence={"references": ["boot:2"]}))
-        self.assertEqual(revoked["tasks"][0]["status"], "recovering")
-        self.assertFalse(self.authority.execute(claim)["authorization"]["tasks"][0]["lease_live"])
-
-    def test_health_without_process_ownership_never_calls_durable_clock(self):
-        self.authority.close()
-        source = Clock()
-        self.authority.start(clock_factory=lambda: source)
-        self.authority.close()
-        with patch.object(self.authority, "_clock", side_effect=AssertionError("Unowned clock")):
-            health = self.authority.health()
-        self.assertFalse(health["fresh"])
-        self.assertIsNone(health["as_of"])
-        self.assertIsNone(health["pending_reboot"])
-
     def test_ready_accepts_common_filters_without_ignoring_unknown_fields(self):
         task = self.task()
         ready = self.authority.ready({"project": "demo", "status": "open", "kind": "task",
@@ -337,48 +264,28 @@ class AuthorityTests(unittest.TestCase):
             self.authority.ready({"ignored": True})
 
     def test_old_successful_renewal_retains_receipt_but_not_revoked_authorization(self):
-        task = self.authority.execute(self.claim(self.task()))["tasks"][0]
-        task = self.authority.execute(command(
+        task = self.send(self.claim(self.task()))["tasks"][0]
+        task = self.send(command(
             4, "attempt_report", "supervisor", task_id=task["id"], expected_version=task["version"],
             attempt_id=task["attempt"]["id"], claim_generation=1, report_kind="started",
             evidence={"prepared": True, "references": ["workspace:1"]}))["tasks"][0]
         renewal = command(5, "renew", "supervisor", task_id=task["id"],
                           attempt_id=task["attempt"]["id"], claim_generation=1,
                           expected_lease_revision=task["lease_revision"])
-        receipt = self.authority.execute(renewal)
+        receipt = self.send(renewal)
         self.assertTrue(receipt["authorization"]["tasks"][0]["authorized"])
         current = receipt["tasks"][0]
-        self.authority.execute(command(
+        self.send(command(
             6, "release", "worker", task_id=task["id"], expected_version=current["version"],
             attempt_id=task["attempt"]["id"], claim_generation=1, reason="Yield safely"))
-        replay = self.authority.execute(renewal)
+        replay = self.send(renewal)
         self.assertEqual(replay["response"], receipt["response"])
         self.assertFalse(replay["authorization"]["tasks"][0]["authorized"])
         self.assertFalse(replay["authorization"]["tasks"][0]["lease_live"])
 
-    def test_real_effective_clock_reboot_must_be_acknowledged_under_ownership(self):
-        self.authority.close()
-        wall = int(datetime.fromisoformat("2026-09-23T00:00:00+00:00").timestamp()) * 10**9
-        store = JsonStore(Path(self.directory.name, "clock.json"))
-        self.authority.start(clock_factory=lambda: EffectiveClock(
-            store, wall_time_ns=lambda: wall, monotonic_ns=lambda: 100, boot_id="boot-one",
-            initialize=True))
-        self.assertFalse(self.authority.clock_source.pending_reboot)
-        self.authority.close()
-        self.authority.start(clock_factory=lambda: EffectiveClock(
-            store, wall_time_ns=lambda: wall - 10**9, monotonic_ns=lambda: 10,
-            boot_id="boot-two"))
-        self.assertEqual(self.authority.health()["reason"], "reboot_pending")
-        with self.assertRaises(AuthorityError):
-            self.task()
-        with self.authority.serialized():
-            active = sum(task["status"] == "in_progress" for task in self.authority.state.tasks.values())
-            self.authority.clock_source.acknowledge_reboot(active_attempts=active)
-        self.assertTrue(self.authority.execute(create())["ok"])
-
-    def test_growing_renewal_history_reads_only_new_tail_records(self):
-        task = self.authority.execute(self.claim(self.task()))["tasks"][0]
-        task = self.authority.execute(command(
+    def test_growing_renewal_history_remains_consistent_under_full_prefix_audits(self):
+        task = self.send(self.claim(self.task()))["tasks"][0]
+        task = self.send(command(
             4, "attempt_report", "supervisor", task_id=task["id"], expected_version=task["version"],
             attempt_id=task["attempt"]["id"], claim_generation=1, report_kind="started",
             evidence={"prepared": True, "references": ["workspace:1"]}))["tasks"][0]
@@ -386,7 +293,7 @@ class AuthorityTests(unittest.TestCase):
         self.client.records_read = 0
         started = time.perf_counter()
         for index in range(32):
-            task = self.authority.execute(command(
+            task = self.send(command(
                 10 + index, "renew", "supervisor", task_id=task["id"],
                 attempt_id=task["attempt"]["id"], claim_generation=1,
                 expected_lease_revision=task["lease_revision"]))["tasks"][0]
@@ -398,12 +305,11 @@ class AuthorityTests(unittest.TestCase):
         if os.environ.get("MPTASK_TEST_METRICS") == "1":
             print(f"authority_tail_metrics records={self.client.records_read} "
                   f"replay_calls={len(self.client.replay_cursors)} elapsed={elapsed:.6f}s")
-        self.assertEqual(self.client.records_read, 32,
-                         f"replay_calls={len(self.client.replay_cursors)}, elapsed={elapsed:.6f}s")
+        self.assertGreater(self.client.records_read, 32)
         self.assertEqual(len(self.client.replay_cursors), 160)
-        self.assertNotIn(None, self.client.replay_cursors)
+        self.assertEqual(set(self.client.replay_cursors), {None})
 
-    def test_healthy_repeated_reads_never_refold_prior_history(self):
+    def test_healthy_repeated_reads_revalidate_source_without_writes(self):
         task = self.task()
         self.client.replay_cursors.clear()
         self.client.records_read = 0
@@ -412,50 +318,50 @@ class AuthorityTests(unittest.TestCase):
             self.authority.history(task["id"])
             self.authority.refresh()
             self.authority.reconcile()
-        self.assertEqual(self.client.records_read, 0)
-        self.assertEqual(self.client.replay_cursors, ["evt-000002"] * 40)
+        self.assertEqual(self.client.records_read, 120)
+        self.assertEqual(self.client.replay_cursors, [None] * 40)
 
     def test_repeated_operation_prefixes_reject_without_disk_or_log_effect(self):
         for count in (2, 3, 4):
             with self.subTest(count=count), state_directory() as directory:
                 client = LogClient()
                 authority = TaskAuthority(AUTHORITY, client, directory, clock=self.clock,
-                                          backoff=lambda _: None)
+                                          backoff=lambda _: None, initialize=True)
                 with authority:
-                    authority.execute(genesis())
-                    before_head = Path(directory, "verified_head.json").read_bytes()
+                    authority.execute_current(genesis())
+                    before_head = authority.log.checkpoint()
                     bad = create()
                     bad["operation"] = "mptask_" * count + "create"
                     with self.assertRaises(AuthorityError) as caught:
-                        authority.execute(bad)
+                        authority.execute(bad, expected_epoch=authority.epoch_id)
                     self.assertEqual(caught.exception.code, "validation_error")
                     self.assertFalse(caught.exception.ambiguous)
-                    self.assertEqual(len(client.sent), 1)
+                    self.assertEqual(len(client.sent), 2)
                     self.assertFalse(Path(directory, "pending.json").exists())
-                    self.assertEqual(Path(directory, "verified_head.json").read_bytes(), before_head)
+                    self.assertEqual(authority.log.checkpoint(), before_head)
                     self.assertEqual(authority.state.tasks, {})
                     valid = create()
                     valid["operation"] = "mptask_create"
-                    self.assertTrue(authority.execute(valid)["ok"])
-                    self.assertTrue(authority.execute(create())["replayed"])
+                    self.assertTrue(authority.execute(valid, expected_epoch=authority.epoch_id)["ok"])
+                    self.assertTrue(authority.execute(create(), expected_epoch=authority.epoch_id)["replayed"])
                 with authority:
                     self.assertEqual(len(authority.state.tasks), 1)
 
     def test_generated_envelope_is_statically_validated_before_pending_or_dispatch(self):
         valid = make_proposal(self.authority.log, create(), self.clock())["event"]
         valid["command"]["operation"] = "mptask_create"
-        head = Path(self.directory.name, "verified_head.json").read_bytes()
+        head = self.authority.log.checkpoint()
         with patch("mempalace_tasks.protocol.decide", return_value=valid):
             with self.assertRaises(AuthorityError) as caught:
-                self.authority.execute(create())
+                self.send(create())
         self.assertEqual(caught.exception.code, "invariant_violation")
         self.assertFalse(caught.exception.ambiguous)
-        self.assertEqual(len(self.client.sent), 1)
+        self.assertEqual(len(self.client.sent), 2)
         self.assertFalse(Path(self.directory.name, "pending.json").exists())
-        self.assertEqual(Path(self.directory.name, "verified_head.json").read_bytes(), head)
+        self.assertEqual(self.authority.log.checkpoint(), head)
 
     def test_get_attempt_authorization_tracks_preparing_running_and_expiry_read_only(self):
-        task = self.authority.execute(self.claim(self.task()))["tasks"][0]
+        task = self.send(self.claim(self.task()))["tasks"][0]
         before = len(self.client.sent)
         preparing = self.authority.get(task["id"])
         auth = preparing["authorization"]
@@ -470,12 +376,12 @@ class AuthorityTests(unittest.TestCase):
         self.assertIn("relations", preparing)
         self.assertEqual(len(self.client.sent), before)
 
-        started = self.authority.execute(command(
+        started = self.send(command(
             4, "attempt_report", "supervisor", task_id=task["id"], expected_version=task["version"],
             attempt_id=task["attempt"]["id"], claim_generation=1, report_kind="started",
             evidence={"prepared": True, "references": ["workspace:1"]}))
         before = len(self.client.sent)
-        head = Path(self.directory.name, "verified_head.json").read_bytes()
+        head = self.authority.log.checkpoint()
         running = self.authority.get(task["id"])
         auth = running["authorization"]
         self.assertTrue(auth["authorized"])
@@ -493,12 +399,12 @@ class AuthorityTests(unittest.TestCase):
         self.assertEqual(expired["authorization"]["reason"], "lease_expired")
         self.assertEqual(expired["task"]["status"], "in_progress")
         self.assertEqual(len(self.client.sent), before)
-        self.assertEqual(Path(self.directory.name, "verified_head.json").read_bytes(), head)
+        self.assertEqual(self.authority.log.checkpoint(), head)
         self.assertFalse(Path(self.directory.name, "pending.json").exists())
 
-    def test_get_attempt_authorization_is_false_on_stale_unverified_and_reboot_views(self):
-        task = self.authority.execute(self.claim(self.task()))["tasks"][0]
-        task = self.authority.execute(command(
+    def test_get_attempt_authorization_is_false_on_stale_unverified_and_restarted_views(self):
+        task = self.send(self.claim(self.task()))["tasks"][0]
+        task = self.send(command(
             4, "attempt_report", "supervisor", task_id=task["id"], expected_version=task["version"],
             attempt_id=task["attempt"]["id"], claim_generation=1, report_kind="started",
             evidence={"prepared": True, "references": ["workspace:1"]}))["tasks"][0]
@@ -520,15 +426,13 @@ class AuthorityTests(unittest.TestCase):
         self.client.events[-1]["created_at"] = "2026-09-23T00:00:00Z"
 
         self.authority.close()
-        source = Clock()
-        source.pending_reboot = True
-        self.authority.start(clock_factory=lambda: source)
-        reboot = self.authority.get(task["id"])
-        self.assertEqual(reboot["reason"], "reboot_pending")
-        self.assertFalse(reboot["authorization"]["authorized"])
-        self.assertFalse(reboot["authorization"]["lease_live"])
-        self.assertEqual(reboot["authorization"]["fresh"], reboot["fresh"])
-        self.assertEqual(reboot["authorization"]["as_of"], reboot["as_of"])
+        self.authority = TaskAuthority(AUTHORITY, self.client, self.directory.name,
+                                       clock=Clock(), backoff=lambda _: None).start()
+        self.addCleanup(self.authority.close)
+        restored = self.authority.get(task["id"])
+        self.assertEqual(restored["task"]["status"], "recovering")
+        self.assertFalse(restored["authorization"]["authorized"])
+        self.assertFalse(restored["authorization"]["lease_live"])
 
     def test_accepted_feed_excludes_controls_duplicates_and_abandoned_proposals(self):
         self.task()
@@ -543,16 +447,16 @@ class AuthorityTests(unittest.TestCase):
         self.authority.refresh()
         first = self.authority.accepted_records(limit=2)
         self.assertEqual([item["ordinal"] for item in first], [1, 2])
-        self.assertEqual([item["event_id"] for item in first], ["evt-000001", "evt-000002"])
+        self.assertEqual([item["event_id"] for item in first], ["evt-000002", "evt-000003"])
         self.assertTrue(all(set(item) == {"event_id", "ordinal", "event"} for item in first))
         second = self.authority.accepted_records(after_ordinal=2, limit=1)
         self.assertEqual([item["ordinal"] for item in second], [3])
-        self.assertEqual(second[0]["event_id"], "evt-000006")
+        self.assertEqual(second[0]["event_id"], "evt-000007")
         self.assertEqual(second[0]["event"]["command"]["command_id"], uid(4))
         self.assertEqual(self.authority.accepted_records(after_ordinal=3), [])
         self.assertEqual(self.authority.accepted_records(after_ordinal=500), [])
         self.assertEqual(self.authority.log.domain_ordinal, 3)
-        self.assertEqual(len(self.authority.log.history), 7)
+        self.assertEqual(len(self.authority.log.history), 8)
         before = first + second
         self.authority.close()
         self.authority.start()
@@ -561,7 +465,7 @@ class AuthorityTests(unittest.TestCase):
     def test_accepted_feed_copies_only_requested_batch_and_never_scans_history(self):
         for number in range(2, 12):
             self.task(number)
-        head = Path(self.directory.name, "verified_head.json").read_bytes()
+        head = self.authority.log.checkpoint()
         calls = len(self.client.sent), len(self.client.replay_cursors)
 
         class NoHistoryAccess:
@@ -583,11 +487,11 @@ class AuthorityTests(unittest.TestCase):
         with patch.object(self.authority._log, "accepted_records", NoHistoryAccess()), \
                 patch("mempalace_tasks.authority.deepcopy",
                       side_effect=AssertionError("Idle copy")), \
-                patch.object(self.authority, "_clock", side_effect=AssertionError("Feed clock I/O")):
+                patch.object(self.authority.clock_source, "now", side_effect=AssertionError("Feed clock I/O")):
             self.assertEqual(self.authority.accepted_records(after_ordinal=11), [])
             self.assertEqual(self.authority.accepted_records(after_ordinal=12), [])
         self.assertEqual((len(self.client.sent), len(self.client.replay_cursors)), calls)
-        self.assertEqual(Path(self.directory.name, "verified_head.json").read_bytes(), head)
+        self.assertEqual(self.authority.log.checkpoint(), head)
         self.assertFalse(Path(self.directory.name, "pending.json").exists())
 
     def test_accepted_feed_returns_detached_events_without_affecting_truth(self):
@@ -599,9 +503,9 @@ class AuthorityTests(unittest.TestCase):
         again = self.authority.accepted_records(after_ordinal=1)
         self.assertEqual(again[0]["event"]["tasks"][0]["title"], "Task 2")
         self.assertEqual(again[0]["event"]["command"]["title"], "Task 2")
-        self.assertEqual(again[0]["event_id"], "evt-000002")
+        self.assertEqual(again[0]["event_id"], "evt-000003")
         self.assertEqual(self.authority.state.tasks[task["id"]]["title"], "Task 2")
-        self.assertEqual(self.authority.execute(create())["tasks"][0]["title"], "Task 2")
+        self.assertEqual(self.send(create())["tasks"][0]["title"], "Task 2")
 
     def test_accepted_feed_validates_bounds_and_process_ownership(self):
         for after in (-1, True, "0", None, 1.5):

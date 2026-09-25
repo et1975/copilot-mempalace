@@ -115,16 +115,14 @@ def _redact(value, token):
 def _valid_abandonment(payload, requested_command_id, requested_epoch=None):
     fields = {
         "ok", "outcome", "command_id", "event_id", "ordinal", "replayed",
-        "response", "tasks", "authorization",
+        "response", "tasks", "authorization", "epoch_id",
     }
-    if requested_epoch is not None:
-        fields.add("epoch_id")
-        try:
-            if (type(payload.get("epoch_id")) is not str or payload["epoch_id"] != requested_epoch
-                    or str(UUID(payload["epoch_id"])) != payload["epoch_id"]):
-                return False
-        except ValueError:
+    try:
+        if (type(payload.get("epoch_id")) is not str or payload["epoch_id"] != requested_epoch
+                or str(UUID(payload["epoch_id"])) != payload["epoch_id"]):
             return False
+    except ValueError:
+        return False
     if set(payload) != fields:
         return False
     command_id = payload["command_id"]
@@ -159,11 +157,14 @@ def _valid_read_diagnostic(payload):
     required = {
         "schema_version", "authority_id", "as_of", "last_verified_at",
         "raw_cursor", "domain_head", "domain_ordinal", "fresh", "reason",
+        "epoch_id", "startup_pending", "request_epoch_required",
     }
     if not required <= payload.keys() or not (
         type(payload["schema_version"]) is int and payload["schema_version"] == 1
         and type(payload["authority_id"]) is str
         and payload["fresh"] is False
+        and type(payload["startup_pending"]) is bool
+        and payload["request_epoch_required"] is True
         and type(payload["reason"]) is str and bool(payload["reason"].strip())
         and type(payload["domain_ordinal"]) is int and payload["domain_ordinal"] >= 0
         and ("ok" not in payload or type(payload["ok"]) is bool)
@@ -176,6 +177,10 @@ def _valid_read_diagnostic(payload):
             return False
     try:
         if str(UUID(payload["authority_id"])) != payload["authority_id"]:
+            return False
+        if payload["epoch_id"] is not None and (
+                type(payload["epoch_id"]) is not str
+                or str(UUID(payload["epoch_id"])) != payload["epoch_id"]):
             return False
         for key in ("as_of", "last_verified_at"):
             value = payload[key]
@@ -194,7 +199,6 @@ def _valid_read_diagnostic(payload):
         return False
     return (
         ("started" not in payload or type(payload["started"]) is bool)
-        and (payload.get("pending_reboot") is None or type(payload["pending_reboot"]) is bool)
         and ("protocol" not in payload or type(payload["protocol"]) is dict)
         and (payload.get("pending_command") is None or type(payload["pending_command"]) is dict)
     )

@@ -35,11 +35,11 @@ def error_record(error: Exception, operation: str) -> dict:
 
 
 class MutationRequests:
-    """Keep exact IDs until terminal; the authority persists ambiguous proposals.
+    """Keep exact IDs until terminal within a frozen authority incarnation.
 
     These local entries are scheduling metadata, not another task journal.
-    After a host restart authority.reconcile() resolves its persisted pending
-    proposal before newly generated requests can be submitted.
+    The authority retains uncertain proposals only in memory; a new owner's
+    activation fences absent old requests rather than restoring local metadata.
     """
     def __init__(self, authority: AuthorityPort):
         self.authority = authority
@@ -102,17 +102,14 @@ class LeaseMaintenance:
     def _snapshot(self):
         with self.authority.serialized():
             now = self.clock.now()
-            return self.authority.state, now, self.clock.pending_reboot
+            return self.authority.state, now, self.authority.health()["startup_pending"]
 
-    def _candidates(self, state, now, reboot):
+    def _candidates(self, state, now, startup_pending):
+        if startup_pending:
+            return
         for task in sorted(state.tasks.values(), key=lambda t: t["id"]):
             if task["status"] == "in_progress":
-                if reboot:
-                    yield {"operation": "attempt_report", "actor": self.system_actor,
-                           **execution_tokens(task), "report_kind": "recovery_started",
-                           "reason": "authority_reboot",
-                           "evidence": {"references": [self._reference(state, task)]}}
-                elif instant(now) >= min(instant(task["lease_expires_at"]),
+                if instant(now) >= min(instant(task["lease_expires_at"]),
                                          instant(task["attempt"]["progress_deadline"]),
                                          instant(task["attempt"]["hard_deadline"])):
                     yield {"operation": "expire", "actor": self.system_actor,
@@ -135,8 +132,7 @@ class LeaseMaintenance:
 
     def tick(self) -> dict:
         result = {"expired": 0, "recovered": 0, "revoked": 0, "raced": 0,
-                  "unknown": 0, "abandoned": 0, "unfinished": 0, "errors": [],
-                  "reboot_acknowledged": False}
+                  "unknown": 0, "abandoned": 0, "unfinished": 0, "errors": []}
         self._ticks += 1
         try:
             self.authority.reconcile()
@@ -148,9 +144,11 @@ class LeaseMaintenance:
         seen = set()
         try:
             for _ in range(self.batch_limit):
-                state, now, reboot = self._snapshot()
+                state, now, startup_pending = self._snapshot()
+                if startup_pending:
+                    break
                 commands = list(self.requests.pending.values())
-                commands.extend(self._candidates(state, now, reboot))
+                commands.extend(self._candidates(state, now, startup_pending))
                 command = next((c for c in commands if self.requests.key(c) not in seen), None)
                 if command is None:
                     break
@@ -165,16 +163,11 @@ class LeaseMaintenance:
                     result["errors"].append(receipt)
                 else:
                     result[outcome] += 1
-            with self.authority.serialized():
-                if self.clock.pending_reboot:
-                    active = sum(t["status"] == "in_progress"
-                                 for t in self.authority.state.tasks.values())
-                    if active == 0 and not self.requests.pending:
-                        self.clock.acknowledge_reboot(active_attempts=active)
-                        result["reboot_acknowledged"] = True
-            state, now, reboot = self._snapshot()
-            remaining = {self.requests.key(c) for c in self._candidates(state, now, reboot)}
-            result["unfinished"] = len(remaining | self.requests.pending.keys())
+            state, now, startup_pending = self._snapshot()
+            remaining = {self.requests.key(c) for c in self._candidates(state, now, startup_pending)}
+            result["unfinished"] = len(remaining | self.requests.pending.keys()) + (
+                sum(task["status"] == "in_progress" for task in state.tasks.values())
+                if startup_pending else 0)
         except Exception as error:
             result["errors"].append(error_record(error, "maintenance"))
         self._last = copy.deepcopy(result)

@@ -97,7 +97,7 @@ class SupervisorClockTests(unittest.TestCase):
             wall_time_ns=lambda: wall[0],
             continuous_time_ns=lambda: int(self.elapsed() * 1_000_000_000),
         )
-        self.clock = SimpleNamespace(now=runtime.now, pending_reboot=False)
+        self.clock = SimpleNamespace(now=runtime.now, observe=runtime.observe)
         self.port = DomainPort(self.clock)
         task_id = self.port.create()
         host = self.host(elapsed_time=self.elapsed)
@@ -197,7 +197,7 @@ class SupervisorClockTests(unittest.TestCase):
         self.assertTrue(process.stopped)
         self.assertEqual(process._deadline, 1300)
 
-    def test_direct_owned_process_keeps_legacy_monotonic_deadline(self):
+    def test_direct_owned_process_uses_explicit_monotonic_deadline(self):
         process = self.worker(deadline=time.monotonic() + 0.15)
         self.assertTrue(process.wait_stopped(timeout=2))
         self.assertTrue(process.deadline_expired)

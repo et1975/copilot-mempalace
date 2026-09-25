@@ -10,8 +10,8 @@ GET /identity?nonce=<64 lowercase hex> accepts no bearer and returns the exact
 configuration checks, and the activation barrier have completed. Each connect
 authenticates that proof before deriving an instance-scoped MCP/control bearer.
 
-In journal mode, instance_id is the authority's accepted epoch_id, not a
-launcher-generated incarnation. Only the activated authority can supply it.
+The instance_id is the authority's accepted epoch_id, not a launcher-generated
+incarnation. Only the activated authority can supply it.
 ConnectionInfo is an immutable observation: callers freeze this epoch with each
 logical mutation. Discovery neither injects expected_epoch into commands nor
 refreshes it on retries; a later explicit connect produces a separate snapshot.
@@ -96,9 +96,8 @@ def binding_fingerprint(config: ServiceConfig) -> str:
         "hub_token_file": (str(platform.canonical_path(config.hub_token_file))
                            if config.hub_token_file is not None else None),
         "host": config.host, "port": config.port, "lifecycle": config.lifecycle,
-        "recovery_mode": config.recovery_mode, "configuration": config.configuration,
+        "configuration": config.configuration,
         "maintenance_actor": config.maintenance_actor, "recovery_actor": config.recovery_actor,
-        "project_wings": config.project_wings, "projections_enabled": config.projections_enabled,
     }
     return hashlib.sha256(canonical_json(fields).encode("utf-8")).hexdigest()
 
@@ -115,8 +114,8 @@ def publish_registry(config: ServiceConfig, identity: InstanceIdentity) -> None:
 
     This does not acquire ownership, create runtime directories, or certify
     readiness. The parent CLI/server must enforce the ownership precondition
-    and use the accepted authority.epoch_id as identity.instance_id in journal
-    mode, only after the activation barrier has completed.
+    and use the accepted authority.epoch_id as identity.instance_id only after
+    the activation barrier has completed.
     """
     if not isinstance(identity, InstanceIdentity) or not _bound(config, identity):
         raise DiscoveryError("binding_mismatch", "Listener identity differs from configuration")

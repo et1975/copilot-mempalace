@@ -283,7 +283,7 @@ def _summary(log):
 def validate_task_snapshot(data_path, *, expected_authorities=None, require_logstream=False):
     """Return a JSON-native summary, or raise SnapshotError(code, message).
 
-    ``status`` is ``valid`` or optional legacy ``absent``. ``authorities`` maps
+    ``status`` is ``valid`` or optional ``absent``. ``authorities`` maps
     canonical UUIDs to initialization/epoch, accepted domain ordinal/head, raw
     counts, complete task snapshots (including holds), root-goal IDs, edges,
     configuration and full accepted notes with payload/text hashes. Task counts

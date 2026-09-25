@@ -15,6 +15,7 @@ from mempalace_tasks.palace import PalaceClient, PalaceError
 
 
 STREAM = "mptask/11111111-1111-1111-1111-111111111111"
+EPOCH = "22222222-2222-2222-2222-222222222222"
 LEGACY_DESCRIPTION = (
     "List agent-coordination events with structured filters, oldest first "
     "(append order, not timestamp order). Use since_event_id as the resume "
@@ -135,6 +136,8 @@ def tool_fixture(ordered=True):
 def proposal(command_id="command-1"):
     return {
         "record_type": "mptask.command",
+        "schema_version": 2,
+        "epoch_id": EPOCH,
         "authority_id": STREAM.removeprefix("mptask/"),
         "command_id": command_id,
         "payload_hash": "example-hash-validated-by-protocol-not-adapter",
@@ -152,7 +155,8 @@ def stored_event(index, body=None):
         "to_agent": "*",
         "correlation_id": f"command-{index}",
         "body": json.dumps(proposal(f"command-{index}")) if body is None else body,
-        "metadata": {"authority_id": STREAM.removeprefix("mptask/")},
+        "metadata": {"authority_id": STREAM.removeprefix("mptask/"),
+                     "command_id": f"command-{index}", "epoch_id": EPOCH},
         "artifact_ids": [],
         "branch": None,
         "base_commit": None,
@@ -320,6 +324,24 @@ class PalaceTests(unittest.TestCase):
             self.hub.rpc(request, payload) if request["method"] == "tools/call" else None
         )
 
+    def test_append_rejects_unversioned_and_retired_task_envelopes_before_dispatch(self):
+        for version in (None, 1, 3, True):
+            with self.subTest(version=version):
+                payload = proposal()
+                if version is None:
+                    payload.pop("schema_version")
+                else:
+                    payload["schema_version"] = version
+                self.assert_palace_error(
+                    "invalid_argument", lambda: self.client.append_event(payload))
+        self.assertEqual(self.hub.calls("mempalace_event_append"), [])
+
+    def test_event_reads_reject_retired_task_envelopes(self):
+        event = stored_event(1)
+        event["body"] = json.dumps({**proposal("command-1"), "schema_version": 1})
+        self.hub.events = [event]
+        self.assert_palace_error("invalid_event", self.client.list_events)
+
     def test_discovers_initialize_and_uncached_schema(self):
         first = self.client.discover()
         self.assertEqual("mempalace-ordered-v1", first["profile"])
@@ -337,6 +359,8 @@ class PalaceTests(unittest.TestCase):
     def test_new_profile_replays_1201_in_append_order_through_empty_page(self):
         self.hub.events = [stored_event(i) for i in range(1, 1202)]
         self.hub.events[700]["body"] = self.hub.events[699]["body"]
+        self.hub.events[700]["correlation_id"] = self.hub.events[699]["correlation_id"]
+        self.hub.events[700]["metadata"] = copy.deepcopy(self.hub.events[699]["metadata"])
         events = list(self.client.replay_events())
         self.assertEqual([f"evt-{i:06}" for i in range(1, 1202)], [e["id"] for e in events])
         calls = self.hub.calls("mempalace_event_list")
@@ -491,6 +515,8 @@ class PalaceTests(unittest.TestCase):
         from authority_fixture import AUTHORITY, NOW, create, genesis, uid
 
         log = LogState(AUTHORITY)
+        fold_record(log, self.client.append_event(
+            make_epoch(log, uid(1000), uid(2000), NOW)))
         fold_record(log, self.client.append_event(make_proposal(log, genesis(), NOW)))
         for number in (1, 2):
             fold_record(log, self.client.append_event(

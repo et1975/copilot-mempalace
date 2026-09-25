@@ -11,12 +11,16 @@ from mempalace_tasks.inspection import build_frame, render_json, render_text, ru
 
 AS_OF = "2026-09-23T00:01:00Z"
 TASK_ID = "task-first"
+EPOCH = "00000000-0000-0000-0000-0000000003e8"
 
 
 def metadata(**changes):
     return {
         "schema_version": 1,
         "authority_id": "11111111-1111-1111-1111-111111111111",
+        "epoch_id": EPOCH,
+        "startup_pending": False,
+        "request_epoch_required": True,
         "as_of": AS_OF,
         "last_verified_at": AS_OF,
         "raw_cursor": "evt-000004",
@@ -88,10 +92,12 @@ def history(**changes):
         **metadata(), "snapshot_id": "33333333-3333-3333-3333-333333333333",
         "task_id": TASK_ID, "after_record_seq": 0, "upper_record_seq": 8,
         "rows": [{
-            "record_seq": 4, "event_id": "evt-000004", "record_type": "proposal",
+            "record_seq": 4, "event_id": "evt-000004", "record_type": "mptask.command",
+            "epoch_id": EPOCH,
             "command_id": "44444444-4444-4444-4444-444444444444",
             "task_ids": [TASK_ID], "disposition": "accepted", "outcome": "committed",
-            "payload": {"record_type": "proposal", "command": {"operation": "claim"}},
+            "payload": {"record_type": "mptask.command", "epoch_id": EPOCH,
+                        "event": {"command": {"operation": "claim"}}},
         }], "next_cursor": None, **changes,
     }
 

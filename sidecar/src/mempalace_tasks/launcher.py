@@ -16,7 +16,7 @@ authorization capability or a substitute for the child's OWN authority.lock.
 Both foreground and launched children enter ``startup_election`` before
 authority acquisition, recovery, listener binding and registry publication.
 Only a validated stdin ticket permits bypass of the parent's currently held
-start.lock. In journal mode, InstanceIdentity.instance_id is the authority's
+start.lock. InstanceIdentity.instance_id is the authority's
 accepted epoch_id, known only after activation against the configured MemPalace
 hub. Neither this ticket nor the launcher chooses or authorizes that epoch.
 Release the election after publication, not the authority lock. The parent
@@ -84,7 +84,7 @@ def parse_startup_ticket(config: ServiceConfig, data: bytes) -> StartupTicket:
     """Validate already-bounded stdin bytes; no reads, locks or durable writes."""
     if (type(data) is not bytes or not 1 <= len(data) <= _TICKET_LIMIT
             or not data.endswith(b"\n") or data.count(b"\n") != 1
-            or config.lifecycle != "launcher" or config.recovery_mode != "journal"):
+            or config.lifecycle != "launcher"):
         raise DiscoveryError("invalid_ticket", "Invalid launcher startup ticket")
     value = _decode(data, "invalid_ticket")
     if (set(value) != {"schema_version", "authority_id", "binding", "nonce"}
@@ -305,7 +305,7 @@ def start(config_path: str | os.PathLike[str], *, timeout: float = 10.0) -> Conn
     deadline = _Deadline(timeout)
     path = platform.canonical_path(config_path)
     config = load_config(path)
-    if config.lifecycle != "launcher" or config.recovery_mode != "journal":
+    if config.lifecycle != "launcher":
         raise DiscoveryError("external_lifecycle", "Configuration does not authorize launcher lifecycle")
     platform.ensure_private_directory(config.runtime_dir)
     with _election(config, deadline):

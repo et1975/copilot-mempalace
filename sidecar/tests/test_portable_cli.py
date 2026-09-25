@@ -12,13 +12,12 @@ import unittest
 from unittest.mock import patch
 from uuid import uuid4
 
-from authority_fixture import genesis
+from authority_fixture import LogClient, genesis
 from mempalace_tasks import cli, launcher
 from mempalace_tasks.client import TaskClientError, TaskServiceClient
 from mempalace_tasks.discovery import DiscoveryError, connect
 from mempalace_tasks.platform_support import LifetimeLock
 from portable_lifecycle_fixture import ConfigurationFixture, ROOT_TOKEN
-from test_journal_authority import JournalClient
 from test_palace import TestHub
 
 
@@ -26,7 +25,7 @@ class PortableCliTests(unittest.TestCase):
     def setUp(self):
         self.fixture = ConfigurationFixture()
         self.addCleanup(self.fixture.close)
-        self.log = JournalClient()
+        self.log = LogClient()
 
     def call(self, *args):
         output, errors = io.StringIO(), io.StringIO()
@@ -37,8 +36,7 @@ class PortableCliTests(unittest.TestCase):
         return code, output.getvalue(), errors.getvalue()
 
     def test_init_uses_only_journal_and_lifetime_lock(self):
-        with patch.object(cli, "JsonStore", side_effect=AssertionError("legacy store")):
-            result = self.call("init")
+        result = self.call("init")
         self.assertEqual(result[0], 0, result)
         self.assertEqual([row["record_type"] for row in self.log.sent],
                          ["mptask.epoch", "mptask.command"])
@@ -54,7 +52,7 @@ class PortableCliTests(unittest.TestCase):
             path.write_bytes(b"future-not-json")
         with patch.object(cli, "PalaceClient", return_value=self.log):
             with cli.owned_authority(self.fixture.config) as owner:
-                self.assertEqual(owner.recovery_mode, "journal")
+                self.assertIsNotNone(owner.epoch_id)
                 self.assertTrue(cli._maintenance(owner, self.fixture.config).tick()["errors"] == [])
                 self.assertTrue(owner.health()["fresh"])
         self.assertTrue(all(path.read_bytes() == b"future-not-json" for path in paths))
@@ -75,19 +73,24 @@ class PortableCliTests(unittest.TestCase):
         self.assertIn("configuration_conflict", result[2])
         self.assertEqual(self.log.sent, before)
 
-    def test_enabled_projection_refused_before_any_authority_writes(self):
+    def test_removed_projection_configuration_rejected_before_any_authority_writes(self):
         self.fixture.document.update(projections_enabled=True, project_wings={"demo": "demo"})
-        self.fixture.save()
+        self.fixture.path.write_text(json.dumps(self.fixture.document), encoding="utf-8")
         result = self.call("serve")
         self.assertEqual(result[0], 2, result)
-        self.assertIn("projection_unsupported", result[2])
+        self.assertIn("invalid_configuration", result[2])
         self.assertEqual(self.log.sent, [])
         self.assertFalse(self.fixture.config.runtime_dir.exists())
 
-    def test_explicit_project_refused_in_journal_mode(self):
+    def test_project_is_not_a_command_and_help_has_no_mode_switches(self):
+        result = self.call("--help")
+        self.assertEqual(result[0], 0, result)
+        self.assertNotIn("project,", result[1])
+        self.assertNotIn("version-1", result[1])
+        self.assertNotIn("legacy", result[1])
         result = self.call("project", "--resume")
         self.assertEqual(result[0], 2, result)
-        self.assertIn("projection_unsupported", result[2])
+        self.assertIn("invalid_configuration", result[2])
         self.assertFalse(self.fixture.config.runtime_dir.exists())
 
     def test_inspect_and_connect_never_start_an_absent_service(self):

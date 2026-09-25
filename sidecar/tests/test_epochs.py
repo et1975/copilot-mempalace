@@ -7,7 +7,7 @@ from uuid import UUID, uuid5
 from mempalace_tasks import protocol
 from mempalace_tasks.codec import canonical_json, payload_hash
 from mempalace_tasks.model import state_to_dict
-from authority_fixture import AUTHORITY, NOW, command, create, genesis, raw, uid
+from authority_fixture import AUTHORITY, EPOCH, NOW, activate, command, create, genesis, raw, uid
 
 
 LATER = "2026-09-23T00:00:10Z"
@@ -15,30 +15,19 @@ LATER = "2026-09-23T00:00:10Z"
 
 def epoch_raw(payload, index):
     """Mirror the adapter routing without treating correlation as uniqueness."""
-    if payload["record_type"] == "mptask.epoch":
-        event = raw({"record_type": "mptask.epoch",
-                     "command_id": payload["activation_id"]}, index)
-        event["body"] = canonical_json(payload)
-        event["metadata"] = {
-            "authority_id": AUTHORITY, "activation_id": payload["activation_id"],
-            "epoch_id": payload["epoch_id"],
-        }
-        return event
-    event = raw(payload, index)
-    if payload["schema_version"] == 2:
-        event["metadata"]["epoch_id"] = payload["epoch_id"]
-    return event
+    return raw(payload, index)
 
 
 class EpochTests(unittest.TestCase):
     def setUp(self):
         self.log = protocol.LogState(AUTHORITY)
+        self.initial_activation = activate(self.log)
         self.genesis = protocol.make_proposal(self.log, genesis(), NOW)
         self.fold(self.genesis)
 
     def fold(self, payload, log=None):
         log = self.log if log is None else log
-        return protocol.fold_record(log, epoch_raw(payload, len(log.history) + 1))
+        return protocol.fold_record(log, epoch_raw(payload, len(log.history)))
 
     def activate(self, number, log=None, now=NOW):
         log = self.log if log is None else log
@@ -57,7 +46,7 @@ class EpochTests(unittest.TestCase):
         self.assertEqual(barrier, {
             "record_type": "mptask.epoch", "schema_version": 2,
             "authority_id": AUTHORITY, "epoch_id": uid(1001),
-            "activation_id": uid(2001), "previous_activation_id": None,
+            "activation_id": uid(2001), "previous_activation_id": uid(2000),
             "at": LATER, "payload_hash": payload_hash(barrier),
         })
         self.fold(barrier)
@@ -72,7 +61,7 @@ class EpochTests(unittest.TestCase):
         self.assertEqual(self.log.outcomes, {})
         self.assertEqual(self.log.proposals, {})
         self.assertEqual(self.log.controls, {})
-        self.assertEqual(self.log.historical_outcome(None, uid(1)), before.outcomes[uid(1)])
+        self.assertEqual(self.log.historical_outcome(EPOCH, uid(1)), before.outcomes[uid(1)])
         self.assertEqual(self.log.activation_attempts[uid(2001)]["outcome"], "accepted")
         self.assertEqual(self.log.history[-1]["disposition"], "activated")
 
@@ -83,14 +72,14 @@ class EpochTests(unittest.TestCase):
         receipt = deepcopy(self.log.outcomes[uid(2)])
         self.activate(1)
         self.fold(proposal)
-        self.assertEqual(self.log.historical_outcome(None, uid(2)), receipt)
+        self.assertEqual(self.log.historical_outcome(EPOCH, uid(2)), receipt)
         self.assertNotIn(uid(2), self.log.outcomes)
         self.assertEqual(self.log.history[-1]["disposition"], "stale")
         self.assertEqual(len(self.log.state.tasks), 1)
         self.activate(1, after)
         self.fold(proposal, after)
         self.assertEqual(after.state.tasks, {})
-        self.assertIsNone(after.historical_outcome(None, uid(2)))
+        self.assertIsNone(after.historical_outcome(EPOCH, uid(2)))
         self.assertEqual(after.history[-1]["outcome"], "stale")
 
     def test_stale_proposal_and_settlement_do_not_compare_new_scope_same_uuid(self):
@@ -116,8 +105,8 @@ class EpochTests(unittest.TestCase):
         self.assertNotEqual(self.log.raw_hash, before.raw_hash)
         self.assertNotEqual(self.log.raw_cursor, before.raw_cursor)
 
-    def test_unknown_discarded_future_and_legacy_records_bypass_chain_validation(self):
-        legacy = protocol.make_proposal(self.log, create(), NOW)
+    def test_unknown_discarded_future_and_retired_records_bypass_chain_validation(self):
+        initial = protocol.make_proposal(self.log, create(), NOW)
         future = deepcopy(self.log)
         self.activate(99, future)
         unknown = protocol.make_proposal(future, create(), NOW)
@@ -126,7 +115,7 @@ class EpochTests(unittest.TestCase):
         unknown["payload_hash"] = payload_hash(unknown)
         self.activate(1)
         before = deepcopy(self.log)
-        for payload in (legacy, unknown, protocol.make_settlement(legacy),
+        for payload in (initial, unknown, protocol.make_settlement(initial),
                         protocol.make_settlement(unknown)):
             self.fold(payload)
             self.assertEqual(self.log.history[-1]["outcome"], "stale")
@@ -165,7 +154,7 @@ class EpochTests(unittest.TestCase):
         self.fold(a, future)
         b = protocol.make_epoch(future, uid(1002), uid(2002), NOW)
         self.fold(b)
-        self.assertIsNone(self.log.epoch_id)
+        self.assertEqual(self.log.epoch_id, EPOCH)
         rejection = deepcopy(self.log.activation_attempts[uid(2002)])
         self.assertEqual(rejection["outcome"], "stale")
         self.fold(a)
@@ -234,19 +223,19 @@ class EpochTests(unittest.TestCase):
         self.assertEqual(self.log.domain_ordinal, 1)
         self.assertEqual(self.log.history[-1]["disposition"], "duplicate")
 
-    def test_settlement_identity_namespaces_epoch_without_changing_legacy_id(self):
-        legacy = protocol.make_proposal(self.log, create(), NOW)
-        legacy_control = protocol.make_settlement(legacy)
-        self.assertEqual(legacy_control["control_id"], str(uuid5(
-            UUID(AUTHORITY), f"mptask.settle:{uid(2)}:{legacy['payload_hash']}")))
+    def test_settlement_identity_namespaces_each_epoch(self):
+        initial = protocol.make_proposal(self.log, create(), NOW)
+        initial_control = protocol.make_settlement(initial)
+        self.assertEqual(initial_control["control_id"], str(uuid5(
+            UUID(AUTHORITY), f"mptask.settle:{EPOCH}:{uid(2)}:{initial['payload_hash']}")))
         self.activate(1)
         v2 = protocol.make_proposal(self.log, create(), NOW)
         control = protocol.make_settlement(v2)
         self.assertEqual(control["control_id"], str(uuid5(
             UUID(AUTHORITY), f"mptask.settle:{uid(1001)}:{uid(2)}:{v2['payload_hash']}")))
-        self.assertEqual(v2["event"], legacy["event"])
-        self.assertEqual(v2["task_ids"], legacy["task_ids"])
-        self.assertNotEqual(control["control_id"], legacy_control["control_id"])
+        self.assertEqual(v2["event"], initial["event"])
+        self.assertEqual(v2["task_ids"], initial["task_ids"])
+        self.assertNotEqual(control["control_id"], initial_control["control_id"])
 
     def test_historical_lookup_is_explicit_detached_and_scoped(self):
         old = protocol.make_proposal(self.log, create(), NOW)
@@ -257,10 +246,10 @@ class EpochTests(unittest.TestCase):
         changed["title"] = "A new scope may reuse an abandoned UUID"
         self.fold(protocol.make_proposal(self.log, changed, NOW))
         committed = deepcopy(self.log.outcomes[uid(2)])
-        self.assertEqual(self.log.historical_outcome(None, uid(2)), abandoned)
+        self.assertEqual(self.log.historical_outcome(EPOCH, uid(2)), abandoned)
         self.assertEqual(self.log.historical_outcome(uid(1001), uid(2)), committed)
         self.assertIsNone(self.log.historical_outcome(uid(9999), uid(2)))
-        self.assertEqual(self.log.scoped_outcomes[(AUTHORITY, None, uid(2))], abandoned)
+        self.assertEqual(self.log.scoped_outcomes[(AUTHORITY, EPOCH, uid(2))], abandoned)
         self.assertEqual(self.log.scoped_outcomes[(AUTHORITY, uid(1001), uid(2))], committed)
         detached = self.log.historical_outcome(uid(1001), uid(2))
         detached["response"]["tasks"][0]["title"] = "Caller mutation"
@@ -300,21 +289,22 @@ class EpochTests(unittest.TestCase):
         self.assertEqual(self.log.state.tasks[task_id]["version"], 3)
         self.assertEqual(self.log.domain_ordinal, 4)
 
-    def test_v1_replay_bytes_and_task_identity_are_preserved_across_activation(self):
+    def test_accepted_replay_bytes_and_task_identity_are_preserved_across_activation(self):
         proposal = protocol.make_proposal(self.log, create(), NOW)
         settlement = protocol.make_settlement(proposal)
         self.fold(proposal)
         self.fold(settlement)
-        legacy_history = deepcopy(self.log.history)
+        initial_history = deepcopy(self.log.history)
         accepted = canonical_json(self.log.accepted_records)
         receipt = deepcopy(self.log.outcomes[uid(2)])
         barrier = self.activate(1)
         replay = protocol.LogState(AUTHORITY)
+        activate(replay)
         for payload in (self.genesis, proposal, settlement, barrier):
             self.fold(payload, replay)
-        self.assertEqual(replay.history[:3], legacy_history)
+        self.assertEqual(replay.history[:4], initial_history)
         self.assertEqual(canonical_json(replay.accepted_records), accepted)
-        self.assertEqual(replay.historical_outcome(None, uid(2)), receipt)
+        self.assertEqual(replay.historical_outcome(EPOCH, uid(2)), receipt)
         self.assertEqual(replay, self.log)
         self.assertNotIn("epoch_id", replay.accepted_records[1]["event"])
 
@@ -322,6 +312,7 @@ class EpochTests(unittest.TestCase):
         branch = deepcopy(self.log)
         self.activate(1, branch)
         proposal = protocol.make_proposal(branch, create(), NOW)
+        self.log = protocol.LogState(AUTHORITY)
         before = deepcopy(self.log)
         self.fold(protocol.make_settlement(proposal))
         self.fold(proposal)

@@ -91,7 +91,7 @@ class RestoreTests(unittest.TestCase):
         fold_record(log, fixtures.raw_record(old, 1000))
         self.assertEqual(log.history[-1]["disposition"], "stale")
         self.assertEqual(state_to_dict(log.state), before)
-        self.assertIsNone(log.historical_outcome(None, fixtures.uid(20)))
+        self.assertIsNone(log.historical_outcome(old["epoch_id"], fixtures.uid(20)))
 
     def test_restore_ignores_missing_or_discarded_future_sidecar_files(self):
         outside = self.fixture.root / "future"

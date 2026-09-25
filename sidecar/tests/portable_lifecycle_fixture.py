@@ -217,7 +217,7 @@ class IdentityServer:
 
 
 def main():
-    """Stand-in for the *not yet integrated* CLI startup-ticket contract."""
+    """Controlled launcher child for identity/transport faults, not task recovery."""
     import argparse
     import sys
     from mempalace_tasks.launcher import startup_election

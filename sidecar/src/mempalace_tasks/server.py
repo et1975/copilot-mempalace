@@ -24,10 +24,8 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 from .authority import AuthorityError
-from .codec import canonical_json
 from .config import ConfigError, _constant, _pairs, validate_binding, validate_token
 from .domain import CLASSES, CONTENT, DEFAULT_POLICY, EDGE_TYPES, EXECUTION, ROLES, SCHEMAS, STATUSES
-from .projection import ProjectionError, ProjectionRecord
 from .lifecycle import HttpLifecycle
 from .server_identity import InstanceIdentity, make_proof
 
@@ -64,8 +62,10 @@ def _object(properties, required=()):
             "required": sorted(required), "additionalProperties": False}
 
 
-def _schemas(*, journal=False):
+def _schemas():
     string = {"type": "string", "minLength": 1}
+    uuid = {"type": "string",
+            "pattern": r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"}
     positive = {"type": "integer", "minimum": 1}
     references = {"type": "array", "items": string, "maxItems": 20, "uniqueItems": True}
     policy = _object({
@@ -138,17 +138,11 @@ def _schemas(*, journal=False):
         if name in {"transition", "expand", "goal_close"}:
             properties["evidence"] = {**references, "minItems": 1}
         result[name] = _object(properties, required | {"actor", "command_id"})
-        if journal:
-            result[name]["properties"]["expected_epoch"] = {
-                "type": "string",
-                "pattern": r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
-            }
-            result[name]["required"].append("expected_epoch")
-    if journal:
-        result["outcome"] = _object({
-            "epoch_id": {"type": ["string", "null"], "minLength": 1},
-            "command_id": string,
-        }, ("epoch_id", "command_id"))
+        result[name]["properties"]["expected_epoch"] = deepcopy(uuid)
+        result[name]["required"].append("expected_epoch")
+    result["outcome"] = _object({
+        "epoch_id": deepcopy(uuid), "command_id": deepcopy(uuid),
+    }, ("epoch_id", "command_id"))
     filters = {name: string for name in ("project", "goal_id", "assignee")}
     filters.update({"status": {"type": "string", "enum": sorted(STATUSES)},
                     "kind": fields["kind"], "needs_attention": {"type": "boolean"}})
@@ -289,48 +283,9 @@ class _MCPRoute:
         await self.manager.handle_request(scope, receive, send)
 
 
-class ProjectionPump:
-    """Single-driver bounded delivery over one owned authority/projector pair."""
-
-    def __init__(self, authority, projector):
-        self.authority, self.projector = authority, projector
-        self._verified_checkpoint = None
-
-    def run_batch(self, *, limit=10):
-        if type(limit) is not int or not 1 <= limit <= 100:
-            raise ValueError("Projection batch limit must be in 1..100")
-        checkpoint = self.projector.health()["checkpoint"]
-        ordinal = 0 if checkpoint is None else checkpoint["ordinal"]
-        if checkpoint is not None and checkpoint != self._verified_checkpoint:
-            previous = self.authority.accepted_records(after_ordinal=ordinal - 1, limit=1)
-            if (checkpoint["authority_id"] != self.authority.authority_id or not previous
-                    or previous[0]["ordinal"] != ordinal
-                    or checkpoint["event_id"] != previous[0]["event_id"]
-                    or checkpoint["event_hash"] != hashlib.sha256(
-                        canonical_json(previous[0]["event"]).encode()).hexdigest()):
-                raise ProjectionError("projection_history_mismatch",
-                                      "Projection checkpoint does not match accepted history")
-        accepted = self.authority.accepted_records(after_ordinal=ordinal, limit=limit)
-        # The feed copies only this bounded batch, then releases authority serialization.
-        records = (ProjectionRecord(row["event_id"], row["ordinal"], row["event"])
-                   for row in accepted)
-        result = self.projector.run_batch(records, limit=limit)
-        self._verified_checkpoint = deepcopy(result["checkpoint"])
-        return result
-
-
-def project_batch(authority, projector, *, limit=10):
-    """One-shot delivery; retain a ProjectionPump for repeated timer/batch work."""
-    return ProjectionPump(authority, projector).run_batch(limit=limit)
-
-
 class _Runtime:
-    def __init__(self, authority, maintenance, token, projector, lifecycle=None):
+    def __init__(self, authority, maintenance, token, lifecycle=None):
         self.authority, self.maintenance, self.token = authority, maintenance, token
-        self.projector = projector
-        self.projection_pump = ProjectionPump(authority, projector) if projector is not None else None
-        self.projection_status = {"enabled": projector is not None, "paused": False,
-                                  "checkpoint": None, "last_error": None}
         self.sweep = authority.state.configuration["policy"]["sweep_seconds"]
         self.last_tick = float("-inf")
         self.maintenance_status = {"ok": False, "ticks": 0, "reason": "not_started"}
@@ -341,7 +296,6 @@ class _Runtime:
     async def start(self):
         self.request_limit = anyio.CapacityLimiter(4)
         self.maintenance_limit = anyio.CapacityLimiter(1)
-        self.projection_limit = anyio.CapacityLimiter(1)
         self.tick_lock = anyio.Lock()
         self.stop_lock = anyio.Lock()
         await self.tick_if_due()
@@ -353,9 +307,6 @@ class _Runtime:
                 await self.tick_if_due(force=True)
             if not health["fresh"] or not self.maintenance_status["ok"]:
                 raise AuthorityError("not_ready", "Authority startup did not complete")
-        if self.projector is not None:
-            self.projection_status = _safe(await anyio.to_thread.run_sync(
-                self.projector.health, limiter=self.projection_limit), self.token)
 
     async def dispatch(self, function, *args, **kwargs):
         return await anyio.to_thread.run_sync(
@@ -380,29 +331,6 @@ class _Runtime:
         while True:
             await anyio.sleep(max(0.01, self.sweep - (time.monotonic() - self.last_tick)))
             await self.tick_if_due()
-
-    async def project(self):
-        while True:
-            if not self.projection_status["paused"]:
-                try:
-                    def batch():
-                        result = self.projection_pump.run_batch()
-                        return result, self.projector.health()
-                    result, health = await anyio.to_thread.run_sync(batch, limiter=self.projection_limit)
-                    self.projection_status = _safe(health, self.token)
-                except Exception as error:
-                    try:
-                        self.projection_status = _safe(await anyio.to_thread.run_sync(
-                            self.projector.health, limiter=self.projection_limit), self.token)
-                    except Exception:
-                        self.projection_status = {**self.projection_status, "health_unavailable": True}
-                    self.projection_status = {
-                        **self.projection_status, "paused": True, "last_error": {
-                            "code": error.code if isinstance(error, ProjectionError) else "projection_failed",
-                            "message": "Projection paused; stop service and explicitly resume or rebuild",
-                        },
-                    }
-            await anyio.sleep(1)
 
     async def ready(self, arguments):
         await self.tick_if_due()
@@ -431,12 +359,10 @@ class _Runtime:
         if name in PUBLIC_OPERATIONS:
             if name == "claim":
                 await self.tick_if_due()
-            if getattr(self.authority, "recovery_mode", "legacy") == "journal":
-                command = dict(arguments)
-                epoch = command.pop("expected_epoch")
-                return await self.dispatch(self.authority.execute, {"operation": name, **command},
-                                           expected_epoch=epoch)
-            return await self.dispatch(self.authority.execute, {"operation": name, **arguments})
+            command = dict(arguments)
+            epoch = command.pop("expected_epoch")
+            return await self.dispatch(self.authority.execute, {"operation": name, **command},
+                                       expected_epoch=epoch)
         if name == "ready":
             return await self.ready(arguments)
         if name == "wait_ready":
@@ -444,7 +370,6 @@ class _Runtime:
         if name == "health":
             return {**await self.dispatch(self.authority.health),
                     "maintenance": deepcopy(self.maintenance_status),
-                    "projection": deepcopy(self.projection_status),
                     **({"lifecycle": {"state": self.lifecycle.phase,
                                       "failure": self.lifecycle.failure}}
                        if self.lifecycle is not None else {})}
@@ -534,22 +459,18 @@ async def _bounded_body(request, maximum):
     return bytes(body)
 
 
-def create_app(authority, maintenance, *, token, host="127.0.0.1", port=8766, projector=None,
+def create_app(authority, maintenance, *, token, host="127.0.0.1", port=8766,
                lifecycle=None):
     """Borrow started authority ownership; the caller closes it after ASGI shutdown."""
     binding = validate_binding(host, port)
     validate_token(token)
-    journal = getattr(authority, "recovery_mode", "legacy") == "journal"
-    if journal and projector is not None:
-        raise ConfigError("Journal-mode projection requires a disposable epoch-aware integration",
-                          code="projection_unsupported")
     if lifecycle is not None and (
             lifecycle.identity.instance_id != authority.epoch_id
             or lifecycle.identity.authority_id != authority.authority_id
             or lifecycle.identity.endpoint != f"http://{binding}/mcp"):
         raise AuthorityError("identity_mismatch", "Listener must use the accepted authority epoch")
-    runtime = _Runtime(authority, maintenance, token, projector, lifecycle)
-    schemas = _schemas(journal=journal)
+    runtime = _Runtime(authority, maintenance, token, lifecycle)
+    schemas = _schemas()
     validators = {key: Draft202012Validator(value) for key, value in schemas.items()}
     sdk = Server("mempalace-tasks", version="1")
 
@@ -559,10 +480,8 @@ def create_app(authority, maintenance, *, token, host="127.0.0.1", port=8766, pr
             name=f"mptask_{name}", description=(
                 "Read diagnostic task state; never authorizes execution."
                 if name in READ_OPERATIONS else
-                f"Apply {name}; retain command_id"
-                + (" and frozen expected_epoch; never upgrade an ambiguous request."
-                   if journal else " on ambiguous outcomes.")
-                + " Actor must be registered."),
+                f"Apply {name}; retain command_id and frozen expected_epoch; "
+                "never upgrade an ambiguous request. Actor must be registered."),
             inputSchema=deepcopy(schema),
         ) for name, schema in schemas.items()]
 
@@ -574,13 +493,13 @@ def create_app(authority, maintenance, *, token, host="127.0.0.1", port=8766, pr
         try:
             if name != f"mptask_{operation}" or operation not in schemas:
                 raise AuthorityError("unknown_tool", "Unknown task tool")
-            if journal and operation in PUBLIC_OPERATIONS and isinstance(arguments, dict) and (
+            if operation in PUBLIC_OPERATIONS and isinstance(arguments, dict) and (
                     "expected_epoch" not in arguments):
                 raise AuthorityError("epoch_required", "A frozen request epoch is required")
             if next(validators[operation].iter_errors(arguments), None) is not None:
                 raise AuthorityError("validation_error", "Arguments do not match this tool's schema")
             if operation in PUBLIC_OPERATIONS:
-                if journal and arguments["expected_epoch"] != authority.epoch_id:
+                if arguments["expected_epoch"] != authority.epoch_id:
                     raise AuthorityError("stale_epoch", "Request epoch differs from this owner")
                 runtime.admit_mutation(operation, arguments)
             if runtime.in_flight >= MAX_IN_FLIGHT:
@@ -624,8 +543,6 @@ def create_app(authority, maintenance, *, token, host="127.0.0.1", port=8766, pr
             async with manager.run(), anyio.create_task_group() as workers:
                 await runtime.start()
                 workers.start_soon(runtime.maintain)
-                if projector is not None:
-                    workers.start_soon(runtime.project)
                 try:
                     yield
                 finally:
@@ -705,63 +622,55 @@ def create_app(authority, maintenance, *, token, host="127.0.0.1", port=8766, pr
     return app
 
 
-def serve(authority, maintenance, *, token, host="127.0.0.1", port=8766, projector=None,
-          config=None, on_ready=None):
+def serve(authority, maintenance, *, token, host="127.0.0.1", port=8766,
+          config, on_ready=None):
     """Foreground server; caller retains ownership until ASGI and writers finish.
 
-    A journal config enables identity/control and binds port zero exactly once.
+    The configured listener enables identity/control and binds port zero exactly once.
     on_ready releases startup election only after listener/authority readiness
     and registry publication. No upstream startup or idle shutdown occurs here.
     """
     import uvicorn
 
-    if config is not None:
-        if config.recovery_mode != "journal" or projector is not None or config.projections_enabled:
-            raise ConfigError("Portable serving requires journal mode without projection",
-                              code="projection_unsupported")
-        validate_binding(host, port, allow_dynamic=True)
-        if (host, port, token) != (config.host, config.port, config.service_token):
-            raise ConfigError("Listener differs from configured binding")
-        family = socket.AF_INET6 if ip_address(host).version == 6 else socket.AF_INET
-        with socket.socket(family, socket.SOCK_STREAM) as listener:
-            listener.bind((host, port))
-            listener.listen(128)
-            listener.setblocking(False)
-            bound_port = listener.getsockname()[1]
-            identity = InstanceIdentity(authority.authority_id, authority.epoch_id,
-                                        f"http://{validate_binding(host, bound_port)}/mcp")
+    validate_binding(host, port, allow_dynamic=True)
+    if (host, port, token) != (config.host, config.port, config.service_token):
+        raise ConfigError("Listener differs from configured binding")
+    family = socket.AF_INET6 if ip_address(host).version == 6 else socket.AF_INET
+    with socket.socket(family, socket.SOCK_STREAM) as listener:
+        listener.bind((host, port))
+        listener.listen(128)
+        listener.setblocking(False)
+        bound_port = listener.getsockname()[1]
+        identity = InstanceIdentity(authority.authority_id, authority.epoch_id,
+                                    f"http://{validate_binding(host, bound_port)}/mcp")
 
-            def shutdown():
-                runner.should_exit = True
+        def shutdown():
+            runner.should_exit = True
 
-            lifecycle = HttpLifecycle(config, identity, shutdown=shutdown, on_ready=on_ready)
-            app = create_app(authority, maintenance, token=token, host=host, port=bound_port,
-                             lifecycle=lifecycle)
+        lifecycle = HttpLifecycle(config, identity, shutdown=shutdown, on_ready=on_ready)
+        app = create_app(authority, maintenance, token=token, host=host, port=bound_port,
+                         lifecycle=lifecycle)
 
-            class PortableServer(uvicorn.Server):
-                async def startup(self, sockets=None):
-                    await super().startup(sockets=sockets)
-                    if not self.started or self.should_exit:
-                        raise AuthorityError("startup_failed", "HTTP listener startup failed")
-                    try:
-                        lifecycle.publish()
-                    except BaseException:
-                        await self.shutdown(sockets=sockets)
-                        raise
+        class PortableServer(uvicorn.Server):
+            async def startup(self, sockets=None):
+                await super().startup(sockets=sockets)
+                if not self.started or self.should_exit:
+                    raise AuthorityError("startup_failed", "HTTP listener startup failed")
+                try:
+                    lifecycle.publish()
+                except BaseException:
+                    await self.shutdown(sockets=sockets)
+                    raise
 
-            runner = PortableServer(uvicorn.Config(
-                app, host=host, port=bound_port, access_log=False, log_level="warning",
-                ws="none", proxy_headers=False, limit_concurrency=128, timeout_graceful_shutdown=None))
-            try:
-                runner.run(sockets=[listener])
-            except BaseException:
-                lifecycle.phase = "failed"
-                lifecycle.failure = "listener_failed"
-                raise
-            finally:
-                lifecycle.clear()
-            lifecycle.phase = "stopped"
-        return
-    app = create_app(authority, maintenance, token=token, host=host, port=port, projector=projector)
-    uvicorn.run(app, host=host, port=port, access_log=False, log_level="warning",
-                ws="none", limit_concurrency=128, timeout_graceful_shutdown=30)
+        runner = PortableServer(uvicorn.Config(
+            app, host=host, port=bound_port, access_log=False, log_level="warning",
+            ws="none", proxy_headers=False, limit_concurrency=128, timeout_graceful_shutdown=None))
+        try:
+            runner.run(sockets=[listener])
+        except BaseException:
+            lifecycle.phase = "failed"
+            lifecycle.failure = "listener_failed"
+            raise
+        finally:
+            lifecycle.clear()
+        lifecycle.phase = "stopped"

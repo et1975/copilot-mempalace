@@ -14,11 +14,10 @@ import httpx
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
-from authority_fixture import AUTHORITY, command, create, genesis, state_directory, uid
-from mempalace_tasks.authority import JournalAuthority
+from authority_fixture import AUTHORITY, LogClient, command, create, genesis, state_directory, uid
+from mempalace_tasks.authority import TaskAuthority
 from mempalace_tasks import cli, server
 from mempalace_tasks.client import TaskClientError, TaskServiceClient
-from mempalace_tasks.config import ConfigError
 from mempalace_tasks.discovery import connect, DiscoveryError
 from mempalace_tasks.launcher import stop
 from mempalace_tasks.maintenance import LeaseMaintenance
@@ -27,15 +26,14 @@ from mempalace_tasks.server import create_app, PUBLIC_OPERATIONS
 from mempalace_tasks.server_identity import InstanceIdentity, verify_proof
 from portable_lifecycle_fixture import ConfigurationFixture, ROOT_TOKEN
 from service_fixture import SocketRunner, TOKEN
-from test_journal_authority import JournalClient
 
 
 @contextmanager
 def journal_service(log=None, directory=None):
     owned_directory = state_directory() if directory is None else None
     directory = owned_directory.name if owned_directory is not None else directory
-    log = JournalClient() if log is None else log
-    owner = JournalAuthority(AUTHORITY, log, directory, initialize=True,
+    log = LogClient() if log is None else log
+    owner = TaskAuthority(AUTHORITY, log, directory, initialize=True,
                              backoff=lambda _: None).start()
     if owner.state.configuration is None:
         owner.execute_current(genesis())
@@ -83,14 +81,6 @@ def sdk_call(url, token, name, arguments):
 
 
 class JournalHttpTests(unittest.TestCase):
-    def test_embedded_journal_app_also_refuses_legacy_projection_checkpoint(self):
-        with journal_service() as (owner, _, _):
-            maintenance = LeaseMaintenance(owner.bound_current(), owner.clock_source,
-                                           system_actor="system", recovery_actor="operator")
-            with self.assertRaises(ConfigError) as caught:
-                create_app(owner, maintenance, token=TOKEN, port=12345, projector=object())
-            self.assertEqual(caught.exception.code, "projection_unsupported")
-
     def test_discovery_requires_epoch_for_all_public_journal_mutations(self):
         with journal_service() as (_, _, url):
             tools = sdk_tools(url)
@@ -101,7 +91,7 @@ class JournalHttpTests(unittest.TestCase):
                                      "string")
             self.assertEqual(set(tools["mptask_outcome"]["required"]), {"epoch_id", "command_id"})
             self.assertEqual(tools["mptask_outcome"]["properties"]["epoch_id"]["type"],
-                             ["string", "null"])
+                             "string")
 
     def test_missing_stale_epoch_rejected_before_write_and_valid_epoch_is_not_domain_input(self):
         with journal_service() as (owner, log, url):
@@ -121,7 +111,7 @@ class JournalHttpTests(unittest.TestCase):
 
     def test_old_receipt_is_read_only_scoped_evidence_after_restart(self):
         with state_directory() as directory:
-            log = JournalClient()
+            log = LogClient()
             with journal_service(log, directory) as (owner, _, url):
                 old_epoch = owner.epoch_id
                 request = {key: value for key, value in create().items() if key != "operation"}
@@ -157,7 +147,7 @@ class JournalHttpTests(unittest.TestCase):
                 owner, "outcome", side_effect=RuntimeError("owned failure")):
             client = TaskServiceClient(url, token=TOKEN)
             with self.assertRaises(TaskClientError) as caught:
-                client.call_tool("mptask_outcome", {"epoch_id": None, "command_id": uid(10)})
+                client.call_tool("mptask_outcome", {"epoch_id": owner.epoch_id, "command_id": uid(10)})
             self.assertFalse(caught.exception.ambiguous)
 
     def test_stale_claim_does_not_trigger_request_driven_maintenance(self):
@@ -173,25 +163,16 @@ class JournalHttpTests(unittest.TestCase):
                 self.assertEqual(caught.exception.code, "stale_epoch")
                 self.assertFalse(caught.exception.ambiguous)
 
-    def test_null_epoch_resolves_imported_legacy_history_without_authorizing_it(self):
-        from authority_fixture import raw
-        from mempalace_tasks.protocol import LogState, fold_record, make_proposal
-
-        log, state = JournalClient(), LogState(AUTHORITY)
-        for request in (genesis(), create()):
-            event = raw(make_proposal(state, request, "2026-09-23T00:00:00Z"), len(log.events) + 1)
-            log.events.append(event)
-            fold_record(state, event)
-        with journal_service(log) as (_, _, url):
+    def test_outcome_requires_a_canonical_uuid_scope_before_reading_history(self):
+        with journal_service() as (owner, _, url):
             reader = TaskServiceClient(url, token=TOKEN)
-            result = reader.call_tool("mptask_outcome", {"epoch_id": None, "command_id": uid(2)})
-            self.assertEqual(result["resolution"], "committed")
-            self.assertIsNone(result["receipt"]["epoch_id"])
-            self.assertFalse(result["authorization"]["authorized"])
-            log.read_error = True
-            stale = reader.call_tool("mptask_outcome", {"epoch_id": None, "command_id": uid(2)})
-            self.assertFalse(stale["fresh"])
-            self.assertEqual(stale["reason"], "upstream_unavailable")
+            for epoch in (None, "", "not-uuid", uid(2).replace("-", "")):
+                with self.subTest(epoch=epoch), patch.object(
+                        owner, "outcome", side_effect=AssertionError("Invalid scope reached authority")):
+                    with self.assertRaises(TaskClientError) as caught:
+                        reader.call_tool("mptask_outcome", {"epoch_id": epoch, "command_id": uid(2)})
+                    self.assertEqual(caught.exception.code, "validation_error")
+                    self.assertFalse(caught.exception.ambiguous)
 
 
 class PortableServer:
@@ -205,7 +186,7 @@ class PortableServer:
                                             if key not in {"operation", "command_id"}}
         self.fixture.save()
         self.config = self.fixture.config
-        self.log = JournalClient()
+        self.log = LogClient()
         with patch.object(cli, "PalaceClient", return_value=self.log):
             cli.initialize(self.config)
         self.ready = threading.Event()
