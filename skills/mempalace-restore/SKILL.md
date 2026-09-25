@@ -8,13 +8,15 @@ description: Use when the user wants to restore, recover, import, or rebuild a m
 Recover a local MemPalace palace from a `restic` snapshot when `~/.mempalace/`
 is lost, corrupted, accidentally changed, or needs to roll back to an earlier
 state. MemPalace has no native backup/restore command; the `mempalace-backup`
-skill creates `restic` snapshots of `~/.mempalace/` excluding ephemeral
-`locks/`.
+skill creates `restic` snapshots of the HOME subtree excluding `locks/`.
+Task events, accepted history, epoch controls, complete source notes and native
+artifacts live in DATA/logstream.sqlite3 with DATA/replica.json. No matching
+external pending/head/clock recovery directory is required.
 
-**Default philosophy: make every restore reversible.** Stop writers, inspect the
-snapshot, move the current palace aside, then restore into place. Never
-overwrite `~/.mempalace/` as the first move unless this is full-machine disaster
-recovery and there is no current palace.
+**Default: validate private staging without touching the live target.**
+Publication is explicit, offline and reversible. Never restore directly over
+live files or rename the whole HOME directory: that relocates its cooperative
+lock namespace and allows a second lock inode.
 
 ## Restore runbook
 
@@ -31,16 +33,18 @@ avoid `--insecure-no-password`. See
 [`mempalace-backup`'s restic cheatsheet](../mempalace-backup/references/restic-cheatsheet.md)
 for repo setup and the full command menu.
 
-### 1. Stop writers
+### 1. Prepare the offline boundary before publication
 
-```bash
-mempalace daemon stop
-mempalace daemon status
-```
+Staging alone does not require stopping the live target. Before `--in-place`,
+stop task admission/workers, hubs (including read-only hubs), daemon/CLI/stdio
+writers and peer sync, and suppress all new launches/autostarters. Use their
+owners; never kill/adopt a discovered PID. Keep this boundary through later
+fresh sidecar activation and recovery.
 
-Restore when the palace is not actively being served. After swapping files,
-reopen it with MCP `mempalace_reconnect`, or restart the harness/MCP server if
-that tool is unavailable.
+The helper requires `--offline`, rejects active/indeterminate registered writers,
+and acquires real cooperative leases. The flag and missing registry records are
+not proofs of quiescence. Daemon-stop acknowledgement is not drain completion,
+and `daemon wait` requires a job ID, not a wait-for-stop invocation.
 
 ### 2. Pick a snapshot
 
@@ -54,31 +58,27 @@ restic find chroma.sqlite3
 Use `latest` only when you are confident the newest snapshot is the desired
 state. For rollback, choose the specific snapshot before the bad write.
 
-### 3. Restore safely, then swap
+### 3. Materialize and validate private staging
 
-Safe default: restore into a staging directory, inspect, then move into place.
-
-```bash
-restic restore <snapshot-id>:"$HOME/.mempalace" --target /tmp/palace-restore
-ls /tmp/palace-restore
-test -f /tmp/palace-restore/palace/.mempalace/origin.json
-
-mv ~/.mempalace ~/.mempalace.bak-$(date +%Y%m%d-%H%M%S)
-mv /tmp/palace-restore ~/.mempalace
-```
-
-Full-machine disaster recovery variant, after confirming there is no live
-palace to preserve:
+Use a preinstalled Python that can import the epoch-aware `mempalace_tasks`
+package (`PYTHONPATH=<repo>/sidecar/src` in a checkout), plus preinstalled restic
+and MemPalace CLI. Never install tools implicitly during restore.
 
 ```bash
-mkdir -p ~/.mempalace && restic restore <snapshot-id>:"$HOME/.mempalace" --target ~/.mempalace
+python3 ../mempalace-backup/scripts/palace_backup.py --palace ~/.mempalace \
+  restore <snapshot-id> --target ~/.mempalace-restore-stage --require-logstream
 ```
 
-Or restore the snapshot back to its original absolute locations:
-
-```bash
-restic restore <snapshot-id> --target /
-```
+The default target is a unique sibling of HOME; explicit targets must be disjoint
+and empty. Custom DATA layout comes from the snapshot's manifest/staged config,
+not old live config or ambient path variables. Global `--data-path` can select
+an in-HOME layout for old snapshots. Task history is replayed with the shared
+v1/v2 protocol, and replica, artifact hashes/sizes and links are verified.
+Use repeatable `--expected-authority <uuid>` when no captured manifest declares
+the expected authorities. Missing required task data is never a legacy fallback.
+Required membership comes from the selected snapshot and explicit requirements,
+not newer live state. Authorities created after that snapshot may legitimately
+be absent; explicitly requiring one still rejects the older snapshot.
 
 Inspect the restored tree shape. `restic` stores full absolute source paths, so
 a plain `restic restore <snapshot-id> --target ~/.mempalace` recreates the whole
@@ -88,30 +88,47 @@ path under the target, for example
 `config.json`, `palace/`, `knowledge_graph.sqlite3`, `wal/`, and `tunnels.json`
 land directly under the restore target.
 
-### 4. Rebuild and validate the index
+### 4. Activate in private staging, then publish offline
 
 ```bash
-mempalace repair
-mempalace repair-status
+python3 ../mempalace-backup/scripts/palace_backup.py --palace ~/.mempalace \
+  restore <snapshot-id> --target ~/.mempalace-restore-stage \
+  --from-stage --in-place --offline --require-logstream
 ```
 
-`repair-status` is read-only. Expect SQLite row count and HNSW element count to
-match. If they do not, use
-[references/disaster-recovery.md](references/disaster-recovery.md) and
-[`mempalace` HNSW recovery](../mempalace/references/hnsw-recovery.md).
+`--from-stage` skips restic and uses the existing private tree. While holding
+cooperative leases, the helper appends a fresh v2 epoch for every initialized
+authority using the installed direct `mempalace --palace <stage-DATA> logstream
+append` API, then replays to prove each epoch accepted/current. Task IDs,
+accepted domain history, holds, full notes, artifact hashes/metadata/links and
+replica identity must remain unchanged. The timestamp is no earlier than
+replayed effective-time high water. No task claims/workers are created.
 
-If rows were poisoned by an interrupted index update, try:
+Only then are contents published using reversible same-filesystem moves.
+HOME itself, canonical lock inodes and existing `locks/`/`server/` directories
+stay in place. Old contents remain in a unique sibling `.bak-*` directory.
+SQLite writer probes are bounded; database handles close before native Windows
+renames while cooperative leases remain held. Uncooperative raw file writers or
+new launches invalidate the required offline boundary.
 
-```bash
-mempalace repair --mode max-seq-id
-mempalace repair-status
-```
+Any partial append or publication is an error, not success. Keep staging and
+rollback contents for inspection. See the administrative marker recovery steps
+in [disaster recovery](references/disaster-recovery.md). Nothing is started
+automatically, including repair, a hub, daemon, worker or service.
 
-### 5. Reopen the running MCP server
+### 5. Deliberately reopen and recover
 
-Use MCP `mempalace_reconnect` after external file swaps so the server
-invalidates caches and reopens the restored palace. If MCP is not available,
-restart the harness or MCP server instead.
+After publication, an epoch-aware sidecar starts with another fresh successor
+and fences/reconciles inherited attempts before execution admission. Old v1
+sidecars cannot serve the new journal. Old pending/head/clock files, whether
+missing or from a discarded future, are ignored; never replay them into the
+restored palace. Reconnect is not a restore barrier or permission to leave an old
+hub running through publication.
+
+External effects still need reconciliation. Mesh origin-sequence rollback,
+transparent replicated failover and independent rollback detection are not
+provided; fresh task epochs do not repair replication provenance collisions.
+Do not resume peer reinjection for a restored single-hub authority.
 
 ### 6. Smoke test
 
@@ -159,15 +176,12 @@ restic check
 - `search`: known terms return hits, proving the embedder/origin pairing works.
 - `restic check`: the local backup repository is readable for future restores.
 
-If you perform manual SQLite checks and the `sqlite3` CLI is missing, Python's
-stdlib `sqlite3` module is enough:
-
-```bash
-python3 -c "import sqlite3;sqlite3.connect('DB').execute('PRAGMA wal_checkpoint(TRUNCATE)')"
-python3 -c "import sqlite3;print(sqlite3.connect('DB').execute('PRAGMA integrity_check').fetchone())"
-```
-
-`locks/` was excluded from backup and is ephemeral; do not try to restore it.
+The helper uses stdlib SQLite; no sqlite3 executable is required. A checkpoint
+is not an exclusion proof. `locks/` is excluded from snapshots but its canonical
+live inodes are permanent coordination objects: never unlink/replace them.
+If index repair is needed afterward, use the actual DATA path with
+`mempalace --palace <DATA> repair` / `repair-status` during a separate controlled
+maintenance window.
 
 ## Import a wing bundle
 

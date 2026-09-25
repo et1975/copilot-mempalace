@@ -12,102 +12,60 @@ on demand, with no cron/systemd installed by this skill.
 
 ## What's in the palace
 
-Everything lives under `~/.mempalace/`.
+The helper's `--palace` is the **HOME** subtree, default `~/.mempalace`.
+DATA defaults to HOME/palace but can be configured elsewhere. `--data-path`
+overrides the path environment/configuration. External data roots, links,
+hardlinked task storage and data under preserved control directories are
+refused rather than silently omitted. The table shows the default layout.
 
 | Path | Back up? | Notes |
 |---|---:|---|
 | `config.json`, `tunnels.json` | include | Small JSON config/link state. |
 | `knowledge_graph.sqlite3` plus `-wal`, `-shm` | include | SQLite KG store; checkpoint before snapshot. |
 | `palace/chroma.sqlite3` plus `-wal`, `-shm` | include | Chroma metadata; checkpoint before snapshot. |
+| `palace/logstream.sqlite3` plus `-wal`, `-shm` | include | Events, complete task protocol bodies, artifacts and their links share this database. |
+| `palace/replica.json` | include | Stable provenance identity; never rotate it as a restore epoch. |
+| `.palace-backup.json` | include | Captured layout, expected authorities and task-content digest; not another task authority store. |
 | `palace/<uuid>/*.bin` | include | HNSW vector index binaries. |
 | `palace/<uuid>.drift-*/` | include | Drift snapshots; keep for recovery context. |
 | `palace/.mempalace/origin.json` | **include** | Critical embedder identity; restoring without it breaks search. |
 | `wal/` | include | MemPalace write-ahead log. |
-| `locks/` | **exclude** | Ephemeral `mine_palace_*.lock` / `*.lock`; stale restores are harmful. |
+| `locks/` | **exclude** | Permanent cooperative lock inodes must remain at their canonical paths; never unlink or restore copies. |
 
 Never add an exclude that can hide `palace/.mempalace/origin.json`.
 
 ## Backup safety model
 
-### 1. Quiesce writers
+### 1. Establish an offline maintenance boundary
 
-Stop the opt-in long-lived daemon if it is running:
+Stop task admission/workers, writable and read-only hubs, CLI/stdio writers,
+daemon work and peer sync through their owners. Suppress new launches and
+autostarters for the entire capture. Do not kill/adopt discovered PIDs.
+`--offline` acknowledges this external condition; it does not prove it.
 
-```bash
-mempalace daemon status
-mempalace daemon stop
-mempalace daemon wait
-```
+Daemon-stop acknowledgement, mine-lock age, registry absence and successful WAL
+checkpointing are **not** all-writer quiescence. There is no
+`daemon wait` wait-for-stop command: that subcommand requires a job ID.
 
-Check for active mining/sweeping before the snapshot:
+### 2. Use the guarded helper for logstream/task storage
 
-```bash
-mempalace status
-ls -lt ~/.mempalace/locks/mine_palace_*.lock 2>/dev/null | head
-```
+The selected Python must already import the epoch-aware `mempalace_tasks`
+package. In a repository checkout, `PYTHONPATH=<repo>/sidecar/src` selects it.
+Require preinstalled tools; do not download/install during recovery.
 
-If a mine lock is fresh or `mempalace status` shows active work, wait or abort.
-Do **not** take a mid-mine snapshot. The live MCP server is hosted by the current
-harness and should not be killed mid-session; avoiding active mines plus SQLite
-WAL checkpointing is the mitigation.
+The helper refuses active or malformed/unreadable hub/daemon records, acquires
+the real current-user HOME-relative MemPalace writer lease, checkpoints existing
+KG/Chroma/logstream databases, then holds bounded-acquisition SQLite
+`BEGIN IMMEDIATE` writer exclusions through restic capture and verification.
+This keeps each main DB/WAL pair stable. It validates task history/artifacts and
+writes `.palace-backup.json` into the same HOME subtree before snapshotting.
 
-### 2. Checkpoint SQLite WALs
+The lease does not cover raw CLI/peer/file writes. SQLite exclusions cover
+ordinary database writes, not file replacement, HNSW mutation by an uncooperative
+process, or arbitrary new launches. Those remain prohibited by the offline
+maintenance boundary. Online task backup is not supported.
 
-Flush both SQLite databases so restic captures a single consistent main DB file:
-
-```bash
-sqlite3 ~/.mempalace/knowledge_graph.sqlite3 'PRAGMA wal_checkpoint(TRUNCATE);'
-sqlite3 ~/.mempalace/palace/chroma.sqlite3 'PRAGMA wal_checkpoint(TRUNCATE);'
-```
-
-If `command -v sqlite3` fails, use the Python fallback below instead; Python's
-`sqlite3` module is part of the standard library.
-
-```bash
-python3 - <<'PY'
-import os
-import sqlite3
-
-palace = os.path.expanduser("~/.mempalace")
-for db in ("knowledge_graph.sqlite3", "palace/chroma.sqlite3"):
-    con = sqlite3.connect(os.path.join(palace, db))
-    print(db, con.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone())
-    con.close()
-PY
-```
-
-If checkpointing cannot truncate because a writer still holds the WAL, prefer to
-abort and retry after writers stop. Emergency fallback: make explicit consistent
-SQLite copies and include them in the same restic snapshot with a clear tag:
-
-```bash
-STAGE=~/mempalace-backup-staging
-mkdir -p "$STAGE/palace"
-sqlite3 ~/.mempalace/knowledge_graph.sqlite3 "VACUUM INTO '$STAGE/knowledge_graph.sqlite3';"
-sqlite3 ~/.mempalace/palace/chroma.sqlite3 "VACUUM INTO '$STAGE/palace/chroma.sqlite3';"
-```
-
-Without the CLI, use the same Python module and parameterized `VACUUM INTO`:
-
-```bash
-python3 - <<'PY'
-import os
-import sqlite3
-
-palace = os.path.expanduser("~/.mempalace")
-stage = os.path.expanduser("~/mempalace-backup-staging")
-os.makedirs(os.path.join(stage, "palace"), exist_ok=True)
-for src, dest in (
-    ("knowledge_graph.sqlite3", "knowledge_graph.sqlite3"),
-    ("palace/chroma.sqlite3", "palace/chroma.sqlite3"),
-):
-    con = sqlite3.connect(os.path.join(palace, src))
-    con.execute("VACUUM INTO ?", (os.path.join(stage, dest),))
-    con.close()
-PY
-```
-
-### 3. Snapshot
+### 3. Capture
 
 Use environment variables for the local repo and password file; never hard-code
 the password and do not use `--insecure-no-password`.
@@ -116,21 +74,19 @@ the password and do not use `--insecure-no-password`.
 export RESTIC_REPOSITORY=/mnt/backup/mempalace-restic
 export RESTIC_PASSWORD_FILE=~/.config/mempalace-restic.pass
 
-restic backup ~/.mempalace \
-  --exclude ~/.mempalace/locks \
-  --tag palace \
-  --tag "$(hostname)"
+python3 scripts/palace_backup.py --palace ~/.mempalace \
+  backup --offline --require-logstream
 ```
 
-If using the `VACUUM INTO` fallback, include the staging path too:
+Add `--expected-authority <canonical-uuid>` for each known authority. A captured
+manifest also declares known task storage, so later missing data cannot silently
+become a legacy empty palace. `--force` and `--no-quiesce` do not bypass any task
+safety check. A busy database, corrupt logstream, missing declared storage or
+incomplete restore marker is an error.
 
-```bash
-restic backup ~/.mempalace ~/mempalace-backup-staging \
-  --exclude ~/.mempalace/locks \
-  --tag palace \
-  --tag "$(hostname)" \
-  --tag sqlite-vacuum-copy
-```
+Genuinely legacy palaces without logstream retain the old best-effort
+daemon/mine/checkpoint path and emergency `--force` behavior. That path is not
+a task-safe capture. Missing optional legacy logstream creates no database.
 
 ### 4. Verify
 
@@ -176,6 +132,9 @@ the **logical** exporter [`scripts/palace_wing.py`](scripts/palace_wing.py), whi
 reads a wing's contents straight from the palace SQLite and writes either a
 portable JSONL bundle or a human-readable markdown directory.
 
+Wing exports do not export the task journal. Durable tasks require the
+whole-palace logstream/artifact recovery unit above.
+
 ```bash
 # Export needs NO restic and NO mempalace import — it reads the palace SQLite directly.
 # --palace is the mempalace HOME dir (~/.mempalace), NOT the nested palace/ dir.
@@ -206,26 +165,26 @@ per-wing archival, migration, or cloning. Import is documented in the
 
 ## Helper script
 
-For a deterministic, idempotent version of the whole flow, use the bundled
-Python helper [`scripts/palace_backup.py`](scripts/palace_backup.py). It quiesces
-writers, checkpoints both SQLite WALs via Python's stdlib `sqlite3` (no CLI
-dependency), snapshots with the correct excludes/tags, and verifies — and it
-restores with restic's absolute-path-stripping subpath syntax. It forwards
-`--palace` to every `mempalace` subcommand so it never touches the wrong palace.
+The helper uses stdlib SQLite, preserves HOME versus DATA semantics, and passes
+the actual DATA directory to MemPalace CLI operations. Restore defaults to
+validation in private staging, without stopping/touching the live target.
+Publication preserves HOME's `locks/` and `server/` control directories.
 
 ```bash
 export RESTIC_REPOSITORY=/mnt/backup/mempalace-restic
 export RESTIC_PASSWORD_FILE=~/.config/mempalace-restic.pass
 
-./scripts/palace_backup.py backup                 # quiesce + checkpoint + snapshot + verify
-./scripts/palace_backup.py checkpoint             # WAL-checkpoint both DBs only
+./scripts/palace_backup.py backup --offline --require-logstream
+./scripts/palace_backup.py checkpoint --require-logstream  # not quiescence proof
 ./scripts/palace_backup.py verify                 # restic check + repair-status
-./scripts/palace_backup.py --dry-run backup       # echo commands without running them
+./scripts/palace_backup.py --dry-run backup --offline
 ```
 
 Restore lives in the same script (see the `mempalace-restore` skill):
-`./scripts/palace_backup.py restore <snapshot> --in-place`. Tests:
-`python3 scripts/test_palace_backup.py`.
+`./scripts/palace_backup.py restore <snapshot> --in-place --offline`.
+Tests use the helper's standalone runner, not unittest discovery:
+`python3 -W error scripts/test_palace_backup.py`, with the repository's
+`sidecar/src` and `sidecar/tests` on `PYTHONPATH` and an external temporary root.
 
 ## See also
 

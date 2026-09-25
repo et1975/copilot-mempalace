@@ -1,8 +1,10 @@
-"""Single-host serialized task authority with bounded, durable uncertainty recovery.
+"""Legacy file-backed authority and shared serialized decision/read machinery.
 
 Only execute/reconcile/start write recovery metadata or append records. Diagnostic
 reads may replay the log, but never settle, expire, recover, or clear pending work.
 The upstream append-order log is truth; local files are verified recovery metadata.
+JournalAuthority is a lazy export of the palace-only subclass, which replaces
+these local persistence hooks and requires epoch-bound requests.
 """
 
 from collections import Counter, OrderedDict
@@ -43,6 +45,8 @@ class AuthorityError(Exception):
 
 
 class TaskAuthority:
+    recovery_mode = "legacy"
+
     def __init__(self, authority_id, client, state_dir, *, clock, backoff=time.sleep):
         identifier(authority_id, "authority_id")
         if not callable(clock) or not callable(backoff):
@@ -55,9 +59,7 @@ class TaskAuthority:
         self._backoff = backoff
         self._mutex = threading.RLock()
         self._process = os.getpid()
-        self._owner = AuthorityLock(state_dir, authority_id)
-        self._pending_store = PendingStore(state_dir)
-        self._head_store = HeadStore(state_dir)
+        self._owner, self._pending_store, self._head_store = self._make_recovery_io()
         self._owned = False
         self._started = False
         self._log = LogState(authority_id)
@@ -71,6 +73,10 @@ class TaskAuthority:
         self._persistence_error = False
         self._snapshots = OrderedDict()
         self._cursor_key = secrets.token_bytes(32)
+
+    def _make_recovery_io(self):
+        return (AuthorityLock(self.state_dir, self.authority_id),
+                PendingStore(self.state_dir), HeadStore(self.state_dir))
 
     def _same_process(self):
         if os.getpid() != self._process:
@@ -98,7 +104,8 @@ class TaskAuthority:
             except AuthorityError as error:
                 if mutation is not None and mutation["ambiguous"]:
                     error.ambiguous = True
-                if error.code in {"log_rollback", "outcome_unknown", "missing_state", "clock_error"}:
+                if error.code in {"log_rollback", "outcome_unknown", "missing_state", "clock_error",
+                                  "migration_required"}:
                     self._verified = False
                     self._last_error = {"code": error.code}
                 raise
@@ -259,7 +266,15 @@ class TaskAuthority:
                     remaining.remove(checkpoint)
         if remaining:
             raise AuthorityError("log_rollback", "Verified raw prefix is absent")
+        self._check_protocol_mode(rebuilt)
         return rebuilt
+
+    def _check_protocol_mode(self, log):
+        if self.recovery_mode == "legacy" and log.epoch_id is not None:
+            raise AuthorityError(
+                "migration_required",
+                "This journal requires epoch-bound recovery; use a journal-mode authority",
+            )
 
     def _refresh_locked(self, *, verify_prefix=False):
         saved = self._read_checkpoint()
@@ -285,6 +300,7 @@ class TaskAuthority:
                     if error.code == "unknown_cursor":
                         raise AuthorityError("log_rollback", "Verified raw cursor disappeared") from error
                     raise
+        self._check_protocol_mode(rebuilt)
         now = self._now()
         if (rebuilt.state.last_event_at is not None
                 and instant(now) < instant(rebuilt.state.last_event_at)):
@@ -319,13 +335,20 @@ class TaskAuthority:
         self._last_error = None
         return outcome
 
+    def _record_pending(self, proposal):
+        self._pending_store.write(proposal)
+        self._pending = {"proposal": proposal, "settlement": None}
+
+    def _record_settlement(self, settlement):
+        self._pending_store.attach_settlement(settlement)
+        self._pending["settlement"] = settlement
+
     def _resolve_pending(self, *, force_settlement=False):
         outcome = self._check_pending_outcome()
         if outcome is not None and not force_settlement:
             return self._finish_pending(outcome)
         settlement = make_settlement(self._pending["proposal"])
-        self._pending_store.attach_settlement(settlement)
-        self._pending["settlement"] = settlement
+        self._record_settlement(settlement)
         last_code = None
         for delay in (1, 2, 4):
             try:
@@ -420,8 +443,7 @@ class TaskAuthority:
                 return self._receipt(known, replayed=True)
             self._check_boot_command(normalized)
             proposal = make_proposal(self._log, normalized, self._now())
-            self._pending_store.write(proposal)
-            self._pending = {"proposal": proposal, "settlement": None}
+            self._record_pending(proposal)
             mutation["ambiguous"] = True
             uncertain = False
             try:
@@ -714,3 +736,10 @@ class TaskAuthority:
                      "after_record_seq": after_record_seq}, rows)
                 offset = 0
             return self._page(snapshot_id, offset, limit)
+
+
+def __getattr__(name):
+    if name == "JournalAuthority":
+        from .journal_authority import JournalAuthority
+        return JournalAuthority
+    raise AttributeError(name)

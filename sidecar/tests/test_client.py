@@ -95,8 +95,10 @@ class OwnedServer:
             ),
         )
 
-        async def tool(value: dict | None = None, command_id: str | None = None):
-            self.calls.append({"value": value, "command_id": command_id})
+        async def tool(value: dict | None = None, command_id: str | None = None,
+                       expected_epoch: str | None = None):
+            self.calls.append({"value": value, "command_id": command_id,
+                               **({"expected_epoch": expected_epoch} if expected_epoch is not None else {})})
             await asyncio.sleep(self.delays.get("tool", 0))
             if isinstance(self.response, types.CallToolResult):
                 return self.response
@@ -112,7 +114,7 @@ class OwnedServer:
 
         for name in (
             "mptask_snapshot", "mptask_get", "mptask_list", "mptask_ready",
-            "mptask_history", "mptask_health", "mptask_wait_ready",
+            "mptask_history", "mptask_health", "mptask_wait_ready", "mptask_outcome",
             "mptask_create", "mptask_future_write",
         ):
             sdk.add_tool(tool, name=name, structured_output=False)
@@ -447,7 +449,8 @@ class ClientTests(unittest.TestCase):
     def test_maps_rpc_error_after_dispatch_conservatively(self):
         with OwnedServer() as server:
             server.rpc_error_method = "tools/call"
-            for name, ambiguous in (("mptask_get", False), ("mptask_future_write", True)):
+            for name, ambiguous in (("mptask_get", False), ("mptask_outcome", False),
+                                    ("mptask_future_write", True)):
                 with self.subTest(name=name):
                     with self.assertRaises(TaskClientError) as raised:
                         server.client().call_tool(name, {})
@@ -510,7 +513,7 @@ class ClientTests(unittest.TestCase):
             server.delays = {"tool": 0.2}
             for name in (
                 "mptask_snapshot", "mptask_get", "mptask_list", "mptask_ready",
-                "mptask_history", "mptask_health", "mptask_wait_ready",
+                "mptask_history", "mptask_health", "mptask_wait_ready", "mptask_outcome",
             ):
                 with self.subTest(name=name):
                     with self.assertRaises(TaskClientError) as raised:
@@ -637,6 +640,7 @@ class ClientTests(unittest.TestCase):
                         server.client().call_tool("mptask_create", {"command_id": COMMAND_ID})
                     self.assertEqual(raised.exception.code, "invalid_response")
                     self.assertTrue(raised.exception.ambiguous)
+
             for missing in abandoned_receipt():
                 with self.subTest(missing=missing):
                     server.result = abandoned_receipt()
@@ -644,6 +648,23 @@ class ClientTests(unittest.TestCase):
                     with self.assertRaises(TaskClientError) as raised:
                         server.client().call_tool("mptask_create", {"command_id": COMMAND_ID})
                     self.assertTrue(raised.exception.ambiguous)
+
+    def test_journal_abandonment_must_match_frozen_epoch_without_retry_or_upgrade(self):
+        epoch = "22222222-2222-4222-8222-222222222222"
+        with OwnedServer() as server:
+            args = {"command_id": COMMAND_ID, "expected_epoch": epoch}
+            server.result = {**abandoned_receipt(), "epoch_id": epoch}
+            self.assertEqual(server.client().call_tool("mptask_create", args)["epoch_id"], epoch)
+            for invalid in (None, "", "not-an-epoch", COMMAND_ID, 1):
+                with self.subTest(epoch=invalid):
+                    before = len(server.calls)
+                    server.result = {**abandoned_receipt(), "epoch_id": invalid}
+                    with self.assertRaises(TaskClientError) as raised:
+                        server.client().call_tool("mptask_create", args)
+                    self.assertEqual(raised.exception.code, "invalid_response")
+                    self.assertTrue(raised.exception.ambiguous)
+                    self.assertEqual(server.calls[before:],
+                                     [{"value": None, "command_id": COMMAND_ID, "expected_epoch": epoch}])
 
     def test_abandonment_requires_a_canonical_requested_command_identity(self):
         with OwnedServer() as server:
@@ -762,7 +783,7 @@ class ClientTests(unittest.TestCase):
         with OwnedServer() as server:
             for name in (
                 "mptask_health", "mptask_snapshot", "mptask_get", "mptask_list",
-                "mptask_ready", "mptask_history", "mptask_wait_ready",
+                "mptask_ready", "mptask_history", "mptask_wait_ready", "mptask_outcome",
             ):
                 for representation in ("both", "text", "structured"):
                     with self.subTest(name=name, representation=representation):

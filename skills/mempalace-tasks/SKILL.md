@@ -21,6 +21,11 @@ not a drawer, KG projection, local todo, or remembered assignment.
 Discover the sidecar's advertised `mptask_*` tools and argument schemas before
 calling them. Use the registered actor identity and actual fields; every mutation
 requires `command_id` and `actor`. Completion is `target="closed"`, not `"done"`.
+Journal-mode mutations additionally require `expected_epoch` from a current
+read/health response's `epoch_id`. Freeze the authority, epoch, command ID and
+exact payload for each logical request; never update its epoch on retry.
+Legacy schemas remain separate. A new owner epoch revokes old execution
+authorization, even if owner/attempt/generation fields otherwise match.
 Missing service/schema support blocks tracked mutations; report it rather than
 starting another writer or substituting direct KG, drawer, or event-log writes.
 Native `mempalace_task_create` / `mempalace_event_ack` delegation acknowledgments
@@ -44,7 +49,8 @@ Before starting or resuming work:
    attempt/generation to the host packet, not merely any authorized task.
    A receipt's original `response`/`tasks` remain historical. `input.json` may hold
    a preparing-time snapshot; obtain a fresh read, not a mutation just to get
-   authorization. Revalidate on resumption, conflict or changed generation.
+   authorization. Revalidate on resumption, conflict or changed generation/epoch.
+   Historical `mptask_outcome` lookup never grants current authorization.
 
 The registered host supervisor owns renewal, durable checkpoint reporting, worker
 containment, and physical settlement/recovery attestations. It renews with
@@ -97,9 +103,16 @@ actor. Source-free admission is an explicit registered coordinator/operator acti
 
 | Observed command outcome | Safe next action |
 |---|---|
-| Timeout, `outcome_unknown`, pending, or ambiguous failure | Preserve the exact command ID and payload. Resolve/retry that request through the authority; absence from one read is not abandonment. |
+| Timeout, `outcome_unknown`, pending, or ambiguous failure | Preserve authority, original epoch, exact command ID and payload. Resolve/retry that same scoped request; never substitute a newly read epoch. Absence from one read is not abandonment. |
 | Committed, including a replay | Use the recorded result; independently revalidate current execution authorization. |
 | Confirmed terminal `outcome="abandoned"` | That ID is permanently resolved. Re-read state and authority; if the operation is still needed, submit a **new command ID**. Preserve the discovery's stable `intent_key`. |
+
+In journal mode, resolve old requests through
+`mptask_outcome(epoch_id=ORIGINAL_EPOCH, command_id=ORIGINAL_ID)`; `epoch_id=null`
+selects legacy history. Reconnecting can supply a new transport credential but
+must not upgrade the request's epoch. `resolution="not_recorded"` is not confirmed
+abandonment or proof that external effects did not occur. A historical receipt
+does not renew a lease or authorize execution; re-read current task authorization.
 
 Recovery/settlement evidence must reflect actual effects:
 
@@ -126,8 +139,10 @@ drawers and KG projections are historical, not authorization. Inspection must no
 claim, renew, sweep, reconcile, or silently start a writer.
 Diagnostic config/token reads validate regular files and required permissions,
 then fail explicitly if invalid. They do not create or chmod files or parent
-directories. Only explicit init may create its own credential/state artifacts;
-private-state storage helpers are not general-purpose config readers.
+directories. Only explicit init may create a missing service credential;
+journal-mode owner activation may create disposable runtime coordination.
+Neither is read-only inspection, and private storage helpers are not
+general-purpose config readers.
 
 An empty ready frontier is **not** goal completion. Inspect running, blocked,
 deferred, recovering, quarantined, and proposed work. Only an authorized

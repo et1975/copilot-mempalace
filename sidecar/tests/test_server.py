@@ -264,6 +264,8 @@ class ServerTests(unittest.TestCase):
                 self.assertNotIn(TOKEN, response.text)
             headers = {"Authorization": f"Bearer {TOKEN}"}
             self.assertEqual(http.post(service.url + "/", json={}, headers=headers).status_code, 404)
+            self.assertEqual(http.post(service.url.removesuffix("/mcp") + "/control/stop",
+                                       json={}, headers=headers).status_code, 404)
             for extra, status in (
                 ({"Host": "127.0.0.1:1"}, 421), ({"Host": "evil.invalid"}, 421),
                 ({"Origin": "http://127.0.0.1:1"}, 403), ({"Origin": "null"}, 403),

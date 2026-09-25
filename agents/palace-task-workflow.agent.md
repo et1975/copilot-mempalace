@@ -17,6 +17,7 @@ tools:
   - mempalace-tasks/mptask_snapshot
   - mempalace-tasks/mptask_get
   - mempalace-tasks/mptask_history
+  - mempalace-tasks/mptask_outcome
   - mempalace-tasks/mptask_ready
   - mempalace-tasks/mptask_wait_ready
   - mempalace-tasks/mptask_bootstrap
@@ -75,8 +76,13 @@ Read service health and list owned tasks with `mptask_snapshot` using
 `mptask_get`; match current owner/attempt/generation against the host packet and
 check its derived authorization, live lease, profile readiness, checkpoint,
 blockers and resources. A freshly evaluated receipt can also establish current
-authorization; preparing-time `input.json` cannot. No mutation is required just
-to obtain authorization. Historical pages/assignments aid discovery, not
+authorization; historical `mptask_outcome` lookup and preparing-time `input.json`
+cannot. In journal mode, read the current `epoch_id` and supply `expected_epoch`
+on each new mutation. Freeze authority/epoch/command ID/payload together;
+reconnection must not upgrade an ambiguous request's epoch. A new epoch requires
+fresh task authorization even when owner/attempt/generation appear unchanged.
+No mutation is required just to obtain authorization.
+Historical pages/assignments aid discovery, not
 authorization. If a lease is stale or recovery pending, hand it to the registered
 supervisor rather than resume or manufacture a replacement.
 
@@ -158,8 +164,10 @@ Compare durable results against task acceptance. Have the live owner request
 version, summary and evidence only when execution-class completion requirements
 are met.
 Integration failures are evidence for bounded follow-up work, not fabricated
-success. Resolve uncertain command outcomes using the skill's same-ID versus
-terminal-abandoned/new-ID rules.
+success. Resolve uncertain command outcomes using the skill's same-scoped-request
+versus terminal-abandoned/new-ID rules. In journal mode use `mptask_outcome` with
+the original `epoch_id` (`null` for legacy history) and `command_id`; a historical
+receipt or `not_recorded` result is not current authorization or effect proof.
 
 Respect task backoff, deadlines and retry budget. A quarantined branch is a
 reported escalation for an explicit operator decision; unrelated eligible work

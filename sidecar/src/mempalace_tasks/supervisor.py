@@ -2,6 +2,9 @@
 
 step() is deterministic with an injected authority clock. A separate per-process
 watchdog enforces the last CONFIRMED authorization during blocked network calls.
+elapsed_time supplies seconds on one shared deadline basis; by default it is
+suspend-inclusive continuous time. A clock fault latches until a new supervisor
+is constructed; stopping owned processes alone does not reconcile their effects.
 Native hosts need a real identity/stop/isolation/reconciliation adapter; native
 Copilot cancellation or /fleet integration is deliberately not advertised.
 """
@@ -10,13 +13,22 @@ from __future__ import annotations
 import copy
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from .domain import ready_tasks, task_eligibility
-from .execution import ExecutionError, LocalProfile, OwnedProcess, Workspace, read_checkpoint, read_result
+from .execution import (
+    DeadlineClock, ExecutionError, LocalProfile, OwnedProcess, Workspace,
+    read_checkpoint, read_result, require_process_supervision,
+)
 from .journal import JsonStore
 from .maintenance import MutationRequests, error_record, execution_tokens, instant
+from .platform_support import continuous_time_ns
+
+
+def _continuous_seconds():
+    return continuous_time_ns() / 1_000_000_000
 
 
 @dataclass
@@ -40,7 +52,8 @@ class Worker:
 
 class HostSupervisor:
     def __init__(self, authority, clock, maintenance, *, supervisor_id, worker_id,
-                 profiles, pool_size=1, filters=None, stop_margin_seconds=5):
+                 profiles, pool_size=1, filters=None, stop_margin_seconds=5,
+                 elapsed_time: Callable[[], float] | None = None):
         if type(pool_size) is not int or not 1 <= pool_size <= 100:
             raise ValueError("pool_size must be in 1..100")
         if type(stop_margin_seconds) not in {int, float} or not 3 <= stop_margin_seconds <= 60:
@@ -58,6 +71,10 @@ class HostSupervisor:
                     not isinstance(self.filters[field], list)
                     or any(not isinstance(value, str) or not value for value in self.filters[field])):
                 raise ValueError("Task/resource filters must be lists of nonempty strings")
+        require_process_supervision()
+        source = _continuous_seconds if elapsed_time is None else elapsed_time
+        self.elapsed_time = source if isinstance(source, DeadlineClock) else DeadlineClock(source)
+        self.elapsed_time()
         with authority.serialized():
             config = authority.state.configuration or {}
             supervisor = config.get("supervisors", {}).get(supervisor_id, {})
@@ -90,10 +107,10 @@ class HostSupervisor:
     def _view(self):
         with self.authority.serialized():
             # Persistence latency must consume, never extend, the execution window.
-            monotonic_anchor = time.monotonic()
+            elapsed_anchor = self.elapsed_time()
             state, now = self.authority.state, instant(self.clock.now())
             health = self.authority.health()
-            return state, now, self.clock.pending_reboot, monotonic_anchor, health
+            return state, now, self.clock.pending_reboot, elapsed_anchor, health
 
     @staticmethod
     def _current(health):
@@ -134,7 +151,7 @@ class HostSupervisor:
             snapshot["lease_expires_at"], snapshot["attempt"]["progress_deadline"],
             snapshot["attempt"]["hard_deadline"]))
 
-    def _confirmed(self, worker, task, now, monotonic_anchor, receipt, health):
+    def _confirmed(self, worker, task, now, elapsed_anchor, receipt, health):
         if not self._current(health):
             raise ExecutionError("authority_not_current", "Unverified projection cannot authorize execution")
         original = self._receipt_task(receipt, worker.task_id)
@@ -147,11 +164,11 @@ class HostSupervisor:
                 or original["attempt"]["owner"] != self.worker_id):
             raise ExecutionError("stale_generation", "No current owned execution authorization")
         until = self._lease_limit(task, original)
-        worker.confirmed_lease = until
-        worker.next_renew = now + timedelta(seconds=task["policy"]["renewal_seconds"])
-        cutoff = monotonic_anchor + (until - now).total_seconds() - self.stop_margin
+        cutoff = elapsed_anchor + (until - now).total_seconds() - self.stop_margin
         if worker.process:
             worker.process.confirm_deadline(cutoff)
+        worker.confirmed_lease = until
+        worker.next_renew = now + timedelta(seconds=task["policy"]["renewal_seconds"])
         return cutoff
 
     def _stop(self, worker):
@@ -202,7 +219,7 @@ class HostSupervisor:
         return False
 
     def _accept_receipt(self, worker, receipt, result):
-        state, now, reboot, monotonic_anchor, health = self._view()
+        state, now, reboot, elapsed_anchor, health = self._view()
         if not self._require_current(health, result):
             return False
         purpose = worker.purpose
@@ -211,7 +228,7 @@ class HostSupervisor:
         if purpose in {"started", "renew"}:
             cutoff = None
             if not reboot and self._matches(worker, task) and task["status"] == "in_progress":
-                cutoff = self._confirmed(worker, task, now, monotonic_anchor, receipt, health)
+                cutoff = self._confirmed(worker, task, now, elapsed_anchor, receipt, health)
             if purpose == "started":
                 worker.phase = "running"
                 if (not self._closing and not reboot and not worker.failure
@@ -221,7 +238,7 @@ class HostSupervisor:
                         and worker.confirmed_lease > now + timedelta(seconds=self.stop_margin)):
                     worker.quiescence_unknown = True
                     worker.process = OwnedProcess(
-                        worker.profile, worker.workspace, deadline=cutoff)
+                        worker.profile, worker.workspace, deadline=cutoff, elapsed_time=self.elapsed_time)
                     worker.quiescence_unknown = False
                     result["started"] += 1
                 else:
@@ -521,6 +538,13 @@ class HostSupervisor:
                     result["queued"] = len(self._ready(state, now))
             except Exception as error:
                 result["errors"].append(error_record(error, "step"))
+                if self.elapsed_time.error is not None:
+                    for worker in [*self.workers.values(), *self._recoveries.values()]:
+                        worker.failure = self.elapsed_time.error.code
+                        try:
+                            self._stop(worker)
+                        except Exception as stop_error:
+                            result["errors"].append(error_record(stop_error, "stop"))
             return self._finish(result)
 
     def _finish(self, result):
@@ -529,12 +553,15 @@ class HostSupervisor:
         return result
 
     def health(self):
-        return {"ok": (self._last is None or not self._last["errors"])
+        return {"ok": self.elapsed_time.error is None
+                and (self._last is None or not self._last["errors"])
                 and not (self._recoveries or self._claims or self._claim_receipts or self.requests.pending)
                 and not any(w.pending or w.pending_receipt or (w.process and w.process.error)
                             for w in self.workers.values()),
                 "active": len(self.workers), "pending_claims": len(self._claims),
                 "unresolved_recoveries": len(self._recoveries), "peak_workers": self._peak,
+                "clock_error": (error_record(self.elapsed_time.error, "clock")
+                                if self.elapsed_time.error is not None else None),
                 "last_step": copy.deepcopy(self._last)}
 
     def close(self):

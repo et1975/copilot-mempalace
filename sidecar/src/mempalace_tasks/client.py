@@ -20,7 +20,7 @@ from mcp.client.streamable_http import streamable_http_client
 
 _READ_TOOLS = frozenset({
     "mptask_snapshot", "mptask_get", "mptask_list", "mptask_ready",
-    "mptask_history", "mptask_health", "mptask_wait_ready",
+    "mptask_history", "mptask_health", "mptask_wait_ready", "mptask_outcome",
 })
 _CLIENT_IO = ContextVar("task_client_io", default=False)
 
@@ -112,11 +112,20 @@ def _redact(value, token):
     return value
 
 
-def _valid_abandonment(payload, requested_command_id):
-    if set(payload) != {
+def _valid_abandonment(payload, requested_command_id, requested_epoch=None):
+    fields = {
         "ok", "outcome", "command_id", "event_id", "ordinal", "replayed",
         "response", "tasks", "authorization",
-    }:
+    }
+    if requested_epoch is not None:
+        fields.add("epoch_id")
+        try:
+            if (type(payload.get("epoch_id")) is not str or payload["epoch_id"] != requested_epoch
+                    or str(UUID(payload["epoch_id"])) != payload["epoch_id"]):
+                return False
+        except ValueError:
+            return False
+    if set(payload) != fields:
         return False
     command_id = payload["command_id"]
     event_id = payload["event_id"]
@@ -191,7 +200,7 @@ def _valid_read_diagnostic(payload):
     )
 
 
-def _decode_result(result, token, requested_command_id, name):
+def _decode_result(result, token, requested_command_id, name, requested_epoch=None):
     try:
         structured = result.structuredContent
         text = None
@@ -218,7 +227,7 @@ def _decode_result(result, token, requested_command_id, name):
 
     diagnostic = name in _READ_TOOLS and not result.isError and _valid_read_diagnostic(payload)
     if payload.get("outcome") == "abandoned":
-        if result.isError or not _valid_abandonment(payload, requested_command_id):
+        if result.isError or not _valid_abandonment(payload, requested_command_id, requested_epoch):
             raise TaskClientError("invalid_response", "Task service returned an invalid abandoned receipt")
     elif not diagnostic and (
         result.isError or payload.get("ok") is False or payload.get("error") is not None
@@ -405,7 +414,8 @@ class TaskServiceClient:
                                 raise TaskClientError("invalid_response", "Task service discovery exceeded its page limit")
                             dispatched = True
                             result = await session.call_tool(name, arguments)
-                            payload = _decode_result(result, self._token, arguments.get("command_id"), name)
+                            payload = _decode_result(result, self._token, arguments.get("command_id"),
+                                                     name, arguments.get("expected_epoch"))
             if incoming_error is not None:
                 raise incoming_error
             return payload

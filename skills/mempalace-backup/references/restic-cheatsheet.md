@@ -31,6 +31,20 @@ running. This is unrelated to `~/.mempalace/locks`, which backups exclude.
 
 ## Backup
 
+For logstream/task storage use the guarded helper from the skill directory:
+
+```bash
+python3 scripts/palace_backup.py backup --offline --require-logstream
+```
+
+Its preinstalled interpreter must import `mempalace_tasks`. Establish the offline
+writer/no-new-launch boundary first; the flag is only acknowledgement. The
+helper holds cooperative and SQLite writer exclusions while restic reads the
+single HOME root. Neither `--force` nor a standalone WAL checkpoint makes a live
+task backup safe.
+
+The raw command below is a restic syntax reference, not a task-consistency gate:
+
 ```bash
 restic backup ~/.mempalace \
   --exclude ~/.mempalace/locks \

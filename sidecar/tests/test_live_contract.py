@@ -5,13 +5,14 @@ import json
 import os
 from pathlib import Path
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import unittest
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from uuid import uuid4
 
 from mempalace_tasks.palace import PalaceClient
@@ -113,6 +114,90 @@ class LiveContractTests(unittest.TestCase):
         if self.log is not None:
             self.log.close()
             self.log = None
+
+    def test_journal_only_restore_over_real_hub_discards_future_local_state(self):
+        from authority_fixture import command, create, genesis
+        from mempalace_tasks.authority import AuthorityError
+        from mempalace_tasks.journal_authority import JournalAuthority
+
+        client = self.start_hub()
+        runtime = self.root / "runtime"
+        owner = JournalAuthority(self.authority, client, runtime, initialize=True).start()
+        self.addCleanup(owner.close)
+        owner.execute_current(genesis())
+        created = owner.execute(create(), expected_epoch=owner.epoch_id)["tasks"][0]
+        task_id = created["id"]
+        claimed = owner.execute(command(
+            3, "claim", "worker", task_id=task_id, expected_version=1,
+            supervisor_id="supervisor"), expected_epoch=owner.epoch_id)["tasks"][0]
+        owner.execute(command(
+            4, "attempt_report", "supervisor", task_id=task_id,
+            expected_version=claimed["version"], attempt_id=claimed["attempt"]["id"],
+            claim_generation=claimed["claim_generation"], report_kind="started",
+            evidence={"references": ["fixture:prepared"], "prepared": True}),
+            expected_epoch=owner.epoch_id)
+        self.assertTrue(owner.get(task_id)["authorization"]["authorized"])
+        original_epoch = owner.epoch_id
+        owner.close()
+        self.stop_hub()
+
+        frozen = self.root / "snapshot.sqlite3"
+        source = self.palace / "logstream.sqlite3"
+        with closing(sqlite3.connect(source.as_uri() + "?mode=ro", uri=True)) as reader:
+            with closing(sqlite3.connect(frozen)) as writer:
+                reader.backup(writer)
+                self.assertEqual(writer.execute("PRAGMA journal_mode=DELETE").fetchone()[0],
+                                 "delete")
+        replica = (self.palace / "replica.json").read_bytes()
+
+        client = self.start_hub()
+        future = JournalAuthority(self.authority, client, runtime).start()
+        self.addCleanup(future.close)
+        current = future.get(task_id)["task"]
+        note = command(5, "note", task_id=task_id, expected_version=current["version"],
+                       tag="future", text="This event is after the chosen snapshot.")
+        future.execute(note, expected_epoch=future.epoch_id)
+        future_proposal = json.loads(future.log.proposals[note["command_id"]])
+        future_epoch = future.epoch_id
+        future.close()
+        self.stop_hub()
+
+        shutil.copyfile(frozen, source)
+        for suffix in ("-wal", "-shm"):
+            source.with_name(source.name + suffix).unlink(missing_ok=True)
+        (self.palace / "replica.json").write_bytes(replica)
+        for name in ("pending.json", "verified_head.json", "clock.json", "projection.json"):
+            (runtime / name).write_bytes(b"discarded future; deliberately invalid JSON")
+
+        client = self.start_hub()
+        restored = JournalAuthority(self.authority, client, runtime).start()
+        self.addCleanup(restored.close)
+        self.assertNotIn(restored.epoch_id, (original_epoch, future_epoch))
+        self.assertEqual(set(restored.state.tasks), {task_id})
+        self.assertFalse(restored.get(task_id)["authorization"]["authorized"])
+        self.assertEqual(restored.state.tasks[task_id]["automatic_retries_used"], 0)
+        with self.assertRaises(AuthorityError) as stale:
+            restored.execute(note, expected_epoch=future_epoch)
+        self.assertEqual(stale.exception.code, "stale_epoch")
+        self.assertIsNone(restored.outcome(future_epoch, note["command_id"])["receipt"])
+
+        client.append_event(future_proposal)
+        restored.refresh()
+        self.assertTrue(restored.health()["fresh"])
+        self.assertIsNone(restored.outcome(future_epoch, note["command_id"])["receipt"])
+        self.assertEqual(restored.log.history[-1]["disposition"], "stale")
+        restored.close()
+
+        fresh_runtime = self.root / "fresh-runtime"
+        fresh = JournalAuthority(self.authority, client, fresh_runtime).start()
+        self.addCleanup(fresh.close)
+        self.assertEqual(set(fresh.state.tasks), {task_id})
+        self.assertFalse(fresh.get(task_id)["authorization"]["authorized"])
+        self.assertEqual({path.name for path in fresh_runtime.iterdir()}, {"authority.lock"})
+        self.assertTrue(all(
+            (runtime / name).read_bytes() == b"discarded future; deliberately invalid JSON"
+            for name in ("pending.json", "verified_head.json", "clock.json", "projection.json")
+        ))
 
     def payload(self, label):
         return {

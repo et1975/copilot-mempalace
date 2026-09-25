@@ -433,6 +433,117 @@ class PalaceTests(unittest.TestCase):
         stored = self.client.append_event(value)
         self.assertEqual("mptask.settle", stored["type"])
 
+    def test_epoch_and_scoped_envelopes_round_trip_complete_bodies_and_routing(self):
+        from mempalace_tasks.protocol import LogState, fold_record, make_epoch, make_proposal
+        from mempalace_tasks.protocol import make_settlement
+        from authority_fixture import AUTHORITY, NOW, genesis, uid
+
+        log = LogState(AUTHORITY)
+        barrier = make_epoch(log, uid(1001), uid(2001), NOW)
+        fold_record(log, self.client.append_event(barrier))
+        proposal = make_proposal(log, genesis(), NOW)
+        for payload in (proposal, make_settlement(proposal)):
+            fold_record(log, self.client.append_event(payload))
+        events = list(self.client.replay_events())
+        self.assertEqual([barrier, proposal, make_settlement(proposal)],
+                         [json.loads(event["body"]) for event in events])
+        self.assertEqual([uid(2001), uid(1), uid(1)],
+                         [event["correlation_id"] for event in events])
+        self.assertEqual(events[0]["metadata"], {
+            "authority_id": AUTHORITY, "activation_id": uid(2001), "epoch_id": uid(1001),
+        })
+        self.assertEqual(events[1]["metadata"], {
+            "authority_id": AUTHORITY, "command_id": uid(1), "epoch_id": uid(1001),
+        })
+        self.assertEqual(log.outcomes[uid(1)]["outcome"], "committed")
+        self.assertEqual(log.activation_event_id, "evt-000001")
+
+    def test_epoch_lost_reply_is_ambiguous_and_explicit_repeat_keeps_both_physical_rows(self):
+        from mempalace_tasks.protocol import LogState, fold_record, make_epoch
+        from authority_fixture import AUTHORITY, NOW, uid
+
+        log = LogState(AUTHORITY)
+        barrier = make_epoch(log, uid(1001), uid(2001), NOW)
+        self.client.discover()
+
+        def lost_reply(request):
+            self.hub.respond(request)
+            return WireResponse(disconnect=True)
+
+        self.hub.hook = lost_reply
+        self.assert_palace_error(
+            "transport_error", lambda: self.client.append_event(barrier), ambiguous=True,
+        )
+        self.assertEqual(len(self.hub.calls("mempalace_event_append")), 1)
+        self.hub.hook = None
+        self.client.append_event(barrier)
+        for event in self.client.replay_events():
+            fold_record(log, event)
+        self.assertEqual(len(self.hub.events), 2)
+        self.assertEqual(log.activation_event_id, "evt-000001")
+        self.assertEqual(log.raw_cursor, "evt-000002")
+        self.assertEqual(len(log.activation_attempts), 1)
+        self.assertEqual(log.history[-1]["disposition"], "duplicate")
+
+    def test_same_uuid_correlation_lists_both_epoch_scopes_without_deduplication(self):
+        from mempalace_tasks.protocol import LogState, fold_record, make_epoch, make_proposal
+        from mempalace_tasks.protocol import make_settlement
+        from authority_fixture import AUTHORITY, NOW, create, genesis, uid
+
+        log = LogState(AUTHORITY)
+        fold_record(log, self.client.append_event(make_proposal(log, genesis(), NOW)))
+        for number in (1, 2):
+            fold_record(log, self.client.append_event(
+                make_epoch(log, uid(1000 + number), uid(2000 + number), NOW)))
+            payload = make_settlement(make_proposal(log, create(), NOW))
+            fold_record(log, self.client.append_event(payload))
+        events = self.client.list_events(correlation_id=uid(2))
+        self.assertEqual([uid(1001), uid(1002)],
+                         [json.loads(event["body"])["epoch_id"] for event in events])
+        self.assertEqual(len(events), 2)
+
+    def test_discovery_rejects_append_enum_that_cannot_store_epoch_records(self):
+        self.hub.tools[0]["inputSchema"]["properties"]["type"]["enum"] = [
+            "mptask.command", "mptask.settle",
+        ]
+        self.assert_palace_error("unsupported_schema", self.client.discover)
+        self.assertEqual(self.hub.calls("mempalace_event_append"), [])
+
+    def test_epoch_routing_must_be_complete_bounded_and_unambiguous_before_dispatch(self):
+        from mempalace_tasks.protocol import LogState, make_epoch
+        from authority_fixture import AUTHORITY, NOW, uid
+
+        barrier = make_epoch(LogState(AUTHORITY), uid(1001), uid(2001), NOW)
+        for key, value in (("activation_id", ""), ("activation_id", "x" * 257),
+                           ("activation_id", " padded "), ("activation_id", "x\x00y"),
+                           ("epoch_id", None), ("epoch_id", []), ("schema_version", 1)):
+            with self.subTest(key=key, value=value):
+                self.assert_palace_error(
+                    "invalid_argument",
+                    lambda: self.client.append_event({**barrier, key: value}),
+                )
+        self.assertEqual(self.hub.calls("mempalace_event_append"), [])
+
+    def test_scoped_list_records_require_consistent_body_and_metadata_routing(self):
+        from mempalace_tasks.protocol import LogState, make_epoch
+        from authority_fixture import AUTHORITY, NOW, uid
+
+        barrier = make_epoch(LogState(AUTHORITY), uid(1001), uid(2001), NOW)
+        event = self.client.append_event(barrier)
+        variants = []
+        changed = copy.deepcopy(event)
+        changed["metadata"]["epoch_id"] = uid(9999)
+        variants.append(changed)
+        changed = copy.deepcopy(event)
+        changed["correlation_id"] = uid(9999)
+        variants.append(changed)
+        changed = copy.deepcopy(event)
+        changed["body"] = json.dumps({**barrier, "record_type": "mptask.command"})
+        variants.append(changed)
+        for changed in variants:
+            self.call_response(mcp_result({"events": [changed], "count": 1}))
+            self.assert_palace_error("invalid_event", self.client.list_events)
+
     def test_payload_size_invalid_json_and_routing_fail_before_mutation(self):
         for value in (
             [], {"record_type": "mptask.command"},

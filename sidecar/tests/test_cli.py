@@ -2,6 +2,7 @@
 
 from contextlib import redirect_stderr, redirect_stdout
 from copy import deepcopy
+from dataclasses import replace
 import io
 import json
 import os
@@ -74,6 +75,35 @@ class CliTests(unittest.TestCase):
         self.assertIn("configuration_conflict", err)
         self.assertEqual(self.log.sent, originals)
         self.assertNotIn(TOKEN, out + err)
+
+    def test_legacy_cli_propagates_migration_required_without_fallback_or_writes(self):
+        from test_journal_authority import JournalClient
+
+        self.log = JournalClient()
+        self.initialize()
+        legacy = load_config(self.path)
+        with patch.object(cli, "PalaceClient", return_value=self.log):
+            with cli.owned_authority(replace(legacy, schema_version=2)) as owner:
+                self.assertTrue(owner.health()["fresh"])
+                self.assertIsNotNone(owner.epoch_id)
+        original_events = deepcopy(self.log.events)
+        original_sent = deepcopy(self.log.sent)
+        original_files = {path.name: path.read_bytes() for path in legacy.state_dir.iterdir()
+                          if path.is_file()}
+        with patch.object(cli, "PalaceClient", return_value=self.log), patch.object(
+                cli, "serve", side_effect=AssertionError("Legacy listener must not start")):
+            for arguments in (("init",), ("serve",), ("reconcile",), ("project", "--resume")):
+                with self.subTest(command=arguments[0]):
+                    code, output, errors = self.call(*arguments)
+                    self.assertEqual(code, 1, (output, errors))
+                    self.assertEqual(output, "")
+                    self.assertTrue(errors.startswith("migration_required:"), errors)
+                    self.assertNotIn(TOKEN, errors)
+                    self.assertEqual(self.log.events, original_events)
+                    self.assertEqual(self.log.sent, original_sent)
+                    self.assertEqual(
+                        {path.name: path.read_bytes() for path in legacy.state_dir.iterdir()
+                         if path.is_file()}, original_files)
 
     def test_terminally_abandoned_genesis_retry_uses_a_new_persisted_uuid(self):
         self.log.behaviors = ["lost", "ok"]

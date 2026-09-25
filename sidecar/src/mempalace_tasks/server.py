@@ -5,9 +5,11 @@ from contextvars import ContextVar
 from copy import deepcopy
 import hashlib
 import hmac
+from ipaddress import ip_address
 import json
 import logging
 import re
+import socket
 import time
 
 import anyio
@@ -17,20 +19,23 @@ from mcp.server.lowlevel import Server
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
-from starlette.responses import Response
+from starlette.background import BackgroundTask
+from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 from .authority import AuthorityError
 from .codec import canonical_json
-from .config import validate_binding, validate_token
+from .config import ConfigError, _constant, _pairs, validate_binding, validate_token
 from .domain import CLASSES, CONTENT, DEFAULT_POLICY, EDGE_TYPES, EXECUTION, ROLES, SCHEMAS, STATUSES
 from .projection import ProjectionError, ProjectionRecord
+from .lifecycle import HttpLifecycle
+from .server_identity import InstanceIdentity, make_proof
 
 
 MAX_REQUEST_BYTES = 256 * 1024
 MAX_IN_FLIGHT = 32
 PUBLIC_OPERATIONS = tuple(name for name in SCHEMAS if name not in {"authority_create", "expire"})
-READ_OPERATIONS = ("get", "snapshot", "list", "ready", "history", "health", "wait_ready")
+READ_OPERATIONS = ("get", "snapshot", "list", "ready", "history", "health", "wait_ready", "outcome")
 _in_request = ContextVar("mptask_http_request", default=False)
 
 
@@ -59,7 +64,7 @@ def _object(properties, required=()):
             "required": sorted(required), "additionalProperties": False}
 
 
-def _schemas():
+def _schemas(*, journal=False):
     string = {"type": "string", "minLength": 1}
     positive = {"type": "integer", "minimum": 1}
     references = {"type": "array", "items": string, "maxItems": 20, "uniqueItems": True}
@@ -133,6 +138,17 @@ def _schemas():
         if name in {"transition", "expand", "goal_close"}:
             properties["evidence"] = {**references, "minItems": 1}
         result[name] = _object(properties, required | {"actor", "command_id"})
+        if journal:
+            result[name]["properties"]["expected_epoch"] = {
+                "type": "string",
+                "pattern": r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+            }
+            result[name]["required"].append("expected_epoch")
+    if journal:
+        result["outcome"] = _object({
+            "epoch_id": {"type": ["string", "null"], "minLength": 1},
+            "command_id": string,
+        }, ("epoch_id", "command_id"))
     filters = {name: string for name in ("project", "goal_id", "assignee")}
     filters.update({"status": {"type": "string", "enum": sorted(STATUSES)},
                     "kind": fields["kind"], "needs_attention": {"type": "boolean"}})
@@ -187,6 +203,8 @@ def _identifier_map(field, value):
 
 
 def _attempt_authorization(value):
+    if isinstance(value, dict) and set(value) == {"authorized"} and value["authorized"] is False:
+        return True
     if (not isinstance(value, dict) or type(value.get("as_of")) is not str
             or type(value.get("fresh")) is not bool):
         return False
@@ -225,15 +243,23 @@ def _result(payload, *, error=False):
 
 
 class _Boundary:
-    def __init__(self, app, token, binding):
+    def __init__(self, app, token, binding, lifecycle=None):
         self.app, self.token, self.binding = app, token.encode("ascii"), binding
+        self.lifecycle = lifecycle
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http":
             headers = scope["headers"]
             auth = [value for key, value in headers if key.lower() == b"authorization"]
             expected = b"Bearer " + self.token
-            if len(auth) != 1 or not hmac.compare_digest(auth[0], expected):
+            public = self.lifecycle is not None and scope["path"] == "/identity"
+            instance = (None if self.lifecycle is None else
+                        b"Bearer " + self.lifecycle.instance_token.encode("ascii"))
+            accepted = len(auth) == 1 and (
+                hmac.compare_digest(auth[0], expected)
+                and (self.lifecycle is None or scope["path"] != "/control/stop")
+                or instance is not None and hmac.compare_digest(auth[0], instance))
+            if not public and not accepted:
                 return await Response("Unauthorized", 401)(scope, receive, send)
             hosts = [value for key, value in headers if key.lower() == b"host"]
             origins = [value for key, value in headers if key.lower() == b"origin"]
@@ -241,6 +267,13 @@ class _Boundary:
                 return await Response("Invalid Host", 421)(scope, receive, send)
             if origins and origins != [f"http://{self.binding}".encode("ascii")]:
                 return await Response("Invalid Origin", 403)(scope, receive, send)
+            if self.lifecycle is not None:
+                try:
+                    loopback = scope.get("client") and ip_address(scope["client"][0]).is_loopback
+                except ValueError:
+                    loopback = False
+                if not loopback:
+                    return await Response("Loopback required", 403)(scope, receive, send)
         marker = _in_request.set(scope["type"] == "http")
         try:
             await self.app(scope, receive, send)
@@ -292,7 +325,7 @@ def project_batch(authority, projector, *, limit=10):
 
 
 class _Runtime:
-    def __init__(self, authority, maintenance, token, projector):
+    def __init__(self, authority, maintenance, token, projector, lifecycle=None):
         self.authority, self.maintenance, self.token = authority, maintenance, token
         self.projector = projector
         self.projection_pump = ProjectionPump(authority, projector) if projector is not None else None
@@ -302,13 +335,24 @@ class _Runtime:
         self.last_tick = float("-inf")
         self.maintenance_status = {"ok": False, "ticks": 0, "reason": "not_started"}
         self.in_flight = 0
+        self.mutations = 0
+        self.lifecycle = lifecycle
 
     async def start(self):
         self.request_limit = anyio.CapacityLimiter(4)
         self.maintenance_limit = anyio.CapacityLimiter(1)
         self.projection_limit = anyio.CapacityLimiter(1)
         self.tick_lock = anyio.Lock()
+        self.stop_lock = anyio.Lock()
         await self.tick_if_due()
+        if self.lifecycle is not None:
+            for _ in range(10000):
+                health = await self.dispatch(self.authority.health)
+                if not health.get("startup_pending"):
+                    break
+                await self.tick_if_due(force=True)
+            if not health["fresh"] or not self.maintenance_status["ok"]:
+                raise AuthorityError("not_ready", "Authority startup did not complete")
         if self.projector is not None:
             self.projection_status = _safe(await anyio.to_thread.run_sync(
                 self.projector.health, limiter=self.projection_limit), self.token)
@@ -317,9 +361,9 @@ class _Runtime:
         return await anyio.to_thread.run_sync(
             lambda: function(*args, **kwargs), limiter=self.request_limit)
 
-    async def tick_if_due(self):
+    async def tick_if_due(self, *, force=False):
         async with self.tick_lock:
-            if time.monotonic() - self.last_tick < self.sweep:
+            if not force and time.monotonic() - self.last_tick < self.sweep:
                 return
             try:
                 def tick():
@@ -387,6 +431,11 @@ class _Runtime:
         if name in PUBLIC_OPERATIONS:
             if name == "claim":
                 await self.tick_if_due()
+            if getattr(self.authority, "recovery_mode", "legacy") == "journal":
+                command = dict(arguments)
+                epoch = command.pop("expected_epoch")
+                return await self.dispatch(self.authority.execute, {"operation": name, **command},
+                                           expected_epoch=epoch)
             return await self.dispatch(self.authority.execute, {"operation": name, **arguments})
         if name == "ready":
             return await self.ready(arguments)
@@ -395,17 +444,112 @@ class _Runtime:
         if name == "health":
             return {**await self.dispatch(self.authority.health),
                     "maintenance": deepcopy(self.maintenance_status),
-                    "projection": deepcopy(self.projection_status)}
+                    "projection": deepcopy(self.projection_status),
+                    **({"lifecycle": {"state": self.lifecycle.phase,
+                                      "failure": self.lifecycle.failure}}
+                       if self.lifecycle is not None else {})}
         method = self.authority.snapshot if name in {"snapshot", "list"} else getattr(self.authority, name)
         return await self.dispatch(method, **arguments)
 
+    def admit_mutation(self, name, arguments):
+        if self.lifecycle is None or self.lifecycle.phase == "ready":
+            return
+        completion = (name in {"renew", "checkpoint", "release", "recover", "transition"}
+                      or name == "attempt_report" and arguments.get("report_kind") != "started")
+        if self.lifecycle.phase != "draining" or not completion:
+            raise AuthorityError("service_draining", "New task intake is disabled")
 
-def create_app(authority, maintenance, *, token, host="127.0.0.1", port=8766, projector=None):
+    async def identity_ready(self):
+        if self.lifecycle.phase != "ready" or self.mutations:
+            return False
+        try:
+            await self.dispatch(self.authority.refresh, verify_prefix=True)
+            health = await self.dispatch(self.authority.health)
+        except AuthorityError as error:
+            self.lifecycle.failure = error.code
+            return False
+        ready = (health["started"] and health["fresh"] and not health.get("startup_pending")
+                 and health.get("epoch_id") == self.lifecycle.identity.instance_id
+                 and self.maintenance_status["ok"])
+        self.lifecycle.failure = None if ready else health.get("reason") or "maintenance_failed"
+        return ready
+
+    async def drain(self):
+        self.lifecycle.phase = "draining"
+        deadline = time.monotonic() + self.lifecycle.drain_timeout
+        blockers = {"in_flight_mutations": self.mutations}
+        for _ in range(6001):
+            if not self.mutations:
+                await self.tick_if_due(force=True)
+
+                def inspect():
+                    with self.authority.serialized():
+                        health = self.authority.health()
+                        tasks = self.authority.state.tasks.values()
+                        active = [task["id"] for task in tasks if task["status"] == "in_progress"]
+                        recovery = [task["id"] for task in tasks if task["recovery"] is not None
+                                    and not task["recovery"]["barrier_satisfied"]]
+                        return health, active, recovery
+
+                health, active, recovery = await self.dispatch(inspect)
+                blockers = {
+                    "in_flight_mutations": self.mutations, "active_attempts": active[:100],
+                    "active_attempt_count": len(active), "recovery_required": recovery[:100],
+                    "recovery_required_count": len(recovery), "fresh": health["fresh"],
+                    "reason": health["reason"],
+                    "pending_command": health["pending_command"],
+                    "maintenance": deepcopy(self.maintenance_status),
+                }
+                if (not self.mutations and not active and not recovery and health["fresh"]
+                        and self.maintenance_status["ok"]
+                        and not self.maintenance_status.get("pending_requests")):
+                    self.lifecycle.phase = "drained"
+                    self.lifecycle.failure = None
+                    return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            await anyio.sleep(min(0.05, remaining))
+        self.lifecycle.failure = "drain_blocked"
+        raise AuthorityError("drain_blocked", "Drain has active work or unresolved uncertainty", blockers)
+
+
+async def _bounded_body(request, maximum):
+    lengths = request.headers.getlist("content-length")
+    if (len(lengths) > 1 or lengths and (
+            not lengths[0].isascii() or not lengths[0].isdigit())):
+        raise ValueError("Invalid length")
+    if lengths and (len(lengths[0]) > 6 or int(lengths[0]) > maximum):
+        raise OverflowError("Body too large")
+    if request.headers.get("content-encoding", "identity") != "identity":
+        raise ValueError("Encoded body")
+    body = bytearray()
+    with anyio.fail_after(5):
+        async for chunk in request.stream():
+            if len(body) + len(chunk) > maximum:
+                raise OverflowError("Body too large")
+            body.extend(chunk)
+    if lengths and len(body) != int(lengths[0]):
+        raise ValueError("Incomplete body")
+    return bytes(body)
+
+
+def create_app(authority, maintenance, *, token, host="127.0.0.1", port=8766, projector=None,
+               lifecycle=None):
     """Borrow started authority ownership; the caller closes it after ASGI shutdown."""
     binding = validate_binding(host, port)
     validate_token(token)
-    runtime = _Runtime(authority, maintenance, token, projector)
-    schemas = _schemas()
+    journal = getattr(authority, "recovery_mode", "legacy") == "journal"
+    if journal and projector is not None:
+        raise ConfigError("Journal-mode projection requires a disposable epoch-aware integration",
+                          code="projection_unsupported")
+    if lifecycle is not None and (
+            lifecycle.identity.instance_id != authority.epoch_id
+            or lifecycle.identity.authority_id != authority.authority_id
+            or lifecycle.identity.endpoint != f"http://{binding}/mcp"):
+        raise AuthorityError("identity_mismatch", "Listener must use the accepted authority epoch")
+    runtime = _Runtime(authority, maintenance, token, projector, lifecycle)
+    schemas = _schemas(journal=journal)
     validators = {key: Draft202012Validator(value) for key, value in schemas.items()}
     sdk = Server("mempalace-tasks", version="1")
 
@@ -415,7 +559,10 @@ def create_app(authority, maintenance, *, token, host="127.0.0.1", port=8766, pr
             name=f"mptask_{name}", description=(
                 "Read diagnostic task state; never authorizes execution."
                 if name in READ_OPERATIONS else
-                f"Apply {name}; retain command_id on ambiguous outcomes. Actor must be registered."),
+                f"Apply {name}; retain command_id"
+                + (" and frozen expected_epoch; never upgrade an ambiguous request."
+                   if journal else " on ambiguous outcomes.")
+                + " Actor must be registered."),
             inputSchema=deepcopy(schema),
         ) for name, schema in schemas.items()]
 
@@ -427,16 +574,31 @@ def create_app(authority, maintenance, *, token, host="127.0.0.1", port=8766, pr
         try:
             if name != f"mptask_{operation}" or operation not in schemas:
                 raise AuthorityError("unknown_tool", "Unknown task tool")
+            if journal and operation in PUBLIC_OPERATIONS and isinstance(arguments, dict) and (
+                    "expected_epoch" not in arguments):
+                raise AuthorityError("epoch_required", "A frozen request epoch is required")
             if next(validators[operation].iter_errors(arguments), None) is not None:
                 raise AuthorityError("validation_error", "Arguments do not match this tool's schema")
+            if operation in PUBLIC_OPERATIONS:
+                if journal and arguments["expected_epoch"] != authority.epoch_id:
+                    raise AuthorityError("stale_epoch", "Request epoch differs from this owner")
+                runtime.admit_mutation(operation, arguments)
             if runtime.in_flight >= MAX_IN_FLIGHT:
                 raise AuthorityError("service_busy", "Task service concurrency limit reached")
             runtime.in_flight += 1
             admitted = True
             dispatched = operation in PUBLIC_OPERATIONS
-            return _result(_safe(await runtime.call(operation, arguments), token))
+            if dispatched:
+                runtime.mutations += 1
+            payload = _safe(await runtime.call(operation, arguments), token)
+            if lifecycle is not None:
+                payload = _safe(payload, lifecycle.instance_token)
+            return _result(payload)
         except AuthorityError as error:
-            return _result({"error": _safe(error.to_dict(), token)}, error=True)
+            payload = _safe(error.to_dict(), token)
+            if lifecycle is not None:
+                payload = _safe(payload, lifecycle.instance_token)
+            return _result({"error": payload}, error=True)
         except Exception:
             return _result({"error": {
                 "code": "internal_error", "message": "Internal task service failure",
@@ -445,6 +607,8 @@ def create_app(authority, maintenance, *, token, host="127.0.0.1", port=8766, pr
         finally:
             if admitted:
                 runtime.in_flight -= 1
+                if dispatched:
+                    runtime.mutations -= 1
 
     manager = StreamableHTTPSessionManager(
         sdk, json_response=True, stateless=True, max_request_body_size=MAX_REQUEST_BYTES,
@@ -467,16 +631,137 @@ def create_app(authority, maintenance, *, token, host="127.0.0.1", port=8766, pr
                 finally:
                     workers.cancel_scope.cancel()
 
-    app = Starlette(routes=[Route("/mcp", _MCPRoute(manager))], lifespan=lifespan)
+    async def identity(request):
+        if re.fullmatch(rb"nonce=[0-9a-f]{64}", request.scope["query_string"]) is None:
+            return Response("Invalid challenge", 400)
+        try:
+            await _bounded_body(request, 0)
+        except OverflowError:
+            return Response("Body too large", 413)
+        except ValueError:
+            return Response("Invalid request", 400)
+        except TimeoutError:
+            return Response("Request timeout", 408)
+        nonce = request.scope["query_string"][6:].decode("ascii")
+        try:
+            ready = await runtime.identity_ready()
+        except Exception:
+            lifecycle.failure = "identity_failed"
+            return JSONResponse({"error": {
+                "code": "identity_failed", "message": "Cannot verify current owner readiness",
+                "details": {}, "ambiguous": False,
+            }}, status_code=503)
+        return JSONResponse(make_proof(lifecycle.identity, token, nonce, ready=ready))
+
+    async def control_stop(request):
+        try:
+            if (request.scope["query_string"]
+                    or request.headers.get("content-type", "").split(";", 1)[0] != "application/json"):
+                raise ValueError("Invalid request")
+            raw = await _bounded_body(request, 2048)
+            data = json.loads(raw.decode("utf-8"), object_pairs_hook=_pairs, parse_constant=_constant)
+            if (type(data) is not dict
+                    or set(data) != {"schema_version", "instance_id", "drain", "nonce"}
+                    or type(data["schema_version"]) is not int or data["schema_version"] != 1
+                    or data["drain"] is not True or type(data["nonce"]) is not str
+                    or re.fullmatch(r"[0-9a-f]{64}", data["nonce"]) is None):
+                raise ValueError("Invalid request")
+        except OverflowError:
+            return Response("Body too large", 413)
+        except (ValueError, UnicodeError, RecursionError):
+            return Response("Invalid control request", 400)
+        except TimeoutError:
+            return Response("Request timeout", 408)
+        if data["instance_id"] != lifecycle.identity.instance_id:
+            return Response("Instance changed", 409)
+        if runtime.stop_lock.locked() or lifecycle.phase == "drained":
+            return Response("Drain already requested", 409)
+        async with runtime.stop_lock:
+            try:
+                await runtime.drain()
+            except AuthorityError as error:
+                return JSONResponse({"error": _safe(_safe(error.to_dict(), token),
+                                                    lifecycle.instance_token)}, status_code=409)
+            except Exception:
+                lifecycle.phase, lifecycle.failure = "draining", "drain_failed"
+                return JSONResponse({"error": {
+                    "code": "drain_failed", "message": "Drain completion could not be verified",
+                    "details": {}, "ambiguous": True,
+                }}, status_code=503)
+            return JSONResponse({
+                "schema_version": 1, "authority_id": lifecycle.identity.authority_id,
+                "instance_id": lifecycle.identity.instance_id, "accepted": True, "drained": True,
+                "proof": make_proof(lifecycle.identity, token, data["nonce"], ready=False),
+            }, status_code=202, background=BackgroundTask(lifecycle.shutdown))
+
+    routes = [Route("/mcp", _MCPRoute(manager))]
+    if lifecycle is not None:
+        routes.extend([Route("/identity", identity, methods=["GET"]),
+                       Route("/control/stop", control_stop, methods=["POST"])])
+    app = Starlette(routes=routes, lifespan=lifespan)
+    app.state.runtime = runtime
     app.router.redirect_slashes = False
-    app.add_middleware(_Boundary, token=token, binding=binding)
+    app.add_middleware(_Boundary, token=token, binding=binding, lifecycle=lifecycle)
     return app
 
 
-def serve(authority, maintenance, *, token, host="127.0.0.1", port=8766, projector=None):
-    """Foreground server. Ownership remains with the caller's context manager."""
+def serve(authority, maintenance, *, token, host="127.0.0.1", port=8766, projector=None,
+          config=None, on_ready=None):
+    """Foreground server; caller retains ownership until ASGI and writers finish.
+
+    A journal config enables identity/control and binds port zero exactly once.
+    on_ready releases startup election only after listener/authority readiness
+    and registry publication. No upstream startup or idle shutdown occurs here.
+    """
     import uvicorn
 
+    if config is not None:
+        if config.recovery_mode != "journal" or projector is not None or config.projections_enabled:
+            raise ConfigError("Portable serving requires journal mode without projection",
+                              code="projection_unsupported")
+        validate_binding(host, port, allow_dynamic=True)
+        if (host, port, token) != (config.host, config.port, config.service_token):
+            raise ConfigError("Listener differs from configured binding")
+        family = socket.AF_INET6 if ip_address(host).version == 6 else socket.AF_INET
+        with socket.socket(family, socket.SOCK_STREAM) as listener:
+            listener.bind((host, port))
+            listener.listen(128)
+            listener.setblocking(False)
+            bound_port = listener.getsockname()[1]
+            identity = InstanceIdentity(authority.authority_id, authority.epoch_id,
+                                        f"http://{validate_binding(host, bound_port)}/mcp")
+
+            def shutdown():
+                runner.should_exit = True
+
+            lifecycle = HttpLifecycle(config, identity, shutdown=shutdown, on_ready=on_ready)
+            app = create_app(authority, maintenance, token=token, host=host, port=bound_port,
+                             lifecycle=lifecycle)
+
+            class PortableServer(uvicorn.Server):
+                async def startup(self, sockets=None):
+                    await super().startup(sockets=sockets)
+                    if not self.started or self.should_exit:
+                        raise AuthorityError("startup_failed", "HTTP listener startup failed")
+                    try:
+                        lifecycle.publish()
+                    except BaseException:
+                        await self.shutdown(sockets=sockets)
+                        raise
+
+            runner = PortableServer(uvicorn.Config(
+                app, host=host, port=bound_port, access_log=False, log_level="warning",
+                ws="none", proxy_headers=False, limit_concurrency=128, timeout_graceful_shutdown=None))
+            try:
+                runner.run(sockets=[listener])
+            except BaseException:
+                lifecycle.phase = "failed"
+                lifecycle.failure = "listener_failed"
+                raise
+            finally:
+                lifecycle.clear()
+            lifecycle.phase = "stopped"
+        return
     app = create_app(authority, maintenance, token=token, host=host, port=port, projector=projector)
     uvicorn.run(app, host=host, port=port, access_log=False, log_level="warning",
                 ws="none", limit_concurrency=128, timeout_graceful_shutdown=30)

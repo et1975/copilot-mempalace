@@ -3,7 +3,6 @@ import threading
 import time
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import patch
 
 from mempalace_tasks.execution import LocalProfile
@@ -225,7 +224,8 @@ class SupervisorTests(unittest.TestCase):
         tid = port.create()
         maintenance = LeaseMaintenance(port, clock, system_actor="sys", recovery_actor="recovery")
         host = HostSupervisor(port, clock, maintenance, supervisor_id="sup", worker_id="worker",
-                              profiles=[profile(self.root / "latency")])
+                              profiles=[profile(self.root / "latency")],
+                              elapsed_time=lambda: monotonic_base + elapsed[0])
         self.addCleanup(host.close)
         if operation == "renew":
             host.step()
@@ -244,12 +244,9 @@ class SupervisorTests(unittest.TestCase):
             if armed:
                 armed = False
                 elapsed[0] += 20
-        sampled_time = SimpleNamespace(monotonic=lambda: monotonic_base + elapsed[0],
-                                       sleep=time.sleep)
         with patch.object(port, "execute", side_effect=execute_then_delay_snapshot):
             with patch.object(store, "write", side_effect=persist_with_elapsed_time):
-                with patch("mempalace_tasks.supervisor.time", sampled_time):
-                    host.step()
+                host.step()
         worker = host.workers[tid]
         self.assertIsNotNone(worker.process)
         self.assertEqual(elapsed[0], 120 if operation == "renew" else 20)
