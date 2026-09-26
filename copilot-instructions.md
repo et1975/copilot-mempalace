@@ -95,17 +95,33 @@ For deeper workflow docs (init, mine, full search/status walkthrough), invoke th
 ## Optional durable task coordination
 
 For an explicitly tracked sidecar task or a requested durable task workflow,
-invoke the `mempalace-tasks` safety skill and use the separately configured
-`mptask_*` tools. Native memory/delegation acknowledgments, drawers, diaries and
-KG projections are not task ownership or current operational state.
+invoke the [mempalace-tasks safety skill](skills/mempalace-tasks/SKILL.md) and use
+the separately configured `mptask_*` tools. For explicitly tracked native
+`/fleet` goals, select the existing
+[palace-task-workflow agent](agents/palace-task-workflow.agent.md) and follow the
+[per-goal workflow](sidecar/README.md#per-goal-native-fleet-workflow).
+Each goal requires explicit tracking opt-in. Selecting the agent, installing
+this pack, available tools or an ordinary `/fleet` request do not enroll work.
+An explicitly named resume preserves only that goal's scope, not other goals.
+Ordinary native fleet and ephemeral session todos remain available without
+task-service setup or durable writes.
+
+Native fleet remains the orchestrator. Linked session SQL todos are references
+and observations, not synchronized task truth; the durable authority alone
+determines tracked task state. Native memory/delegation acknowledgments,
+drawers, diaries and KG projections are not task ownership or current
+operational state.
 
 Use current owner/attempt/generation and authorization, atomic expand/yield for
 new prerequisites, and confirmed goal closure rather than an empty ready list.
 Worker dispatch and physical supervision remain host responsibilities; do not
-claim native `/fleet` wiring merely because the sidecar is connected. Human
-status/history/watch are read-only observations. If the service is missing,
-report that boundary without creating a replacement writer. Ordinary memory
-filing and ephemeral session todos do not require durable task creation.
+claim native execution support from a healthy MCP frontend or registration.
+No native fleet supervisor is shipped: an authorized coordinator can plan
+durably without one, but tracked execution stays blocked. For an explicit
+tracked request, report missing service/schema/actor or supervision as a
+blocker; do not silently fall back to untracked execution or create a replacement
+writer. Human status/history/watch remain read-only observations, never a reason
+to launch/restart the owner. Ordinary memory filing is unchanged.
 
 ## Optional repository procedural advice (disabled by convention)
 

@@ -1,9 +1,9 @@
 ---
 name: mempalace-tasks
 description: >-
-  Use when working on tracked MemPalace tasks, claiming or resuming task work,
-  publishing discoveries, closing tasks or goals, or handling uncertain task
-  ownership, leases, command outcomes, or recovery.
+  Use when explicitly tracking or resuming a MemPalace goal, including native
+  Copilot fleet work, claiming tracked tasks, publishing discoveries, closing
+  tracked tasks or goals, or handling uncertain ownership, leases, outcomes, or recovery.
 ---
 
 # MemPalace Task Safety
@@ -14,9 +14,15 @@ description: >-
 
 ## Authority boundary
 
-This skill protects tracked work; ordinary memory filing and trivial conversations
-do not require task creation. Task truth belongs to the shared sidecar authority,
-not a drawer, KG projection, local todo, or remembered assignment.
+Tracking is **explicit opt-in per goal**. Selecting the workflow agent, available
+MCP tools, installed guidance, ordinary `/fleet`, or recalling an old goal does not
+enroll work. Ordinary native dispatch and local todos remain available without
+task-service setup or durable task writes. Explicitly resuming a named tracked goal
+retains only that goal's scope; a different goal needs its own opt-in.
+
+Task truth belongs to the shared sidecar authority, not a drawer, KG projection,
+local todo, native worker result, or remembered assignment. Existing memory routing
+still applies to knowledge and conventions, not task ownership.
 
 Discover the sidecar's advertised `mptask_*` tools and argument schemas before
 calling them. Use the registered actor identity and actual fields; every mutation
@@ -26,10 +32,33 @@ read/health response's `epoch_id`. Freeze the authority, epoch, command ID and
 exact payload for each logical request; never update its epoch on retry.
 A new owner epoch revokes old execution
 authorization, even if owner/attempt/generation fields otherwise match.
-Missing service/schema support blocks tracked mutations; report it rather than
-starting another writer or substituting direct KG, drawer, or event-log writes.
+Missing service, schema support or registered actor blocks tracked mutations;
+preserve the request and blocker locally without fabricating IDs, starting another
+writer, or substituting direct KG, drawer, or event-log writes.
 Native `mempalace_task_create` / `mempalace_event_ack` delegation acknowledgments
 are not sidecar claims, leases, or completion evidence.
+
+## Transport is not supervision
+
+A pre-provisioned schema-2 deployment's `mempalace-tasks mcp` frontend proxies the
+advertised tools unchanged to **one shared HTTP owner**, pinning its instance and
+endpoint. Launcher configuration explicitly permits owner startup; external mode
+only connects. Neither mode implements native worker supervision. Healthy service,
+supervisor/profile registration, or a connected stdio gateway does not prove a
+compatible native host exists.
+
+For opted-in native fleet with a service and registered coordinator but no real
+native host, explicitly requested coordinator planning/publication is permitted;
+tracked claims, starts and closures are blocked. Generic supported non-native hosts retain their existing
+execution contract. In native fleet, the native parent remains the sole dispatcher:
+no second coordinator or external queue consumer.
+
+Owner failure or transport error can close the gateway. Reconnection is explicit
+operator/harness setup, not an invented workflow tool; it does not itself authorize
+mutation retry. Never restart launcher mode merely to inspect: use connect-only human
+CLI/status or report the setup blocker. Stdio EOF closes the frontend, not the
+shared owner. Canceling a native worker neither cancels its durable task nor proves
+physical settlement.
 
 ## Current execution authorization
 
@@ -51,6 +80,13 @@ Before starting or resuming work:
    a preparing-time snapshot; obtain a fresh read, not a mutation just to get
    authorization. Revalidate on resumption, conflict or changed generation/epoch.
    Historical `mptask_outcome` lookup never grants current authorization.
+
+For native dispatch, a separately supplied compatible supervisor must provide the
+actual owner, epoch, attempt/generation, prepared execution arrangement and current
+authorization. A prompt path is not an isolation fence. Do not invent a native
+`cwd` parameter, credentials, retry tokens, or preparation/settlement evidence.
+Workers revalidate authorization under this skill; native permissions, model
+selection and cancellation mechanics remain unchanged.
 
 The registered host supervisor owns renewal, durable checkpoint reporting, worker
 containment, and physical settlement/recovery attestations. It renews with
@@ -113,6 +149,7 @@ epoch UUID; null is invalid. Reconnecting can supply a new transport credential 
 must not upgrade the request's epoch. `resolution="not_recorded"` is not confirmed
 abandonment or proof that external effects did not occur. A historical receipt
 does not renew a lease or authorize execution; re-read current task authorization.
+A replacement owner epoch is not automatic retry authorization for that request.
 
 Recovery/settlement evidence must reflect actual effects:
 
@@ -129,6 +166,43 @@ The live owner closes ordinary work using `mptask_transition` with `task_id`,
 `attempt_id`, `claim_generation`, `expected_version`, `target="closed"`, `summary`,
 and nonempty `evidence`.
 Shared completion also needs accepted class-specific settlement.
+
+## Native session references
+
+Use existing `todos` and `todo_deps` without recreating or changing their schema.
+Each linked todo has the stable ID **`mptask:<authority-id>:<task-id>`** and a bounded
+description containing one task's reference packet:
+
+```text
+authority_id: <verified authority>
+goal_id: <explicitly tracked goal>
+task_id: <verified task>
+acceptance: <task acceptance, with references for lengthy detail>
+observed_as_of: <fresh read as_of>
+observed_epoch: <fresh read epoch_id>
+observed_task_version: <task version>
+durable_status: <observed durable status>
+execution_blocker: <current reason, or none when verified>
+```
+
+These are observations, not authority or execution tokens. Include native agent,
+attempt and generation fields only when actually returned/supplied. Keep credentials,
+retry tokens, full graphs and unrelated memories out of the packet.
+
+| Linked todo status | Required observation |
+|---|---|
+| `pending` | Waiting for selection; fresh eligibility is still required before dispatch. |
+| `in_progress` | The correlated native worker is actually running under current authorization; a claim or preparing attempt is insufficient. |
+| `blocked` | Missing host/prerequisite, recovery, proposal/admission, quarantine, cancellation, unaccepted results, or stale/unconfirmed state; record the reason. |
+| `done` | Confirmed accepted durable closure of the corresponding task. Native completion alone is insufficient. |
+
+Local-only setup/planning rows may finish locally; they do not complete linked
+implementation tasks. Fresh durable state contradicting local `done` requires
+updating the **proven linked row** and its reference packet, not merely reporting
+the mismatch. Use `pending` only for freshly eligible, unselected work; otherwise
+`blocked` with the observed reason. Preserve unrelated rows/dependencies. Never
+guess ambiguous identities from semantic similarity or migrate old prototype
+records. Missing/ambiguous references require clarification or a local blocker.
 
 ## Views and completion
 
@@ -161,6 +235,6 @@ reassess; cancelled-only work is not accepted success.
 | Close because the ready queue is empty or the shell exited | Establish acceptance evidence and the appropriate goal/execution barrier. |
 
 See [pressure scenarios](references/scenarios.md) for the baseline, parent-reported
-six-case green result and remaining checks. Workflow/decomposition policy belongs
-to the opt-in `palace-task-workflow` agent; neither artifact creates a fleet or
-host adapter.
+evaluation evidence and remaining checks. Workflow/decomposition policy belongs
+to the opt-in `palace-task-workflow` agent; these instructions do not supply a
+native supervisor or host adapter.

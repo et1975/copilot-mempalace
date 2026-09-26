@@ -326,7 +326,8 @@ do not make an untrusted shared host or a second independent authority safe.
 
 Install/link the optional [task-safety skill](../skills/mempalace-tasks/SKILL.md)
 and [workflow agent](../agents/palace-task-workflow.agent.md) using the pack's
-normal customization mechanism. Their MCP selectors assume server aliases
+normal [copy/link customization pattern](../README.md#step-1--copy-or-symlink-the-customization-pack).
+Their MCP selectors assume server aliases
 `mempalace-tasks` and `mempalace`; adjust aliases consistently if your harness
 uses different names.
 
@@ -399,6 +400,74 @@ represented as live after disconnection.
 Exit status: `0` current/successful; `1` operational/non-current failure;
 `2` invalid arguments/configuration; `130` interruption. Tasks needing attention
 do not themselves make an otherwise current snapshot fail.
+
+## Per-goal native fleet workflow
+
+The existing [task-safety skill](../skills/mempalace-tasks/SKILL.md) and
+[workflow agent](../agents/palace-task-workflow.agent.md) provide optional prompt
+guidance around native Copilot `/fleet`, not a replacement dispatcher or runtime
+enforcement layer. Native fleet remains the orchestrator; session SQL todos carry
+references and observations, while the durable authority alone determines tracked
+task state.
+
+After copying/linking those customizations, select the agent and explicitly
+request tracking for the goal:
+
+```text
+/agent palace-task-workflow
+/fleet Track this goal in MemPalace Tasks: update the cache index and its tests.
+Start with durable planning and report any execution blocker.
+```
+
+A real request must supply the configured project, an actually registered actor,
+acceptance criteria and explicit work/time/cost/concurrency budgets. Never infer
+IDs or actor identity from the logged-in username. To resume the same tracked
+goal, name its actual durable ID; this example ID is synthetic:
+
+```text
+/fleet Resume the tracked MemPalace goal tsk_goal_fixture.
+Refresh its durable state before selecting work.
+```
+
+Selecting the agent, installing the pack, available tools or ordinary `/fleet`
+does **not** opt in. Each new goal needs an explicit request; named resume keeps
+only the existing goal's scope. Unrelated goals and native todos stay untouched.
+
+| Deployment state | Allowed workflow and required report |
+|---|---|
+| No explicit goal opt-in | Ordinary native fleet/session todos; no task-service setup demand or durable writes. |
+| Opted in, service/schema/registered actor unavailable | Keep the request and setup blocker locally; do not claim durable creation, claim or closure, or silently execute untracked instead. |
+| Service and authorized coordinator available, no actual compatible native supervisor | Inspect/resume and publish the authorized durable plan; report tracked execution blocked. |
+| Separately supplied compatible native host plus current task authorization | Conditional native dispatch under the safety contract; report actual host/owner, attempt/generation, evidence and confirmed outcomes. |
+
+**No native fleet supervisor is shipped.** A healthy MCP frontend, execution
+profile or supervisor registration does not establish execution support. The
+optional Linux `HostSupervisor` remains a separate
+[host integration](#worker-assignment-and-execution), not native fleet wiring.
+
+Use the existing [preinstalled-package preparation](#requirements-and-offline-setup),
+[schema-2 initialization/private credentials](#configure-and-initialize) and
+[long-lived stdio registration](#harness-launched-stdio-frontend), not another
+setup recipe. Register `mempalace-tasks mcp`, not one-shot `start`/`connect`.
+Frontends share one HTTP owner: configured launcher consent allows autostart on
+frontend connection; external mode is connect-only. Read-only
+[status/history inspection](#human-supervision) must not trigger launcher startup
+or owner restart.
+
+After frontend failure or owner change, explicitly reconnect the pinned frontend;
+retain the original authority, epoch, command ID and exact payload of unresolved
+mutations. Reconnection is not new execution authorization. EOF, frontend stop
+or native cancellation is neither owner stop nor proof of physical settlement.
+Roll back this workflow for new goals by no longer opting them in; this does not
+erase tracked state, release active claims or settle effects. Follow the
+[host recovery contract](#worker-assignment-and-execution) and
+[recovery procedure](#recovery-and-coherent-palace-backuprestore) for existing work.
+
+The [workflow scenarios](../skills/mempalace-tasks/references/scenarios.md) are
+bounded prompt simulations, not native runtime enforcement or a live harness
+integration test. MCP/service tests or registration checks alone do not verify
+supervised native fleet execution. Existing memory recall/reflection/procedural
+guidance and hooks remain independent and unchanged.
 
 ## Worker assignment and execution
 
