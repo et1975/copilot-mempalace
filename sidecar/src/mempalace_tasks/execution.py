@@ -1,20 +1,24 @@
-"""Registered managed-process adapters, not a native Copilot/fleet adapter.
+"""Profile/artifact contracts and lazy, optional managed-process construction.
 
 Local-only effects exclude daemonized/escaped processes and remote jobs. Git
 worktrees use an explicit immutable base and are preserved for review; nothing
 here applies a patch to a shared checkout. Configure a dedicated root (normally
 below ~/s), never an existing user worktree.
+
+Importing these contracts never loads the Linux supervisor implementation.
+OwnedProcess construction requires that backend; there is no native Copilot or
+fleet adapter, nor a generic process-killing fallback on unsupported hosts.
 """
 from __future__ import annotations
 
 import copy
-import os
+import math
 import re
-import signal
 import stat
 import subprocess
+import sys
 import threading
-import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -26,6 +30,41 @@ class ExecutionError(Exception):
     def __init__(self, code: str, message: str):
         self.code = code
         super().__init__(message)
+
+
+class DeadlineClock:
+    """Shared seconds basis with serialized samples and a latched safety fault.
+
+    Host and watchdog must share this guard: a regression/failure observed by
+    either invalidates further authorization even if the provider later recovers.
+    """
+    def __init__(self, source: Callable[[], float]):
+        if not callable(source):
+            raise ValueError("Execution elapsed_time must be callable")
+        self._source = source
+        self._lock = threading.Lock()
+        self._last = None
+        self.error = None
+
+    def __call__(self) -> float:
+        with self._lock:
+            if self.error is not None:
+                raise self.error
+            try:
+                value = self._source()
+                if type(value) not in (int, float) or value < 0 or not math.isfinite(value):
+                    raise ExecutionError("invalid_clock_sample", "Invalid execution deadline clock sample")
+                if self._last is not None and value < self._last:
+                    raise ExecutionError("continuous_discontinuity", "Execution deadline clock moved backwards")
+            except ExecutionError as error:
+                self.error = error
+                raise
+            except Exception as error:
+                self.error = ExecutionError(getattr(error, "code", "clock_unavailable"),
+                                            "Cannot sample execution deadline clock")
+                raise self.error from error
+            self._last = value
+            return value
 
 
 class ReconciliationAdapter(Protocol):
@@ -245,142 +284,29 @@ def read_checkpoint(workspace: Workspace, task: dict) -> dict | None:
     return value
 
 
-def _process_stat(pid):
-    data = Path(f"/proc/{pid}/stat").read_bytes()
-    fields = data[data.rindex(b")") + 2:].split()
-    return fields[0].decode("ascii"), int(fields[2]), int(fields[19])
+def _linux_execution():
+    if sys.platform != "linux":
+        raise ExecutionError("unsupported_platform", "Owned process supervision requires Linux waitid")
+    from . import execution_linux
+
+    return execution_linux
+
+
+def require_process_supervision():
+    """Check optional local supervision before claims, never during import."""
+    _linux_execution().require_process_supervision()
 
 
 class OwnedProcess:
-    """Linux owned session/group with an independent confirmed-lease watchdog.
+    """Lazy public constructor for the optional owned-process implementation.
 
-    Keep the group leader unreaped with waitid(WNOWAIT) until group stop, so
-    its identity cannot be recycled between observing exit and signalling.
-    No adoption of persisted PIDs and no name-based or arbitrary PID killing.
-    This is cooperative process supervision, not a hostile-code sandbox.
+    The Linux implementation subclasses this public type, retaining instance
+    checks and the existing constructor without loading containment at import.
+    Platform checks belong here, not in harmless profile/artifact operations.
+    Direct callers retain monotonic deadlines unless elapsed_time is supplied.
     """
-    def __init__(self, profile: LocalProfile, workspace: Workspace, *, deadline: float):
-        if not hasattr(os, "WNOWAIT") or not Path("/proc/self/stat").exists():
-            raise ExecutionError("unsupported_platform", "Owned process supervision requires Linux waitid")
-        self._deadline = deadline
-        self._condition = threading.Condition()
-        self._stop_lock = threading.Lock()
-        self._stopped = threading.Event()
-        self.error = None
-        self.deadline_expired = False
-        task = JsonStore(workspace.input_path).read()
-        environment = {**os.environ, "MPTASK_INPUT_PATH": str(workspace.input_path),
-                       "MPTASK_RESULT_PATH": str(workspace.result_path),
-                       "MPTASK_CHECKPOINT_PATH": str(workspace.checkpoint_path),
-                       "MPTASK_TASK_ID": task["id"], "MPTASK_ATTEMPT_ID": task["attempt"]["id"],
-                       "MPTASK_CLAIM_GENERATION": str(task["claim_generation"])}
-        if deadline <= time.monotonic():
-            raise ExecutionError("lease_expired", "No confirmed execution time remains")
-        with (workspace.root / "worker.log").open("xb") as output:
-            self.process = subprocess.Popen(profile.argv, cwd=workspace.working_directory,
-                                            env=environment, stdin=subprocess.DEVNULL,
-                                            stdout=output, stderr=subprocess.STDOUT,
-                                            start_new_session=True)
-        try:
-            _, group, start = _process_stat(self.process.pid)
-            self.identity = (self.process.pid, group, start)
-            self._watchdog = threading.Thread(target=self._watch, name="mptask-lease-watchdog", daemon=True)
-            self._watchdog.start()
-        except BaseException:
-            # This newly created, unreaped child pins the session leader PID even
-            # if /proc or thread creation fails before the identity is recorded.
-            try:
-                os.killpg(self.process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            self.process.wait(timeout=2)
-            raise
-
-    @property
-    def stopped(self):
-        return self._stopped.is_set() and self.error is None
-
-    def confirm_deadline(self, deadline: float):
-        with self._condition:
-            if not self._stopped.is_set():
-                self._deadline = deadline
-                self._condition.notify_all()
-
-    def observe(self):
-        if self.process.returncode is not None:
-            return self.process.returncode
-        result = os.waitid(os.P_PID, self.process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
-        if result is None:
-            return None
-        return result.si_status if result.si_code == os.CLD_EXITED else -result.si_status
-
-    def _signal(self, value):
-        pid, group, start = self.identity
-        _, current_group, current_start = _process_stat(pid)
-        if (current_group, current_start) != (group, start) or group != pid:
-            raise ExecutionError("process_identity_changed", "Refusing to signal unverified execution")
-        try:
-            os.killpg(group, value)
-        except ProcessLookupError:
-            pass
-
-    def _group_running(self):
-        group = self.identity[1]
-        for entry in Path("/proc").iterdir():
-            if entry.name.isdigit():
-                try:
-                    state, process_group, _ = _process_stat(int(entry.name))
-                except (FileNotFoundError, ProcessLookupError):
-                    continue
-                if process_group == group and state not in {"Z", "X"}:
-                    return True
-        return False
-
-    def stop(self, *, grace_seconds=0.1):
-        if not 0 <= grace_seconds <= 5:
-            raise ValueError("grace_seconds must be in 0..5")
-        with self._stop_lock:
-            if self._stopped.is_set():
-                return self.stopped
-            try:
-                self._signal(signal.SIGTERM)
-                end = time.monotonic() + grace_seconds
-                try:
-                    while time.monotonic() < end and self._group_running():
-                        time.sleep(0.005)
-                finally:
-                    # Enumeration failure is not quiescence and must not prevent
-                    # escalation against the still-verified, unreaped owned group.
-                    self._signal(signal.SIGKILL)
-                end = time.monotonic() + 2
-                while time.monotonic() < end and self._group_running():
-                    time.sleep(0.005)
-                if self._group_running():
-                    raise ExecutionError("stop_unconfirmed", "Owned group did not quiesce")
-                self.process.wait(timeout=2)
-                self.error = None
-                self._stopped.set()
-            except Exception as error:
-                self.error = error
-                raise
-            finally:
-                with self._condition:
-                    self._condition.notify_all()
-        return True
-
-    def wait_stopped(self, timeout):
-        return self._stopped.wait(timeout) and self.stopped
-
-    def _watch(self):
-        with self._condition:
-            while not self._stopped.is_set():
-                remaining = self._deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                self._condition.wait(timeout=remaining)
-        if not self._stopped.is_set():
-            self.deadline_expired = True
-            try:
-                self.stop()
-            except Exception as error:
-                self.error = error
+    def __new__(cls, profile: LocalProfile, workspace: Workspace, *, deadline: float,
+                elapsed_time: Callable[[], float] | None = None):
+        if cls is OwnedProcess:
+            return object.__new__(_linux_execution().OwnedProcess)
+        return super().__new__(cls)

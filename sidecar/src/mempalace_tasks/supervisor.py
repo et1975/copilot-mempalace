@@ -2,6 +2,9 @@
 
 step() is deterministic with an injected authority clock. A separate per-process
 watchdog enforces the last CONFIRMED authorization during blocked network calls.
+elapsed_time supplies seconds on one shared deadline basis; by default it is
+suspend-inclusive continuous time. A clock fault latches until a new supervisor
+is constructed; stopping owned processes alone does not reconcile their effects.
 Native hosts need a real identity/stop/isolation/reconciliation adapter; native
 Copilot cancellation or /fleet integration is deliberately not advertised.
 """
@@ -10,13 +13,22 @@ from __future__ import annotations
 import copy
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from .domain import ready_tasks, task_eligibility
-from .execution import ExecutionError, LocalProfile, OwnedProcess, Workspace, read_checkpoint, read_result
+from .execution import (
+    DeadlineClock, ExecutionError, LocalProfile, OwnedProcess, Workspace,
+    read_checkpoint, read_result, require_process_supervision,
+)
 from .journal import JsonStore
 from .maintenance import MutationRequests, error_record, execution_tokens, instant
+from .platform_support import continuous_time_ns
+
+
+def _continuous_seconds():
+    return continuous_time_ns() / 1_000_000_000
 
 
 @dataclass
@@ -40,7 +52,8 @@ class Worker:
 
 class HostSupervisor:
     def __init__(self, authority, clock, maintenance, *, supervisor_id, worker_id,
-                 profiles, pool_size=1, filters=None, stop_margin_seconds=5):
+                 profiles, pool_size=1, filters=None, stop_margin_seconds=5,
+                 elapsed_time: Callable[[], float] | None = None):
         if type(pool_size) is not int or not 1 <= pool_size <= 100:
             raise ValueError("pool_size must be in 1..100")
         if type(stop_margin_seconds) not in {int, float} or not 3 <= stop_margin_seconds <= 60:
@@ -58,6 +71,10 @@ class HostSupervisor:
                     not isinstance(self.filters[field], list)
                     or any(not isinstance(value, str) or not value for value in self.filters[field])):
                 raise ValueError("Task/resource filters must be lists of nonempty strings")
+        require_process_supervision()
+        source = _continuous_seconds if elapsed_time is None else elapsed_time
+        self.elapsed_time = source if isinstance(source, DeadlineClock) else DeadlineClock(source)
+        self.elapsed_time()
         with authority.serialized():
             config = authority.state.configuration or {}
             supervisor = config.get("supervisors", {}).get(supervisor_id, {})
@@ -90,15 +107,15 @@ class HostSupervisor:
     def _view(self):
         with self.authority.serialized():
             # Persistence latency must consume, never extend, the execution window.
-            monotonic_anchor = time.monotonic()
+            elapsed_anchor = self.elapsed_time()
             state, now = self.authority.state, instant(self.clock.now())
             health = self.authority.health()
-            return state, now, self.clock.pending_reboot, monotonic_anchor, health
+            return state, now, health["startup_pending"], elapsed_anchor, health
 
     @staticmethod
     def _current(health):
         return (health.get("fresh") is True and health.get("pending_command") is None
-                and health.get("pending_reboot") is not True and health.get("error") is None)
+                and health.get("startup_pending") is False and health.get("error") is None)
 
     def _require_current(self, health, result):
         if self._current(health):
@@ -134,7 +151,7 @@ class HostSupervisor:
             snapshot["lease_expires_at"], snapshot["attempt"]["progress_deadline"],
             snapshot["attempt"]["hard_deadline"]))
 
-    def _confirmed(self, worker, task, now, monotonic_anchor, receipt, health):
+    def _confirmed(self, worker, task, now, elapsed_anchor, receipt, health):
         if not self._current(health):
             raise ExecutionError("authority_not_current", "Unverified projection cannot authorize execution")
         original = self._receipt_task(receipt, worker.task_id)
@@ -147,20 +164,20 @@ class HostSupervisor:
                 or original["attempt"]["owner"] != self.worker_id):
             raise ExecutionError("stale_generation", "No current owned execution authorization")
         until = self._lease_limit(task, original)
-        worker.confirmed_lease = until
-        worker.next_renew = now + timedelta(seconds=task["policy"]["renewal_seconds"])
-        cutoff = monotonic_anchor + (until - now).total_seconds() - self.stop_margin
+        cutoff = elapsed_anchor + (until - now).total_seconds() - self.stop_margin
         if worker.process:
             worker.process.confirm_deadline(cutoff)
+        worker.confirmed_lease = until
+        worker.next_renew = now + timedelta(seconds=task["policy"]["renewal_seconds"])
         return cutoff
 
     def _stop(self, worker):
         if worker.process is not None:
             worker.process.stop()
 
-    def _stop_due(self, now, reboot, result):
+    def _stop_due(self, now, startup_pending, result):
         for worker in list(self.workers.values()):
-            if (reboot or now >= worker.confirmed_lease - timedelta(seconds=self.stop_margin)
+            if (startup_pending or now >= worker.confirmed_lease - timedelta(seconds=self.stop_margin)
                     or (worker.process is not None
                         and (worker.process.deadline_expired or worker.process.error is not None))):
                 try:
@@ -202,7 +219,7 @@ class HostSupervisor:
         return False
 
     def _accept_receipt(self, worker, receipt, result):
-        state, now, reboot, monotonic_anchor, health = self._view()
+        state, now, startup_pending, elapsed_anchor, health = self._view()
         if not self._require_current(health, result):
             return False
         purpose = worker.purpose
@@ -210,18 +227,18 @@ class HostSupervisor:
         task = state.tasks.get(worker.task_id)
         if purpose in {"started", "renew"}:
             cutoff = None
-            if not reboot and self._matches(worker, task) and task["status"] == "in_progress":
-                cutoff = self._confirmed(worker, task, now, monotonic_anchor, receipt, health)
+            if not startup_pending and self._matches(worker, task) and task["status"] == "in_progress":
+                cutoff = self._confirmed(worker, task, now, elapsed_anchor, receipt, health)
             if purpose == "started":
                 worker.phase = "running"
-                if (not self._closing and not reboot and not worker.failure
+                if (not self._closing and not startup_pending and not worker.failure
                         and self._matches(worker, task) and task["status"] == "in_progress"
                         and task["attempt"]["status"] == "running"
                         and cutoff is not None
                         and worker.confirmed_lease > now + timedelta(seconds=self.stop_margin)):
                     worker.quiescence_unknown = True
                     worker.process = OwnedProcess(
-                        worker.profile, worker.workspace, deadline=cutoff)
+                        worker.profile, worker.workspace, deadline=cutoff, elapsed_time=self.elapsed_time)
                     worker.quiescence_unknown = False
                     result["started"] += 1
                 else:
@@ -299,7 +316,7 @@ class HostSupervisor:
                     return
                 if not self._tracked(worker):
                     return
-                state, now, reboot, _, health = self._view()
+                state, now, startup_pending, _, health = self._view()
                 if not self._require_current(health, result):
                     return
                 task = state.tasks.get(worker.task_id)
@@ -312,7 +329,7 @@ class HostSupervisor:
                     else:
                         self._retire(worker)
                     return
-                if reboot:
+                if startup_pending:
                     self._stop(worker)
                     return
                 if worker.failure:
@@ -375,11 +392,11 @@ class HostSupervisor:
                 if progress is False:
                     return
                 if progress is True:
-                    state, now, reboot, _, health = self._view()
+                    state, now, startup_pending, _, health = self._view()
                     if not self._require_current(health, result):
                         return
                     task = state.tasks.get(worker.task_id)
-                    if reboot or not self._matches(worker, task) or task["status"] != "in_progress":
+                    if startup_pending or not self._matches(worker, task) or task["status"] != "in_progress":
                         continue
                 if now >= worker.next_renew:
                     self._submit(worker, {
@@ -441,7 +458,7 @@ class HostSupervisor:
                                      "message": "Claim remains unconfirmed; no execution started"})
             return
         if outcome == "committed":
-            state, now, reboot, _, health = self._view()
+            state, now, startup_pending, _, health = self._view()
             if not self._require_current(health, result):
                 return
         if pending is not None and self._claims.get(task["id"]) is pending:
@@ -454,7 +471,7 @@ class HostSupervisor:
             result["errors"].append(receipt)
             return
         current = state.tasks[task["id"]]
-        if (reboot or task["id"] in self.workers or current["status"] != "in_progress"
+        if (startup_pending or task["id"] in self.workers or current["status"] != "in_progress"
                 or current["claim_generation"] != task["claim_generation"] + 1
                 or current["attempt"]["supervisor_id"] != self.supervisor_id
                 or current["attempt"]["owner"] != self.worker_id):
@@ -478,9 +495,9 @@ class HostSupervisor:
         with self._lock:
             result = self._result()
             try:
-                _, now, reboot, _, _ = self._view()
-                self._stop_due(now, reboot, result)
-                if reboot or self._next_sweep is None or now >= self._next_sweep:
+                _, now, startup_pending, _, _ = self._view()
+                self._stop_due(now, startup_pending, result)
+                if startup_pending or self._next_sweep is None or now >= self._next_sweep:
                     sweep = self.maintenance.tick()
                     self._next_sweep = now + timedelta(seconds=self.sweep_seconds)
                     result["maintenance"] = sweep
@@ -489,8 +506,8 @@ class HostSupervisor:
                         return self._finish(result)
                 else:
                     self.authority.reconcile()
-                state, now, reboot, _, health = self._view()
-                self._stop_due(now, reboot, result)
+                state, now, startup_pending, _, health = self._view()
+                self._stop_due(now, startup_pending, result)
                 if not self._require_current(health, result):
                     return self._finish(result)
                 for worker in list(self.workers.values()):
@@ -503,10 +520,10 @@ class HostSupervisor:
                 for _ in range(self.pool_size):
                     if self._closing or len(self.workers) + len(self._claims) >= self.pool_size:
                         break
-                    state, now, reboot, _, health = self._view()
+                    state, now, startup_pending, _, health = self._view()
                     if not self._require_current(health, result):
                         break
-                    if reboot:
+                    if startup_pending:
                         break
                     task = next((t for t in self._ready(state, now) if t["id"] not in attempted), None)
                     if task is None:
@@ -521,6 +538,13 @@ class HostSupervisor:
                     result["queued"] = len(self._ready(state, now))
             except Exception as error:
                 result["errors"].append(error_record(error, "step"))
+                if self.elapsed_time.error is not None:
+                    for worker in [*self.workers.values(), *self._recoveries.values()]:
+                        worker.failure = self.elapsed_time.error.code
+                        try:
+                            self._stop(worker)
+                        except Exception as stop_error:
+                            result["errors"].append(error_record(stop_error, "stop"))
             return self._finish(result)
 
     def _finish(self, result):
@@ -529,12 +553,15 @@ class HostSupervisor:
         return result
 
     def health(self):
-        return {"ok": (self._last is None or not self._last["errors"])
+        return {"ok": self.elapsed_time.error is None
+                and (self._last is None or not self._last["errors"])
                 and not (self._recoveries or self._claims or self._claim_receipts or self.requests.pending)
                 and not any(w.pending or w.pending_receipt or (w.process and w.process.error)
                             for w in self.workers.values()),
                 "active": len(self.workers), "pending_claims": len(self._claims),
                 "unresolved_recoveries": len(self._recoveries), "peak_workers": self._peak,
+                "clock_error": (error_record(self.elapsed_time.error, "clock")
+                                if self.elapsed_time.error is not None else None),
                 "last_step": copy.deepcopy(self._last)}
 
     def close(self):
@@ -561,14 +588,14 @@ class HostSupervisor:
                         self.authority.reconcile()
                         if not self._resume(worker, result):
                             continue
-                    state, now, reboot, _, health = self._view()
+                    state, now, startup_pending, _, health = self._view()
                     if not self._require_current(health, result):
                         continue
                     task = state.tasks.get(worker.task_id)
                     if self._matches(worker, task) and task["status"] == "in_progress":
                         if now < min(instant(task["lease_expires_at"]),
                                      instant(task["attempt"]["progress_deadline"]),
-                                     instant(task["attempt"]["hard_deadline"])) and not reboot:
+                                     instant(task["attempt"]["hard_deadline"])) and not startup_pending:
                             self._submit(worker, {
                                 "operation": "release", "actor": self.supervisor_id,
                                 **execution_tokens(task), "reason": "host_stopped",

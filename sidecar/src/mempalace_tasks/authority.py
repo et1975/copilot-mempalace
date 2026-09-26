@@ -1,8 +1,8 @@
-"""Single-host serialized task authority with bounded, durable uncertainty recovery.
+"""Epoch-bound authority: the palace journal is the sole durable task store.
 
-Only execute/reconcile/start write recovery metadata or append records. Diagnostic
-reads may replay the log, but never settle, expire, recover, or clear pending work.
-The upstream append-order log is truth; local files are verified recovery metadata.
+The only local ownership primitive is a stable lifetime lock. Pending commands,
+verified prefixes, clocks and read snapshots are process-local. Restore requires
+a quiesced owner and a fresh instance, never reconciliation of local files.
 """
 
 from collections import Counter, OrderedDict
@@ -20,12 +20,12 @@ from uuid import uuid4
 
 from .codec import canonical_json, command_hash
 from .domain import task_eligibility
-from .journal import AuthorityLock, HeadStore, JournalError, PendingStore
-from .leases import ClockError
+from .platform_support import LifetimeLock, PlatformError, ensure_private_directory
+from .runtime_clock import ClockError, RuntimeClock
 from .model import DomainError, identifier, instant, integer, text, utc
 from .palace import PalaceError
 from .protocol import (
-    LogState, ProtocolError, fold_record, make_proposal, make_settlement, normalize_command,
+    LogState, ProtocolError, fold_record, make_epoch, make_proposal, make_settlement, normalize_command,
 )
 
 
@@ -42,35 +42,87 @@ class AuthorityError(Exception):
                 "ambiguous": self.ambiguous}
 
 
+class _BoundAuthority:
+    """Internal port with a frozen owner epoch; never use for HTTP dispatch."""
+
+    def __init__(self, authority, epoch_id):
+        self._authority, self.epoch_id = authority, epoch_id
+
+    @contextmanager
+    def serialized(self):
+        with self._authority.serialized():
+            self._authority._check_epoch(self.epoch_id)
+            yield self
+
+    @property
+    def state(self):
+        with self.serialized():
+            return self._authority.state
+
+    def health(self):
+        with self.serialized():
+            return self._authority.health()
+
+    def reconcile(self):
+        with self.serialized():
+            return self._authority.reconcile()
+
+    def execute(self, command):
+        return self._authority._execute_current(command, self.epoch_id)
+
+
 class TaskAuthority:
-    def __init__(self, authority_id, client, state_dir, *, clock, backoff=time.sleep):
+    """Serialized decisions, bounded startup fencing and scoped historical reads."""
+
+    STARTUP_BATCH = 100
+
+    def __init__(self, authority_id, client, runtime_dir, *, clock=None, backoff=time.sleep,
+                 expected_configuration=None, initialize=False, system_actor="system",
+                 recovery_actor="operator"):
         identifier(authority_id, "authority_id")
-        if not callable(clock) or not callable(backoff):
-            raise AuthorityError("validation_error", "clock and backoff must be callable")
+        if clock is not None and (not callable(getattr(clock, "now", None))
+                                  or not callable(getattr(clock, "observe", None))):
+            raise AuthorityError("clock_error", "Clock requires now() and observe(timestamp)")
+        if not callable(backoff) or type(initialize) is not bool:
+            raise AuthorityError("validation_error", "Invalid backoff or initialization flag")
+        if any(type(actor) is not str or not actor.strip() or len(actor) > 256
+               for actor in (system_actor, recovery_actor)):
+            raise AuthorityError("validation_error", "Recovery actors must be bounded nonempty names")
+        if expected_configuration is not None and type(expected_configuration) is not dict:
+            raise AuthorityError("validation_error", "Expected configuration must be an object")
+        canonical_json(expected_configuration)
         self.authority_id = authority_id
         self.client = client
-        self.state_dir = Path(state_dir)
-        self._clock = clock
-        self.clock_source = None
+        self.runtime_dir = Path(runtime_dir)
+        self._expected_configuration = deepcopy(expected_configuration)
+        self._initialize = initialize
+        self._system_actor, self._recovery_actor = system_actor, recovery_actor
+        self._initial_clock = clock
+        self.clock_source = clock
+        self._owner_epoch = self._owner_activation = None
+        self._startup_pending = True
+        self._fenced_error = None
         self._backoff = backoff
         self._mutex = threading.RLock()
         self._process = os.getpid()
-        self._owner = AuthorityLock(state_dir, authority_id)
-        self._pending_store = PendingStore(state_dir)
-        self._head_store = HeadStore(state_dir)
+        self._owner = None
         self._owned = False
         self._started = False
         self._log = LogState(authority_id)
         self._pending = None
-        self._saved_head = None
-        self._head_loaded = False
-        self._head_write_attempt = None
         self._verified = False
         self._last_verified_at = None
         self._last_error = None
-        self._persistence_error = False
         self._snapshots = OrderedDict()
         self._cursor_key = secrets.token_bytes(32)
+
+    @property
+    def epoch_id(self):
+        return self._owner_epoch
+
+    @property
+    def startup_pending(self):
+        return self._startup_pending
 
     def _same_process(self):
         if os.getpid() != self._process:
@@ -84,21 +136,21 @@ class TaskAuthority:
                 raise AuthorityError("not_started", "Authority has not acquired ownership")
             try:
                 yield
-            except (DomainError, ProtocolError, JournalError, PalaceError, ClockError) as error:
+            except (DomainError, ProtocolError, PlatformError, PalaceError, ClockError) as error:
+                code = "authority_locked" if error.code == "lock_busy" else error.code
                 if not isinstance(error, DomainError):
                     self._verified = False
-                    self._last_error = {"code": error.code}
-                if isinstance(error, JournalError):
-                    self._persistence_error = True
+                    self._last_error = {"code": code}
                 details = error.details if isinstance(error, (DomainError, ProtocolError)) else {}
                 ambiguous = bool(getattr(error, "ambiguous", False)
                                  or mutation is not None and mutation["ambiguous"])
-                raise AuthorityError(error.code, error.message, details,
+                raise AuthorityError(code, error.message, details,
                                      ambiguous=ambiguous) from error
             except AuthorityError as error:
                 if mutation is not None and mutation["ambiguous"]:
                     error.ambiguous = True
-                if error.code in {"log_rollback", "outcome_unknown", "missing_state", "clock_error"}:
+                if error.code in {"log_rollback", "outcome_unknown", "clock_error",
+                                  "epoch_superseded", "activation_unknown"}:
                     self._verified = False
                     self._last_error = {"code": error.code}
                 raise
@@ -109,27 +161,27 @@ class TaskAuthority:
         with self._boundary():
             yield self
 
-    def start(self, clock_factory=None):
+    def start(self):
         with self._boundary(started=False):
             if self._started:
-                if clock_factory is not None:
-                    raise AuthorityError("already_started", "Clock already selected")
+                self._require_live_owner()
                 return self
             try:
+                ensure_private_directory(self.runtime_dir)
+                self._owner = LifetimeLock(self.runtime_dir / "authority.lock")
                 self._owner.acquire()
                 self._owned = True
-                self._head_loaded = False
-                self._head_write_attempt = None
-                if clock_factory is not None:
-                    source = clock_factory()
-                    if (not callable(getattr(source, "now", None))
-                            or type(getattr(source, "pending_reboot", None)) is not bool):
-                        raise AuthorityError("clock_error", "Clock factory must return a clock")
-                    self.clock_source = source
-                    self._clock = source.now
+                self._pending = None
+                self._owner_epoch = self._owner_activation = None
+                self._startup_pending = True
+                self.clock_source = self._initial_clock
                 self._started = True
                 self.client.discover()
-                self._reconcile_locked()
+                self._refresh_locked(verify_prefix=True)
+                self._activate()
+                self._startup_pending = any(task["status"] == "in_progress"
+                                            for task in self._log.state.tasks.values())
+                self._recover_startup()
                 return self
             except BaseException:
                 self._started = False
@@ -181,7 +233,7 @@ class TaskAuthority:
 
     def _now(self):
         try:
-            now = utc(instant(self._clock()))
+            now = utc(instant(self.clock_source.now()))
             if (self._log.state.last_event_at is not None
                     and instant(now) < instant(self._log.state.last_event_at)):
                 raise AuthorityError("clock_error", "Clock is behind the accepted domain head")
@@ -189,15 +241,10 @@ class TaskAuthority:
         except DomainError as error:
             raise AuthorityError("clock_error", "Clock must return canonical UTC") from error
 
-    def _boot_pending(self):
-        if self.clock_source is None:
-            return False
-        pending = self.clock_source.pending_reboot
-        if type(pending) is not bool:
-            raise AuthorityError("clock_error", "Clock reboot state must be boolean")
-        return pending
-
     def _proposal_outcome(self, proposal, log):
+        self._require_live_owner()
+        if proposal["epoch_id"] != self._owner_epoch or log.epoch_id != self._owner_epoch:
+            raise AuthorityError("stale_epoch", "Pending request belongs to another epoch")
         outcome = log.outcomes.get(proposal["command_id"])
         if outcome is not None and (
                 outcome["command_hash"] != proposal["command_hash"]
@@ -206,126 +253,137 @@ class TaskAuthority:
             raise ProtocolError("invariant_violation", "Pending proposal conflicts with log")
         return outcome
 
-    def _load_pending(self, *, reacquired_log=None):
-        pending = self._pending_store.read()
-        prior_resolved = (self._pending is not None and reacquired_log is not None
-                          and self._proposal_outcome(self._pending["proposal"], reacquired_log)
-                          is not None)
-        if pending is None and self._pending is not None:
-            known = self._proposal_outcome(self._pending["proposal"], self._log)
-            if not prior_resolved and (not self._persistence_error or known is None):
-                raise AuthorityError("missing_state", "Unresolved pending proposal disappeared")
-        if pending is not None:
-            proposal = pending["proposal"]
-            if self._pending is not None and not prior_resolved and (
-                    canonical_json(proposal) != canonical_json(self._pending["proposal"])
-                    or self._pending["settlement"] is not None
-                    and canonical_json(pending["settlement"])
-                    != canonical_json(self._pending["settlement"])):
-                raise ProtocolError("invariant_violation", "Unresolved pending proposal changed")
-            settlement = make_settlement(proposal)
-            if proposal["authority_id"] != self.authority_id:
-                raise ProtocolError("invariant_violation", "Foreign pending proposal")
-            if (pending["settlement"] is not None
-                    and canonical_json(pending["settlement"]) != canonical_json(settlement)):
-                raise ProtocolError("invariant_violation", "Pending settlement mismatch")
-        self._pending = pending
-        return pending
-
-    def _read_checkpoint(self):
-        saved = self._head_store.read()
-        if saved is None and self._saved_head is not None:
-            raise AuthorityError("missing_state", "Verified checkpoint disappeared")
-        if self._head_loaded:
-            allowed = [self._saved_head]
-            if self._head_write_attempt is not None:
-                allowed.append(self._head_write_attempt)
-            if saved not in allowed:
-                raise AuthorityError("log_rollback", "Verified checkpoint changed unexpectedly")
-        return saved
-
-    def _audit_prefix(self, saved):
-        checkpoints = [checkpoint for checkpoint in
-                       (saved, self._log.checkpoint()) if checkpoint is not None
-                       and checkpoint["raw_cursor"] is not None]
-        remaining = list(checkpoints)
+    def _audit_prefix(self):
+        checkpoint = self._log.checkpoint()
+        matched = checkpoint["raw_cursor"] is None
         rebuilt = LogState(self.authority_id)
         for raw in self.client.replay_events():
             fold_record(rebuilt, raw)
-            for checkpoint in list(remaining):
-                if checkpoint["raw_cursor"] == rebuilt.raw_cursor:
-                    if checkpoint != rebuilt.checkpoint():
-                        raise AuthorityError("log_rollback", "Verified raw prefix changed")
-                    remaining.remove(checkpoint)
-        if remaining:
+            if checkpoint["raw_cursor"] == rebuilt.raw_cursor:
+                if checkpoint != rebuilt.checkpoint():
+                    raise AuthorityError("log_rollback", "Verified raw prefix changed")
+                matched = True
+        if not matched:
             raise AuthorityError("log_rollback", "Verified raw prefix is absent")
         return rebuilt
 
+    def _observe_time(self, rebuilt):
+        timestamps = [attempt["at"] for attempt in rebuilt.activation_attempts.values()
+                      if attempt["outcome"] == "accepted"]
+        if rebuilt.state.last_event_at is not None:
+            timestamps.append(rebuilt.state.last_event_at)
+        high_water = max(timestamps, key=instant) if timestamps else None
+        if self.clock_source is None:
+            self.clock_source = RuntimeClock(initial_time=high_water)
+        elif high_water is not None:
+            self.clock_source.observe(high_water)
+
+    def _validate_configuration(self, configuration):
+        if configuration is None:
+            if not self._initialize:
+                raise AuthorityError("not_initialized", "Expected authority journal has no genesis")
+            return
+        if (self._expected_configuration is not None
+                and configuration != self._expected_configuration):
+            raise AuthorityError("configuration_conflict",
+                                 "Requested genesis differs from accepted configuration")
+        actors = configuration["actors"]
+        if (actors.get(self._system_actor) != "system"
+                or actors.get(self._recovery_actor) != "operator"
+                or self._system_actor == self._recovery_actor):
+            raise AuthorityError("configuration_conflict",
+                                 "Registered system and operator recovery identities are required")
+
+    def _raise_fenced(self):
+        if self._fenced_error is not None:
+            raise AuthorityError(self._fenced_error, "This authority incarnation is permanently fenced")
+
+    def _require_live_owner(self):
+        self._raise_fenced()
+        if (self._owner_epoch is None or self._log.epoch_id != self._owner_epoch
+                or self._log.activation_id != self._owner_activation):
+            raise AuthorityError("activation_pending", "Current owner activation is not verified")
+
     def _refresh_locked(self, *, verify_prefix=False):
-        saved = self._read_checkpoint()
-        if not self._head_loaded:
-            self._verified = False
-            rebuilt = self._audit_prefix(saved)
-            self._load_pending(reacquired_log=rebuilt)
-        else:
-            had_pending = self._pending is not None
-            self._load_pending()
-            audit = verify_prefix or not self._verified or not had_pending and self._pending is not None
-            self._verified = False
-            if audit:
-                rebuilt = self._audit_prefix(saved)
-            else:
-                # Each fold publishes a coherent verified prefix under the mutex.
-                # An interrupted tail stays non-current and requires a full audit.
-                rebuilt = self._log
-                try:
-                    for raw in self.client.replay_events(rebuilt.raw_cursor):
-                        fold_record(rebuilt, raw)
-                except PalaceError as error:
-                    if error.code == "unknown_cursor":
-                        raise AuthorityError("log_rollback", "Verified raw cursor disappeared") from error
-                    raise
-        now = self._now()
-        if (rebuilt.state.last_event_at is not None
-                and instant(now) < instant(rebuilt.state.last_event_at)):
-            raise AuthorityError("clock_error", "Clock is behind the replayed domain head")
+        self._raise_fenced()
+        self._verified = False
+        try:
+            rebuilt = self._audit_prefix()
+            self._validate_configuration(rebuilt.state.configuration)
+            if self._owner_epoch is not None and (
+                    rebuilt.epoch_id != self._owner_epoch
+                    or rebuilt.activation_id != self._owner_activation):
+                raise AuthorityError("epoch_superseded", "Another startup activation superseded this owner")
+        except (ProtocolError, AuthorityError) as error:
+            if error.code in {"log_rollback", "invariant_violation", "epoch_superseded"}:
+                self._fenced_error = error.code
+            self._last_error = {"code": error.code}
+            raise
+        self._observe_time(rebuilt)
         self._log = rebuilt
-        if not self._head_loaded:
-            self._saved_head = saved
-            self._head_loaded = True
+        self._last_verified_at = self._now()
         self._verified = True
-        self._last_verified_at = now
-        if not self._persistence_error:
-            self._last_error = None
+        self._last_error = None
         return rebuilt
 
-    def _persist_head(self):
-        self._read_checkpoint()
-        head = self._log.checkpoint()
-        self._head_write_attempt = head
-        self._head_store.write(head)
-        self._saved_head = head
-        self._head_loaded = True
-        self._head_write_attempt = None
+    def _activate(self):
+        last_code = None
+        for _ in range(3):
+            marker = make_epoch(self._log, str(uuid4()), str(uuid4()), self._now())
+            for delay in (1, 2, 4):
+                try:
+                    self.client.append_event(deepcopy(marker))
+                except PalaceError as error:
+                    last_code = error.code
+                try:
+                    self._refresh_locked(verify_prefix=True)
+                except PalaceError as error:
+                    last_code = error.code
+                else:
+                    attempt = self._log.activation_attempts.get(marker["activation_id"])
+                    if attempt is not None:
+                        if attempt["outcome"] == "accepted":
+                            if self._log.activation_id != marker["activation_id"]:
+                                self._fenced_error = "epoch_superseded"
+                                raise AuthorityError("epoch_superseded",
+                                                     "Startup activation was already superseded")
+                            self._owner_epoch = marker["epoch_id"]
+                            self._owner_activation = marker["activation_id"]
+                            return
+                        break
+                self._backoff(delay)
+            else:
+                raise AuthorityError("activation_unknown", "Startup activation remains unconfirmed",
+                                     {"activation_id": marker["activation_id"],
+                                      "cause": last_code or "outcome_unknown"}, ambiguous=True)
+            self._refresh_locked(verify_prefix=True)
+        raise AuthorityError("activation_rejected", "Startup lost all bounded activation attempts")
 
     def _check_pending_outcome(self):
         return self._proposal_outcome(self._pending["proposal"], self._log)
 
     def _finish_pending(self, outcome):
-        self._persist_head()
-        self._pending_store.clear()
+        self._require_live_owner()
         self._pending = None
-        self._persistence_error = False
         self._last_error = None
         return outcome
+
+    def _record_pending(self, proposal):
+        self._require_live_owner()
+        if proposal["event"]["command"]["operation"] == "authority_create":
+            self._validate_configuration(proposal["event"]["configuration"])
+        self._pending = {"proposal": deepcopy(proposal), "settlement": None}
+
+    def _record_settlement(self, settlement):
+        self._require_live_owner()
+        self._pending["settlement"] = deepcopy(settlement)
 
     def _resolve_pending(self, *, force_settlement=False):
         outcome = self._check_pending_outcome()
         if outcome is not None and not force_settlement:
             return self._finish_pending(outcome)
         settlement = make_settlement(self._pending["proposal"])
-        self._pending_store.attach_settlement(settlement)
-        self._pending["settlement"] = settlement
+        self._record_settlement(settlement)
         last_code = None
         for delay in (1, 2, 4):
             try:
@@ -348,13 +406,31 @@ class TaskAuthority:
                               "cause": last_code or "outcome_unknown"}, ambiguous=True)
 
     def _reconcile_locked(self):
-        self._refresh_locked(verify_prefix=self._pending is not None)
-        if self._pending is not None:
-            return self._resolve_pending()
-        self._persist_head()
-        self._persistence_error = False
-        self._last_error = None
-        return None
+        self._refresh_locked(verify_prefix=True)
+        self._require_live_owner()
+        outcome = self._resolve_pending() if self._pending is not None else None
+        self._recover_startup()
+        return outcome
+
+    def _recover_startup(self):
+        if not self._startup_pending:
+            return
+        for _ in range(self.STARTUP_BATCH):
+            task = next((task for task in sorted(self._log.state.tasks.values(), key=lambda t: t["id"])
+                         if task["status"] == "in_progress"), None)
+            if task is None:
+                break
+            self.execute_current({
+                "operation": "attempt_report", "command_id": str(uuid4()),
+                "actor": self._system_actor, "task_id": task["id"],
+                "expected_version": task["version"], "attempt_id": task["attempt"]["id"],
+                "claim_generation": task["claim_generation"], "report_kind": "recovery_started",
+                "reason": "authority_startup",
+                "evidence": {"references": [
+                    f"mptask://{self.authority_id}/epochs/{self._owner_epoch}"]},
+            })
+        self._startup_pending = (self._pending is not None or any(
+            task["status"] == "in_progress" for task in self._log.state.tasks.values()))
 
     def reconcile(self):
         with self._boundary():
@@ -362,19 +438,15 @@ class TaskAuthority:
             return self._receipt(outcome, replayed=True) if outcome else self._health_locked()
 
     def refresh(self, *, verify_prefix=False):
-        """Read the healthy tail; opt into a full historical prefix audit.
-
-        Startup and recovery after uncertainty/disconnection audit automatically.
-        Healthy reads trust historical immutability under the append-only contract.
-        """
+        """Refresh through a verified full prefix; never mutate domain truth."""
         with self._boundary():
             if type(verify_prefix) is not bool:
                 raise AuthorityError("validation_error", "verify_prefix must be boolean")
             self._refresh_locked(verify_prefix=verify_prefix or self._pending is not None)
             return self._health_locked()
 
-    def _check_boot_command(self, command):
-        if not self._boot_pending():
+    def _check_startup_command(self, command):
+        if not self._startup_pending:
             return
         config = self._log.state.configuration
         role = config["actors"].get(command.get("actor")) if config is not None else None
@@ -386,11 +458,36 @@ class TaskAuthority:
             and role == "system"
         )
         if not maintenance:
-            raise AuthorityError("reboot_pending", "Inherited attempts must be revoked first")
+            raise AuthorityError("startup_pending", "Inherited attempts must be revoked first")
 
-    def execute(self, command):
+    def _check_epoch(self, expected_epoch):
+        if expected_epoch is None:
+            raise AuthorityError("epoch_required", "A frozen request epoch is required")
+        identifier(expected_epoch, "expected_epoch")
+        if expected_epoch != self._owner_epoch:
+            raise AuthorityError("stale_epoch", "Request epoch differs from this owner")
+        self._require_live_owner()
+
+    def execute(self, command, *, expected_epoch=None):
+        with self._boundary():
+            self._check_epoch(expected_epoch)
+            if self._startup_pending:
+                raise AuthorityError("startup_pending", "Inherited attempts must be revoked first")
+            return self._execute_current(command, expected_epoch)
+
+    def execute_current(self, command):
+        """Trusted initialization only; transport callers must provide a frozen epoch."""
+        return self._execute_current(command, self._owner_epoch)
+
+    def bound_current(self):
+        with self._boundary():
+            self._require_live_owner()
+            return _BoundAuthority(self, self._owner_epoch)
+
+    def _execute_current(self, command, expected_epoch):
         mutation = {"ambiguous": False}
         with self._boundary(mutation=mutation):
+            self._check_epoch(expected_epoch)
             normalized = normalize_command(command)
             digest = command_hash(normalized)
             previous = self._log.outcomes.get(normalized["command_id"])
@@ -414,14 +511,11 @@ class TaskAuthority:
                 known = self._log.outcomes.get(normalized["command_id"])
             if known is not None:
                 mutation["ambiguous"] = True
-                self._persist_head()
-                self._persistence_error = False
                 self._last_error = None
                 return self._receipt(known, replayed=True)
-            self._check_boot_command(normalized)
+            self._check_startup_command(normalized)
             proposal = make_proposal(self._log, normalized, self._now())
-            self._pending_store.write(proposal)
-            self._pending = {"proposal": proposal, "settlement": None}
+            self._record_pending(proposal)
             mutation["ambiguous"] = True
             uncertain = False
             try:
@@ -442,14 +536,14 @@ class TaskAuthority:
     def _freshness(self):
         if not self._started:
             return False, "not_started"
+        if self._fenced_error is not None:
+            return False, self._fenced_error
+        if self._startup_pending:
+            return False, "startup_pending"
         if self._pending is not None:
             return False, "pending_command"
-        if self._persistence_error:
-            return False, "persistence_unconfirmed"
         if not self._verified:
             return False, self._last_error["code"] if self._last_error else "unverified"
-        if self._boot_pending():
-            return False, "reboot_pending"
         if self._log.state.configuration is None:
             return False, "uninitialized"
         return True, None
@@ -459,12 +553,12 @@ class TaskAuthority:
         return {"schema_version": 1, "authority_id": self.authority_id, "as_of": now,
                 "last_verified_at": self._last_verified_at, "raw_cursor": self._log.raw_cursor,
                 "domain_head": self._log.domain_head, "domain_ordinal": self._log.domain_ordinal,
-                "fresh": fresh, "reason": reason}
+                "fresh": fresh, "reason": reason, "epoch_id": self._owner_epoch,
+                "startup_pending": self._startup_pending, "request_epoch_required": True}
 
     def _health_locked(self):
         result = self._metadata(self._now() if self._started else None)
         result.update({"started": self._started,
-                       "pending_reboot": self._boot_pending() if self._started else None,
                        "protocol": {"raw_hash": self._log.raw_hash,
                                     "record_count": len(self._log.history),
                                     "outcomes": dict(Counter(
@@ -512,16 +606,34 @@ class TaskAuthority:
                        "command_id": outcome["command_id"], "event_id": outcome["event_id"],
                        "ordinal": outcome["ordinal"], "replayed": replayed,
                        "response": response, "tasks": deepcopy(tasks), "authorization": authorization})
+        result["epoch_id"] = outcome["epoch_id"]
+        if outcome["epoch_id"] != self._owner_epoch:
+            authorization["fresh"] = False
+            for task in authorization["tasks"]:
+                task.update(authorized=False, lease_live=False, lease_expires_at=None,
+                            reason="stale_epoch")
         return result
+
+    def outcome(self, epoch_id, command_id):
+        """Selected historical evidence, never proof of absent external effects."""
+        with self._boundary():
+            identifier(epoch_id, "epoch_id")
+            identifier(command_id, "command_id")
+            self._observe()
+            outcome = self._log.historical_outcome(epoch_id, command_id)
+            receipt = None if outcome is None else self._receipt(outcome, replayed=True)
+            return {**self._metadata(self._now()), "request_epoch": epoch_id,
+                    "command_id": command_id,
+                    "resolution": "not_recorded" if outcome is None else outcome["outcome"],
+                    "receipt": receipt, "authorization": {"authorized": False},
+                    "external_effects": "not_determined"}
 
     def _observe(self):
         try:
             self._refresh_locked(verify_prefix=self._pending is not None)
-        except (PalaceError, ProtocolError, JournalError, AuthorityError) as error:
+        except (PalaceError, ProtocolError, AuthorityError) as error:
             self._verified = False
             self._last_error = {"code": error.code}
-            if isinstance(error, JournalError):
-                self._persistence_error = True
 
     def _task(self, task_id):
         if type(task_id) is not str or task_id not in self._log.state.tasks:

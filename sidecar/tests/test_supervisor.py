@@ -3,12 +3,11 @@ import threading
 import time
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import patch
 
 from mempalace_tasks.execution import LocalProfile
 from mempalace_tasks.journal import JournalError, JsonStore
-from mempalace_tasks.leases import EffectiveClock
+from mempalace_tasks.runtime_clock import RuntimeClock
 from mempalace_tasks.maintenance import LeaseMaintenance
 from mempalace_tasks.supervisor import HostSupervisor
 from runtime_support import DomainPort, ManualClock, PortError, RealAuthorityFixture, temporary_directory
@@ -213,54 +212,51 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(self.port.state.tasks[tid]["status"], "recovering")
         self.assertIsNotNone(self.port.state.resources["local-resource"]["reservation"])
 
-    def _persist_delayed_authorization(self, operation):
+    def _sample_delayed_authorization(self, operation):
         elapsed = [0]
         monotonic_base = time.monotonic()
         epoch_ns = 1790164800000000000
-        store = JsonStore(self.root / "clock.json")
-        clock = EffectiveClock(store, wall_time_ns=lambda: epoch_ns + elapsed[0] * 1000000000,
-                               monotonic_ns=lambda: elapsed[0] * 1000000000,
-                               boot_id="runtime-latency-test", initialize=True)
+        clock = RuntimeClock(wall_time_ns=lambda: epoch_ns + elapsed[0] * 1000000000,
+                             continuous_time_ns=lambda: elapsed[0] * 1000000000)
         port = DomainPort(clock)
         tid = port.create()
         maintenance = LeaseMaintenance(port, clock, system_actor="sys", recovery_actor="recovery")
         host = HostSupervisor(port, clock, maintenance, supervisor_id="sup", worker_id="worker",
-                              profiles=[profile(self.root / "latency")])
+                              profiles=[profile(self.root / "latency")],
+                              elapsed_time=lambda: monotonic_base + elapsed[0])
         self.addCleanup(host.close)
         if operation == "renew":
             host.step()
             elapsed[0] = 100
         armed = False
-        real_execute, real_write = port.execute, store.write
+        real_execute, real_now = port.execute, clock.now
         def execute_then_delay_snapshot(command):
             nonlocal armed
             response = real_execute(command)
             if command.get("report_kind", command["operation"]) == operation:
                 armed = True
             return response
-        def persist_with_elapsed_time(value):
+        def sample_with_elapsed_time():
             nonlocal armed
-            real_write(value)
+            value = real_now()
             if armed:
                 armed = False
                 elapsed[0] += 20
-        sampled_time = SimpleNamespace(monotonic=lambda: monotonic_base + elapsed[0],
-                                       sleep=time.sleep)
+            return value
         with patch.object(port, "execute", side_effect=execute_then_delay_snapshot):
-            with patch.object(store, "write", side_effect=persist_with_elapsed_time):
-                with patch("mempalace_tasks.supervisor.time", sampled_time):
-                    host.step()
+            with patch.object(clock, "now", side_effect=sample_with_elapsed_time):
+                host.step()
         worker = host.workers[tid]
         self.assertIsNotNone(worker.process)
         self.assertEqual(elapsed[0], 120 if operation == "renew" else 20)
         return worker, monotonic_base
 
-    def test_spawn_cutoff_excludes_effective_clock_persistence_latency(self):
-        worker, anchor = self._persist_delayed_authorization("started")
+    def test_spawn_cutoff_excludes_effective_clock_sampling_latency(self):
+        worker, anchor = self._sample_delayed_authorization("started")
         self.assertAlmostEqual(worker.process._deadline, anchor + 295, places=6)
 
-    def test_renewal_cutoff_excludes_effective_clock_persistence_latency(self):
-        worker, anchor = self._persist_delayed_authorization("renew")
+    def test_renewal_cutoff_excludes_effective_clock_sampling_latency(self):
+        worker, anchor = self._sample_delayed_authorization("renew")
         self.assertAlmostEqual(worker.process._deadline, anchor + 395, places=6)
 
     def test_fresh_checkpoint_each_step_cannot_starve_due_renewal(self):
@@ -493,13 +489,15 @@ class SupervisorTests(unittest.TestCase):
         self.assertTrue(task["attempt"]["settlement"]["process_stopped"])
         self.assertIsNone(self.port.state.resources["local-db"]["reservation"])
 
-    def test_filters_and_reboot_gate_prevent_unauthorized_launch(self):
+    def test_filters_and_startup_gate_prevent_unauthorized_launch(self):
         chosen, ignored = self.port.create(), self.port.create()
         host = self.host(filters={"task_ids": [chosen], "project": "project"})
-        self.clock.pending_reboot = True
+        self.port.startup_pending = True
         self.port.reconcile_error = PortError("upstream_unavailable")
         self.assertEqual(host.step()["started"], 0)
         self.port.reconcile_error = None
+        self.assertEqual(host.step()["started"], 0)
+        self.port.startup_pending = False
         host.step()
         self.assertEqual(set(host.workers), {chosen})
         self.assertEqual(self.port.state.tasks[ignored]["status"], "open")
@@ -604,9 +602,9 @@ class SupervisorTests(unittest.TestCase):
         fixture = RealAuthorityFixture(self.root / "authority", self.clock)
         self.addCleanup(fixture.authority.close)
         tid = fixture.create()
-        maintenance = LeaseMaintenance(fixture.authority, self.clock,
+        maintenance = LeaseMaintenance(fixture.bound, self.clock,
                                        system_actor="sys", recovery_actor="recovery")
-        host = HostSupervisor(fixture.authority, self.clock, maintenance, supervisor_id="sup",
+        host = HostSupervisor(fixture.bound, self.clock, maintenance, supervisor_id="sup",
                               worker_id="worker", profiles=[profile(self.root / "real", "success")])
         self.addCleanup(host.close)
         host.step()
@@ -620,9 +618,9 @@ class SupervisorTests(unittest.TestCase):
         fixture = RealAuthorityFixture(self.root / "authority", self.clock)
         self.addCleanup(fixture.authority.close)
         tid = fixture.create()
-        maintenance = LeaseMaintenance(fixture.authority, self.clock,
+        maintenance = LeaseMaintenance(fixture.bound, self.clock,
                                        system_actor="sys", recovery_actor="recovery")
-        host = HostSupervisor(fixture.authority, self.clock, maintenance, supervisor_id="sup",
+        host = HostSupervisor(fixture.bound, self.clock, maintenance, supervisor_id="sup",
                               worker_id="worker", profiles=[profile(self.root / "real")])
         self.addCleanup(host.close)
         host.step()
@@ -647,24 +645,25 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(fixture.state.tasks[tid]["automatic_retries_used"], 1)
 
     def test_actual_authority_post_clear_clock_error_keeps_original_renewal_request(self):
-        from mempalace_tasks.leases import ClockError
+        from mempalace_tasks.runtime_clock import ClockError
         fixture = RealAuthorityFixture(self.root / "authority", self.clock)
         self.addCleanup(fixture.authority.close)
         tid = fixture.create()
-        maintenance = LeaseMaintenance(fixture.authority, self.clock,
+        maintenance = LeaseMaintenance(fixture.bound, self.clock,
                                        system_actor="sys", recovery_actor="recovery")
-        host = HostSupervisor(fixture.authority, self.clock, maintenance, supervisor_id="sup",
+        host = HostSupervisor(fixture.bound, self.clock, maintenance, supervisor_id="sup",
                               worker_id="worker", profiles=[profile(self.root / "real")])
         self.addCleanup(host.close)
         host.step()
         worker = host.workers[tid]
-        original_clear = fixture.authority._pending_store.clear
-        original_clock = fixture.authority._clock
+        original_clear = fixture.authority._finish_pending
+        original_clock = fixture.authority.clock_source.now
         armed = False
-        def clear_then_fail_receipt():
+        def clear_then_fail_receipt(outcome):
             nonlocal armed
-            original_clear()
+            result = original_clear(outcome)
             armed = True
+            return result
         def receipt_clock():
             nonlocal armed
             if armed:
@@ -672,8 +671,8 @@ class SupervisorTests(unittest.TestCase):
                 raise ClockError("clock_sample_failed", "Receipt clock unavailable after pending clear")
             return original_clock()
         self.clock.seconds = 100
-        with patch.object(fixture.authority._pending_store, "clear", side_effect=clear_then_fail_receipt):
-            with patch.object(fixture.authority, "_clock", side_effect=receipt_clock):
+        with patch.object(fixture.authority, "_finish_pending", side_effect=clear_then_fail_receipt):
+            with patch.object(fixture.authority.clock_source, "now", side_effect=receipt_clock):
                 host.step()
         self.assertIsNotNone(worker.pending)
         self.assertEqual(worker.confirmed_lease.isoformat(), "2026-09-23T12:05:00+00:00")
@@ -685,14 +684,14 @@ class SupervisorTests(unittest.TestCase):
                      and p["event"]["command"]["operation"] == "renew"]
         self.assertEqual(len(originals), 1)
 
-    def test_confirmed_renewal_cannot_adopt_other_threads_unpersisted_extension(self):
+    def test_confirmed_renewal_cannot_adopt_other_threads_unconfirmed_extension(self):
         from mempalace_tasks.authority import AuthorityError
         fixture = RealAuthorityFixture(self.root / "authority", self.clock)
         self.addCleanup(fixture.authority.close)
         tid = fixture.create()
-        maintenance = LeaseMaintenance(fixture.authority, self.clock,
+        maintenance = LeaseMaintenance(fixture.bound, self.clock,
                                        system_actor="sys", recovery_actor="recovery")
-        host = HostSupervisor(fixture.authority, self.clock, maintenance, supervisor_id="sup",
+        host = HostSupervisor(fixture.bound, self.clock, maintenance, supervisor_id="sup",
                               worker_id="worker", profiles=[profile(self.root / "real")])
         self.addCleanup(host.close)
         host.step()
@@ -700,8 +699,8 @@ class SupervisorTests(unittest.TestCase):
         original_cutoff = worker.process._deadline
         a_succeeded, b_finished = threading.Event(), threading.Event()
         receipts, failures = [], []
-        real_execute = fixture.authority.execute
-        real_head_write = fixture.authority._head_store.write
+        real_execute = fixture.bound.execute
+        real_receipt = fixture.authority._receipt
 
         def renew_b():
             try:
@@ -729,14 +728,15 @@ class SupervisorTests(unittest.TestCase):
                     raise AssertionError("Renewal B did not reach its persistence failure")
             return receipt
 
-        def fail_b_head(value):
+        def fail_b_receipt(value, **kwargs):
             if threading.current_thread() is competing:
-                raise JournalError("io_error", "Unconfirmed B head persistence", ambiguous=True)
-            return real_head_write(value)
+                from mempalace_tasks.runtime_clock import ClockError
+                raise ClockError("clock_sample_failed", "Unconfirmed B receipt clock")
+            return real_receipt(value, **kwargs)
 
         self.clock.seconds = 100
-        with patch.object(fixture.authority, "execute", side_effect=receipt_barrier):
-            with patch.object(fixture.authority._head_store, "write", side_effect=fail_b_head):
+        with patch.object(fixture.bound, "execute", side_effect=receipt_barrier):
+            with patch.object(fixture.authority, "_receipt", side_effect=fail_b_receipt):
                 competing.start()
                 try:
                     result = host.step()
@@ -773,9 +773,9 @@ class SupervisorTests(unittest.TestCase):
         fixture = RealAuthorityFixture(self.root / "authority", self.clock)
         self.addCleanup(fixture.authority.close)
         tid = fixture.create()
-        maintenance = LeaseMaintenance(fixture.authority, self.clock,
+        maintenance = LeaseMaintenance(fixture.bound, self.clock,
                                        system_actor="sys", recovery_actor="recovery")
-        host = HostSupervisor(fixture.authority, self.clock, maintenance, supervisor_id="sup",
+        host = HostSupervisor(fixture.bound, self.clock, maintenance, supervisor_id="sup",
                               worker_id="worker", profiles=[profile(self.root / "real")])
         self.addCleanup(host.close)
         host.step()
@@ -798,12 +798,12 @@ class SupervisorTests(unittest.TestCase):
                 fixture = RealAuthorityFixture(self.root / phase / "authority", clock)
                 self.addCleanup(fixture.authority.close)
                 tid = fixture.create()
-                maintenance = LeaseMaintenance(fixture.authority, clock,
+                maintenance = LeaseMaintenance(fixture.bound, clock,
                                                system_actor="sys", recovery_actor="recovery")
-                host = HostSupervisor(fixture.authority, clock, maintenance, supervisor_id="sup",
+                host = HostSupervisor(fixture.bound, clock, maintenance, supervisor_id="sup",
                                       worker_id="worker", profiles=[profile(self.root / phase / "work")])
                 self.addCleanup(host.close)
-                execute = fixture.authority.execute
+                execute = fixture.bound.execute
                 injected = False
                 def inject_unconfirmed_extension(command):
                     nonlocal injected
@@ -812,15 +812,16 @@ class SupervisorTests(unittest.TestCase):
                         injected = True
                         clock.seconds = 150
                         task = fixture.authority.state.tasks[tid]
-                        with patch.object(fixture.authority._head_store, "write",
-                                          side_effect=JournalError("io_error", "Unconfirmed head",
-                                                                   ambiguous=True)):
+                        from mempalace_tasks.runtime_clock import ClockError
+                        with patch.object(fixture.authority, "_receipt",
+                                          side_effect=ClockError("clock_sample_failed",
+                                                                 "Unconfirmed receipt")):
                             with self.assertRaises(AuthorityError):
                                 fixture.send("renew", actor="sup", task_id=tid,
                                              attempt_id=task["attempt"]["id"], claim_generation=1,
                                              expected_lease_revision=task["lease_revision"])
                     return receipt
-                with patch.object(fixture.authority, "execute", side_effect=inject_unconfirmed_extension):
+                with patch.object(fixture.bound, "execute", side_effect=inject_unconfirmed_extension):
                     self.assertEqual(host.step()["started"], 0)
                 self.assertTrue(injected)
                 self.assertFalse(fixture.authority.health()["fresh"])

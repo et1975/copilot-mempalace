@@ -2,7 +2,6 @@ import unittest
 from pathlib import Path
 
 from mempalace_tasks.journal import JsonStore
-from mempalace_tasks.leases import EffectiveClock
 from mempalace_tasks.maintenance import LeaseMaintenance
 from runtime_support import DomainPort, ManualClock, PortError, RealAuthorityFixture, temporary_directory
 
@@ -75,46 +74,6 @@ class LeaseTests(unittest.TestCase):
         self.assertEqual(len(proofs), 1)
         self.assertTrue(proofs[0]["publication_revoked"])
         self.assertNotIn("process_stopped", proofs[0])
-
-    def test_reboot_revokes_all_active_before_ack_and_preserves_retry_budget(self):
-        ids = [self.port.create(), self.port.create("shared", resource_keys=["resource"])]
-        for tid in ids:
-            self.port.claim(tid)
-        self.clock.pending_reboot = True
-        maintenance = LeaseMaintenance(self.port, self.clock, system_actor="sys",
-                                       recovery_actor="recovery", batch_limit=1)
-        result = maintenance.tick()
-        self.assertTrue(self.clock.pending_reboot)
-        self.assertGreater(result["unfinished"], 0)
-        for _ in range(4):
-            maintenance.tick()
-        self.assertFalse(self.clock.pending_reboot)
-        self.assertTrue(all(t["status"] != "in_progress" for t in self.port.state.tasks.values()))
-        self.assertEqual(self.port.state.tasks[ids[0]]["automatic_retries_used"], 0)
-        self.assertIsNotNone(self.port.state.resources["resource"]["reservation"])
-
-    def test_real_clock_reboot_barrier_survives_reopening_and_failure(self):
-        with temporary_directory() as directory:
-            store = JsonStore(Path(directory) / "clock.json")
-            clock = EffectiveClock(store, wall_time_ns=lambda: 1790164800000000000,
-                                   monotonic_ns=lambda: 0, boot_id="boot-a", initialize=True)
-            port = DomainPort(clock)
-            tid = port.create()
-            port.claim(tid)
-            rebooted = EffectiveClock(store, wall_time_ns=lambda: 1790164800000000000,
-                                      monotonic_ns=lambda: 0, boot_id="boot-b")
-            port.clock_source = rebooted
-            maintenance = LeaseMaintenance(port, rebooted, system_actor="sys",
-                                           recovery_actor="recovery")
-            port.reconcile_error = PortError("upstream_unavailable")
-            self.assertTrue(maintenance.tick()["errors"])
-            reopened = EffectiveClock(store, wall_time_ns=lambda: 1790164800000000000,
-                                      monotonic_ns=lambda: 0, boot_id="boot-b")
-            self.assertTrue(reopened.pending_reboot)
-            port.reconcile_error = None
-            maintenance.tick()
-            self.assertFalse(reopened.pending_reboot)
-            self.assertEqual(port.state.tasks[tid]["automatic_retries_used"], 0)
 
     def test_unknown_request_retains_id_but_abandonment_gets_fresh_id(self):
         tid = self.port.create()
@@ -228,7 +187,7 @@ class LeaseTests(unittest.TestCase):
             self.addCleanup(fixture.authority.close)
             tid = fixture.create()
             fixture.claim(tid)
-            maintenance = LeaseMaintenance(fixture.authority, self.clock,
+            maintenance = LeaseMaintenance(fixture.bound, self.clock,
                                            system_actor="sys", recovery_actor="recovery")
             self.clock.seconds = 300
             fixture.client.behaviors = ["lost", "lost", "lost", "lost"]
@@ -242,7 +201,7 @@ class LeaseTests(unittest.TestCase):
             self.assertNotEqual(originals[0]["command_id"], originals[1]["command_id"])
             self.assertEqual(fixture.state.tasks[tid]["automatic_retries_used"], 1)
 
-    def test_real_authority_boot_gate_and_maintenance_ack_are_composed(self):
+    def test_real_authority_restart_fences_previous_executor_and_preserves_retries(self):
         from mempalace_tasks.authority import AuthorityError, TaskAuthority
         with temporary_directory() as directory:
             fixture = RealAuthorityFixture(Path(directory) / "state", self.clock)
@@ -250,20 +209,21 @@ class LeaseTests(unittest.TestCase):
             fixture.claim(tid)
             authority_id = fixture.state.authority_id
             fixture.authority.close()
-            self.clock.pending_reboot = True
             restarted = TaskAuthority(authority_id, fixture.client, Path(directory) / "state",
-                                      clock=self.clock.now, backoff=lambda _: None)
-            restarted.start(clock_factory=lambda: self.clock)
+                                      clock=self.clock, backoff=lambda _: None,
+                                      system_actor="sys", recovery_actor="recovery").start()
             self.addCleanup(restarted.close)
             fixture.authority = restarted
             with self.assertRaises(AuthorityError) as caught:
                 fixture.send("renew", actor="sup", task_id=tid,
                              attempt_id=fixture.state.tasks[tid]["attempt"]["id"],
                              claim_generation=1, expected_lease_revision=1)
-            self.assertEqual(caught.exception.code, "reboot_pending")
-            maintenance = LeaseMaintenance(restarted, self.clock, system_actor="sys",
+            self.assertEqual(caught.exception.code, "not_started")
+            fixture.bound = restarted.bound_current()
+            maintenance = LeaseMaintenance(fixture.bound, self.clock, system_actor="sys",
                                            recovery_actor="recovery")
             result = maintenance.tick()
-            self.assertTrue(result["reboot_acknowledged"])
+            self.assertEqual(result["errors"], [])
+            self.assertFalse(restarted.health()["startup_pending"])
             self.assertEqual(fixture.state.tasks[tid]["status"], "open")
             self.assertEqual(fixture.state.tasks[tid]["automatic_retries_used"], 0)

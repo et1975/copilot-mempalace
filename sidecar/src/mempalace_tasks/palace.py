@@ -3,10 +3,11 @@
 ``base_url`` is the exact JSON-RPC endpoint (including its path). No hub
 discovery, redirects, proxies, local writer, or mutation retries are used.
 
-``append_event`` accepts a JSON object with ``record_type`` (mptask.command or
-mptask.settle), ``authority_id`` and ``command_id``. The complete object becomes
-canonical JSON in the body. The protocol layer, not this adapter, validates
-domain semantics, proposal hashes and command-chain progression.
+``append_event`` accepts command, settlement and epoch activation envelopes.
+The complete object becomes canonical JSON in the body. Correlation is the
+command UUID (activation UUID for barriers), never a deduplication key; v2
+scope also lives in the body and metadata. The protocol layer, not this adapter,
+validates domain semantics, hashes and accepted-chain progression.
 """
 
 from collections.abc import Callable, Iterator
@@ -25,10 +26,11 @@ from urllib.parse import urlsplit
 _APPEND = "mempalace_event_append"
 _LIST = "mempalace_event_list"
 _WRITER = "mempalace-tasks"
-_KINDS = ("mptask.command", "mptask.settle")
+_KINDS = ("mptask.command", "mptask.settle", "mptask.epoch")
 _PAGE_SIZE = 500
 _BODY_LIMIT = 240 * 1024
 _RESPONSE_LIMIT = 160 * 1024 * 1024
+# This is the deployed hub's implicit-order list API, not an old task envelope.
 _LEGACY_PROFILE = "mempalace-legacy-append-order-v1"
 _ORDERED_PROFILE = "mempalace-ordered-v1"
 _PROTOCOL_VERSIONS = ("2024-11-05", "2025-03-26", "2025-06-18")
@@ -120,6 +122,27 @@ def _encode(value: dict) -> bytes:
 
 def _nonempty(value: object) -> bool:
     return isinstance(value, str) and bool(value.strip())
+
+
+def _routing_value(value: object) -> bool:
+    return (_nonempty(value) and value == value.strip() and len(value) <= 256
+            and all(ord(char) >= 32 and ord(char) != 127 for char in value))
+
+
+def _payload_route(payload: object, authority_id: str, code: str) -> tuple[str, dict]:
+    if (not isinstance(payload, dict) or payload.get("record_type") not in _KINDS
+            or payload.get("authority_id") != authority_id):
+        _fail(code, "Invalid task-event routing fields")
+    activation = payload["record_type"] == "mptask.epoch"
+    identity = "activation_id" if activation else "command_id"
+    if not _routing_value(payload.get(identity)):
+        _fail(code, "Invalid task-event identity")
+    if (type(payload.get("schema_version")) is not int or payload["schema_version"] != 2
+            or not _routing_value(payload.get("epoch_id"))):
+        _fail(code, "Invalid task-event epoch routing")
+    metadata = {"authority_id": authority_id, identity: payload[identity],
+                "epoch_id": payload["epoch_id"]}
+    return payload[identity], metadata
 
 
 def _schema(schema: object) -> tuple[dict, list]:
@@ -554,12 +577,13 @@ class PalaceClient:
             _validate(sample_list, tools[_LIST]["inputSchema"])
             _validate("x" * _BODY_LIMIT, append_properties["body"])
             for kind in _KINDS:
+                identity = "activation_id" if kind == "mptask.epoch" else "command_id"
                 _validate({
                     "stream": self.stream, "room": "tasks", "type": kind,
                     "from_agent": _WRITER, "body": "{}",
                     "metadata": {
                         "authority_id": self.stream.removeprefix("mptask/"),
-                        "command_id": "probe",
+                        identity: "probe", "epoch_id": "probe",
                     },
                     "correlation_id": "probe",
                 }, tools[_APPEND]["inputSchema"])
@@ -585,24 +609,21 @@ class PalaceClient:
         return _unwrap(result)
 
     def call_tool(self, name: str, arguments: dict) -> dict:
-        """Call a discovered tool once; projection tools are negotiated separately."""
+        """Call a discovered hub tool once."""
         return self._run(lambda exchange: self._call(exchange, name, arguments))
 
     def append_event(self, payload: dict) -> dict:
-        if (not isinstance(payload, dict) or payload.get("record_type") not in _KINDS
-                or not _nonempty(payload.get("command_id"))
-                or payload.get("authority_id") != self.stream.removeprefix("mptask/")):
-            _fail("invalid_argument", "Invalid task-event routing fields")
+        correlation_id, metadata = _payload_route(
+            payload, self.stream.removeprefix("mptask/"), "invalid_argument")
         _json_value(payload, floats=False)
         body = _encode(payload)
         if len(body) > _BODY_LIMIT:
             _fail("body_too_large", "Task-event body exceeds 240 KiB")
-        metadata = {"authority_id": payload["authority_id"], "command_id": payload["command_id"]}
         if len(_encode(metadata)) >= 4096:
             _fail("body_too_large", "Task-event routing metadata must be below 4 KiB")
         arguments = {
             "stream": self.stream, "room": "tasks", "type": payload["record_type"],
-            "from_agent": _WRITER, "correlation_id": payload["command_id"],
+            "from_agent": _WRITER, "correlation_id": correlation_id,
             "body": body.decode("utf-8"), "metadata": metadata,
         }
 
@@ -621,14 +642,21 @@ class PalaceClient:
             _fail("invalid_event", "Stored event must be an object")
         if event.get("body_truncated"):
             _fail("truncated_body", "Stored event body was truncated")
-        if (not _nonempty(event.get("id")) or event.get("stream") != self.stream
+        if (not _routing_value(event.get("id")) or event.get("stream") != self.stream
                 or event.get("room") != "tasks" or event.get("from_agent") != _WRITER
-                or event.get("type") not in _KINDS or not _nonempty(event.get("correlation_id"))
+                or event.get("type") not in _KINDS
+                or not _routing_value(event.get("correlation_id"))
                 or not isinstance(event.get("metadata"), dict)
                 or not isinstance(event.get("body"), str)
                 or not _nonempty(event.get("created_at"))):
             _fail("invalid_event", "Stored event violates the reserved-stream contract")
-        _decode(event["body"], code="invalid_event")
+        payload = _decode(event["body"], code="invalid_event")
+        correlation_id, metadata = _payload_route(
+            payload, self.stream.removeprefix("mptask/"), "invalid_event")
+        if (event["type"] != payload["record_type"]
+                or event["correlation_id"] != correlation_id
+                or any(event["metadata"].get(key) != value for key, value in metadata.items())):
+            _fail("invalid_event", "Stored task-event scope does not match its routing")
         if "body_length" in event:
             length = event["body_length"]
             if type(length) is not int or length not in (

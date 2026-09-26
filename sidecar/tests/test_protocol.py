@@ -2,21 +2,42 @@ from copy import deepcopy
 import unittest
 
 from mempalace_tasks.codec import canonical_json, payload_hash
-from mempalace_tasks.model import state_to_dict
+from mempalace_tasks.model import DomainError, state_to_dict
 from mempalace_tasks.protocol import (
     LogState, ProtocolError, fold_record, make_proposal, make_settlement,
 )
-from authority_fixture import AUTHORITY, NOW, command, create, genesis, raw, uid
+from authority_fixture import AUTHORITY, EPOCH, NOW, activate, command, create, genesis, raw, uid
 
 
 class ProtocolTests(unittest.TestCase):
     def setUp(self):
         self.log = LogState(AUTHORITY)
+        self.activation = activate(self.log)
         self.genesis = make_proposal(self.log, genesis(), NOW)
         fold_record(self.log, raw(self.genesis, 1))
 
     def proposal(self, number=2):
         return make_proposal(self.log, create(number), NOW)
+
+    def test_proposal_requires_an_accepted_epoch_before_genesis(self):
+        with self.assertRaises(ProtocolError):
+            make_proposal(LogState(AUTHORITY), genesis(), NOW)
+
+    def test_obsolete_v1_envelope_is_rejected_not_replayed_or_fenced(self):
+        legacy = deepcopy(self.genesis)
+        legacy.pop("epoch_id", None)
+        legacy["schema_version"] = 1
+        legacy["payload_hash"] = payload_hash(legacy)
+        event = raw(self.genesis, 20)
+        event["body"] = canonical_json(legacy)
+        for log in (LogState(AUTHORITY), deepcopy(self.log)):
+            with self.subTest(activated=log.epoch_id is not None), self.assertRaises(ProtocolError):
+                fold_record(log, event)
+
+    def test_historical_lookup_rejects_null_epoch(self):
+        with self.assertRaises(DomainError) as caught:
+            self.log.historical_outcome(None, uid(1))
+        self.assertEqual(caught.exception.code, "validation_error")
 
     def test_proposal_does_not_mutate_state_and_hashes_complete_envelope(self):
         before = state_to_dict(self.log.state)
@@ -59,7 +80,7 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(self.log.domain_head, "evt-000002")
         self.assertEqual(self.log.domain_ordinal, 2)
         self.assertEqual([row["disposition"] for row in self.log.history],
-                         ["accepted", "accepted", "duplicate", "settled", "duplicate"])
+                         ["activated", "accepted", "accepted", "duplicate", "settled", "duplicate"])
 
     def test_reused_id_or_changed_control_is_invariant_violation(self):
         proposal = self.proposal()
@@ -134,6 +155,8 @@ class ProtocolTests(unittest.TestCase):
     def test_raw_hash_commits_entire_prefix_not_just_latest_payload(self):
         a = LogState(AUTHORITY)
         b = LogState(AUTHORITY)
+        activate(a)
+        activate(b)
         fold_record(a, raw(self.genesis, 1))
         changed = raw(self.genesis, 1)
         changed["created_at"] = "2026-09-23T00:00:01Z"
@@ -181,14 +204,14 @@ class ProtocolTests(unittest.TestCase):
                 proposal["event"][key] = value
                 proposal["payload_hash"] = payload_hash(proposal)
                 control = {
-                    "record_type": "mptask.settle", "schema_version": 1,
+                    "record_type": "mptask.settle", "schema_version": 2, "epoch_id": EPOCH,
                     "authority_id": AUTHORITY, "command_id": uid(2),
                     "command_hash": proposal["command_hash"],
                     "proposal_hash": proposal["payload_hash"], "task_ids": proposal["task_ids"],
                 }
                 from uuid import UUID, uuid5
                 control["control_id"] = str(uuid5(UUID(AUTHORITY),
-                    f"mptask.settle:{uid(2)}:{proposal['payload_hash']}"))
+                    f"mptask.settle:{EPOCH}:{uid(2)}:{proposal['payload_hash']}"))
                 control["payload_hash"] = payload_hash(control)
                 log = deepcopy(self.log)
                 fold_record(log, raw(control, 2))

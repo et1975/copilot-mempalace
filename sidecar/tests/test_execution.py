@@ -261,7 +261,7 @@ class ExecutionTests(unittest.TestCase):
         self.addCleanup(process.process.wait, timeout=3)
         self.addCleanup(process.process.kill)
         self.addCleanup(process.stop)
-        with patch("mempalace_tasks.execution._process_stat", return_value=("S", 999, 999)):
+        with patch("mempalace_tasks.execution_linux._process_stat", return_value=("S", 999, 999)):
             with self.assertRaises(ExecutionError):
                 process.stop()
         self.assertIsNone(process.observe())
@@ -279,8 +279,8 @@ class ExecutionTests(unittest.TestCase):
             self.addCleanup(child.wait, timeout=3)
             self.addCleanup(child.kill)
             return child
-        with patch("mempalace_tasks.execution.subprocess.Popen", side_effect=capture):
-            with patch("mempalace_tasks.execution._process_stat", side_effect=OSError("stat unavailable")):
+        with patch("mempalace_tasks.execution_linux.subprocess.Popen", side_effect=capture):
+            with patch("mempalace_tasks.execution_linux._process_stat", side_effect=OSError("stat unavailable")):
                 with self.assertRaises(OSError):
                     OwnedProcess(adapter, workspace, deadline=time.monotonic() + 20)
         self.assertEqual(len(children), 1)

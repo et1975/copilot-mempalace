@@ -12,13 +12,23 @@ audit hook that nags when an external tool is about to run without a prior `memp
 - **[skills/mempalace/SKILL.md](skills/mempalace/SKILL.md)** — full skill: 30 MCP tools (read/write/tunnels/KG/diary),
   proactive vs reactive use, mining hygiene, HNSW drift recovery, auto-save hook notes.
 - **[MemPalace Tasks sidecar](sidecar/README.md)** — optional, separately installed
-  Python MCP service for durable tasks, dependencies, atomic claims/discoveries,
-  renewable fenced leases and recovery over the MemPalace logstream. Includes
-  read-only `status` / `list` / `show` / `history` / bounded `watch`, a
+  Python Streamable HTTP MCP service for durable tasks, dependencies, atomic
+  claims/discoveries and renewable fenced leases. Schema 2 replays the MemPalace
+  logstream as its sole durable task/recovery store, with a fresh fenced epoch
+  per owner startup and disposable local runtime/discovery files. Foreground
+  hosting requires no service manager; launcher startup is explicit opt-in.
+  Includes authenticated `connect`, read-only `status` / `list` / `show` /
+  `history` / bounded `watch`, a
   [task-safety skill](skills/mempalace-tasks/SKILL.md), and an opt-in
   [workflow agent](agents/palace-task-workflow.agent.md). Worker dispatch remains
   a host responsibility; connecting MCP does not automatically wire native `/fleet`.
-  Ordinary memory filing does not require this optional service.
+  No native `/fleet` execution adapter is shipped. Linux process supervision is
+  optional and separate; macOS/Windows hosting code exists but native
+  certification remains unrun. Only the current journal-backed authority is
+  supported; there is no original-runtime or old-format compatibility mode.
+  Ordinary memory filing does not require this service. See its [recovery
+  contract](sidecar/README.md#recovery-and-coherent-palace-backuprestore) before
+  changing an existing deployment.
 - **[skills/dreaming/SKILL.md](skills/dreaming/SKILL.md)** — offline consolidation ("dreaming"): a 5-phase
   pipeline (harvest → adjudicate → review → adopt → verify) that merges near-duplicate drawers and resolves
   adjudicated KG contradiction/staleness candidates between sessions, plus constructive `reflect`
@@ -48,8 +58,11 @@ audit hook that nags when an external tool is about to run without a prior `memp
   [`skills/dreaming/scripts/`](skills/dreaming/scripts/) and documents the derive contract in
   [`skills/contemplate/references/derive.md`](skills/contemplate/references/derive.md).
 - **[skills/mempalace-backup/SKILL.md](skills/mempalace-backup/SKILL.md)** — safely back up the local palace with
-  [`restic`](https://restic.net/): quiesce writers, checkpoint both SQLite WALs, snapshot `~/.mempalace/`
-  (excluding ephemeral `locks/`, always keeping `palace/.mempalace/origin.json`), verify, and prune. Local repos
+  [`restic`](https://restic.net/): quiesce writers, capture a coherent physical
+  palace cut including the resolved data directory and committed SQLite/WAL state,
+  preserve palace provenance (including `palace/.mempalace/origin.json`), verify,
+  and prune. The current helper refuses data roots outside the selected HOME
+  backup root rather than omitting them. Local repos
   only, on demand. Ships a tested Python helper
   ([`scripts/palace_backup.py`](skills/mempalace-backup/scripts/palace_backup.py) + `test_palace_backup.py`) that
   needs no `sqlite3` CLI, plus a [restic cheatsheet](skills/mempalace-backup/references/restic-cheatsheet.md).
@@ -57,8 +70,13 @@ audit hook that nags when an external tool is about to run without a prior `memp
   ships [`scripts/palace_wing.py`](skills/mempalace-backup/scripts/palace_wing.py) — a logical wing export/import that
   reads the palace SQLite directly into a portable JSONL bundle and replays it back.
 - **[skills/mempalace-restore/SKILL.md](skills/mempalace-restore/SKILL.md)** — restore / disaster-recovery
-  counterpart: reversible staged restore (move the current palace aside first), restic's absolute-path-stripping
-  subpath syntax so files land directly, then `mempalace repair` / `repair-status` and MCP `mempalace_reconnect`.
+  counterpart: offline, reversible private-staging restore with explicit
+  validation before publication/reconnection.
+  For journal-mode tasks, offline exclusion and a staged epoch barrier precede
+  publication and fresh owner activation. Preserve `logstream.sqlite3`, required
+  artifacts and `replica.json`; no matching sidecar pending/head/clock backup set
+  is required. Restore does not undo external effects. The runbook owns the
+  exact helper flags and current platform/refusal limits.
   Scenario runbook in [references/disaster-recovery.md](skills/mempalace-restore/references/disaster-recovery.md).
 - **[hooks/palace-reflex.json](hooks/palace-reflex.json) + [hooks/palace-reflex.py](hooks/palace-reflex.py)** —
   `PreToolUse` audit hook. Maintains a per-session ring buffer of recent tool calls under `$TMPDIR`. Fires when
@@ -91,6 +109,11 @@ audit hook that nags when an external tool is about to run without a prior `memp
 - Python 3 on `PATH` (for the hook). The hook fails silently if Python is missing.
 - For the backup/restore skills only: [`restic`](https://restic.net/) on `PATH`
   (`zypper in restic`, `apt install restic`, `brew install restic`, …).
+- For the optional Tasks sidecar: Python **3.11+**, MCP SDK **1.30.0**, and
+  Windows-only **`pywin32==311`** in its hash-pinned universal requirements lock.
+  Actual validation ran on Linux/Python 3.12, not native macOS/Windows.
+  [Offline preparation](sidecar/README.md#requirements-and-offline-setup) uses
+  preprovisioned artifacts; service startup never builds/downloads packages.
 
 ## Opt-in procedural rollout
 

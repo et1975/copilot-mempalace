@@ -8,7 +8,7 @@ from pathlib import Path
 import threading
 import time
 import unittest
-from unittest.mock import PropertyMock, patch
+from unittest.mock import patch
 
 import httpx
 
@@ -16,14 +16,33 @@ from authority_fixture import command, create, uid
 from mempalace_tasks.authority import AuthorityError
 from mempalace_tasks.client import TaskClientError, TaskServiceClient
 from mempalace_tasks.domain import SCHEMAS
-from mempalace_tasks.journal import JsonStore
 from mempalace_tasks.model import state_to_dict
-from mempalace_tasks.projection import ProjectionError, TaskProjector
 from service_fixture import ServiceFixture, TOKEN
-from test_projection import ADD, OwnedTransport
 
 
 class ServerTests(unittest.TestCase):
+    def test_public_schemas_are_current_only_without_runtime_mode_flags(self):
+        from jsonschema import Draft202012Validator
+        from mempalace_tasks.server import _schemas, PUBLIC_OPERATIONS
+
+        schemas = _schemas()
+        for operation in PUBLIC_OPERATIONS:
+            self.assertIn("expected_epoch", schemas[operation]["required"])
+        validator = Draft202012Validator(schemas["outcome"])
+        self.assertTrue(validator.is_valid({"epoch_id": uid(1), "command_id": uid(2)}))
+        self.assertFalse(validator.is_valid({"epoch_id": None, "command_id": uid(2)}))
+
+    def test_current_health_reports_startup_epoch_without_projection_or_boot_gate(self):
+        with ServiceFixture() as service:
+            result = TaskServiceClient(service.url, token=TOKEN).call_tool("mptask_health", {})
+            self.assertEqual(result["schema_version"], 1)
+            self.assertEqual(result["epoch_id"], service.epoch)
+            self.assertIs(result["startup_pending"], False)
+            self.assertIs(result["request_epoch_required"], True)
+            self.assertNotIn("projection", result)
+            self.assertNotIn("pending_reboot", result)
+            self.assertNotIn("recovery_mode", result)
+
     def test_fenced_resource_identifiers_round_trip_into_valid_supervisor_preparation(self):
         profiles = {
             "local": {"execution_class": "isolated"},
@@ -39,9 +58,10 @@ class ServerTests(unittest.TestCase):
             resource_keys = ["authorization", "credential-key", "password", "secrets/db", "token"]
             request = {key: value for key, value in create().items() if key != "operation"}
             request.update(execution_class="resource_fenced", execution_profile="fenced",
-                           resource_keys=resource_keys)
+                           resource_keys=resource_keys, expected_epoch=service.epoch)
             task_id = client.call_tool("mptask_create", request)["task_id"]
             claimed = client.call_tool("mptask_claim", {
+                "expected_epoch": service.epoch,
                 "command_id": uid(3), "actor": "worker", "task_id": task_id,
                 "expected_version": 1, "supervisor_id": "supervisor"})
             task = claimed["tasks"][0]
@@ -51,6 +71,7 @@ class ServerTests(unittest.TestCase):
                              dict.fromkeys(resource_keys, 1))
 
             started = client.call_tool("mptask_attempt_report", {
+                "expected_epoch": service.epoch,
                 "command_id": uid(4), "actor": "supervisor", "task_id": task_id,
                 "expected_version": task["version"], "attempt_id": task["attempt"]["id"],
                 "claim_generation": task["claim_generation"], "report_kind": "started",
@@ -60,11 +81,13 @@ class ServerTests(unittest.TestCase):
             self.assertTrue(started["authorization"]["tasks"][0]["authorized"])
             task = started["tasks"][0]
             released = client.call_tool("mptask_release", {
+                "expected_epoch": service.epoch,
                 "command_id": uid(5), "actor": "worker", "task_id": task_id,
                 "expected_version": task["version"], "attempt_id": task["attempt"]["id"],
                 "claim_generation": task["claim_generation"], "reason": "Owned fixture release",
             })
             client.call_tool("mptask_recover", {
+                "expected_epoch": service.epoch,
                 "command_id": uid(6), "actor": "operator", "task_id": task_id,
                 "expected_version": released["tasks"][0]["version"], "retry_decision": "preserve",
                 "evidence": {"effects_reconciled": True,
@@ -107,7 +130,7 @@ class ServerTests(unittest.TestCase):
         }) as service:
             request = create()
             request["execution_profile"] = "secrets/profile"
-            service.authority.execute(request)
+            service.execute(request)
             state = state_to_dict(service.authority.state)
             self.assertEqual(_safe(state, TOKEN), state)
 
@@ -115,7 +138,7 @@ class ServerTests(unittest.TestCase):
         with ServiceFixture() as service:
             client = TaskServiceClient(service.url, token=TOKEN)
             request = {key: value for key, value in create().items() if key != "operation"}
-            request.update(description="", acceptance="")
+            request.update(description="", acceptance="", expected_epoch=service.epoch)
             result = client.call_tool("mptask_create", request)
             self.assertEqual(result["tasks"][0]["description"], "")
             self.assertEqual(result["tasks"][0]["acceptance"], "")
@@ -134,8 +157,9 @@ class ServerTests(unittest.TestCase):
 
     def test_update_can_clear_description_and_acceptance_over_sdk(self):
         with ServiceFixture() as service:
-            task_id = service.authority.execute(create())["task_id"]
+            task_id = service.execute(create())["task_id"]
             result = service.sdk("mptask_update", {
+                "expected_epoch": service.epoch,
                 "actor": "operator", "command_id": uid(3), "task_id": task_id,
                 "expected_version": 1, "patch": {"description": "", "acceptance": ""},
             })
@@ -147,6 +171,7 @@ class ServerTests(unittest.TestCase):
     def test_bootstrap_allows_empty_goal_and_planning_text_over_sdk(self):
         with ServiceFixture() as service:
             result = service.sdk("mptask_bootstrap", {
+                "expected_epoch": service.epoch,
                 "actor": "operator", "command_id": uid(2), "project": "demo",
                 "title": "Owned goal", "description": "", "acceptance": "",
                 "planning_task": {
@@ -162,12 +187,13 @@ class ServerTests(unittest.TestCase):
 
     def test_expansion_allows_empty_nested_task_text_over_sdk(self):
         with ServiceFixture() as service:
-            goal_id = service.authority.execute(command(
+            goal_id = service.execute(command(
                 2, "bootstrap", project="demo", title="Owned goal", description="", acceptance="",
                 planning_task={"title": "Owned plan", "description": "", "acceptance": "",
                                "execution_class": "isolated", "execution_profile": "local"},
                 goal_policy={"scope": "Owned fixture"}))["goal_id"]
             result = service.sdk("mptask_expand", {
+                "expected_epoch": service.epoch,
                 "actor": "operator", "command_id": uid(3), "goal_id": goal_id,
                 "expected_graph_revision": 1, "source_disposition": "continue",
                 "tasks": [{"intent_key": "empty-text-child", "title": "Owned child",
@@ -189,8 +215,8 @@ class ServerTests(unittest.TestCase):
                 if operation in {"authority_create", "expire"}:
                     continue
                 schema = tools[f"mptask_{operation}"].inputSchema
-                self.assertEqual(set(schema["properties"]), allowed | {"actor", "command_id"})
-                self.assertEqual(set(schema["required"]), required | {"actor", "command_id"})
+                self.assertEqual(set(schema["properties"]), allowed | {"actor", "command_id", "expected_epoch"})
+                self.assertEqual(set(schema["required"]), required | {"actor", "command_id", "expected_epoch"})
                 self.assertIs(schema["additionalProperties"], False)
             self.assertEqual(tools["mptask_transition"].inputSchema["properties"]["evidence"]["type"],
                              "array")
@@ -200,11 +226,12 @@ class ServerTests(unittest.TestCase):
 
     def test_two_real_clients_share_one_claim_authority_and_typed_rejection(self):
         with ServiceFixture() as service:
-            task_id = service.authority.execute(create())["task_id"]
+            task_id = service.execute(create())["task_id"]
             clients = [TaskServiceClient(service.url, token=TOKEN) for _ in range(2)]
             def claim(index):
                 request = command(10 + index, "claim", actor=f"worker{index or ''}",
                                   task_id=task_id, expected_version=1, supervisor_id="supervisor")
+                request["expected_epoch"] = service.epoch
                 if index == 1:
                     request["actor"] = "worker2"
                 try:
@@ -227,7 +254,8 @@ class ServerTests(unittest.TestCase):
     def test_structured_validation_and_business_errors_do_not_reflect_input(self):
         with ServiceFixture() as service:
             for name, arguments in (
-                ("mptask_create", {"actor": "operator", "command_id": uid(5), "password": TOKEN}),
+                ("mptask_create", {"actor": "operator", "command_id": uid(5), "password": TOKEN,
+                                   "expected_epoch": service.epoch}),
                 ("mptask_expire", {"actor": "system", "command_id": uid(5)}),
                 ("mptask_get", {"task_id": "unknown"}),
             ):
@@ -244,6 +272,7 @@ class ServerTests(unittest.TestCase):
             client = TaskServiceClient(service.url, token=TOKEN)
             service.log.behaviors = ["lost", "ok"]
             args = {k: v for k, v in create(20).items() if k != "operation"}
+            args["expected_epoch"] = service.epoch
             result = client.call_tool("mptask_create", args)
             self.assertFalse(result["ok"])
             self.assertEqual(result["outcome"], "abandoned")
@@ -264,6 +293,8 @@ class ServerTests(unittest.TestCase):
                 self.assertNotIn(TOKEN, response.text)
             headers = {"Authorization": f"Bearer {TOKEN}"}
             self.assertEqual(http.post(service.url + "/", json={}, headers=headers).status_code, 404)
+            self.assertEqual(http.post(service.url.removesuffix("/mcp") + "/control/stop",
+                                       json={}, headers=headers).status_code, 401)
             for extra, status in (
                 ({"Host": "127.0.0.1:1"}, 421), ({"Host": "evil.invalid"}, 421),
                 ({"Origin": "http://127.0.0.1:1"}, 403), ({"Origin": "null"}, 403),
@@ -280,7 +311,7 @@ class ServerTests(unittest.TestCase):
 
     def test_diagnostic_reads_do_not_sweep_or_write_task_recovery_metadata(self):
         with ServiceFixture(policy={"sweep_seconds": 86400}) as service:
-            task_id = service.authority.execute(create())["task_id"]
+            task_id = service.execute(create())["task_id"]
             files = {path.name: path.read_bytes() for path in Path(service.directory.name).iterdir()
                      if path.is_file()}
             writes = len(service.log.sent)
@@ -297,8 +328,8 @@ class ServerTests(unittest.TestCase):
     def test_expiry_runs_without_requests_and_releases_isolated_task(self):
         expired = threading.Event()
         with ServiceFixture() as service:
-            task_id = service.authority.execute(create())["task_id"]
-            service.authority.execute(command(3, "claim", actor="worker", task_id=task_id,
+            task_id = service.execute(create())["task_id"]
+            service.execute(command(3, "claim", actor="worker", task_id=task_id,
                                               expected_version=1, supervisor_id="supervisor"))
             service.log.on_append = lambda payload: (
                 expired.set() if payload.get("event", {}).get("command", {}).get("operation") == "recover"
@@ -328,7 +359,7 @@ class ServerTests(unittest.TestCase):
 
     def test_wait_ready_is_bounded_and_time_changes_eligibility_without_new_head(self):
         with ServiceFixture(policy={"sweep_seconds": 86400}) as service:
-            task_id = service.authority.execute(create(deferred_until="2026-09-23T00:01:00Z"))["task_id"]
+            task_id = service.execute(create(deferred_until="2026-09-23T00:01:00Z"))["task_id"]
             client = TaskServiceClient(service.url, token=TOKEN)
             first = client.call_tool("mptask_ready", {})
             self.assertEqual(first["tasks"], [])
@@ -346,164 +377,6 @@ class ServerTests(unittest.TestCase):
             with self.assertRaises(TaskClientError) as caught:
                 client.call_tool("mptask_wait_ready", {"timeout_seconds": 31})
             self.assertFalse(caught.exception.ambiguous)
-
-    def test_projection_uses_only_accepted_domain_ordinals_and_resumes(self):
-        from mempalace_tasks.server import project_batch
-
-        transport = OwnedTransport()
-        factory = lambda service: TaskProjector(
-            transport, JsonStore(Path(service.directory.name) / "service-projection.json"),
-            {"demo": "owned-test-wing"})
-        service = ServiceFixture(projector=factory)
-        # Offline delivery exercises the same production batch used by the worker.
-        try:
-            service.log.behaviors = ["lost", "ok"]
-            self.assertEqual(service.authority.execute(create(2))["outcome"], "abandoned")
-            committed = service.authority.execute(create(3))
-            result = project_batch(service.authority, service.projector)
-            self.assertEqual(result["processed"], 2)
-            self.assertEqual(result["checkpoint"]["ordinal"], 2)
-            self.assertEqual(result["checkpoint"]["event_id"], committed["event_id"])
-            self.assertEqual(transport.count(ADD), 1)
-            self.assertEqual(project_batch(service.authority, service.projector)["processed"], 0)
-            self.assertEqual(transport.count(ADD), 1)
-            service.projector.reset()
-            self.assertEqual(project_batch(service.authority, service.projector)["processed"], 2)
-        finally:
-            service.__exit__(None, None, None)
-
-    def test_projection_batch_uses_bounded_feed_without_reading_full_log(self):
-        from mempalace_tasks.server import project_batch
-
-        transport = OwnedTransport()
-        factory = lambda service: TaskProjector(
-            transport, JsonStore(Path(service.directory.name) / "service-projection.json"),
-            {"demo": "owned-test-wing"})
-        service = ServiceFixture(projector=factory)
-        try:
-            for number in range(2, 8):
-                service.authority.execute(create(number))
-            with patch.object(type(service.authority), "log", new_callable=PropertyMock,
-                              side_effect=AssertionError("Projection copied full authority log")):
-                result = project_batch(service.authority, service.projector, limit=2)
-            self.assertEqual(result["processed"], 2)
-            self.assertEqual(result["checkpoint"]["ordinal"], 2)
-            self.assertEqual(transport.count(ADD), 1)
-        finally:
-            service.__exit__(None, None, None)
-
-    def test_projection_timer_caught_up_ticks_copy_no_accepted_events(self):
-        transport = OwnedTransport()
-        factory = lambda service: TaskProjector(
-            transport, JsonStore(Path(service.directory.name) / "service-projection.json"),
-            {"demo": "owned-test-wing"})
-        service = ServiceFixture(projector=factory, policy={"sweep_seconds": 86400})
-        self.addCleanup(service.__exit__, None, None, None)
-        service.authority.execute(create())
-        calls, caught_up = [], threading.Event()
-        read_feed = service.authority.accepted_records
-
-        def observed(after_ordinal=0, limit=100):
-            rows = read_feed(after_ordinal=after_ordinal, limit=limit)
-            calls.append((after_ordinal, limit, len(rows)))
-            if len(calls) >= 3:
-                caught_up.set()
-            return rows
-
-        with patch.object(service.authority, "accepted_records", observed), patch.object(
-            type(service.authority), "log", new_callable=PropertyMock,
-            side_effect=AssertionError("Timer copied full authority log"),
-        ), service:
-            self.assertTrue(caught_up.wait(4))
-            self.assertEqual(calls[:3], [(0, 10, 2), (2, 10, 0), (2, 10, 0)])
-            self.assertEqual(transport.count(ADD), 1)
-            health = TaskServiceClient(service.url, token=TOKEN).call_tool("mptask_health", {})
-            self.assertFalse(health["projection"]["paused"])
-            self.assertEqual(health["projection"]["checkpoint"]["ordinal"], 2)
-
-    def test_projection_checkpoint_validation_uses_one_prior_record_and_rejects_mismatch(self):
-        from mempalace_tasks.server import project_batch
-
-        transport = OwnedTransport()
-        factory = lambda service: TaskProjector(
-            transport, JsonStore(Path(service.directory.name) / "service-projection.json"),
-            {"demo": "owned-test-wing"})
-        service = ServiceFixture(projector=factory)
-        try:
-            service.authority.execute(create())
-            project_batch(service.authority, service.projector)
-            store = JsonStore(Path(service.directory.name) / "service-projection.json")
-            checkpoint = store.read()
-            remote_calls = len(transport.calls)
-            read_feed = service.authority.accepted_records
-            calls = []
-
-            def observed(after_ordinal=0, limit=100):
-                rows = read_feed(after_ordinal=after_ordinal, limit=limit)
-                calls.append((after_ordinal, limit, len(rows)))
-                return rows
-
-            with patch.object(service.authority, "accepted_records", observed), patch.object(
-                type(service.authority), "log", new_callable=PropertyMock,
-                side_effect=AssertionError("Validation copied full authority log"),
-            ):
-                for update, expected_calls in (
-                    ({"event_hash": "a" * 64}, [(1, 1, 1)]),
-                    ({"ordinal": 100}, [(99, 1, 0)]),
-                ):
-                    with self.subTest(update=update):
-                        store.write({**checkpoint, **update})
-                        projector = TaskProjector(transport, store, {"demo": "owned-test-wing"})
-                        calls.clear()
-                        with self.assertRaises(ProjectionError) as caught:
-                            project_batch(service.authority, projector)
-                        self.assertEqual(caught.exception.code, "projection_history_mismatch")
-                        self.assertEqual(calls, expected_calls)
-            self.assertEqual(len(transport.calls), remote_calls)
-        finally:
-            service.__exit__(None, None, None)
-
-    def test_slow_projection_does_not_hold_authority_lock_or_starve_expiry(self):
-        from mempalace_tasks.server import project_batch
-
-        entered, release, recovered = threading.Event(), threading.Event(), threading.Event()
-        class SlowTransport(OwnedTransport):
-            blocked = False
-
-            def call_tool(self, name, arguments):
-                if name == ADD and self.blocked:
-                    entered.set()
-                    if not release.wait(5):
-                        raise AssertionError("Projection was not released")
-                return super().call_tool(name, arguments)
-        transport = SlowTransport()
-        factory = lambda service: TaskProjector(
-            transport, JsonStore(Path(service.directory.name) / "service-projection.json"),
-            {"demo": "owned-test-wing"})
-        service = ServiceFixture(projector=factory)
-        task_id = service.authority.execute(create())["task_id"]
-        service.authority.execute(command(3, "claim", actor="worker", task_id=task_id,
-                                          expected_version=1, supervisor_id="supervisor"))
-        project_batch(service.authority, service.projector)
-        service.authority.execute(create(4))
-        transport.blocked = True
-        with service:
-            try:
-                self.assertTrue(entered.wait(2))
-                service.clock.value = "2026-09-23T00:05:00Z"
-                service.log.on_append = lambda payload: (
-                    recovered.set()
-                    if payload.get("event", {}).get("command", {}).get("operation") == "recover"
-                    else None)
-                client = TaskServiceClient(service.url, token=TOKEN)
-                health = client.call_tool("mptask_health", {})
-                self.assertTrue(health["projection"]["enabled"])
-                self.assertEqual(health["projection"]["checkpoint"]["ordinal"], 3)
-                self.assertTrue(recovered.wait(3))
-                self.assertEqual(client.call_tool("mptask_get", {"task_id": task_id})["task"]["status"],
-                                 "open")
-            finally:
-                release.set()
 
     def test_failed_maintenance_is_visible_and_independent_next_tick_retries(self):
         with ServiceFixture() as service:
@@ -557,33 +430,9 @@ class ServerTests(unittest.TestCase):
             self.assertTrue(result["isError"])
             self.assertEqual(result["structuredContent"]["error"]["code"], "validation_error")
 
-    def test_failed_projection_pauses_with_last_confirmed_checkpoint_visible(self):
-        transport = OwnedTransport()
-        factory = lambda service: TaskProjector(
-            transport, JsonStore(Path(service.directory.name) / "service-projection.json"),
-            {"demo": "owned-test-wing"})
-        service = ServiceFixture(projector=factory)
-        service.authority.execute(create())
-        other = create(3)
-        other["project"] = "unmapped"
-        service.authority.execute(other)
-        with service:
-            client = TaskServiceClient(service.url, token=TOKEN)
-            for _ in range(30):
-                health = client.call_tool("mptask_health", {})
-                if health["projection"]["paused"]:
-                    break
-                time.sleep(0.05)
-            self.assertTrue(health["projection"]["paused"])
-            self.assertEqual(health["projection"]["checkpoint"]["ordinal"], 2)
-            self.assertIsNotNone(health["projection"]["last_error"])
-            calls = len(transport.calls)
-            time.sleep(1.1)
-            self.assertEqual(len(transport.calls), calls, "Paused lane must not silently retry indefinitely")
-
     def test_noncurrent_health_remains_data_and_diagnostics_do_not_reconcile(self):
         with ServiceFixture(policy={"sweep_seconds": 86400}) as service:
-            task_id = service.authority.execute(create())["task_id"]
+            task_id = service.execute(create())["task_id"]
             service.log.read_error = True
             client = TaskServiceClient(service.url, token=TOKEN)
             observed = client.call_tool("mptask_get", {"task_id": task_id})
@@ -596,8 +445,8 @@ class ServerTests(unittest.TestCase):
 
     def test_get_preserves_singular_attempt_authorization_across_sdk_and_client(self):
         with ServiceFixture(policy={"sweep_seconds": 86400}) as service:
-            task_id = service.authority.execute(create())["task_id"]
-            claimed = service.authority.execute(command(
+            task_id = service.execute(create())["task_id"]
+            claimed = service.execute(command(
                 3, "claim", actor="worker", task_id=task_id,
                 expected_version=1, supervisor_id="supervisor"))
             client = TaskServiceClient(service.url, token=TOKEN)
@@ -612,7 +461,7 @@ class ServerTests(unittest.TestCase):
             self.assertTrue(prepared["authorization"]["lease_live"])
 
             task = claimed["tasks"][0]
-            service.authority.execute(command(
+            service.execute(command(
                 4, "attempt_report", actor="supervisor", task_id=task_id,
                 expected_version=task["version"], attempt_id=task["attempt"]["id"],
                 claim_generation=task["claim_generation"], report_kind="started",
@@ -654,8 +503,10 @@ class ServerTests(unittest.TestCase):
             service.log.on_append = blocked_append
             with ThreadPoolExecutor(1) as pool:
                 client = TaskServiceClient(service.url, token=TOKEN)
+                arguments = {key: value for key, value in create(10).items() if key != "operation"}
+                arguments["expected_epoch"] = service.epoch
                 future = pool.submit(client.call_tool, "mptask_create",
-                                     {key: value for key, value in create(10).items() if key != "operation"})
+                                     arguments)
                 try:
                     self.assertTrue(entered.wait(2))
                     service.server.should_exit = True

@@ -18,16 +18,15 @@ def temporary_directory():
 class ManualClock:
     def __init__(self):
         self.seconds = 0
-        self.pending_reboot = False
 
     def now(self):
         return (datetime(2026, 9, 23, 12, tzinfo=timezone.utc)
                 + timedelta(seconds=self.seconds)).isoformat().replace("+00:00", "Z")
 
-    def acknowledge_reboot(self, *, active_attempts):
-        if active_attempts != 0:
-            raise ValueError("active attempts")
-        self.pending_reboot = False
+    def observe(self, timestamp):
+        value = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        self.seconds = max(self.seconds, (value - datetime(
+            2026, 9, 23, 12, tzinfo=timezone.utc)).total_seconds())
 
 
 class PortError(Exception):
@@ -45,6 +44,7 @@ class DomainPort:
         self.outcomes = {}
         self.before_execute = None
         self.reconcile_error = None
+        self.startup_pending = False
         self.send("authority_create", actors={
             "op": "operator", "recovery": "operator", "sys": "system",
             "sup": "supervisor", "worker": "worker",
@@ -83,11 +83,12 @@ class DomainPort:
         return {"ok": True}
 
     def health(self):
-        reboot = self.clock_source.pending_reboot
+        startup_pending = self.startup_pending
         error = None if self.reconcile_error is None else {"code": self.reconcile_error.code}
-        return {"ok": error is None and not reboot, "fresh": error is None and not reboot,
-                "pending_command": None, "pending_reboot": reboot, "error": error,
-                "reason": error["code"] if error else "reboot_pending" if reboot else None}
+        return {"ok": error is None and not startup_pending,
+                "fresh": error is None and not startup_pending,
+                "pending_command": None, "startup_pending": startup_pending, "error": error,
+                "reason": error["code"] if error else "startup_pending" if startup_pending else None}
 
     def send(self, operation, actor="op", **fields):
         return self.execute({"operation": operation, "actor": actor,
@@ -123,21 +124,25 @@ class DomainPort:
 class RealAuthorityFixture(DomainPort):
     """Use helper commands with the actual authority/protocol/journal underneath."""
     def __init__(self, directory, clock=None):
+        from pathlib import Path
         from authority_fixture import AUTHORITY, LogClient
         from mempalace_tasks.authority import TaskAuthority
         self.clock_source = clock or ManualClock()
+        Path(directory).parent.mkdir(parents=True, exist_ok=True)
         self.client = LogClient()
         self.authority = TaskAuthority(AUTHORITY, self.client, directory,
-                                       clock=self.clock_source.now, backoff=lambda _: None)
-        self.authority.start(clock_factory=lambda: self.clock_source)
-        self.authority.execute(DomainPort(self.clock_source).commands[0])
+                                       clock=self.clock_source, backoff=lambda _: None,
+                                       initialize=True, system_actor="sys", recovery_actor="recovery")
+        self.authority.start()
+        self.authority.execute_current(DomainPort(self.clock_source).commands[0])
+        self.bound = self.authority.bound_current()
 
     @property
     def state(self):
         return self.authority.state
 
     def execute(self, command):
-        return self.authority.execute(command)
+        return self.bound.execute(command)
 
     def serialized(self):
         return self.authority.serialized()

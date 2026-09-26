@@ -1,25 +1,44 @@
 # MemPalace Tasks
 
 A single-host task authority over an existing MemPalace HTTP hub. The package
-provides an authenticated MCP endpoint, read-only human inspection, and an
-optional managed-process supervision API. It does not replace MemPalace, start
-Copilot fleets automatically, or install another authoritative database.
+provides authenticated Streamable HTTP MCP, read-only human inspection, and
+explicit foreground or opt-in launcher hosting. Schema 2 uses MemPalace as the
+sole durable task/recovery store. No systemd, launchd or Windows service is
+required; Linux worker supervision is a separate, optional integration.
+It does not replace MemPalace, install another task database, or ship a native
+Copilot `/fleet` execution adapter.
 
 ```text
 Copilot / other MCP clients ----\
                                 > task sidecar --> MemPalace logstream
-Human status/history/watch ----/        |
-                                       +--> optional historical drawer/KG views
+Human status/history/watch ----/
 
-External host/coordinator --> claims, worker supervision and result delivery
+External host/coordinator --> claims, optional supervision and result delivery
 ```
 
 ## What is authoritative
 
-The reserved `mptask/<authority_id>` logstream contains immutable commands and
-settlement records. The sidecar reconstructs tasks, dependencies, generations,
-resource reservations and outcomes from that journal. Local pending/head/clock
-files are recovery metadata; drawers and KG facts are historical projections.
+The reserved `mptask/<authority_id>` logstream contains commands, settlement
+records and accepted startup epochs. `TaskAuthority`
+reconstructs tasks, dependencies, generations, resource reservations and scoped
+command outcomes from that journal.
+
+There is one authority implementation and one supported configuration contract:
+schema 2 with `runtime_dir`, journal-only recovery, and `lifecycle` set to
+`external` (default) or `launcher`. A fixed loopback port or `0` for dynamic
+binding is supported. There is no recovery-mode selector or file-backed
+authority alternative.
+
+Runtime locks, registry and launch logs are disposable
+coordination, not a matching task-recovery backup set. Config and credentials
+are reprovisionable local inputs, not versioned task state.
+
+Every owner startup accepts a fresh epoch before readiness,
+including exclusive administration, not just machine reboots. It fences old
+attempt authorization immediately and records inherited attempts as requiring
+recovery in bounded batches. Execution is not automatically resumed. Effective
+time is rebuilt from accepted journal timestamps and a process-local,
+suspend-inclusive clock, never a restored local clock file.
 
 Claims have renewable leases and monotonically increasing generations. A claim
 is initially **preparing**, not permission to execute. A registered supervisor
@@ -32,19 +51,25 @@ New prerequisites use atomic graph publication with source disposition `yield`.
 Goal bootstrap creates the root and planning task together; goal closure checks
 unfinished/proposed work and seals intake. An empty ready list is not completion.
 
-This is a **cooperative, single-host** deployment. All clients use one service and
-one canonical state directory. Its file lock is not a distributed fence. The
-private bearer token identifies trusted local clients as a group; its holder can
-assert registered actor names. This is not multi-tenant per-actor authentication.
+This is a **cooperative, single-host** deployment. All clients use one configured
+hub, one authority and one canonical runtime directory.
+Never move/delete that directory or its stable lock files while an owner can
+still run; using another directory bypasses local exclusion. The lock is not a
+distributed fence or hub-enforced compare-and-swap. The private bearer token
+identifies trusted local clients as a group; its holder can assert registered
+actor names. This is not multi-tenant per-actor authentication.
 
 ## Requirements and offline setup
 
-- Linux for the service clock, process ownership and supervision.
-- Python 3.11+ for the package; the checked dependency lock and SDK integration
-  environment use Linux/Python 3.12.
+- Python **3.11+**. Validation to date ran on **Linux/Python 3.12**.
+- Native Linux, macOS and Windows hosting code paths exist; **macOS/Windows
+  native certification remains unrun**. A universal lock is not platform test
+  evidence. Managed-process containment/supervision currently requires Linux;
+  ordinary HTTP hosting does not initialize that execution backend.
 - An already installed MemPalace hub with the supported append/list contract.
 - Official Python MCP SDK **1.30.0**, pinned with its dependencies in
-  `requirements.lock`.
+  `requirements.lock`; the direct Windows-only dependency is **`pywin32==311`**
+  (`sys_platform == 'win32'`).
 - Git only for execution profiles that create isolated repository worktrees.
 
 From the repository root, with preinstalled Python/uv and the required artifacts
@@ -57,11 +82,19 @@ uv pip install --offline --no-deps --python sidecar/.venv/bin/python -e ./sideca
 sidecar/.venv/bin/mempalace-tasks --help
 ```
 
-If a cached dependency/build tool is missing, provision it from an approved
-source before retrying. Do not add a download/install fallback to service startup.
-The hash-pinned requirements lock is intentional: the available offline cache
-supports this environment but not universal `uv lock` resolution. Other platform
-or interpreter combinations need their own dependency validation.
+These are offline environment-preparation commands, not service-startup steps.
+If a cached dependency/build tool or interpreter is missing, provision it from
+an approved source before retrying. Service startup neither downloads nor builds
+packages; there is no install/network-bootstrap fallback. Windows environments
+use their native executable paths rather than the POSIX `.venv/bin` examples.
+
+The hash-pinned universal requirements lock was regenerated using approved PyPI
+metadata/wheel inspection, including the conditional pywin32 dependency. Its
+recorded generation command can run offline with a preprovisioned cache:
+
+```bash
+uv pip compile sidecar/pyproject.toml --offline --only-binary=:all: --no-python-downloads --no-sources --universal --python-version 3.11 --generate-hashes --output-file sidecar/requirements.lock
+```
 
 Copying the customization pack alone does **not** install or start this package.
 Use a prebuilt, approved package/environment for deployment; do not launch it
@@ -70,25 +103,29 @@ through a command that fetches packages on every MCP connection.
 ## Configure and initialize
 
 Create a private credential/config directory using your normal administration
-tools. Credential parents must already exist. Choose a new authority UUID, an
-unused loopback port, and a dedicated state directory; do not reuse a repository
-or another application's state directory.
+tools. Credential and runtime parents must already exist. For a **new authority**,
+choose a new UUID and a dedicated runtime directory; do not reuse a repository
+or another application's directory. Reopening a current-format authority retains
+its UUID and accepted genesis; it does not initialize replacement task history.
+Older experimental configurations and journal formats are not supported or
+automatically migrated.
 
-Example configuration below is a template, not a deployment. Replace the UUID
-and `/srv/...` paths with your own real, absolute, non-symlink paths. Obtain the
-existing hub credential through its normal administration flow; never paste a
-token into a task, repository, chat or log.
+The configuration below is synthetic, not a deployment. Replace the UUID and
+`/srv/...` paths with absolute native paths without symlinks/reparse points.
+Obtain the existing hub credential through its normal administration flow;
+never paste a token into a task, repository, chat or log.
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "authority_id": "11111111-1111-1111-1111-111111111111",
   "hub_url": "http://127.0.0.1:8765/mcp",
   "hub_token_file": "/srv/mptask-private/hub.token",
   "service_token_file": "/srv/mptask-private/service.token",
-  "state_dir": "/srv/mptask-state",
+  "runtime_dir": "/srv/mptask-runtime",
+  "lifecycle": "external",
   "host": "127.0.0.1",
-  "port": 8766,
+  "port": 0,
   "genesis": {
     "actor": "operator",
     "actors": {
@@ -106,57 +143,84 @@ token into a task, repository, chat or log.
         "profiles": ["local"],
         "workers": ["worker"]
       }
-    },
-    "policy": {
-      "lease_ttl_seconds": 300,
-      "renewal_seconds": 100,
-      "sweep_seconds": 15,
-      "progress_timeout_seconds": 1800,
-      "hard_timeout_seconds": 7200,
-      "automatic_retries": 3
     }
   },
   "maintenance_actor": "system",
-  "recovery_actor": "operator",
-  "project_wings": {"demo": "demo-wing"},
-  "projections_enabled": false
+  "recovery_actor": "operator"
 }
 ```
 
 Omit `hub_token_file` only when the explicitly configured hub does not require
-one. Token files must be singly linked regular files owned by the current user,
-with no group/other permissions. Configuration/token reads never repair modes,
-create parents, or chmod a shared directory.
+one. Token files must be private, singly linked regular files validated by the
+native platform layer (owner-only permissions on POSIX, private ACLs on Windows).
+Configuration/token reads never repair permissions, create parents, or chmod a
+shared directory. The bind host must be canonical numeric loopback, such as
+`127.0.0.1` or `::1`. Schema 2 accepts `port: 0` or a fixed port in `1..65535`.
 
-```bash
-sidecar/.venv/bin/mempalace-tasks init --config /srv/mptask-private/config.json --generate-token
-sidecar/.venv/bin/mempalace-tasks serve --config /srv/mptask-private/config.json
-```
+Only explicit `mempalace-tasks init --config CONFIG` may create new genesis.
+Add `--generate-token` to exclusively create a missing private service token;
+it never displays or overwrites the token or replaces accepted configuration.
+Initialization is idempotent for the same normalized genesis, but opens an owner
+and is **not** read-only inspection or the restore procedure. Actors, supervisors
+and declared capabilities are fixed by that genesis; changing JSON later does
+not change accepted authorization.
 
-`init --generate-token` exclusively creates a missing private service token
-without displaying it. It does not overwrite existing tokens or accepted
-configuration. Initialization is idempotent for the same normalized genesis.
-Actors, supervisors and declared capabilities are fixed by that genesis; changing
-the JSON later is not an implicit authorization/configuration migration.
+### Foreground and launcher lifecycle
 
-`serve` is foreground and requires prior initialization. It never creates a
-replacement clock, chooses another palace, or starts an embedded storage writer
-when the configured hub is unavailable. Use your normal user-service manager
-for unattended operation, with the preinstalled executable and explicit config.
-No service or MCP registration is installed automatically.
+The following is command syntax, not an automatic deployment sequence.
+`CONFIG` is an absolute configuration path; alternatively set `MPTASK_CONFIG`.
+
+| Command | Behavior |
+|---|---|
+| `mempalace-tasks serve --config CONFIG` | Standard foreground owner; requires accepted genesis. Works with `lifecycle: "external"` without a service manager. |
+| `mempalace-tasks start --config CONFIG --timeout 10s` | Explicit start/reuse; requires schema 2 and `lifecycle: "launcher"`. No implicit init. |
+| `mempalace-tasks connect --config CONFIG --timeout 10s` | Read-only discovery of an authenticated, ready owner; never starts one. |
+| `mempalace-tasks connect --config CONFIG --start --timeout 10s` | Explicit launcher start/reuse, under the same configured consent as `start`. |
+| `mempalace-tasks stop --config CONFIG --instance-id UUID --timeout 10s` | Drain exactly the previously observed instance, then confirm listener closure and ownership release. |
+
+For `start`, `connect` and `stop`, timeout defaults to ten seconds, accepts a positive
+`s`/`m`/`h` duration, and is bounded to 300 seconds. Each operation shares one
+monotonic deadline across election waits, HTTP exchanges and polling. Identity
+checks may use its entire remaining budget, so slower journal freshness checks
+are not cut short by a separate per-poll timeout. Failed startup may additionally
+take up to two seconds to clean up only the child it launched.
+Stop requires the actual
+`instance_id` from a prior connection, not the stable authority UUID. Blocked
+drain, lost replies or unconfirmed release are explicit failures/unknown outcomes,
+not permission to kill a registry PID or automatically retry the stop request.
+
+Foreground and launcher startup share local election and lifetime ownership.
+The launcher uses the preinstalled interpreter and a private-stdin startup ticket
+internally; the ticket is not a user-facing credential or a public launch API.
+It never picks another hub, authority or recovery path. Optional service-manager
+wrappers can run the same foreground command, but no service, hub or MCP
+registration is installed or changed automatically.
 
 ## Connect MCP clients
 
 Keep the existing MemPalace MCP registration for ordinary memory operations.
-Add a **separate Streamable HTTP** server named `mempalace-tasks`, pointing to the
-configured endpoint, for example `http://127.0.0.1:8766/mcp`.
+Use a **separate Streamable HTTP** server named `mempalace-tasks`. In schema 2,
+`connect` validates the private disposable registry's configuration binding,
+then challenges the listener for an authenticated identity/readiness proof.
+The accepted epoch is its `instance_id`; a registry pathname or PID alone is
+not ownership or readiness. Port zero resolves to the actual bound endpoint.
 
-Configure its `Authorization: Bearer ...` header securely from the private
-service token using the harness's supported credential mechanism. Do not commit
-the header value or expose it in shell history. In Copilot CLI, use the `/mcp`
-configuration manager. Use numeric loopback addresses, the exact `/mcp` path,
-and the configured port; redirects, DNS hostnames and public binding are not
-supported by this service/client profile.
+CLI `connect` returns only `url`, `authority_id`, `instance_id` and `ready`, never
+a token. Programmatic `discovery.connect(config)` returns an immutable
+`ConnectionInfo` with an instance-scoped bearer for
+`TaskServiceClient(info.url, token=info.token)`. It neither starts a writer nor
+injects/updates mutation epochs. Reconnect explicitly after an owner change;
+do not apply the new epoch to an unresolved old request.
+
+For harness HTTP registration, supply the endpoint and bearer through the
+harness's supported credential mechanism. MCP accepts the provisioned service
+bearer or an instance-scoped bearer; lifecycle stop requires the latter.
+A fixed port permits a fixed URL such as `http://127.0.0.1:8766/mcp`;
+dynamic-port registrations must follow newly verified discovery after restart.
+There is no automatic harness-registration/credential-refresh adapter.
+Never put credentials in tasks, repository files, logs or shell history.
+Use numeric loopback and the exact `/mcp` path; redirects, DNS hostnames and
+public binding are not supported by this service/client profile.
 
 All sessions connect to the **same running service**, not a fresh stateful server
 process per agent. Host/Origin checks and token checks protect the endpoint; they
@@ -177,20 +241,34 @@ Discover actual `tools/list` schemas instead of copying argument guesses.
 | Lifecycle | `mptask_create`, `update`, `claim`, `renew`, `checkpoint`, `attempt_report`, `release`, `recover`, `transition`, `note` |
 | Graph and goals | `mptask_add_dependency`, `remove_dependency`, `bootstrap`, `expand`, `goal_close` |
 | Read/observe | `mptask_get`, `snapshot`, `list`, `ready`, `history`, `health`, `wait_ready` |
+| Historical resolution | `mptask_outcome` |
 
 Every short name in the table has the `mptask_` prefix. Public mutations require
-`actor` and `command_id`; clients do not pass `operation`. Internal genesis and
+`actor`, `command_id`, and **`expected_epoch`**
+from the current read/health response's `epoch_id`. Clients do not pass
+`operation`. Missing or stale epochs are rejected before mutation, even for a
+known command ID. Internal genesis and
 expiry commands are not exposed as public MCP tools.
 
-For uncertain outcomes, retain the exact command ID/payload. Ordered settlement
-either observes its commit or permanently abandons a delayed original. Only a
-confirmed terminal-abandoned outcome permits a new ID for the still-needed
-request. A successful old receipt remains historical; use current
-`get.authorization` and match the host-supplied owner/attempt/generation.
+Freeze **authority + epoch + command ID + exact payload** for a logical request.
+Its journal identity is `(authority_id, epoch_id, command_id)`. Do not refresh
+`expected_epoch` on retry, silently resubmit under a new epoch, or infer failure
+from a timeout. The client performs no automatic mutation retries.
+
+Resolve historical requests with
+`mptask_outcome(epoch_id=ORIGINAL_EPOCH, command_id=ORIGINAL_ID)`.
+The original epoch UUID is required; a null or newly substituted epoch is invalid.
+The lookup is read-only and can return `resolution="not_recorded"` with no receipt;
+absence is not confirmed abandonment or evidence of absent external effects.
+Only a confirmed terminal-abandoned outcome permits a new ID for a still-needed
+request after fresh state/authorization checks. An old receipt is historical,
+not current execution permission. Use current `mptask_get.authorization` and
+match the host-supplied actor/owner, attempt and generation as well as the epoch.
 
 ## Human supervision
 
 ```bash
+sidecar/.venv/bin/mempalace-tasks connect --config /srv/mptask-private/config.json --timeout 10s
 sidecar/.venv/bin/mempalace-tasks status --config /srv/mptask-private/config.json --project demo
 sidecar/.venv/bin/mempalace-tasks list --config /srv/mptask-private/config.json --needs-attention
 sidecar/.venv/bin/mempalace-tasks show TASK_ID --config /srv/mptask-private/config.json
@@ -199,10 +277,10 @@ sidecar/.venv/bin/mempalace-tasks watch --config /srv/mptask-private/config.json
 sidecar/.venv/bin/mempalace-tasks inspect --config /srv/mptask-private/config.json
 ```
 
-These commands query the running service. They never claim, renew, expire,
-reconcile, start a writer, or modify user config/token permissions. `inspect`
-reports authority and runtime-lane health; task views show scope/counts, owner,
-generation, deadlines/progress, blockers, resources, retry/recovery and evidence.
+These commands discover/query the running service. They never claim, renew,
+expire, reconcile, start a writer, or modify user config/token permissions.
+`inspect` reports authority and runtime-lane health; task views show scope/counts,
+owner, generation, deadlines/progress, blockers, resources, retry/recovery and evidence.
 
 Text distinguishes **CURRENT**, **STALE**, **OUTCOME UNKNOWN** and pinned
 **HISTORICAL SNAPSHOT**. JSON preserves these distinctions and source metadata.
@@ -230,12 +308,12 @@ The sidecar determines readiness and enforces claims. **Choosing, launching and
 supervising workers belongs to an external host/coordinator.** Native Copilot
 `/fleet` is not automatically subscribed to this queue.
 
-The package includes `HostSupervisor`, `LocalProfile` and an explicit bounded
-programmatic helper, `mempalace_tasks.cli.supervise`. The helper acquires exclusive
-local authority ownership and cannot run alongside a separate `serve` owner.
-It is not an advertised shell subcommand or a native Copilot integration.
-Applications assembling both MCP and supervision must share the same owned
-authority rather than open a second writer.
+The optional **Linux** integration includes `HostSupervisor`, `LocalProfile` and
+an explicit bounded programmatic helper, `mempalace_tasks.cli.supervise`. The
+helper acquires exclusive local authority ownership and cannot run alongside a
+separate `serve` owner. It is not an advertised shell subcommand or a native
+Copilot integration. Applications assembling both MCP and supervision must share
+the same owned authority rather than open a second writer.
 
 Profiles use preconfigured absolute executable paths. They receive paths and
 identity through `MPTASK_INPUT_PATH`, `MPTASK_RESULT_PATH`,
@@ -257,41 +335,63 @@ profile excludes remote effects and escaping/daemonized processes. External
 effects require an explicit reconciliation adapter or operator action. Unsafe
 work retains its reservations while unrelated eligible work may continue.
 
-## Recovery, projections and upgrades
+## Recovery and coherent palace backup/restore
 
 The service automatically reconciles ordinary lost append responses. Genuine
 storage loss/corruption, unsupported upstream contracts, or unknown external
 effects remain explicit barriers; the software does not guess that an absent
 record or dead local process proves safety.
 
-With `serve` stopped, exclusive administration is available:
+The authority checks the live, in-memory verified prefix on refresh. Prefix
+rollback/corruption or a superseding epoch fences that owner closed. There is
+**no independent cross-process rollback anchor**: after process death, a
+self-consistent older snapshot cannot by itself prove whether rollback was
+intentional. Restore therefore requires an explicit offline procedure, not a
+live file swap or a silent restart to bypass a detected integrity failure.
 
-```bash
-sidecar/.venv/bin/mempalace-tasks reconcile --config /srv/mptask-private/config.json
-sidecar/.venv/bin/mempalace-tasks project --config /srv/mptask-private/config.json --resume --max-batches 10
-sidecar/.venv/bin/mempalace-tasks project --config /srv/mptask-private/config.json --rebuild --max-batches 10
-```
+Use the [backup](../skills/mempalace-backup/SKILL.md) and
+[restore](../skills/mempalace-restore/SKILL.md) runbooks for the helper interface
+and its current platform/refusal limits. At a high level:
 
-Projection is off by default. When enabled, it runs through a separate client
-outside the authority lock. Only accepted domain records are projected;
-heartbeats are not embedded. Delivery is explicitly at least once. Large source
-records are losslessly partitioned; immutable revision nodes preserve provenance.
-MemPalace's legacy KG validity is whole-second: derived boundaries use a
-conservative ceiling while exact source timestamps remain in content/`source_at`.
-Historical KG/drawers are never current task authority.
+1. Quiesce task owners, workers/effects, hub writers and outstanding mutations;
+   maintain an operator-controlled no-new-launch boundary. Stopping one task
+   listener, checkpointing SQLite or finding no registry is not proof that all
+   palace writers are excluded.
+2. Capture a coherent physical palace cut covering the **resolved data
+   directory**, including `logstream.sqlite3`, committed WAL state, referenced
+   artifacts and `replica.json`, plus the other palace stores/provenance.
+   Verify path coverage: the current helper refuses DATA roots outside its
+   selected HOME backup root rather than silently omitting them. A wing export
+   is not a task-journal recovery snapshot.
+3. Restore to private staging, validate journal/authority and required artifacts,
+   and establish the staged epoch barrier before publishing under offline
+   exclusion, preserving canonical lock namespaces. Resume only through a fresh
+   owner activation; inherited attempts require recovery and retained
+   client/worker packets remain fenced.
 
-A failed projection pauses visibly without rolling back tasks. A bounded manual
-resume/rebuild may leave backlog; rebuilding touches only the derived checkpoint,
-not task history. Quiesce workers and stop the service before replacing its
-package or restoring storage. Preserve the MemPalace logstream together with
-local pending/head/clock recovery files. Removing the package must not delete
-these records.
+The snapshot retains the task IDs, edges, holds and source-plan/artifact content
+it actually contains; post-snapshot work may be absent. Do not replay pending
+commands or restore sidecar cache files from a discarded future.
+Reprovision config/tokens as needed and rebuild disposable discovery/runtime
+state only while owners are quiescent. Neither palace restore nor task fencing
+undoes Git/cloud effects or target-side fence counters; reconcile those before
+unsafe work can be repeated.
 
-Healthy operations consume verified append-only tails; startup, uncertainty
-recovery and explicit full audits verify the stored prefix. In-place history
-rewrites are outside the cooperative contract and are detected at full audits,
-not on every healthy read. No log compaction, distributed failover or Beads CLI/
-Dolt/formula compatibility is claimed.
+### Supported data and administration
+
+Only the current schema-2 configuration and epoch-bound journal envelopes are
+accepted. The original experimental authority, schema-1 configuration and
+pre-epoch journal formats have no compatibility or migration path. Unsupported
+records fail explicitly; they are never silently skipped or replaced with a new
+authority. Removing this code does not delete stored palace records.
+
+With all other owners stopped, `mempalace-tasks reconcile --config CONFIG`
+is exclusive **mutating** administration, not inspection; it also opens a new
+epoch. Package replacement likewise requires quiescence.
+Removing the package must not delete the accepted palace records.
+
+No log compaction, distributed failover, native `/fleet` dispatch or Beads
+CLI/Dolt/formula compatibility is claimed.
 
 ## Development checks
 
@@ -312,5 +412,5 @@ MPTASK_LIVE_HUB=1 MPTASK_TEST_TMPDIR="$SESSION_FILES" PYTHONPATH=sidecar/src \
 
 The real-hub fixture isolates HOME and palace storage, binds port zero, validates
 its child-owned registry before connecting, and stops only its own processes.
-It never registers a service or writes task/projection records into the user's
+It never registers a service or writes task records into the user's
 existing palace.

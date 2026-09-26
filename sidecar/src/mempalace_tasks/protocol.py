@@ -1,8 +1,9 @@
-"""Ordered proposal/settlement fold. No transport, clock, or filesystem effects.
+"""Ordered, epoch-fenced journal fold. No transport, clock, or filesystem effects.
 
 LogState belongs to one serialized owner. fold_record mutates it only after an
 entire record validates and returns it for convenience. Consumers must receive
-a detached copy, never the owner's mutable instance.
+a detached copy, never the owner's mutable instance. Only v2 envelopes are
+supported; None means no accepted activation, not an implicit request scope.
 """
 
 from copy import deepcopy
@@ -22,6 +23,8 @@ _COMMON = {"record_type", "schema_version", "authority_id", "command_id",
            "command_hash", "task_ids", "payload_hash"}
 _PROPOSAL = _COMMON | {"ordinal", "previous_event_id", "event"}
 _SETTLEMENT = _COMMON | {"proposal_hash", "control_id"}
+_EPOCH = {"record_type", "schema_version", "authority_id", "epoch_id", "activation_id",
+          "previous_activation_id", "at", "payload_hash"}
 _EVENT = {"schema_version", "authority_id", "kind", "command", "at", "tasks",
           "edges_added", "edges_removed", "resources", "configuration", "changes", "response"}
 _HASH = re.compile("[0-9a-f]{64}")
@@ -63,6 +66,13 @@ def normalize_command(command):
 class LogState:
     authority_id: str
     state: object = field(init=False)
+    epoch_id: str | None = field(default=None, init=False)
+    activation_id: str | None = field(default=None, init=False)
+    activation_at: str | None = field(default=None, init=False)
+    activation_event_id: str | None = field(default=None, init=False)
+    activation_attempts: dict = field(default_factory=dict, init=False)
+    used_epochs: dict = field(default_factory=dict, init=False)
+    scoped_outcomes: dict = field(default_factory=dict, init=False)
     outcomes: dict = field(default_factory=dict, init=False)
     proposals: dict = field(default_factory=dict, init=False)
     controls: dict = field(default_factory=dict, init=False)
@@ -81,38 +91,59 @@ class LogState:
         return {"raw_cursor": self.raw_cursor, "raw_hash": self.raw_hash,
                 "domain_head": self.domain_head, "domain_ordinal": self.domain_ordinal}
 
+    def historical_outcome(self, epoch_id, command_id):
+        """Resolve exactly one scope, never grant current execution authorization."""
+        identifier(epoch_id, "epoch_id")
+        identifier(command_id, "command_id")
+        return deepcopy(self.scoped_outcomes.get((self.authority_id, epoch_id, command_id)))
+
 
 def _seal(payload):
-    payload["payload_hash"] = payload_hash(payload)
-    if len(canonical_json(payload).encode("utf-8")) > MAX_PAYLOAD_BYTES:
-        raise ProtocolError("payload_too_large", "Complete task envelope exceeds 240 KiB")
+    try:
+        payload["payload_hash"] = payload_hash(payload)
+        if len(canonical_json(payload).encode("utf-8")) > MAX_PAYLOAD_BYTES:
+            raise ProtocolError("payload_too_large", "Complete task envelope exceeds 240 KiB")
+    except DomainError as error:
+        raise ProtocolError("invariant_violation", "Invalid protocol value",
+                            {"cause": error.code}) from error
     return _validate_payload(payload, payload["authority_id"])
 
 
+def make_epoch(log, epoch_id, activation_id, now):
+    """Build an attempt against the current activation; the host supplies fresh UUIDs."""
+    return _seal({"record_type": "mptask.epoch", "schema_version": 2,
+                  "authority_id": log.authority_id, "epoch_id": epoch_id,
+                  "activation_id": activation_id, "previous_activation_id": log.activation_id,
+                  "at": now})
+
+
 def make_proposal(log, command, now):
+    _require(log.epoch_id is not None, "An accepted epoch is required before any proposal")
     normalized = normalize_command(command)
     event = decide(log.state, normalized, now)
-    return _seal({"record_type": "mptask.command", "schema_version": 1,
+    return _seal({"record_type": "mptask.command",
+                  "schema_version": 2, "epoch_id": log.epoch_id,
                   "authority_id": log.authority_id, "command_id": normalized["command_id"],
                   "command_hash": command_hash(normalized), "ordinal": log.domain_ordinal + 1,
                   "previous_event_id": log.domain_head, "event": event,
                   "task_ids": sorted(task["id"] for task in event["tasks"])})
 
 
-def _control_id(authority_id, command_id, proposal_hash):
-    return str(uuid5(UUID(authority_id), f"mptask.settle:{command_id}:{proposal_hash}"))
+def _control_id(authority_id, command_id, proposal_hash, epoch_id):
+    return str(uuid5(UUID(authority_id), f"mptask.settle:{epoch_id}:{command_id}:{proposal_hash}"))
 
 
 def make_settlement(proposal):
     _validate_payload(proposal, proposal.get("authority_id") if type(proposal) is dict else None)
     _require(proposal["record_type"] == "mptask.command", "Settlement requires a proposal")
-    return _seal({"record_type": "mptask.settle", "schema_version": 1,
+    return _seal({"record_type": "mptask.settle",
+                  "schema_version": 2, "epoch_id": proposal["epoch_id"],
                   "authority_id": proposal["authority_id"],
                   "command_id": proposal["command_id"], "command_hash": proposal["command_hash"],
                   "proposal_hash": proposal["payload_hash"],
                   "task_ids": deepcopy(proposal["task_ids"]),
                   "control_id": _control_id(proposal["authority_id"], proposal["command_id"],
-                                            proposal["payload_hash"])})
+                                            proposal["payload_hash"], proposal["epoch_id"])})
 
 
 def _validate_payload(payload, authority_id):
@@ -120,31 +151,42 @@ def _validate_payload(payload, authority_id):
         encoded = canonical_json(payload)
         _require(type(payload) is dict, "Protocol payload must be an object")
         record_type = payload.get("record_type")
-        _require(type(record_type) is str and record_type in {"mptask.command", "mptask.settle"},
+        _require(type(record_type) is str
+                 and record_type in {"mptask.command", "mptask.settle", "mptask.epoch"},
                  "Unknown record type")
-        expected = _PROPOSAL if record_type == "mptask.command" else _SETTLEMENT
+        version = payload.get("schema_version")
+        _require(type(version) is int and version == 2, "Unsupported protocol schema")
+        if record_type == "mptask.epoch":
+            expected = _EPOCH
+        else:
+            expected = (_PROPOSAL if record_type == "mptask.command" else _SETTLEMENT) | {"epoch_id"}
         _require(set(payload) == expected, "Missing or unknown protocol fields")
-        _require(type(payload["schema_version"]) is int and payload["schema_version"] == 1,
-                 "Unsupported protocol schema")
         identifier(payload["authority_id"], "authority_id")
-        identifier(payload["command_id"], "command_id")
         _require(payload["authority_id"] == authority_id, "Foreign authority")
-        for key in ("command_hash", "payload_hash"):
-            _require(type(payload[key]) is str and _HASH.fullmatch(payload[key]) is not None,
-                     "Malformed hash")
+        identifier(payload["epoch_id"], "epoch_id")
+        _require(type(payload["payload_hash"]) is str
+                 and _HASH.fullmatch(payload["payload_hash"]) is not None, "Malformed hash")
         _require(payload_hash(payload) == payload["payload_hash"], "Payload hash mismatch")
+        _require(len(encoded.encode("utf-8")) <= MAX_PAYLOAD_BYTES, "Oversized protocol record")
+        if record_type == "mptask.epoch":
+            identifier(payload["activation_id"], "activation_id")
+            if payload["previous_activation_id"] is not None:
+                identifier(payload["previous_activation_id"], "previous_activation_id")
+            instant(payload["at"], "activation time")
+            return payload
+        identifier(payload["command_id"], "command_id")
+        _require(type(payload["command_hash"]) is str
+                 and _HASH.fullmatch(payload["command_hash"]) is not None, "Malformed hash")
         ids = payload["task_ids"]
         _require(type(ids) is list and all(type(tid) is str for tid in ids), "Malformed task IDs")
         _require(ids == sorted(set(ids)), "Task IDs must be sorted and distinct")
         for tid in ids:
             _require(tid.startswith("tsk_"), "Malformed task ID")
             identifier(tid[4:], "task_id")
-        _require(len(encoded.encode("utf-8")) <= MAX_PAYLOAD_BYTES, "Oversized protocol record")
         if record_type == "mptask.command":
             _require(type(payload["ordinal"]) is int and payload["ordinal"] > 0, "Invalid ordinal")
             _require(payload["previous_event_id"] is None
-                     or (type(payload["previous_event_id"]) is str
-                         and bool(payload["previous_event_id"])), "Invalid predecessor")
+                     or _routing_value(payload["previous_event_id"]), "Invalid predecessor")
             event = payload["event"]
             _require(type(event) is dict and set(event) == _EVENT, "Malformed domain event")
             _require(type(event["schema_version"]) is int and event["schema_version"] == 1
@@ -182,7 +224,8 @@ def _validate_payload(payload, authority_id):
                      "Malformed proposal hash")
             identifier(payload["control_id"], "control_id")
             _require(payload["control_id"] == _control_id(
-                authority_id, payload["command_id"], payload["proposal_hash"]),
+                authority_id, payload["command_id"], payload["proposal_hash"],
+                payload["epoch_id"]),
                 "Unstable settlement identity")
     except DomainError as error:
         raise ProtocolError("invariant_violation", "Invalid protocol value",
@@ -202,6 +245,11 @@ def _invalid_number(value):
     raise ProtocolError("invariant_violation", "Non-integral JSON number")
 
 
+def _routing_value(value):
+    return (type(value) is str and bool(value) and value == value.strip()
+            and len(value) <= 256 and all(ord(char) >= 32 and ord(char) != 127 for char in value))
+
+
 def _decode_raw(log, raw):
     try:
         canonical_json(raw)
@@ -209,7 +257,8 @@ def _decode_raw(log, raw):
         for key in ("id", "stream", "room", "type", "from_agent", "correlation_id", "body",
                     "metadata", "created_at"):
             _require(key in raw, "Incomplete raw record")
-        _require(type(raw["id"]) is str and bool(raw["id"]), "Invalid raw event ID")
+        for key in ("id", "stream", "room", "type", "from_agent", "correlation_id", "created_at"):
+            _require(_routing_value(raw[key]), "Invalid raw routing value")
         _require(raw["id"] not in log.raw_ids, "Repeated raw event ID")
         _require(raw["stream"] == f"mptask/{log.authority_id}" and raw["room"] == "tasks"
                  and raw["from_agent"] == "mempalace-tasks", "Foreign route or writer")
@@ -219,20 +268,78 @@ def _decode_raw(log, raw):
         payload = json.loads(raw["body"], object_pairs_hook=_pairs, parse_float=_invalid_number,
                              parse_constant=_invalid_number)
         _validate_payload(payload, log.authority_id)
+        identity = "activation_id" if payload["record_type"] == "mptask.epoch" else "command_id"
         _require(raw["type"] == payload["record_type"]
-                 and raw["correlation_id"] == payload["command_id"], "Raw routing mismatch")
+                 and raw["correlation_id"] == payload[identity], "Raw routing mismatch")
         _require(type(raw["metadata"]) is dict
                  and raw["metadata"].get("authority_id") == log.authority_id
-                 and raw["metadata"].get("command_id") == payload["command_id"],
+                 and raw["metadata"].get(identity) == payload[identity],
                  "Raw metadata mismatch")
+        _require(raw["metadata"].get("epoch_id") == payload["epoch_id"],
+                 "Raw epoch metadata mismatch")
+        _require(len(canonical_json(raw["metadata"]).encode("utf-8")) <= 64 * 1024,
+                 "Oversized raw metadata")
         return payload
     except (DomainError, ValueError, RecursionError) as error:
         raise ProtocolError("invariant_violation", "Invalid raw JSON record") from error
 
 
+def _raw_digest(log, raw_event):
+    return hashlib.sha256(canonical_json({
+        "previous_raw_hash": log.raw_hash, "record": raw_event,
+    }).encode("utf-8")).hexdigest()
+
+
+def _advance_raw(log, raw_event, digest, history):
+    log.raw_ids.add(raw_event["id"])
+    log.raw_cursor, log.raw_hash = raw_event["id"], digest
+    log.history.append(history)
+    return log
+
+
+def _fold_epoch(log, raw_event, payload):
+    activation_id = payload["activation_id"]
+    epoch_id = payload["epoch_id"]
+    known = log.activation_attempts.get(activation_id)
+    if known is not None:
+        _require(canonical_json(known["payload"]) == canonical_json(payload),
+                 "Activation ID reused with different content")
+        disposition, attempt = "duplicate", known
+    else:
+        accepted = (payload["previous_activation_id"] == log.activation_id
+                    and epoch_id not in log.used_epochs)
+        disposition = "activated" if accepted else "stale"
+        attempt = {"outcome": "accepted" if accepted else "stale",
+                   "activation_id": activation_id, "epoch_id": epoch_id,
+                   "event_id": raw_event["id"], "at": payload["at"],
+                   "payload": deepcopy(payload)}
+    digest = _raw_digest(log, raw_event)
+    history = {"record_seq": len(log.history) + 1, "event_id": raw_event["id"],
+               "record_type": payload["record_type"], "activation_id": activation_id,
+               "epoch_id": epoch_id, "task_ids": [], "disposition": disposition,
+               "outcome": attempt["outcome"], "payload": deepcopy(payload)}
+    if known is None:
+        log.activation_attempts[activation_id] = attempt
+        log.used_epochs.setdefault(epoch_id, activation_id)
+    if disposition == "activated":
+        log.epoch_id, log.activation_id = epoch_id, activation_id
+        log.activation_at, log.activation_event_id = payload["at"], raw_event["id"]
+        log.outcomes, log.proposals, log.controls = {}, {}, {}
+    return _advance_raw(log, raw_event, digest, history)
+
+
 def fold_record(log, raw_event):
     payload = _decode_raw(log, raw_event)
+    if payload["record_type"] == "mptask.epoch":
+        return _fold_epoch(log, raw_event, payload)
+    epoch_id = payload["epoch_id"]
     command_id = payload["command_id"]
+    if epoch_id != log.epoch_id:
+        history = {"record_seq": len(log.history) + 1, "event_id": raw_event["id"],
+                   "record_type": payload["record_type"], "command_id": command_id,
+                   "epoch_id": epoch_id, "task_ids": deepcopy(payload["task_ids"]),
+                   "disposition": "stale", "outcome": "stale", "payload": deepcopy(payload)}
+        return _advance_raw(log, raw_event, _raw_digest(log, raw_event), history)
     known = log.outcomes.get(command_id)
     proposal = payload["record_type"] == "mptask.command"
     proposal_digest = payload["payload_hash"] if proposal else payload["proposal_hash"]
@@ -280,16 +387,19 @@ def fold_record(log, raw_event):
                            "task_ids": deepcopy(payload["task_ids"]), "event_id": raw_event["id"],
                            "ordinal": None, "response": None, "command": None}
 
-    raw_digest = hashlib.sha256(canonical_json({
-        "previous_raw_hash": log.raw_hash, "record": raw_event,
-    }).encode("utf-8")).hexdigest()
+    raw_digest = _raw_digest(log, raw_event)
     history = {"record_seq": len(log.history) + 1, "event_id": raw_event["id"],
                "record_type": payload["record_type"], "command_id": command_id,
                "task_ids": deepcopy(payload["task_ids"]), "disposition": disposition,
                "outcome": (outcome or known)["outcome"], "payload": deepcopy(payload)}
+    history["epoch_id"] = epoch_id
+    if outcome is not None:
+        outcome["authority_id"] = log.authority_id
+        outcome["epoch_id"] = epoch_id
     log.state = state
     if outcome is not None:
         log.outcomes[command_id] = outcome
+        log.scoped_outcomes[(log.authority_id, epoch_id, command_id)] = outcome
     if proposal:
         log.proposals[command_id] = encoded
     else:
@@ -299,7 +409,4 @@ def fold_record(log, raw_event):
         log.domain_ordinal = payload["ordinal"]
         log.accepted_records.append({"event_id": raw_event["id"], "ordinal": payload["ordinal"],
                                      "event": history["payload"]["event"]})
-    log.raw_ids.add(raw_event["id"])
-    log.raw_cursor, log.raw_hash = raw_event["id"], raw_digest
-    log.history.append(history)
-    return log
+    return _advance_raw(log, raw_event, raw_digest, history)
