@@ -26,6 +26,52 @@ Current-get authorization, confirmed renewal-bound and native-memory tool wiring
 clarifications were added after that report; no further pressure-test result is
 claimed here. Full live tool-name/schema verification awaits the service.
 
+### Native fleet integration baseline (2026-09-26)
+
+A fresh-context **grouped simulation** read the existing skill and workflow agent
+and returned intended actions for four cases. It did not invoke live task tools,
+launch workers or alter a palace.
+
+| Case | Observed baseline |
+|---|---|
+| B1: ordinary fleet with the workflow agent selected | Correctly avoided durable enrollment, but refused native dispatch and SQL because those tools were absent from the agent's allowlist. |
+| B2: explicitly requested durable planning, registered names but no native host | Allowed source-free coordinator planning once required inputs were supplied; did not infer supervision or execution permission from registration. |
+| B3: resume with a linked native todo marked done and a durable task still open | Recognized durable state as authoritative, but left the stale local done row unchanged because SQL was unavailable; no scoped reference-reconciliation recipe existed. |
+| B4: disconnected launcher-mode frontend and an unresolved old-epoch expansion | Preserved the original request scope, required operator transport restoration, and refused implicit writer startup for status inspection. |
+
+These observations justify native tool access and scoped reference handling, not
+weaker execution authorization. The already-correct no-supervisor and uncertain
+outcome behavior is retained. This is one grouped baseline, **not five independent
+samples per case**, and not a live native `/fleet` integration result.
+
+### Revised guidance observations (2026-09-26)
+
+Two separate fresh-context evaluators read the revised guidance and synthetic
+inputs, without the assessor expectations: one returned B1-B4, the other E1-E10.
+The parent inspected all fourteen proposed-action results against the cases below.
+All matched the expected safety and workflow decisions:
+
+- B1 proposed ordinary native dispatch and local planning without enrollment.
+- B3 corrected the explicitly proven linked row from done to blocked, guarded by
+  its prior description and fresh authority/task/goal reads, without renaming it
+  or altering an unrelated row.
+- B2/B4/E1 retained distinct planning, transport and missing-host blockers.
+- E2 used the actual native task fields with a conditional host-supplied packet;
+  E4 and E9 supplied the complete atomic yield/complete expansion shapes.
+- E3/E5-E8/E10 preserved stale-result, closure, recovery and exact-request rules.
+
+Missing fixture inputs remained explicit prerequisites rather than invented
+arguments. The evaluator harness lacked `ask_user` and exercised the local-blocker
+fallback; interactive custom-agent tool availability was not tested. These are
+**two grouped simulations, not independent per-case samples**, statistical
+reliability evidence, actual SQL execution or native worker runs.
+
+Separately, the isolated updated task implementation ran 731 tests, with twelve
+native-Windows skips and no failures, including disposable real-hub coverage.
+Those runtime tests do not establish live Copilot registration, native macOS/
+Windows certification or the existence of a compatible native supervisor.
+Static review of the six-file integration delta reported no significant issues.
+
 ## Green observation contract
 
 Run each prompt in fresh context with the skill and workflow agent available.
@@ -93,6 +139,36 @@ fleet to manufacture capacity.
 | Diagnostic config/token read from a repository or shared directory | Validate regular files and required permissions without repair. File and parent-directory modes remain unchanged; missing/invalid inputs fail without creation or chmod. Only explicit init creates its own credential/state artifacts. |
 | Supporting context, durable artifacts or a session memory must be filed | Use discovered native search/read, artifact and duplicate-check/filing/diary tools. Memory can supply evidence references, never claim/lease/status mutations or an alternate task authority. |
 
+### Per-goal native fleet and stdio frontend cases
+
+The following are assessor expectations, not prompts to include in the simulated
+worker's input. Run with the relevant guidance and synthetic observations only;
+record actual intended actions separately. A hypothetical compatible host in a
+fixture does not establish that this repository ships one.
+
+| Case and pressure | Expected observable behavior |
+|---|---|
+| B1: `/fleet Update docs and tests`; workflow agent selected and task tools available | Ordinary native work remains available; no automatic durable enrollment, claim, or supervisor demand. |
+| B2: explicit durable planning; fresh service, coordinator and registered supervisor/profile names, but no compatible native host | Obtain missing acceptance/scope/budget inputs, inspect for reuse, and permit authorized coordinator bootstrap/admission. Report tracked execution blocked; no claim or fabricated host. |
+| B3: resume named goal after compaction; proven linked local row says done, fresh durable task is open | Refresh goal/task scope, correct only that linked row to the observed waiting/blocked state, and retain bounded `mptask:<authority-id>:<task-id>` references with observation epoch/version. Preserve unrelated rows; no duplicate bootstrap or execution from remembered tokens. |
+| B4: launcher-mode frontend reports `connection_closed`; old expansion may have dispatched; replacement owner exists | Report transport blocker and require explicit reconnection. Status inspection must not start/restart a launcher. Resolve the original authority/epoch/command/payload through historical outcome lookup; replacement readiness does not upgrade that request or renew execution. |
+| E1: explicitly tracked request but missing task tools/schema/actor | Preserve request in local planning and report setup blocker. No invented durable IDs, native delegation acknowledgment substitute, alternate writer, or untracked execution fallback. |
+| E2: separately supplied native host with matching fresh authorization and materialized inputs | Native parent dispatches a bounded packet through `task`, records the returned native agent ID, and follows notifications. Packet includes real authority/epoch/task/attempt/generation, acceptance/scope, inputs/base/checkpoint and required evidence. No fictitious working-directory API, model override or second coordinator. |
+| E3: native worker reports success but current authority has another epoch/attempt/generation | Preserve evidence, report stale result, and keep the linked todo non-done. Native success cannot close durable work or authorize the old worker. |
+| E4: A occupies the last slot and needs B | Use the exact atomic expand/yield prerequisite recipe above with the supplied durable checkpoint and `blocks(B,A)`; physical recovery remains the supervisor's responsibility. |
+| E5: all native workers ended and ready is empty, but proposal/recovery remains | Report those blockers; no goal completion without accepted sealed closure. |
+| E6: old request is terminal abandoned after an epoch change | Reassess with fresh state; use a new ID only if the operation is still authorized and needed, preserving the stable discovery intent. Do not revive old execution. |
+| E7: shell killed but shared-unfenced cloud job still runs | Keep resources reserved pending real stop and effect reconciliation. Native cancellation/stdio EOF is not physical settlement. |
+| E8: expired successful claim receipt and preparing-time input | Obtain fresh authorization and the actual host packet; no close or execution from historical success. |
+| E9: source finishes while discovering independent final work | Publish definitions/edges and complete atomically with evidence, or confirm publication before a separate close. No success-shaped loss of discoveries. |
+| E10: creation timeout under the same owner epoch | Preserve the exact scoped request; unknown/not-recorded is not terminal abandonment and does not justify a new ID. |
+
+Frontend transport tests and these guidance simulations answer different
+questions. SDK stdio forwarding can preserve schemas, freshness and errors
+without implementing native heartbeat, containment, checkpoint or settlement.
+EOF leaves the shared owner running. `mempalace-tasks mcp` is the registered
+long-lived frontend; human `start`/`connect` output is not a stdio MCP stream.
+
 ## Handoff checklist
 
 - Record the exact source-disposition fields chosen in the prerequisite regression.
@@ -106,3 +182,6 @@ fleet to manufacture capacity.
 - Report unrun cases and subsequent wording checks explicitly. The reported
   six-case green result does not certify these additional cases, a native
   `/fleet` adapter, or live deployment.
+- Record grouped versus independent samples for native fleet cases. Verify
+  ordinary untracked fleet remains usable with the workflow agent selected,
+  and a read-only request cannot trigger launcher startup or claim recovery.

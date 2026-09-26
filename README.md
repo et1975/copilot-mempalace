@@ -24,8 +24,14 @@ audit hook that nags when an external tool is about to run without a prior `memp
   Includes authenticated `connect`, read-only `status` / `list` / `show` /
   `history` / bounded `watch`, a
   [task-safety skill](skills/mempalace-tasks/SKILL.md), and an opt-in
-  [workflow agent](agents/palace-task-workflow.agent.md). Worker dispatch remains
-  a host responsibility; connecting MCP does not automatically wire native `/fleet`.
+  [workflow agent](agents/palace-task-workflow.agent.md). The
+  [per-goal native fleet workflow](sidecar/README.md#per-goal-native-fleet-workflow)
+  keeps native `/fleet` as orchestrator and requires explicit tracking for each
+  goal; selecting the agent or installing this pack does not enroll ordinary work.
+  Without a separately supplied compatible native supervisor, it supports
+  durable planning and execution-blocker reporting, not tracked execution.
+  Worker dispatch remains a host responsibility; connecting MCP does not
+  automatically wire native `/fleet`.
   No native `/fleet` execution adapter is shipped. Linux process supervision is
   optional and separate; macOS/Windows hosting code exists but native
   certification remains unrun. Only the current journal-backed authority is
@@ -227,6 +233,13 @@ ln -s "$(pwd)/hooks/copilot_transcript.py" ~/.copilot/hooks/copilot_transcript.p
 
 The hook JSON references `python3 ~/.copilot/hooks/palace-reflex.py`. If you'd rather keep the script outside
 `~/.copilot/hooks/`, edit the `command` field accordingly.
+
+For the optional [per-goal task workflow](sidecar/README.md#per-goal-native-fleet-workflow),
+copy or link `skills/mempalace-tasks/` into `~/.copilot/skills/` and
+`agents/palace-task-workflow.agent.md` into `~/.copilot/agents/` using the same
+customization pattern. These are prompt guidance, not a supervisor or task-service
+installation; [Tasks registration](#optional-tasks-registration) and each goal's
+tracking opt-in are separate.
 
 ### Seeding Copilot user memory
 
