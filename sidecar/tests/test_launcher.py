@@ -13,6 +13,7 @@ from uuid import uuid4
 
 from mempalace_tasks import discovery, launcher
 from mempalace_tasks import platform_support as platform
+from mempalace_tasks.server_identity import make_proof
 from portable_lifecycle_fixture import ConfigurationFixture, IdentityServer, ROOT_TOKEN
 
 
@@ -119,6 +120,67 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(info.instance_id, server.identity.instance_id)
         self.assertFalse(self.children)
 
+    def test_slow_authenticated_existing_owner_is_reused_without_spawning(self):
+        server = self.server(identity_delay=0.4)
+        direct = discovery.connect(self.config, timeout=2)
+        info = launcher.start(self.fixture.path, timeout=2)
+        self.assertEqual(info, direct)
+        self.assertEqual(len(server.requests), 2)
+        self.assertFalse(self.children)
+        self.assertFalse(server.closed.is_set())
+        self.assertTrue(launcher._owner_busy(self.config))
+
+    def test_slow_existing_owner_timeout_is_bounded_and_never_stops_the_owner(self):
+        server = self.server(identity_delay=0.4)
+        began = time.monotonic()
+        self.error("owner_unready", lambda: launcher.start(self.fixture.path, timeout=0.15))
+        self.assertLess(time.monotonic() - began, 0.7)
+        self.assertFalse(self.children)
+        self.assertFalse(server.closed.is_set())
+        self.assertTrue(launcher._owner_busy(self.config))
+        self.assertFalse(any(item[0] == "POST" for item in server.requests))
+
+    def test_slow_identity_with_wrong_token_or_instance_is_not_reused(self):
+        server = self.server(identity_delay=0.4)
+        for mode, token in (("normal", "other-test-only-token"), ("wrong-instance", ROOT_TOKEN)):
+            with self.subTest(mode=mode):
+                server.mode = mode
+                self.config.service_token_file.write_text(token, encoding="utf-8")
+                self.error("identity_mismatch", lambda: launcher.start(self.fixture.path, timeout=2))
+                self.assertFalse(self.children)
+                self.assertFalse(server.closed.is_set())
+                self.assertTrue(launcher._owner_busy(self.config))
+
+    def test_readiness_retries_share_one_overall_deadline(self):
+        server = self.server()
+        for timeout, ready, elapsed in ((0.8, False, 0.8), (1.0, True, 0.85)):
+            with self.subTest(timeout=timeout):
+                clock = SimpleNamespace(now=100.0)
+
+                def sleep(duration):
+                    clock.now += duration
+
+                def exchange(identity, deadline, *, path):
+                    # Model a 400ms HTTP exchange without replacing proof validation.
+                    sleep(min(0.4, deadline.remaining()))
+                    deadline.remaining()
+                    return make_proof(identity, ROOT_TOKEN, path.split("nonce=")[1],
+                                      ready=clock.now >= 100.7)
+
+                fake_time = SimpleNamespace(monotonic=lambda: clock.now, sleep=sleep)
+                with patch.object(discovery, "time", fake_time), patch.object(
+                        discovery, "_request", side_effect=exchange):
+                    if ready:
+                        info = launcher.start(self.fixture.path, timeout=timeout)
+                        self.assertEqual(info.instance_id, server.identity.instance_id)
+                        self.assertTrue(info.ready)
+                    else:
+                        self.error("owner_unready", lambda: launcher.start(
+                            self.fixture.path, timeout=timeout))
+                self.assertAlmostEqual(clock.now - 100.0, elapsed)
+        self.assertFalse(self.children)
+        self.assertTrue(launcher._owner_busy(self.config))
+
     def test_held_owner_lock_without_registry_never_starts_a_competing_child(self):
         platform.ensure_private_directory(self.config.runtime_dir)
         with platform.LifetimeLock(self.config.runtime_dir / "authority.lock"):
@@ -138,11 +200,50 @@ class LauncherTests(unittest.TestCase):
         self.assertFalse(self.children)
         self.assertFalse(server.closed.is_set())
 
+    def test_slow_authenticated_listener_without_ownership_is_not_replaced(self):
+        server = self.server(own=False, identity_delay=0.4)
+        self.error("owner_unlocked", lambda: launcher.start(self.fixture.path, timeout=2))
+        self.assertFalse(self.children)
+        self.assertFalse(server.closed.is_set())
+
     def test_delayed_child_readiness_still_uses_parent_election(self):
         with patch.dict(os.environ, {"MPTASK_FIXTURE_DELAY": "0.15"}):
             info = launcher.start(self.fixture.path, timeout=3)
         self.assertTrue(info.ready)
         launcher.stop(self.config, expected_instance_id=info.instance_id, timeout=3)
+
+    def test_slow_authenticated_child_identity_is_confirmed_within_start_deadline(self):
+        accepted_epoch = "22222222-2222-2222-2222-222222222222"
+        with patch.dict(os.environ, {"MPTASK_FIXTURE_IDENTITY_DELAY": "0.4",
+                                     "MPTASK_FIXTURE_ACCEPTED_EPOCH": accepted_epoch}):
+            info = launcher.start(self.fixture.path, timeout=3)
+        self.assertEqual(info.instance_id, accepted_epoch)
+        self.assertTrue(info.ready)
+        self.assertEqual(len(self.children), 1)
+        self.assertIsNone(self.children[0].poll())
+        launcher.stop(self.config, expected_instance_id=info.instance_id, timeout=3)
+        self.assertEqual(self.children[0].wait(3), 0)
+
+    def test_slow_child_identity_timeout_cleans_up_only_owned_child_within_bound(self):
+        began = time.monotonic()
+        with patch.dict(os.environ, {"MPTASK_FIXTURE_IDENTITY_DELAY": "2"}):
+            self.error("startup_timeout", lambda: launcher.start(self.fixture.path, timeout=1))
+        self.assertLess(time.monotonic() - began, 3.5)
+        self.assertEqual(len(self.children), 1)
+        self.assertIsNotNone(self.children[0].poll())
+        with platform.LifetimeLock(self.config.runtime_dir / "authority.lock"):
+            pass
+        with platform.LifetimeLock(self.config.runtime_dir / "start.lock"):
+            pass
+
+    def test_slow_wrong_child_identity_is_rejected_and_owned_child_reaped(self):
+        with patch.dict(os.environ, {"MPTASK_FIXTURE_IDENTITY_DELAY": "0.4",
+                                     "MPTASK_FIXTURE_MODE": "wrong-instance"}):
+            self.error("identity_mismatch", lambda: launcher.start(self.fixture.path, timeout=3))
+        self.assertEqual(len(self.children), 1)
+        self.assertIsNotNone(self.children[0].poll())
+        with platform.LifetimeLock(self.config.runtime_dir / "authority.lock"):
+            pass
 
     def test_failed_readiness_stops_and_reaps_only_parent_owned_child(self):
         with patch.dict(os.environ, {"MPTASK_FIXTURE_MODE": "never-ready"}):
@@ -360,6 +461,18 @@ class LauncherTests(unittest.TestCase):
             self.config, expected_instance_id=server.identity.instance_id, timeout=0.2))
         self.assertTrue(server.owner_released.is_set())
         self.assertFalse(server.closed.is_set())
+
+    def test_slow_stop_observations_share_deadline_and_require_listener_release(self):
+        server = self.server(mode="stop-listener-held", identity_delay=0.4)
+        began = time.monotonic()
+        error = self.error("stop_unknown", lambda: launcher.stop(
+            self.config, expected_instance_id=server.identity.instance_id, timeout=1.2))
+        self.assertLess(time.monotonic() - began, 1.8)
+        self.assertTrue(error.ambiguous)
+        self.assertTrue(server.owner_released.is_set())
+        self.assertFalse(server.closed.is_set())
+        self.assertEqual(len([item for item in server.requests if item[0] == "POST"]), 1)
+        self.assertFalse(self.children)
 
     def test_missing_control_route_is_explicit_not_fake_production_success(self):
         server = self.server(mode="stop-unimplemented")

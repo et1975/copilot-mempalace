@@ -51,8 +51,10 @@ class ConfigurationFixture:
 
 
 class IdentityServer:
-    def __init__(self, config, *, mode="normal", ready=True, own=True, instance_id=None):
+    def __init__(self, config, *, mode="normal", ready=True, own=True, instance_id=None,
+                 identity_delay=0):
         self.config, self.mode, self.ready = config, mode, ready
+        self.identity_delay = identity_delay
         self.requests = []
         self.owner = None
         self.owner_released = threading.Event()
@@ -85,6 +87,7 @@ class IdentityServer:
             def do_GET(self):
                 fixture.requests.append(("GET", self.path, dict(self.headers), None))
                 nonce = parse_qs(urlsplit(self.path).query).get("nonce", [""])[0]
+                time.sleep(fixture.identity_delay)
                 if fixture.mode == "stop-reset" and not fixture.ready:
                     self.connection.shutdown(socket.SHUT_RDWR)
                     self.connection.close()
@@ -238,8 +241,9 @@ def main():
         # Controlled stand-in for the epoch accepted by journal activation, not
         # an epoch allocated by the launcher or a claim of testing the journal.
         fixture = IdentityServer(
-            config, ready=mode != "never-ready",
-            instance_id=os.environ.get("MPTASK_FIXTURE_ACCEPTED_EPOCH"))
+            config, mode=mode, ready=mode != "never-ready",
+            instance_id=os.environ.get("MPTASK_FIXTURE_ACCEPTED_EPOCH"),
+            identity_delay=float(os.environ.get("MPTASK_FIXTURE_IDENTITY_DELAY", "0")))
         fixture.publish()
         diagnostic_pid = os.environ.get("MPTASK_FIXTURE_DIAGNOSTIC_PID")
         if diagnostic_pid is not None:

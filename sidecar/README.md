@@ -179,7 +179,12 @@ The following is command syntax, not an automatic deployment sequence.
 | `mempalace-tasks stop --config CONFIG --instance-id UUID --timeout 10s` | Drain exactly the previously observed instance, then confirm listener closure and ownership release. |
 
 For `start`, `connect` and `stop`, timeout defaults to ten seconds, accepts a positive
-`s`/`m`/`h` duration, and is bounded to 300 seconds. Stop requires the actual
+`s`/`m`/`h` duration, and is bounded to 300 seconds. Each operation shares one
+monotonic deadline across election waits, HTTP exchanges and polling. Identity
+checks may use its entire remaining budget, so slower journal freshness checks
+are not cut short by a separate per-poll timeout. Failed startup may additionally
+take up to two seconds to clean up only the child it launched.
+Stop requires the actual
 `instance_id` from a prior connection, not the stable authority UUID. Blocked
 drain, lost replies or unconfirmed release are explicit failures/unknown outcomes,
 not permission to kill a registry PID or automatically retry the stop request.

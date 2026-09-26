@@ -167,10 +167,6 @@ def _optional_registry(config: ServiceConfig) -> InstanceIdentity | None:
         return None
 
 
-def _poll_deadline(deadline: _Deadline) -> _Deadline:
-    return _Deadline(min(0.25, deadline.remaining()))
-
-
 def _wait_owner(config: ServiceConfig, deadline: _Deadline) -> ConnectionInfo:
     for _ in range(_POLL_LIMIT):
         try:
@@ -179,7 +175,7 @@ def _wait_owner(config: ServiceConfig, deadline: _Deadline) -> ConnectionInfo:
                 raise DiscoveryError("owner_unready", "Existing owner exited before becoming ready")
             identity = _optional_registry(config)
             if identity is not None:
-                info = _probe(config, identity, _poll_deadline(deadline))
+                info = _probe(config, identity, deadline)
                 if not _owner_busy(config):
                     raise DiscoveryError("owner_unready", "Existing owner released its lock")
                 return info
@@ -281,7 +277,7 @@ def _wait_child(config: ServiceConfig, previous: InstanceIdentity | None,
                 raise DiscoveryError("child_exited", "Owned child exited before confirmed readiness")
             identity = _optional_registry(config)
             if identity is not None and identity != previous:
-                info = _probe(config, identity, _poll_deadline(deadline))
+                info = _probe(config, identity, deadline)
                 if child.poll() is not None or not _owner_busy(config):
                     raise DiscoveryError("startup_unknown", "Child readiness lost before confirmation",
                                          ambiguous=True)
@@ -314,7 +310,7 @@ def start(config_path: str | os.PathLike[str], *, timeout: float = 10.0) -> Conn
             return _wait_owner(config, deadline)
         if previous is not None:
             try:
-                _probe(config, previous, _poll_deadline(deadline), require_ready=False)
+                _probe(config, previous, deadline, require_ready=False)
             except DiscoveryError as error:
                 if error.code != "endpoint_unavailable":
                     raise
@@ -379,7 +375,7 @@ def stop(config: ServiceConfig, *, expected_instance_id: str, timeout: float = 1
                 if current is not None and current != identity:
                     raise DiscoveryError("instance_changed", "Instance changed during drain")
                 try:
-                    observed = _probe(config, identity, _poll_deadline(deadline), require_ready=False)
+                    observed = _probe(config, identity, deadline, require_ready=False)
                 except DiscoveryError as error:
                     if error.code not in {"endpoint_unavailable", "transport_error", "timeout"}:
                         raise
