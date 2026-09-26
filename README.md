@@ -12,11 +12,15 @@ audit hook that nags when an external tool is about to run without a prior `memp
 - **[skills/mempalace/SKILL.md](skills/mempalace/SKILL.md)** — full skill: 30 MCP tools (read/write/tunnels/KG/diary),
   proactive vs reactive use, mining hygiene, HNSW drift recovery, auto-save hook notes.
 - **[MemPalace Tasks sidecar](sidecar/README.md)** — optional, separately installed
-  Python Streamable HTTP MCP service for durable tasks, dependencies, atomic
-  claims/discoveries and renewable fenced leases. Schema 2 replays the MemPalace
-  logstream as its sole durable task/recovery store, with a fresh fenced epoch
+  Python Streamable HTTP MCP service with a harness-launched stdio frontend for
+  durable tasks, dependencies, atomic claims/discoveries and renewable fenced
+  leases. Schema 2 replays the MemPalace logstream as its sole durable task/recovery
+  store, with a fresh fenced epoch
   per owner startup and disposable local runtime/discovery files. Foreground
-  hosting requires no service manager; launcher startup is explicit opt-in.
+  hosting requires no service manager. `mempalace-tasks mcp --config CONFIG`
+  uses the schema-2 lifecycle policy: launcher mode opts into autostart/reuse of
+  one shared HTTP owner; external mode only connects. Closing a frontend leaves
+  that owner running.
   Includes authenticated `connect`, read-only `status` / `list` / `show` /
   `history` / bounded `watch`, a
   [task-safety skill](skills/mempalace-tasks/SKILL.md), and an opt-in
@@ -182,6 +186,21 @@ Chat tool picker; in the CLI: `copilot mcp get mempalace`). Other harnesses (Cla
 `mempalace-mcp` command in their respective config files — see [`skills/mempalace/references/harness-config.md`](skills/mempalace/references/harness-config.md).
 
 Optional: pin a non-default palace location with `mempalace-mcp --palace /path/to/palace`.
+
+#### Optional Tasks registration
+
+The task service is a separate, opt-in registration named `mempalace-tasks`.
+First provision its [installed package/environment](sidecar/README.md#requirements-and-offline-setup),
+schema-2 configuration, accepted genesis and private credentials. Register
+`mempalace-tasks mcp --config /absolute/path/tasks.json` as the long-lived stdio
+command; see the [generic configuration and verified Copilot CLI registration
+example](sidecar/README.md#registration-examples). Copying this pack does not
+install it, initialize task state or register a server.
+
+The config's `launcher` lifecycle permits autostart/reuse; default `external`
+requires an already running owner. [Direct HTTP registration](sidecar/README.md#direct-streamable-http-alternative)
+remains available. Neither transport automatically wires native `/fleet`
+execution, and no service manager is required.
 
 ### Step 1 — Copy or symlink the customization pack
 

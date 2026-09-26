@@ -1,5 +1,6 @@
 """Opt-in contract test against a disposable, preinstalled MemPalace hub."""
 
+import asyncio
 import hashlib
 import json
 import os
@@ -12,7 +13,8 @@ import tempfile
 import threading
 import time
 import unittest
-from contextlib import closing, contextmanager
+from contextlib import asynccontextmanager, closing, contextmanager
+from datetime import timedelta
 from uuid import uuid4
 
 from mempalace_tasks.palace import PalaceClient
@@ -277,10 +279,7 @@ class LiveContractTests(unittest.TestCase):
         finally:
             runner.socket.close()
 
-    def test_goal_discovery_inspection_and_service_replay_over_real_hub(self):
-        from mempalace_tasks.client import TaskClientError
-
-        self.start_hub()
+    def task_config(self, *, lifecycle="external", port=8766):
         hub_token = self.root / "hub.token"
         hub_token.write_text("isolated-contract-test", encoding="ascii")
         hub_token.chmod(0o600)
@@ -293,7 +292,8 @@ class LiveContractTests(unittest.TestCase):
             "service_token_file": str(self.root / "service.token"),
             "runtime_dir": str(self.root / "task-runtime"),
             "host": "127.0.0.1",
-            "port": 8766,
+            "port": port,
+            "lifecycle": lifecycle,
             "genesis": {
                 "actor": "operator",
                 "actors": {
@@ -311,6 +311,116 @@ class LiveContractTests(unittest.TestCase):
         initialized = self.run_cli(config_path, "init", "--generate-token")
         self.assertEqual(0, initialized.returncode, initialized.stderr)
         self.assertTrue(json.loads(initialized.stdout)["ok"])
+        return config_path
+
+    def test_stdio_frontends_autostart_share_owner_and_leave_it_running(self):
+        from mcp import ClientSession, StdioServerParameters
+        from mcp.client.stdio import stdio_client
+        from mempalace_tasks.config import load_config
+        from mempalace_tasks.discovery import connect
+        from mempalace_tasks.launcher import _owner_busy, stop
+
+        self.start_hub()
+        config_path = self.task_config(lifecycle="launcher", port=0)
+        config = load_config(str(config_path))
+        expected_owner = None
+        self.assertFalse(_owner_busy(config))
+        environment = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1] / "src"))
+        params = StdioServerParameters(
+            command=sys.executable,
+            args=["-W", "error", "-m", "mempalace_tasks", "mcp",
+                  "--config", str(config_path), "--timeout", "5s"],
+            env=environment,
+        )
+        logs = []
+
+        @asynccontextmanager
+        async def frontend():
+            path = self.root / f"frontend-{len(logs)}.log"
+            logs.append(path)
+            with path.open("w", encoding="utf-8") as errors:
+                async with stdio_client(params, errlog=errors) as (reader, writer):
+                    async with ClientSession(
+                        reader, writer, read_timeout_seconds=timedelta(seconds=12),
+                    ) as session:
+                        await session.initialize()
+                        yield session
+
+        async def scenario():
+            nonlocal expected_owner
+            async with frontend() as first:
+                health = await first.call_tool("mptask_health", {})
+                self.assertFalse(health.isError)
+                epoch = health.structuredContent["epoch_id"]
+                expected_owner = epoch
+                first_tools = await first.list_tools()
+                descriptors = {tool.name: tool.model_dump() for tool in first_tools.tools}
+                self.assertIn("mptask_outcome", descriptors)
+                self.assertIn("expected_epoch",
+                              descriptors["mptask_create"]["inputSchema"]["required"])
+                async with frontend() as second:
+                    second_health = await second.call_tool("mptask_health", {})
+                    self.assertEqual(epoch, second_health.structuredContent["epoch_id"])
+                    self.assertEqual(
+                        descriptors,
+                        {tool.name: tool.model_dump() for tool in (await second.list_tools()).tools},
+                    )
+                    fields = {
+                        "actor": "operator", "command_id": str(uuid4()),
+                        "expected_epoch": epoch,
+                        "project": "frontend-test", "kind": "task",
+                        "title": "Created through stdio", "description": "", "acceptance": "",
+                        "execution_class": "isolated", "execution_profile": "local",
+                    }
+                    created = await second.call_tool("mptask_create", fields)
+                    self.assertFalse(created.isError)
+                    result = created.structuredContent
+                    self.assertEqual(result, json.loads(created.content[0].text))
+                    self.assertEqual(fields["command_id"], result["command_id"])
+                    task_id = result["tasks"][0]["id"]
+                    fetched = await first.call_tool("mptask_get", {"task_id": task_id})
+                    self.assertEqual(fields["title"], fetched.structuredContent["task"]["title"])
+                    rejected = await second.call_tool(
+                        "mptask_create", {**fields, "command_id": str(uuid4()),
+                                          "expected_epoch": str(uuid4())},
+                    )
+                    self.assertTrue(rejected.isError)
+                    self.assertEqual("stale_epoch", rejected.structuredContent["error"]["code"])
+                    self.assertIs(rejected.structuredContent["error"]["ambiguous"], False)
+                    missing_epoch = dict(fields)
+                    del missing_epoch["expected_epoch"]
+                    rejected = await second.call_tool("mptask_create", missing_epoch)
+                    self.assertTrue(rejected.isError)
+                remaining = await first.call_tool("mptask_health", {})
+                self.assertEqual(epoch, remaining.structuredContent["epoch_id"])
+                listed = await first.call_tool(
+                    "mptask_snapshot", {"filters": {"project": "frontend-test"}},
+                )
+                self.assertEqual(1, listed.structuredContent["summary"]["total"])
+            discovered = await asyncio.to_thread(connect, config, timeout=5)
+            self.assertEqual(epoch, discovered.instance_id)
+            self.assertTrue(discovered.ready)
+
+        try:
+            asyncio.run(asyncio.wait_for(scenario(), timeout=45))
+            for path in logs:
+                text = path.read_text(encoding="utf-8")
+                self.assertNotIn(config.service_token, text)
+                self.assertNotIn("isolated-contract-test", text)
+                self.assertNotIn("Traceback (most recent call last)", text)
+        finally:
+            if _owner_busy(config):
+                info = connect(config, timeout=5)
+                if expected_owner is not None:
+                    self.assertEqual(expected_owner, info.instance_id)
+                stop(config, expected_instance_id=info.instance_id, timeout=10)
+            self.assertFalse(_owner_busy(config))
+
+    def test_goal_discovery_inspection_and_service_replay_over_real_hub(self):
+        from mempalace_tasks.client import TaskClientError
+
+        self.start_hub()
+        config_path = self.task_config()
 
         with self.task_service(config_path) as client:
             epoch = client.call_tool("mptask_health", {})["epoch_id"]

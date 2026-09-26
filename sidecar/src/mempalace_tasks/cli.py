@@ -113,6 +113,7 @@ def _parser():
     for name, description in (
         ("init", "Explicit new-authority init, not data-loss recovery; idempotent with intact state"),
         ("serve", "Run foreground authenticated MCP; requires prior init"),
+        ("mcp", "Run stdio MCP frontend; reuse/start launcher owner or connect to external owner"),
         ("start", "Explicitly start/reuse a configured launcher owner"),
         ("connect", "Discover an authenticated ready owner; never starts unless --start"),
         ("stop", "Drain the expected instance and confirm listener and ownership release"),
@@ -126,7 +127,7 @@ def _parser():
     ):
         command = commands.add_parser(name, help=description, description=description)
         command.add_argument("--config", default=argparse.SUPPRESS)
-        if name in {"start", "connect", "stop"}:
+        if name in {"start", "connect", "stop", "mcp"}:
             command.add_argument("--timeout", type=parse_duration, default=10.0)
         if name == "connect":
             command.add_argument("--start", action="store_true",
@@ -178,6 +179,9 @@ def main(argv=None) -> int:
             args = _parser().parse_args(argv)
         except SystemExit as exit:
             return int(exit.code)
+        if args.command == "mcp":
+            from .stdio_frontend import main as stdio_main
+            return stdio_main(args.config, timeout=args.timeout)
         config = load_config(args.config, allow_missing_service_token=(
             args.command == "init" and args.generate_token))
         if args.command in {"start", "connect", "stop"}:
