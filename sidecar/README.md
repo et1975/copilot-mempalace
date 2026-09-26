@@ -406,9 +406,11 @@ do not themselves make an otherwise current snapshot fail.
 The existing [task-safety skill](../skills/mempalace-tasks/SKILL.md) and
 [workflow agent](../agents/palace-task-workflow.agent.md) provide optional prompt
 guidance around native Copilot `/fleet`, not a replacement dispatcher or runtime
-enforcement layer. Native fleet remains the orchestrator; session SQL todos carry
-references and observations, while the durable authority alone determines tracked
-task state.
+enforcement layer. Native fleet remains the orchestrator. Task state is read and
+written only through the `mempalace-tasks` MCP registration; MemPalace context and
+evidence use the `mempalace` MCP registration. The workflow has no generic `sql`
+dependency, direct database access or native-todo mirror. Handoff references are
+observations, while the durable authority alone determines tracked task state.
 
 After copying/linking those customizations, select the agent and explicitly
 request tracking for the goal:
@@ -436,7 +438,7 @@ only the existing goal's scope. Unrelated goals and native todos stay untouched.
 | Deployment state | Allowed workflow and required report |
 |---|---|
 | No explicit goal opt-in | Ordinary native fleet/session todos; no task-service setup demand or durable writes. |
-| Opted in, service/schema/registered actor unavailable | Keep the request and setup blocker locally; do not claim durable creation, claim or closure, or silently execute untracked instead. |
+| Opted in, service/schema/registered actor unavailable | Report the request and setup blocker in the conversation; no alternate storage, durable success claim or silent untracked execution. |
 | Service and authorized coordinator available, no actual compatible native supervisor | Inspect/resume and publish the authorized durable plan; report tracked execution blocked. |
 | Separately supplied compatible native host plus current task authorization | Conditional native dispatch under the safety contract; report actual host/owner, attempt/generation, evidence and confirmed outcomes. |
 

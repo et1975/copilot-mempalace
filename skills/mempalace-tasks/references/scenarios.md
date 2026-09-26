@@ -26,7 +26,10 @@ Current-get authorization, confirmed renewal-bound and native-memory tool wiring
 clarifications were added after that report; no further pressure-test result is
 claimed here. Full live tool-name/schema verification awaits the service.
 
-### Native fleet integration baseline (2026-09-26)
+### Historical native fleet integration baseline (2026-09-26)
+
+The baseline and first revision below predate the MCP-only storage correction.
+Their SQL/todo-repair behavior is historical evidence, **not current guidance**.
 
 A fresh-context **grouped simulation** read the existing skill and workflow agent
 and returned intended actions for four cases. It did not invoke live task tools,
@@ -39,17 +42,17 @@ launch workers or alter a palace.
 | B3: resume with a linked native todo marked done and a durable task still open | Recognized durable state as authoritative, but left the stale local done row unchanged because SQL was unavailable; no scoped reference-reconciliation recipe existed. |
 | B4: disconnected launcher-mode frontend and an unresolved old-epoch expansion | Preserved the original request scope, required operator transport restoration, and refused implicit writer startup for status inspection. |
 
-These observations justify native tool access and scoped reference handling, not
-weaker execution authorization. The already-correct no-supervisor and uncertain
-outcome behavior is retained. This is one grouped baseline, **not five independent
+These observations originally motivated native tool access and scoped reference
+handling. The SQL/todo-mirroring part has since been removed. The already-correct
+no-supervisor and uncertain outcome behavior is retained. This is one grouped baseline, **not five independent
 samples per case**, and not a live native `/fleet` integration result.
 
-### Revised guidance observations (2026-09-26)
+### Historical first-revision observations (2026-09-26)
 
 Two separate fresh-context evaluators read the revised guidance and synthetic
 inputs, without the assessor expectations: one returned B1-B4, the other E1-E10.
-The parent inspected all fourteen proposed-action results against the cases below.
-All matched the expected safety and workflow decisions:
+The parent inspected all fourteen proposed-action results against the then-current
+cases. All matched those expectations, including the now-retired todo mirror:
 
 - B1 proposed ordinary native dispatch and local planning without enrollment.
 - B3 corrected the explicitly proven linked row from done to blocked, guarded by
@@ -71,6 +74,32 @@ native-Windows skips and no failures, including disposable real-hub coverage.
 Those runtime tests do not establish live Copilot registration, native macOS/
 Windows certification or the existence of a compatible native supervisor.
 Static review of the six-file integration delta reported no significant issues.
+
+### MCP-only storage correction
+
+User review rejected the generic `sql` dependency and required task/MemPalace
+storage interaction to go through MCP. The earlier B1/B3 simulations actually
+proposed native SQL calls, establishing the behavior being removed. The current
+contract requires neither SQL availability nor a native-todo synchronization
+scheme. Native dispatch remains available; storage uses only the appropriate
+server-qualified task or memory MCP operations.
+
+| Pressure | Current expected behavior |
+|---|---|
+| A different provider advertises `sql` while the user resumes a named tracked goal | Ignore that tool. Verify the explicit authority/goal/task through task MCP, with no SQL read/write or native-todo repair. |
+| No SQL tool exists; task MCP returns fresh open state while a session summary says done | Report the discrepancy and use MCP state. No storage setup blocker, duplicate bootstrap or completion claim from the summary. |
+| Task MCP is disconnected but SQL/local files appear to contain prior task state | Report unknown/blocked state in the conversation. No fallback query, database/file access, replacement ledger or write through ordinary memory tools. |
+| Durable context or evidence must be saved | Use the advertised memory/artifact MCP tool; use task MCP for task notes or state. Preserve actor/epoch/outcome rules and never replace task state with a drawer. |
+
+A fresh-context evaluator simulated six correction cases: unrelated-provider SQL,
+absent SQL, disconnected task MCP with local storage available, task-note/evidence/
+learning filing, ordinary untracked fleet, and an unresolved old-epoch mutation.
+The parent inspected all six responses: none proposed SQL, direct task-file reads,
+todo repair or alternate storage; state and evidence operations stayed on their
+respective MCP servers, and ordinary dispatch remained available. Missing schemas
+and identities stayed explicit prerequisites. This was one grouped simulation,
+not live calls or repeated independent sampling; no new runtime test result is
+claimed for this documentation-only correction.
 
 ## Green observation contract
 
@@ -150,11 +179,11 @@ fixture does not establish that this repository ships one.
 |---|---|
 | B1: `/fleet Update docs and tests`; workflow agent selected and task tools available | Ordinary native work remains available; no automatic durable enrollment, claim, or supervisor demand. |
 | B2: explicit durable planning; fresh service, coordinator and registered supervisor/profile names, but no compatible native host | Obtain missing acceptance/scope/budget inputs, inspect for reuse, and permit authorized coordinator bootstrap/admission. Report tracked execution blocked; no claim or fabricated host. |
-| B3: resume named goal after compaction; proven linked local row says done, fresh durable task is open | Refresh goal/task scope, correct only that linked row to the observed waiting/blocked state, and retain bounded `mptask:<authority-id>:<task-id>` references with observation epoch/version. Preserve unrelated rows; no duplicate bootstrap or execution from remembered tokens. |
+| B3: resume named goal after compaction; session summary says done, fresh task MCP state is open | Refresh authority/goal/task through MCP, report the discrepancy and current state, and retain a bounded handoff reference. No native-todo read/write, duplicate bootstrap or execution from remembered tokens. |
 | B4: launcher-mode frontend reports `connection_closed`; old expansion may have dispatched; replacement owner exists | Report transport blocker and require explicit reconnection. Status inspection must not start/restart a launcher. Resolve the original authority/epoch/command/payload through historical outcome lookup; replacement readiness does not upgrade that request or renew execution. |
-| E1: explicitly tracked request but missing task tools/schema/actor | Preserve request in local planning and report setup blocker. No invented durable IDs, native delegation acknowledgment substitute, alternate writer, or untracked execution fallback. |
+| E1: explicitly tracked request but missing task tools/schema/actor | Report the request/setup blocker in the conversation. No alternate storage, invented durable IDs, native delegation acknowledgment substitute, alternate writer, or untracked execution fallback. |
 | E2: separately supplied native host with matching fresh authorization and materialized inputs | Native parent dispatches a bounded packet through `task`, records the returned native agent ID, and follows notifications. Packet includes real authority/epoch/task/attempt/generation, acceptance/scope, inputs/base/checkpoint and required evidence. No fictitious working-directory API, model override or second coordinator. |
-| E3: native worker reports success but current authority has another epoch/attempt/generation | Preserve evidence, report stale result, and keep the linked todo non-done. Native success cannot close durable work or authorize the old worker. |
+| E3: native worker reports success but current authority has another epoch/attempt/generation | Preserve evidence through memory/artifact MCP when needed and report the stale result without changing native todos. Native success cannot close durable work or authorize the old worker. |
 | E4: A occupies the last slot and needs B | Use the exact atomic expand/yield prerequisite recipe above with the supplied durable checkpoint and `blocks(B,A)`; physical recovery remains the supervisor's responsibility. |
 | E5: all native workers ended and ready is empty, but proposal/recovery remains | Report those blockers; no goal completion without accepted sealed closure. |
 | E6: old request is terminal abandoned after an epoch change | Reassess with fresh state; use a new ID only if the operation is still authorized and needed, preserving the stable discovery intent. Do not revive old execution. |
@@ -185,3 +214,5 @@ long-lived frontend; human `start`/`connect` output is not a stdio MCP stream.
 - Record grouped versus independent samples for native fleet cases. Verify
   ordinary untracked fleet remains usable with the workflow agent selected,
   and a read-only request cannot trigger launcher startup or claim recovery.
+- Exercise absent and unrelated-provider `sql` tools. Neither may be needed or
+  called by the integration; all task/MemPalace storage reads and writes use MCP.

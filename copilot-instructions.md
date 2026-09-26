@@ -106,8 +106,10 @@ An explicitly named resume preserves only that goal's scope, not other goals.
 Ordinary native fleet and ephemeral session todos remain available without
 task-service setup or durable writes.
 
-Native fleet remains the orchestrator. Linked session SQL todos are references
-and observations, not synchronized task truth; the durable authority alone
+Native fleet remains the orchestrator. All task and MemPalace storage interaction
+in this workflow uses the configured, server-qualified MCP tools. It does not
+require a generic `sql` tool or read/write native todo storage. Bounded handoff
+references are observations, not a mirrored ledger; the durable authority alone
 determines tracked task state. Native memory/delegation acknowledgments,
 drawers, diaries and KG projections are not task ownership or current
 operational state.

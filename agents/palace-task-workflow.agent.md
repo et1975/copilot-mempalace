@@ -5,7 +5,6 @@ tools:
   - skill
   - view
   - ask_user
-  - sql
   - task
   - read_agent
   - write_agent
@@ -45,12 +44,14 @@ this guidance returns results/discoveries to its existing parent.
 
 First identify the goal's explicit tracking request. Selecting this agent,
 connecting MCP, ordinary `/fleet`, memory lookup or an unrelated prior opt-in does
-not enroll a goal. Without opt-in, use ordinary native `task` dispatch and `sql`
-planning without task-service setup demands or durable task writes.
+not enroll a goal. Without opt-in, use ordinary native `task` dispatch without
+task-service setup demands or durable task writes. The harness manages its own
+session planning; this workflow does not access its storage.
 
 For an explicitly tracked or named resume request, invoke `mempalace-tasks` before
 task operations. If intent/identity is ambiguous, use `ask_user`; when interaction
-is unavailable, preserve a local blocker rather than inventing a goal or actor.
+is unavailable, report the blocker in the conversation rather than inventing a
+goal, actor or storage fallback.
 Human inspection is read-only, not authorization to create, claim or repair work.
 
 The tool selectors assume configured MCP server names `mempalace-tasks` for
@@ -59,11 +60,17 @@ advertised names and schemas before use. Missing tools or an alias mismatch are
 setup blockers to report, not permission to use native MemPalace delegation tools
 as task authority or install/start an alternate service.
 
+All task and MemPalace storage interactions use these server-qualified MCP tools.
+There is no generic `sql` dependency, CLI/database/file fallback, or native-todo
+mirror to maintain. If the needed MCP server is unavailable, report that storage
+operation as blocked. Native `task`, `read_agent` and `write_agent` handle dispatch
+and messages, not task or memory storage.
+
 For native fleet, use this deployment branch before arranging tracked execution:
 
 | Observed state | Next action |
 |---|---|
-| Service, current schema or registered actor unavailable | Keep the request/blocker local; issue no new durable mutations and preserve any unresolved outcome. |
+| Service, current schema or registered actor unavailable | Report the request/blocker in the conversation; issue no new durable mutations, use no alternate store, and preserve any unresolved request identity. |
 | Service and coordinator available, no compatible native host | Inspect/resume and publish explicitly requested coordinator planning only; report execution blocked, with no claims, starts or closures. |
 | Separately supplied compatible native supervisor and current authorization | Use the existing safety contract and native parent dispatch for that authorized task. |
 
@@ -98,9 +105,11 @@ operator. Worker discoveries use that worker's current source authorization.
 
 ### 1. Establish context and resume before creating
 
-For a named resume, first read its scoped native references using `sql`, then
-refresh the referenced authority and goal; do this again after compaction or
-interruption. Use current tool shapes: `mptask_health({})`,
+For a named resume, use the user's explicit goal/task reference and verify its
+authority through MCP; do this again after compaction or interruption. Session
+handoffs and memory search can supply identity hints, not current task state.
+If the authority or goal is ambiguous, ask rather than selecting by similarity.
+Use current tool shapes on the configured task MCP server: `mptask_health({})`,
 `mptask_snapshot({"filters":{"project":...,"goal_id":...,"assignee":...}})` with
 applicable filters only, and `mptask_get({"task_id":...})`. Retrieve relevant
 history with `mptask_history({"task_id":...})`. For execution, match current
@@ -126,16 +135,13 @@ planning task. Supply `project`, `title`, `description`, `acceptance`,
 `planning_task`, and `goal_policy` with declared `scope` and bounded
 `max_tasks`/`max_batch`. An empty starting queue calls for planning, not success.
 
-Use `sql` to create/update only verified linked references under
-`mptask:<authority-id>:<task-id>`, with the skill's bounded description and observed
-epoch/version/status fields. Select by exact scoped ID and verify authority/task
-identity plus requested goal membership against fresh reads before changing a row.
-If a linked row says `done` but the durable task remains open, **update that exact
-row now**: `pending` for freshly eligible, unselected work, otherwise `blocked`
-with the actual execution blocker. Refresh its packet in the same SQL update.
-Do not leave it done while only narrating the discrepancy. Preserve unrelated rows,
-dependencies and SQL schema; do not migrate unscoped prototype rows. Local-only
-planning may finish locally, distinct from accepted durable work.
+Build the skill's bounded handoff/report reference from fresh MCP observations.
+Do not create or repair native todo rows. If a session summary or native completion
+conflicts with current MCP state, report the discrepancy and use current MCP state
+for the next decision. A reference is not a second task ledger. When a durable
+task note or evidence artifact is needed, use the existing task-note or MemPalace
+artifact MCP operation with its advertised schema and actual authorization;
+neither is a substitute for task-state mutation.
 
 ### 2. Decompose into complete, bounded publications
 
@@ -185,12 +191,14 @@ skill and revalidate current authorization. Use native tool schemas without a
 fabricated `cwd` argument, isolation fence, credential, retry token, model override
 or permission bypass.
 
-Record the native agent ID only from the dispatch result, correlating it with the
-actual task/attempt. Use normal completion notifications and `read_agent` for known
-IDs; `write_agent` supplies bounded follow-up to that worker, not new authorization.
-Update the linked row to `in_progress` only for actual authorized running work,
-never a claim/preparing attempt. Native return text or exit zero is evidence to
-assess, not durable closure; cancellation follows the skill's settlement boundary.
+Include the native agent ID in the handoff/report only from the dispatch result,
+correlating it with the actual task/attempt. Use normal completion notifications
+and `read_agent` for known IDs; `write_agent` supplies bounded follow-up to that
+worker, not new authorization.
+Report running work only when the worker is actually executing under current
+authorization, never for a claim/preparing attempt. Native return text or exit
+zero is evidence to assess, not durable closure; cancellation follows the skill's
+settlement boundary.
 
 Honor host capacity and user-approved budgets. Full pools leave new work queued;
 idle slots use bounded `mptask_wait_ready` with nested `filters`,
@@ -225,8 +233,9 @@ Compare durable results against task acceptance. Have the live owner request
 `mptask_transition` with `target="closed"`, current live source tokens, expected
 version, summary and evidence only when execution-class completion requirements
 are met.
-After accepted durable task closure is confirmed, refresh that task's scoped todo
-packet and mark it `done`. Keep unaccepted or cancelled results `blocked`.
+After accepted durable task closure is confirmed through MCP, report that outcome
+and its evidence. Keep unaccepted or cancelled results distinct from successful
+completion; do not mirror these outcomes into native todo storage.
 Integration failures are evidence for bounded follow-up work, not fabricated
 success. Resolve uncertain command outcomes using the skill's same-scoped-request
 versus terminal-abandoned/new-ID rules. Use `mptask_outcome` with
