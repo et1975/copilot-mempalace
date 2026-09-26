@@ -1,17 +1,17 @@
 # MemPalace Tasks
 
 A single-host task authority over an existing MemPalace HTTP hub. The package
-provides authenticated Streamable HTTP MCP, read-only human inspection, and
-explicit foreground or opt-in launcher hosting. Schema 2 uses MemPalace as the
-sole durable task/recovery store. No systemd, launchd or Windows service is
-required; Linux worker supervision is a separate, optional integration.
+provides authenticated Streamable HTTP MCP, a harness-launched stdio MCP frontend,
+read-only human inspection, and foreground or opt-in launcher hosting. Schema 2
+uses MemPalace as the sole durable task/recovery store. No systemd, launchd or
+Windows service is required; Linux worker supervision is a separate, optional integration.
 It does not replace MemPalace, install another task database, or ship a native
 Copilot `/fleet` execution adapter.
 
 ```text
-Copilot / other MCP clients ----\
-                                > task sidecar --> MemPalace logstream
-Human status/history/watch ----/
+Harness stdio frontends --------\
+Direct HTTP MCP clients --------> one shared task owner --> MemPalace logstream
+Human status/history/watch -----/
 
 External host/coordinator --> claims, optional supervision and result delivery
 ```
@@ -99,6 +99,10 @@ uv pip compile sidecar/pyproject.toml --offline --only-binary=:all: --no-python-
 Copying the customization pack alone does **not** install or start this package.
 Use a prebuilt, approved package/environment for deployment; do not launch it
 through a command that fetches packages on every MCP connection.
+The executable registered with the harness must already support
+`mempalace-tasks mcp --help`. Use its absolute path if it is not on the harness's
+`PATH`; updating a checkout does not update a separately installed, non-editable
+package. Provision that package explicitly before registering it.
 
 ## Configure and initialize
 
@@ -177,6 +181,7 @@ The following is command syntax, not an automatic deployment sequence.
 | `mempalace-tasks connect --config CONFIG --timeout 10s` | Read-only discovery of an authenticated, ready owner; never starts one. |
 | `mempalace-tasks connect --config CONFIG --start --timeout 10s` | Explicit launcher start/reuse, under the same configured consent as `start`. |
 | `mempalace-tasks stop --config CONFIG --instance-id UUID --timeout 10s` | Drain exactly the previously observed instance, then confirm listener closure and ownership release. |
+| `mempalace-tasks mcp --config CONFIG --timeout 10s` | Long-lived stdio MCP frontend; launcher mode starts/reuses the shared owner, external mode only connects. See [harness startup](#harness-launched-stdio-frontend). |
 
 For `start`, `connect` and `stop`, timeout defaults to ten seconds, accepts a positive
 `s`/`m`/`h` duration, and is bounded to 300 seconds. Each operation shares one
@@ -199,7 +204,97 @@ registration is installed or changed automatically.
 ## Connect MCP clients
 
 Keep the existing MemPalace MCP registration for ordinary memory operations.
-Use a **separate Streamable HTTP** server named `mempalace-tasks`. In schema 2,
+Register a **separate** server named `mempalace-tasks`, using either the
+harness-launched stdio frontend or direct Streamable HTTP. Both reach the same
+shared authority; a stdio process per harness session is not a new task owner.
+
+### Harness-launched stdio frontend
+
+Register the following long-lived command, not the human `start` or `connect`
+command:
+
+```bash
+mempalace-tasks mcp --config /absolute/path/tasks.json --timeout 10s
+```
+
+The configuration must already be schema 2, with accepted genesis, valid private
+credentials and the configured MemPalace hub available. The frontend never
+initializes an authority, migrates old state, repairs permissions or installs
+packages. `MPTASK_CONFIG` is a fallback and `--config` may precede the subcommand;
+prefer an explicit absolute config path in harness registrations.
+
+Startup policy comes from that configuration:
+
+- **`lifecycle: "launcher"`** is explicit consent to autostart. Each frontend
+  authenticates/reuses the ready owner or starts one through the existing
+  election/startup-ticket flow. Concurrent sessions share **one HTTP owner**.
+- **`lifecycle: "external"`** (the default) only discovers/connects. If no ready
+  owner is available, startup fails; explicitly run `serve` or arrange external
+  hosting first. There is no silent launcher fallback or systemd requirement.
+
+`--timeout` defaults to ten seconds and accepts positive `s`/`m`/`h` durations up
+to 300 seconds. It bounds startup and each upstream exchange, **not the lifetime
+of the stdio session**. EOF/cancellation closes only the frontend's connections
+and pending local work; even an owner it launched stays running. Human
+`start`, `connect` and instance-qualified `stop` remain explicit lifecycle
+operations. Disconnecting a harness is not a service stop.
+
+Stdout contains only MCP protocol messages, never human connect metadata or
+bearer tokens; diagnostics go to stderr. The frontend forwards upstream
+`tools/list` descriptors and `tools/call` arguments/results unchanged, including
+schemas, metadata, structured content, errors, freshness and resolved abandoned
+outcomes. It does not inject actors/command IDs, rewrite `expected_epoch`, or
+automatically retry mutations. A possibly sent mutation can have an ambiguous
+outcome after timeout/disconnection; use the original epoch and command ID to
+resolve it, not a rewritten request.
+
+The upstream connection is pinned to its authenticated numeric-loopback endpoint
+and owner instance. It does not silently adopt a replacement owner or follow
+redirects/proxies. After an owner dies or changes, explicitly reconnect/restart
+the frontend; an unresolved old mutation stays bound to its original identity.
+
+#### Registration examples
+
+Credential-free generic stdio configuration (adapt the enclosing key to your
+harness; for example, VS Code uses `servers` rather than `mcpServers`):
+
+```json
+{
+  "mcpServers": {
+    "mempalace-tasks": {
+      "type": "stdio",
+      "command": "/absolute/path/to/mempalace-tasks",
+      "args": ["mcp", "--config", "/absolute/path/tasks.json", "--timeout", "10s"]
+    }
+  }
+}
+```
+
+The executable and configuration paths are placeholders. Tokens stay in the
+private files referenced by `tasks.json`; do not add them to the registration.
+Configuring this command allows the harness to launch it, including the
+configured launcher policy.
+
+**GitHub Copilot CLI:** after explicit package/configuration preparation, this
+registration form is documented in
+[GitHub's MCP setup guide](https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-mcp-servers#using-the-copilot-mcp-add-subcommand)
+and verified against `copilot mcp add --help`:
+
+```bash
+copilot mcp add mempalace-tasks -- /absolute/path/to/mempalace-tasks mcp --config /absolute/path/tasks.json --timeout 10s
+```
+
+This writes a user MCP registration; it is an operator action, not a step the
+task service performs. Everything after `--` belongs to the frontend, so `10s`
+is its timeout, not Copilot's separate millisecond timeout option. Registration
+syntax verification is not a live harness integration test. Use Copilot's
+`/mcp` manager to check the server/tools after configuring it.
+
+### Direct Streamable HTTP alternative
+
+No stdio process is needed for a harness that connects directly over HTTP.
+Explicitly host the owner with `serve`, or opt into launcher mode and run
+`start` / `connect --start`, before registering its endpoint. In schema 2,
 `connect` validates the private disposable registry's configuration binding,
 then challenges the listener for an authenticated identity/readiness proof.
 The accepted epoch is its `instance_id`; a registry pathname or PID alone is
@@ -217,13 +312,16 @@ harness's supported credential mechanism. MCP accepts the provisioned service
 bearer or an instance-scoped bearer; lifecycle stop requires the latter.
 A fixed port permits a fixed URL such as `http://127.0.0.1:8766/mcp`;
 dynamic-port registrations must follow newly verified discovery after restart.
-There is no automatic harness-registration/credential-refresh adapter.
+There is no automatic direct-HTTP harness-registration/credential-refresh adapter.
+The stdio frontend discovers fixed or dynamic endpoints at startup instead of
+requiring the harness to store the HTTP URL; it still requires reconnection
+after an owner change.
 Never put credentials in tasks, repository files, logs or shell history.
 Use numeric loopback and the exact `/mcp` path; redirects, DNS hostnames and
 public binding are not supported by this service/client profile.
 
-All sessions connect to the **same running service**, not a fresh stateful server
-process per agent. Host/Origin checks and token checks protect the endpoint; they
+All sessions connect to the **same running service**, not a fresh stateful owner
+per agent. Host/Origin checks and token checks protect the endpoint; they
 do not make an untrusted shared host or a second independent authority safe.
 
 Install/link the optional [task-safety skill](../skills/mempalace-tasks/SKILL.md)
