@@ -28,6 +28,8 @@ audit hook that nags when an external tool is about to run without a prior `memp
   [per-goal native fleet workflow](sidecar/README.md#per-goal-native-fleet-workflow)
   keeps native `/fleet` as orchestrator and requires explicit tracking for each
   goal; selecting the agent or installing this pack does not enroll ordinary work.
+  Task and MemPalace storage interaction uses the separate, server-qualified MCP
+  tools.
   Without a separately supplied compatible native supervisor, it supports
   durable planning and execution-blocker reporting, not tracked execution.
   Worker dispatch remains a host responsibility; connecting MCP does not

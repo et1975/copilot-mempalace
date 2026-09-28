@@ -103,11 +103,12 @@ the separately configured `mptask_*` tools. For explicitly tracked native
 Each goal requires explicit tracking opt-in. Selecting the agent, installing
 this pack, available tools or an ordinary `/fleet` request do not enroll work.
 An explicitly named resume preserves only that goal's scope, not other goals.
-Ordinary native fleet and ephemeral session todos remain available without
+Ordinary native fleet and session planning remain available without
 task-service setup or durable writes.
 
-Native fleet remains the orchestrator. Linked session SQL todos are references
-and observations, not synchronized task truth; the durable authority alone
+Native fleet remains the orchestrator. All task and MemPalace storage interaction
+in this workflow uses the configured, server-qualified MCP tools. Build bounded
+handoff references from fresh MCP observations; the durable authority alone
 determines tracked task state. Native memory/delegation acknowledgments,
 drawers, diaries and KG projections are not task ownership or current
 operational state.

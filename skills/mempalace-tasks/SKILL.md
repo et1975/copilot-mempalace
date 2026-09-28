@@ -16,16 +16,21 @@ description: >-
 
 Tracking is **explicit opt-in per goal**. Selecting the workflow agent, available
 MCP tools, installed guidance, ordinary `/fleet`, or recalling an old goal does not
-enroll work. Ordinary native dispatch and local todos remain available without
+enroll work. Ordinary native dispatch and session planning remain available without
 task-service setup or durable task writes. Explicitly resuming a named tracked goal
 retains only that goal's scope; a different goal needs its own opt-in.
 
 Task truth belongs to the shared sidecar authority, not a drawer, KG projection,
-local todo, native worker result, or remembered assignment. Existing memory routing
+native worker result, or remembered assignment. Existing memory routing
 still applies to knowledge and conventions, not task ownership.
 
 Discover the sidecar's advertised `mptask_*` tools and argument schemas before
-calling them. Use the registered actor identity and actual fields; every mutation
+calling them. Select tools by their configured MCP server and advertised name,
+not an unqualified name shared with another tool provider. All task storage reads
+and writes use `mempalace-tasks` MCP; MemPalace context and evidence storage use
+`mempalace` MCP. If the needed MCP server is unavailable, report that storage
+operation as blocked.
+Use the registered actor identity and actual fields; every mutation
 requires `command_id`, `actor`, and `expected_epoch`. Completion is
 `target="closed"`, not `"done"`. Obtain `expected_epoch` from a current
 read/health response's `epoch_id`. Freeze the authority, epoch, command ID and
@@ -33,8 +38,9 @@ exact payload for each logical request; never update its epoch on retry.
 A new owner epoch revokes old execution
 authorization, even if owner/attempt/generation fields otherwise match.
 Missing service, schema support or registered actor blocks tracked mutations;
-preserve the request and blocker locally without fabricating IDs, starting another
-writer, or substituting direct KG, drawer, or event-log writes.
+report the request and blocker in the conversation without fabricating IDs,
+starting another writer, or substituting another store or direct KG, drawer, or
+event-log writes.
 Native `mempalace_task_create` / `mempalace_event_ack` delegation acknowledgments
 are not sidecar claims, leases, or completion evidence.
 
@@ -55,9 +61,10 @@ no second coordinator or external queue consumer.
 
 Owner failure or transport error can close the gateway. Reconnection is explicit
 operator/harness setup, not an invented workflow tool; it does not itself authorize
-mutation retry. Never restart launcher mode merely to inspect: use connect-only human
-CLI/status or report the setup blocker. Stdio EOF closes the frontend, not the
-shared owner. Canceling a native worker neither cancels its durable task nor proves
+mutation retry. Never restart launcher mode merely to inspect: use an already
+connected task MCP read or report the setup blocker. Stdio EOF closes the
+frontend, not the shared owner. Canceling a native
+worker neither cancels its durable task nor proves
 physical settlement.
 
 ## Current execution authorization
@@ -167,11 +174,15 @@ The live owner closes ordinary work using `mptask_transition` with `task_id`,
 and nonempty `evidence`.
 Shared completion also needs accepted class-specific settlement.
 
-## Native session references
+## MCP state and handoff references
 
-Use existing `todos` and `todo_deps` without recreating or changing their schema.
-Each linked todo has the stable ID **`mptask:<authority-id>:<task-id>`** and a bounded
-description containing one task's reference packet:
+Resume from an explicitly identified authority and goal/task, verified with
+current task MCP reads. A conversation handoff or memory search can supply an
+identity hint; it cannot supply current authorization or completion. Clarify
+missing or ambiguous references before task operations.
+
+A worker handoff or status report can include this bounded reference packet,
+assembled from MCP observations:
 
 ```text
 authority_id: <verified authority>
@@ -187,22 +198,15 @@ execution_blocker: <current reason, or none when verified>
 
 These are observations, not authority or execution tokens. Include native agent,
 attempt and generation fields only when actually returned/supplied. Keep credentials,
-retry tokens, full graphs and unrelated memories out of the packet.
+retry tokens, full graphs and unrelated memories out of the packet. Durable notes
+and artifacts, when needed, are filed through the appropriate task/MemPalace MCP
+operation; do not copy task status into drawers or notes as a second authority.
 
-| Linked todo status | Required observation |
-|---|---|
-| `pending` | Waiting for selection; fresh eligibility is still required before dispatch. |
-| `in_progress` | The correlated native worker is actually running under current authorization; a claim or preparing attempt is insufficient. |
-| `blocked` | Missing host/prerequisite, recovery, proposal/admission, quarantine, cancellation, unaccepted results, or stale/unconfirmed state; record the reason. |
-| `done` | Confirmed accepted durable closure of the corresponding task. Native completion alone is insufficient. |
-
-Local-only setup/planning rows may finish locally; they do not complete linked
-implementation tasks. Fresh durable state contradicting local `done` requires
-updating the **proven linked row** and its reference packet, not merely reporting
-the mismatch. Use `pending` only for freshly eligible, unselected work; otherwise
-`blocked` with the observed reason. Preserve unrelated rows/dependencies. Never
-guess ambiguous identities from semantic similarity or migrate old prototype
-records. Missing/ambiguous references require clarification or a local blocker.
+Native session planning belongs to the harness. Use fresh MCP state for tracked
+task decisions. If a native result or remembered completion conflicts with that
+state, report the conflict and use the MCP state. Report accepted completion only
+after confirmed durable closure; an unavailable MCP service means unknown or
+blocked.
 
 ## Views and completion
 
@@ -234,7 +238,7 @@ reassess; cancelled-only work is not accepted success.
 | Treat remembered ownership or native acknowledgment as a claim | Verify the current sidecar generation, live lease and prepared execution. |
 | Close because the ready queue is empty or the shell exited | Establish acceptance evidence and the appropriate goal/execution barrier. |
 
-See [pressure scenarios](references/scenarios.md) for the baseline, parent-reported
-evaluation evidence and remaining checks. Workflow/decomposition policy belongs
+See [pressure scenarios](references/scenarios.md) for expected behavior,
+simulation coverage and remaining checks. Workflow/decomposition policy belongs
 to the opt-in `palace-task-workflow` agent; these instructions do not supply a
 native supervisor or host adapter.
