@@ -68,8 +68,10 @@ audit hook that nags when an external tool is about to run without a prior `memp
   and prune. The current helper refuses data roots outside the selected HOME
   backup root rather than omitting them. Local repos
   only, on demand. Ships a tested Python helper
-  ([`scripts/palace_backup.py`](skills/mempalace-backup/scripts/palace_backup.py) + `test_palace_backup.py`) that
+  ([`scripts/palace_backup.py`](skills/mempalace-backup/scripts/palace_backup.py)) that
   needs no `sqlite3` CLI, plus a [restic cheatsheet](skills/mempalace-backup/references/restic-cheatsheet.md).
+  Its [backup tests](tests/mempalace-backup/test_palace_backup.py) are repository-only,
+  not shipped with the installed skill.
   For **per-wing** archival/migration/cloning (which restic cannot do, since wings share physical storage), it also
   ships [`scripts/palace_wing.py`](skills/mempalace-backup/scripts/palace_wing.py) — a logical wing export/import that
   reads the palace SQLite directly into a portable JSONL bundle and replays it back.
@@ -119,15 +121,37 @@ audit hook that nags when an external tool is about to run without a prior `memp
   [Offline preparation](sidecar/README.md#requirements-and-offline-setup) uses
   preprovisioned artifacts; service startup never builds/downloads packages.
 
+## Tests
+
+All tests and test-only helpers live under the repository-root [`tests/`](tests/README.md),
+separate from deployed hooks, skills and sidecar packages. Pytest is the canonical
+runner; root configuration supplies import paths without `PYTHONPATH` or changing
+into production directories. See the [test guide](tests/README.md) for setup,
+suite selectors, existing integration gates and package-content checks.
+
+Commands below run from the repository root. `TEST_PY` must select a preprovisioned
+Python 3.11+ interpreter with pytest 8.4.2 (`requirements-test.txt`); the full suite
+also requires sidecar production dependencies and the existing MemPalace/local
+model prerequisites. Its offline package regression requires preinstalled `uv`
+and sidecar build-system prerequisites in `TEST_PY` (`setuptools>=68`, plus
+`wheel` if required by the chosen backend), separate from runtime dependencies.
+A partial environment is not full-suite validation; tests do not install or
+download missing prerequisites.
+`SESSION_FILES` must be an existing external session artifact directory. Each
+pytest `--basetemp` names a disposable child, never that directory itself.
+
 ## Opt-in procedural rollout
 
 Ordinary recall remains the baseline. First run the deterministic procedural
-tests on throwaway storage, using the already installed MemPalace interpreter:
+tests on throwaway storage, using `TEST_PY` with the existing MemPalace/model
+prerequisites:
 
 ```bash
-cd skills/dreaming/scripts
-PYTHONDONTWRITEBYTECODE=1 DREAMING_TEST_TMPDIR="$SESSION_FILES" TMPDIR="$SESSION_FILES" \
-  "$MPY" -m unittest test_dream_procedure test_procedural_replay -q
+export PYTHONDONTWRITEBYTECODE=1
+DREAMING_TEST_TMPDIR="$SESSION_FILES" TMPDIR="$SESSION_FILES" \
+  "$TEST_PY" -m pytest --basetemp "$SESSION_FILES/pytest-procedural" \
+  tests/dreaming/test_dream_procedure.py \
+  tests/dreaming/test_procedural_replay.py -q
 ```
 
 After separate user approval, enroll a small set of repository-specific rules
@@ -256,18 +280,24 @@ The first call prints the reminder; the second pair is silent; the broad-probe c
 
 ## Verifying the save hook
 
-```bash
-# Unit + integration tests (integration needs the mempalace interpreter):
-cd hooks
-MPY=$(head -1 "$(command -v mempalace)" | sed 's/^#!//')
-"$MPY" -m unittest test_copilot_transcript -v   # 13 tests, all pass
+Use the prepared `TEST_PY` and external `SESSION_FILES` described in
+[Tests](#tests), from the repository root. Optional MemPalace parser integration
+checks retain their existing prerequisite-based skips; report these separately
+from passing tests.
 
-# Smoke test the adapter with a Copilot Stop payload. A short transcript is below
+```bash
+export PYTHONDONTWRITEBYTECODE=1
+export TMPDIR="$SESSION_FILES"
+"$TEST_PY" -m pytest --basetemp "$SESSION_FILES/pytest-hooks" tests/hooks -q
+
 # Smoke test the adapter with a Copilot Stop payload + a tiny events.jsonl. A short
 # transcript is below the 15-message save threshold, so it prints {} (nothing saved yet):
-printf '%s\n' '{"type":"user.message","data":{"content":"hello palace"}}' > /tmp/ev.jsonl
-echo '{"hook_event_name":"Stop","session_id":"t","transcript_path":"/tmp/ev.jsonl","cwd":"/tmp"}' \
-  | python3 copilot_transcript.py   # -> {}
+printf '%s\n' '{"type":"user.message","data":{"content":"hello palace"}}' \
+  > "$SESSION_FILES/hook-smoke-events.jsonl"
+printf '{"hook_event_name":"Stop","session_id":"t","transcript_path":"%s/hook-smoke-events.jsonl","cwd":"%s"}\n' \
+  "$SESSION_FILES" "$SESSION_FILES" \
+  | python3 hooks/copilot_transcript.py   # -> {}
+rm "$SESSION_FILES/hook-smoke-events.jsonl"
 ```
 
 Once installed, a real session that crosses 15 human messages prints

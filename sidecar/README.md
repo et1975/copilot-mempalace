@@ -493,22 +493,46 @@ CLI/Dolt/formula compatibility is claimed.
 
 ## Development checks
 
-Use disposable storage, never the user's live palace. From the repository root:
+Tests and their worker/fixture helpers are repository-only under `tests/sidecar`,
+not included in the installed sidecar or source distribution. Use disposable
+storage, never the user's live palace. Run from the repository root; pytest
+configuration supplies source and test import paths without `PYTHONPATH`.
+
+Select a preprovisioned Python 3.11+ interpreter as `TEST_PY`, with the sidecar's
+declared production dependencies and pytest 8.4.2 from the development-only
+`requirements-test.txt`. The complete repository suite additionally needs the
+existing MemPalace/model prerequisites, preinstalled `uv` on PATH, and this
+sidecar's `[build-system]` prerequisites in `TEST_PY` (`setuptools>=68`, plus
+`wheel` if the chosen backend requires it). The root package regression builds
+wheel/sdist artifacts and rebuilds a wheel from the sdist offline in external
+temporary storage. Build tools remain development-only prerequisites, not runtime
+dependencies. A partial environment is not a full-suite pass. No test command
+installs dependencies or downloads packages/models.
+
+`SESSION_FILES` must be an existing session artifact directory outside the
+repository. Pytest clears its `--basetemp` child: use only a dedicated disposable
+child, never `SESSION_FILES` itself.
 
 ```bash
-PYTHONPATH=sidecar/src MPTASK_TEST_TMPDIR="$SESSION_FILES" \
-  sidecar/.venv/bin/python -W error -m unittest discover -s sidecar/tests -v
+export PYTHONDONTWRITEBYTECODE=1
+export MPTASK_TEST_TMPDIR="$SESSION_FILES"
+export TMPDIR="$SESSION_FILES"
+"$TEST_PY" -W error -m pytest --basetemp "$SESSION_FILES/pytest-sidecar" tests/sidecar -q
 ```
 
-`SESSION_FILES` is a pre-existing test/session artifact directory outside the
-repository. The optional real-hub gate requires preinstalled `mempalace-mcp`:
+The existing optional real-hub gate requires preinstalled `mempalace-mcp`.
+Keep the bytecode export above so child Python processes inherit it:
 
 ```bash
-MPTASK_LIVE_HUB=1 MPTASK_TEST_TMPDIR="$SESSION_FILES" PYTHONPATH=sidecar/src \
-  sidecar/.venv/bin/python -W error -m unittest discover -s sidecar/tests -p test_live_contract.py -v
+MPTASK_LIVE_HUB=1 "$TEST_PY" -W error -m pytest \
+  --basetemp "$SESSION_FILES/pytest-live-hub" tests/sidecar/test_live_contract.py -q
 ```
 
 The real-hub fixture isolates HOME and palace storage, binds port zero, validates
 its child-owned registry before connecting, and stops only its own processes.
 It never registers a service or writes task records into the user's
 existing palace.
+
+See `tests/README.md` in a repository checkout for the full suite matrix, external
+temporary-root defaults and distribution acceptance checks. That developer guide
+and the tests are not shipped in this package.

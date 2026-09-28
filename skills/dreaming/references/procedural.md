@@ -360,13 +360,30 @@ external ledger. Backup remains the palace's existing backup responsibility.
 
 1. **Disabled by convention:** no procedural command use means no procedural
    writes or advice. Keep normal evidence recall and ordinary reflect unchanged.
-2. **Throwaway smoke test:** use the package-owning interpreter and a session
-   directory for `DREAMING_TEST_TMPDIR`/`TMPDIR`. Run `test_dream_procedure` and
-   `test_procedural_replay`; the former exercises all six commands with actual
-   installed handlers, SQLite-exact storage and an isolated local session store.
+2. **Throwaway smoke test:** in a repository checkout, use a preprovisioned
+   Python 3.11+ `TEST_PY` with pytest 8.4.2 and the existing MemPalace/model
+   prerequisites. Run `tests/dreaming/test_dream_procedure.py` and
+   `tests/dreaming/test_procedural_replay.py` from the repository root; tests are
+   repository-only, not shipped with the installed skill. `SESSION_FILES` must
+   be an existing external directory, and the pytest basetemp must be a
+   disposable child, never that directory itself:
+
+   ```bash
+   export PYTHONDONTWRITEBYTECODE=1
+   DREAMING_TEST_TMPDIR="$SESSION_FILES" TMPDIR="$SESSION_FILES" \
+     "$TEST_PY" -m pytest --basetemp "$SESSION_FILES/pytest-procedural" \
+     tests/dreaming/test_dream_procedure.py \
+     tests/dreaming/test_procedural_replay.py -q
+   ```
+
+   Root pytest configuration supplies the source/test import paths. The former
+   module exercises all six commands with actual installed handlers,
+   SQLite-exact storage and an isolated local session store.
    A subprocess test exercises write commands through the actual MCP opener;
    live-WAL tests retain an open writer and read its committed data without
-   checkpointing. No test targets the user's live palace or installs dependencies.
+   checkpointing. No test targets the user's live palace, installs dependencies
+   or downloads models. See `tests/README.md` in the checkout for the full
+   prerequisite matrix; a partial environment is not full-suite validation.
 3. **Separate opt-in:** after user approval enroll a small set for one exact
    repository. Keep original sources available. Do not bulk reinterpret old
    diary prose as instructions, fabricate historical observation stamps, or
