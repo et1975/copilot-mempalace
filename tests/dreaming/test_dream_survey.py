@@ -177,7 +177,7 @@ class TestBuildReport(unittest.TestCase):
 
 class TestDefaultPalace(unittest.TestCase):
     def test_default_palace_reads_mempalace_config_env(self):
-        with tempfile.TemporaryDirectory(dir=os.path.dirname(__file__)) as td:
+        with tempfile.TemporaryDirectory(dir=os.environ.get("DREAMING_TEST_TMPDIR")) as td:
             config_path = os.path.join(td, "config.json")
             with open(config_path, "w", encoding="utf-8") as fh:
                 json.dump({"palace_path": "~/palace-from-config"}, fh)
@@ -186,7 +186,7 @@ class TestDefaultPalace(unittest.TestCase):
                 self.assertEqual(ds._default_palace(), os.path.expanduser("~/palace-from-config"))
 
     def test_default_palace_returns_none_without_palace_path(self):
-        with tempfile.TemporaryDirectory(dir=os.path.dirname(__file__)) as td:
+        with tempfile.TemporaryDirectory(dir=os.environ.get("DREAMING_TEST_TMPDIR")) as td:
             config_path = os.path.join(td, "config.json")
             with open(config_path, "w", encoding="utf-8") as fh:
                 json.dump({"collection_name": "mempalace_drawers"}, fh)

@@ -15,6 +15,31 @@ export RESTIC_PASSWORD_FILE=~/.config/mempalace-restic.pass
 Never hard-code a password. Keep the password file `chmod 600`, and avoid
 `--insecure-no-password`.
 
+## Supported task recovery boundary
+
+Use an already installed epoch-aware sidecar package, MemPalace CLI and restic.
+Task truth is DATA/logstream.sqlite3 (events, artifacts and links), together
+with DATA/replica.json. There is no matching external pending/head/clock state.
+The helper's `--palace` names backup HOME; the MemPalace CLI's `--palace` names
+DATA. Custom layout is resolved from the staged snapshot.
+
+The supported workflow is **private staging, then explicit offline publication**.
+Stop all task/hub/daemon/raw writers, peer sync and autostarters through their
+owners. Maintain no-new-launch exclusion through publication and the next
+sidecar's fresh activation/recovery. `--offline`, a missing registry, daemon-stop
+acknowledgement and checkpoint success are not independent proof of that condition.
+The helper additionally refuses active/indeterminate registry records, acquires
+the canonical cooperative writer leases and performs bounded SQLite writer probes.
+On Windows, a registry PID is conservatively indeterminate without a verified
+native liveness query; no `os.kill(pid, 0)` signal is sent.
+
+Live/online task replacement, raw file replacement during maintenance and mesh
+rollback/failover are unsupported. Corrupted live SQLite/configuration that
+prevents exclusion/identification is refused rather than hidden by `--force`;
+staging-only validation remains available for inspection and controlled salvage.
+Native Windows/macOS publication needs platform validation; the automated
+SQLite, lock, rollback and real staging-CLI integration checks run on Linux.
+
 ## Total loss / new machine
 
 If the machine or home directory is gone, the `restic` repository is the only
@@ -31,31 +56,38 @@ thing that had to survive.
    restic find origin.json
    ```
 
-5. Restore the latest palace into the palace directory:
+5. Materialize and validate a private, disjoint stage:
 
    ```bash
-   mkdir -p ~/.mempalace
-   restic restore latest:"$HOME/.mempalace" --target ~/.mempalace
+   python3 ../mempalace-backup/scripts/palace_backup.py --palace ~/.mempalace \
+     restore latest --target ~/.mempalace-restore-stage --require-logstream
    ```
 
-   The `latest:"$HOME/.mempalace"` subpath form strips the stored absolute path
-   prefix so files land directly under `~/.mempalace/`. Alternative: restore to
-   original absolute locations with `restic restore latest --target /`. If the
-   restored tree lands somewhere unexpected, move the restored palace contents
-   so `config.json`, `tunnels.json`, `knowledge_graph.sqlite3`, `palace/`, and
-   `wal/` are directly under `~/.mempalace/`.
+   The helper uses restic's `snapshot:HOME` subpath form so no original absolute
+   path is nested underneath staging. A captured `.palace-backup.json` declares
+   required logstream/authorities and the restored domain-content digest.
+   For older task snapshots, supply `--require-logstream` and repeatable
+   `--expected-authority <uuid>`. Omit those only for genuinely legacy palaces.
 
-6. Rebuild and verify:
+6. After establishing the offline boundary, activate and publish:
 
    ```bash
-   mempalace repair
-   mempalace repair-status
-   mempalace status
-   mempalace search "<known term>"
+   python3 ../mempalace-backup/scripts/palace_backup.py --palace ~/.mempalace \
+     restore latest --target ~/.mempalace-restore-stage --from-stage \
+     --in-place --offline --require-logstream
    ```
 
-7. Reopen the running server with MCP `mempalace_reconnect`, or restart the
-   harness/MCP server if MCP is unavailable.
+   A fresh epoch per initialized authority is appended through the direct
+   preinstalled MemPalace CLI while the stage is private. Replay proves each
+   accepted/current activation and unchanged domain/artifact/provenance state.
+   Only then are contents published with rollback tracking. HOME, `locks/` and
+   `server/` controls are not renamed or replaced; previous contents are retained.
+
+7. Nothing is started automatically. Deliberately reopen only the completed
+   tree, then let an epoch-aware sidecar activate another successor and recover
+   inherited attempts before task admission. Independently reconcile external
+   effects. Replica identity is preserved; task epochs do not fix mesh origin
+   sequence collisions. Keep peer reinjection excluded.
 
 ## Partial corruption: HNSW index bad, SQLite fine
 
@@ -159,17 +191,40 @@ restic dump <snapshot-id> "$HOME/.mempalace/config.json"
 
 ## Rollback of a bad restore
 
-The safe restore runbook moves the previous palace aside first:
+Never swap whole HOME directories: doing so relocates the canonical lock inode.
+Keep the original `.bak-*` contents and the unsuccessful stage until recovery
+has been verified. Copy the desired old contents to a new private staging
+directory on the same filesystem and use `--from-stage --in-place --offline`;
+recovery replays the older coherent history and adds new epoch barriers rather
+than restoring old execution authorization.
 
-```bash
-mv ~/.mempalace ~/.mempalace.bad-restore-$(date +%Y%m%d-%H%M%S)
-mv ~/.mempalace.bak-<timestamp> ~/.mempalace
-mempalace repair
-mempalace repair-status
-```
+### Interrupted activation
 
-Then reopen with MCP `mempalace_reconnect`, or restart the harness/MCP server.
-Smoke test:
+`DATA/.task-restore-incomplete.json` is an administrative marker, not task truth.
+Any partial append/ambiguous response is a failed, unpublishable stage.
+Preserve it. After fixing the cause, retry the same private stage with
+`--from-stage --in-place --offline`. The journal resolves committed history;
+fresh successor epochs complete preparation. Never import an old local
+pending/head/clock file to settle it.
+
+### Interrupted publication
+
+`HOME/.palace-restore-incomplete.json` records target, stage, rollback directory,
+planned old/new names and completed moves. Ordinary exceptions attempt to move
+published new entries back to staging and restore old entries from rollback.
+If rollback succeeds, the original HOME remains intact and the marker is removed.
+If it cannot complete, the command fails with the exact recovery paths and keeps
+the marker with `phase=rollback_incomplete`.
+
+After process/power interruption, do not start anything or blindly rerun the
+helper. Inspect that marker and all three trees under the offline boundary.
+Reconcile entries by their actual locations against the recorded move plan;
+never overwrite an existing entry or touch canonical control/lock files.
+The marker may lag a completed rename by one step. Preserve all copies until
+the chosen tree is complete and independently validated. This is recoverable
+multi-entry publication, not an atomic whole-filesystem transaction.
+
+Smoke tests after deliberate reopening:
 
 ```bash
 mempalace status
@@ -204,10 +259,6 @@ restic check
 Recovery is complete only when the index counts match, drawer counts are sane,
 known-term search works, and the backup repository still checks clean.
 
-If you perform manual SQLite checks and the `sqlite3` CLI is missing, Python's
-stdlib `sqlite3` module is enough:
-
-```bash
-python3 -c "import sqlite3;sqlite3.connect('DB').execute('PRAGMA wal_checkpoint(TRUNCATE)')"
-python3 -c "import sqlite3;print(sqlite3.connect('DB').execute('PRAGMA integrity_check').fetchone())"
-```
+The helper uses Python's stdlib SQLite for inventory/checkpoint/exclusion and
+the shared protocol for semantic task validation. Do not use a plain SQLite
+open that creates a missing database while investigating lost task storage.

@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """Tests for palace_wing_lib.py (pure core, no mempalace).
 
-Run: ``python3 -m pytest test_palace_wing_lib.py`` or ``python3 test_palace_wing_lib.py``.
+From the repository root, with ``PYTHONDONTWRITEBYTECODE=1`` exported:
+``$TEST_PY -m pytest tests/mempalace-backup/test_palace_wing_lib.py -q``.
 """
 from __future__ import annotations
 
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import palace_wing_lib as lib  # noqa: E402
+import palace_wing_lib as lib
 
 
 # --------------------------------------------------------------------------- #

@@ -12,11 +12,30 @@ common way to silently corrupt a wing export/import.
 ├── wal/  locks/
 └── palace/                           <- the ChromaDB "palace" dir
     ├── chroma.sqlite3                <- vectors + drawer metadata
+    ├── logstream.sqlite3             <- task events AND artifacts/link tables
+    ├── replica.json                  <- stable log provenance, not restore epoch
     ├── <uuid>/*.bin                  <- HNSW index
     └── .mempalace/origin.json        <- embedder identity (critical)
 ```
 
 ## The two resolution rules (they disagree)
+
+For physical backup/restore there is a third store: DATA/logstream.sqlite3.
+Its `events`, `artifacts`, and `event_artifacts` tables hold all indispensable
+task journal/source content. WAL/SHM files beside it can contain committed pages.
+There is no independent artifact directory or task pending/head/clock database
+that must match the restored snapshot.
+
+The backup helper keeps `--palace` as HOME, accepts global `--data-path`, and
+passes DATA to the installed MemPalace CLI's own `--palace` option. The latter
+is not HOME. Configured DATA outside HOME or in a linked/control subtree is
+refused. Restores resolve custom layout from staged configuration or
+`.palace-backup.json`, not old live configuration.
+
+The canonical writer lease is always under the **current user's**
+`~/.mempalace/locks/mine_palace_<16-hex-canonical-DATA-hash>.lock`, even for a
+different backup HOME. Keep this inode and namespace continuously in place.
+Publication moves content entries, not HOME or its `locks/`/`server/` controls.
 
 The running MCP server (`mempalace-mcp`, launched **without** `--palace`) reads:
 

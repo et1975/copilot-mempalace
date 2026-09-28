@@ -92,6 +92,38 @@ For deeper workflow docs (init, mine, full search/status walkthrough), invoke th
 - Use `contemplate` when the user asks to derive, infer, reason, contemplate, or asks "what follows from this?" / "what can we conclude?" It runs on-demand/inline over the active KG with explicit rules and approved materialization.
 - Use `dreaming` for unattended offline consolidation: merge duplicates, resolve contradiction/staleness candidates, induce repeated patterns, or prune low-salience drawers. It should run in a fresh/off-hours session, not inline during feature work.
 
+## Optional durable task coordination
+
+For an explicitly tracked sidecar task or a requested durable task workflow,
+invoke the [mempalace-tasks safety skill](skills/mempalace-tasks/SKILL.md) and use
+the separately configured `mptask_*` tools. For explicitly tracked native
+`/fleet` goals, select the existing
+[palace-task-workflow agent](agents/palace-task-workflow.agent.md) and follow the
+[per-goal workflow](sidecar/README.md#per-goal-native-fleet-workflow).
+Each goal requires explicit tracking opt-in. Selecting the agent, installing
+this pack, available tools or an ordinary `/fleet` request do not enroll work.
+An explicitly named resume preserves only that goal's scope, not other goals.
+Ordinary native fleet and session planning remain available without
+task-service setup or durable writes.
+
+Native fleet remains the orchestrator. All task and MemPalace storage interaction
+in this workflow uses the configured, server-qualified MCP tools. Build bounded
+handoff references from fresh MCP observations; the durable authority alone
+determines tracked task state. Native memory/delegation acknowledgments,
+drawers, diaries and KG projections are not task ownership or current
+operational state.
+
+Use current owner/attempt/generation and authorization, atomic expand/yield for
+new prerequisites, and confirmed goal closure rather than an empty ready list.
+Worker dispatch and physical supervision remain host responsibilities; do not
+claim native execution support from a healthy MCP frontend or registration.
+No native fleet supervisor is shipped: an authorized coordinator can plan
+durably without one, but tracked execution stays blocked. For an explicit
+tracked request, report missing service/schema/actor or supervision as a
+blocker; do not silently fall back to untracked execution or create a replacement
+writer. Human status/history/watch remain read-only observations, never a reason
+to launch/restart the owner. Ordinary memory filing is unchanged.
+
 ## Optional repository procedural advice (disabled by convention)
 
 Only after explicit user opt-in for one repository, supplement ordinary

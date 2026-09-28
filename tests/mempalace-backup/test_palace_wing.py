@@ -4,20 +4,19 @@
 No live palace and no importable ``mempalace`` required: every mempalace /
 palace-SQLite seam on the module is replaced with an in-memory fake.
 
-Run: ``python3 -m pytest test_palace_wing.py`` or ``python3 test_palace_wing.py``.
+From the repository root, with ``PYTHONDONTWRITEBYTECODE=1`` exported:
+``$TEST_PY -m pytest tests/mempalace-backup/test_palace_wing.py -q``.
 """
 from __future__ import annotations
 
 import contextlib
 import sys
+import tempfile
 import uuid
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import palace_wing as pw  # noqa: E402
-import palace_wing_lib as lib  # noqa: E402
-
-_SCRATCH = Path(__file__).resolve().parent
+import palace_wing as pw
+import palace_wing_lib as lib
 
 
 # --------------------------------------------------------------------------- #
@@ -52,11 +51,11 @@ def patched(**overrides):
 
 
 def _bundle_path() -> Path:
-    return _SCRATCH / f".test-bundle-{uuid.uuid4().hex}.jsonl"
+    return Path(tempfile.gettempdir()) / f".test-bundle-{uuid.uuid4().hex}.jsonl"
 
 
 def _out_path() -> Path:
-    return _SCRATCH / f".test-out-{uuid.uuid4().hex}.jsonl"
+    return Path(tempfile.gettempdir()) / f".test-out-{uuid.uuid4().hex}.jsonl"
 
 
 def _write_bundle(records) -> Path:

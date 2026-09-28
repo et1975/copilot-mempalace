@@ -422,13 +422,21 @@ documented future enhancements.
 
 ## Tests
 
-```
-cd skills/dreaming/scripts
-PYTHONDONTWRITEBYTECODE=1 DREAMING_TEST_TMPDIR="$SESSION_FILES" TMPDIR="$SESSION_FILES" \
-  "$MPY" -m unittest discover -s . -p 'test_*.py' -q
+These are repository-only developer checks under `tests/dreaming`, not files
+shipped with the installed skill. From the repository root:
+
+```bash
+export PYTHONDONTWRITEBYTECODE=1
+DREAMING_TEST_TMPDIR="$SESSION_FILES" TMPDIR="$SESSION_FILES" \
+  "$TEST_PY" -m pytest --basetemp "$SESSION_FILES/pytest-dreaming" tests/dreaming -q
 ```
 
 The pure core (`dream_lib.py`) is dependency-free and fully unit-tested; the
 mempalace-facing adapter and procedural CLI are validated on throwaway palaces.
-Use the already installed package-owning interpreter and session artifact
-directory; tests never target a user's live palace.
+`TEST_PY` must be a preprovisioned Python 3.11+ interpreter with pytest 8.4.2 and
+the existing MemPalace/model prerequisites. `SESSION_FILES` must already exist
+outside the checkout; the basetemp child is disposable, not the entire session
+directory. Root pytest configuration supplies imports and defaults missing test
+temporary roots to external storage. Tests never target a user's live palace.
+See `tests/README.md` in the repository for prerequisites and partial-environment
+limitations; tests do not install dependencies or download models.
