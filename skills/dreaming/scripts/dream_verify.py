@@ -1,87 +1,57 @@
 #!/usr/bin/env python3
-"""Report-only convergence verification for dreaming merge decisions."""
+"""Report-only exhaustive merge verification using the harvest candidate pipeline.
+
+Print JSON to stdout. With --strict, residual candidates return status 1.
+Backend, capability or incomplete-scan failures always return status 2.
+"""
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
-from typing import Any
 
+import dream_harvest
 import dream_palace
 
 
-def _max_pair_sim(pair_sims: list[dict[str, Any]]) -> float | None:
-    sims = [pair.get("sim") for pair in pair_sims if pair.get("sim") is not None]
-    if not sims:
-        return None
-    return max(float(sim) for sim in sims)
-
-
-def build_convergence_report(
-    clusters: list[dict[str, Any]],
-    scope: dict[str, Any],
-    params: dict[str, Any],
-) -> dict[str, Any]:
-    residual_clusters = len(clusters)
-    closure = "bounded_partial" if params.get("max_clusters") is not None and residual_clusters == params["max_clusters"] else "true"
-    residuals = [
-        {
-            "drawer_ids": [member["id"] for member in cluster.get("members", [])],
-            "size": cluster.get("size", len(cluster.get("members", []))),
-            "max_sim": _max_pair_sim(cluster.get("pair_sims", [])),
-        }
-        for cluster in clusters
-    ]
+def verify_merge(path: str, *, wing: str | None = None,
+                 room: str | None = None, tau: float = 0.9) -> dict:
+    worklist = dream_harvest.harvest_merge_worklist(path, wing=wing, room=room, tau=tau)
+    items = worklist["items"]
     return {
-        "schema": 1,
-        "task": "merge",
-        "scope": scope,
-        "params": params,
-        "closure": closure,
-        "converged": residual_clusters == 0,
-        "residual_clusters": residual_clusters,
-        "residuals": residuals,
+        "task": "merge", "scope": {"palace": path, "wing": wing, "room": room},
+        "params": {"tau": tau}, "complete": True, "converged": not items,
+        "residual": len(items), "items": items, "errors": [],
     }
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--palace", required=True, help="Path to the mempalace palace directory")
-    ap.add_argument("--wing", help="Scope verification to this wing")
-    ap.add_argument("--room", help="Scope verification to this room")
-    ap.add_argument("--tau", type=float, default=0.9, help="Cosine-similarity threshold (default 0.9)")
-    ap.add_argument("--max-clusters", type=int, help="Maximum duplicate clusters to re-harvest")
-    ap.add_argument("--out", help="Optional JSON report path; stdout is used when omitted")
-    ap.add_argument("--strict", action="store_true", help="Exit non-zero when residual clusters remain")
-    args = ap.parse_args(argv)
-
-    palace_path = dream_palace.bind_palace(args.palace)
-    scope = {"palace": palace_path, "wing": args.wing, "room": args.room}
-    params = {"tau": args.tau, "max_clusters": args.max_clusters}
-    clusters = dream_palace.find_duplicate_clusters(
-        palace_path,
-        wing=args.wing,
-        room=args.room,
-        tau=args.tau,
-        max_clusters=args.max_clusters,
-    )
-    report = build_convergence_report(clusters, scope, params)
-
-    status = "true" if report["converged"] else "false"
-    print(
-        f"merge convergence: {status} — {report['residual_clusters']} residual cluster(s) "
-        f"[closure={report['closure']}]",
-        file=sys.stderr,
-    )
-
-    if args.out:
-        with open(args.out, "w", encoding="utf-8") as fh:
-            json.dump(report, fh, indent=2, ensure_ascii=False)
-    else:
-        json.dump(report, sys.stdout, indent=2, ensure_ascii=False)
-        print()
-
-    return 1 if args.strict and report["residual_clusters"] > 0 else 0
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--palace", help="Palace path (default: mempalace config)")
+    parser.add_argument("--wing", help="Restrict the scan to this wing")
+    parser.add_argument("--room", help="Restrict the scan to this room")
+    parser.add_argument("--tau", type=float, default=0.9, help="Merge cosine threshold (default 0.9)")
+    parser.add_argument("--strict", action="store_true", help="Return status 1 for residual candidates")
+    args = parser.parse_args(argv)
+    path = args.palace or dream_harvest._default_palace()
+    try:
+        if not path:
+            raise ValueError("no --palace given and no configured palace_path")
+        path = dream_palace.bind_palace(path)
+        report = verify_merge(path, wing=args.wing, room=args.room, tau=args.tau)
+    except Exception as exc:  # Report errors explicitly even for non-strict callers.
+        report = {
+            "task": "merge", "scope": {"palace": path, "wing": args.wing, "room": args.room},
+            "params": {"tau": args.tau if math.isfinite(args.tau) else None},
+            "complete": False, "converged": False,
+            "residual": None, "items": [], "errors": [str(exc)],
+        }
+        print(json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False))
+        print(f"error: verification failed: {exc}", file=sys.stderr)
+        return 2
+    print(json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False))
+    return 1 if args.strict and report["residual"] else 0
 
 
 if __name__ == "__main__":

@@ -5,10 +5,31 @@ description: Use when the user wants deliberate, on-demand deductive reasoning o
 
 # Contemplate
 
-On-demand reasoning for a mempalace palace. Where `dreaming` is unattended
-off-hours consolidation, `contemplate` is deliberate inline cognition: derive
-what follows from the active KG under explicitly-approved rules, then decide
-which entailed facts are worth materializing.
+On-demand reasoning for a mempalace palace. Where `dreaming` is
+unattended off-hours consolidation, `contemplate` is deliberate inline
+cognition: derive what follows from the active KG under explicitly-approved
+rules, query for relevant past sessions, propose ontology rules, and report
+knowledge gaps — without automatically adopting new KG conclusions/drawers.
+This is **not a universal read-only guarantee**: existing premise loading may
+reconcile legacy KG provenance, and explicit ontology bootstrap/enable/disable
+commands write configuration. Approved adoption is a separate write step.
+
+**Scope:**
+
+- `--task derive` — bounded deductive closure over active KG facts under
+  explicitly enabled ontology rules (read-only reconnaissance; adjudication +
+  materialization use the 5-phase `dream_harvest.py` / `dream_adopt.py` flow).
+- `--recall` — relevance-ranked past-session reconnaissance for inline
+  grounding; retrieves top-k most relevant Copilot host sessions by embedding
+  cosine similarity (read-only, does not materialize anything).
+- `--task gaps` — standalone read-only gap reconnaissance; ranks missing KG
+  edges but does not retrieve sources or assert facts.
+- `--propose` / `--enable-rule` / `--disable-rule` — ontology proposal review
+  and deliberate rule toggling.
+
+**Constructive synthesis** (distill, generalize, name_gap, connect, tension,
+shared_constraint) is **not** part of contemplate. Use the dreaming skill's
+`reflect` task for on-demand meditation or scheduled generative consolidation.
 
 > **Run this when reasoning is the user's current task.**
 > Do not dispatch it as an off-hours dream: this skill is allowed to run inline
@@ -37,11 +58,123 @@ MPY=$(head -1 "$(command -v mempalace)" | sed 's/^#!//')
 "$MPY" skills/dreaming/scripts/dream_contemplate.py --palace <p> --bootstrap
 ```
 
-`dream_contemplate.py` runs the read-only derive scan in one in-process call
+`dream_contemplate.py` runs the derive scan (without adopting conclusions) in one in-process call
 instead of the multi-command harvest flow, minimizing per-command approval
 prompts. `--bootstrap` only writes disabled ontology rule candidates for review;
 it never enables rules and never adopts derived KG facts. For a fully
 unattended/zero-prompt run, dispatch the driver as a background subagent.
+
+## Relevance recall driver (session reconnaissance)
+
+Use `--recall` when the current reasoning task needs grounding from past Copilot
+host sessions:
+
+```bash
+MPY=$(head -1 "$(command -v mempalace)" | sed 's/^#!//')
+"$MPY" skills/dreaming/scripts/dream_contemplate.py --palace <p> \
+  --recall "<reasoning query>" [--k 5] [--repository <substr>] \
+  [--since <iso>] [--limit-sessions N] [--min-similarity 0.0] \
+  [--format summary|json]
+```
+
+Given a reasoning query, `--recall` retrieves the top-`k` most relevant past
+Copilot host sessions from the session store, relevance-ranked by embedding
+cosine similarity in the palace's own embedding space. It is read-only
+reconnaissance: it surfaces session context for the agent to use as
+grounding/premises while reasoning inline. It does **not** materialize anything
+and does **not** run the deductive derive scan; the no-`--recall` driver remains
+the derive path with the legacy reconciliation caveat above.
+
+Summary output is intentionally skim-friendly, for example:
+
+```text
+1. score=0.84 session=01J... repo=copilot-mempalace updated=2026-07-12 — discussed gap ranking and ontology-rule boundaries
+```
+
+### Same session substrate, opposite access pattern
+
+- **Dreaming = mine for recurrence** — offline/aggregate, cluster-all, with a
+  `min_support` gate over distinct sessions before promoting durable lessons.
+- **Contemplation = query for relevance** — inline/on-demand, query-conditioned
+  k-NN, with no support gate; a single relevant session (`n=1`) is a valid
+  result for grounding the current question.
+
+This is the key contrast with the `dreaming` skill's `pattern --source sessions`
+task: pattern mining looks for themes that recur across `>= min_support`
+distinct sessions, while `--recall` asks which sessions are most relevant to
+this specific reasoning query.
+
+## Gap reconnaissance driver (standalone read-only)
+
+`--task gaps` is **read-only** reconnaissance for the highest-value *missing*
+facts. Given the active KG and the enabled ontology rules, it reports
+hypothesised edges whose addition would unblock currently-underivable `_closure`
+conclusions, ranked by **DUC** (how many conclusions each gap would unblock).
+
+```bash
+MPY=$(head -1 "$(command -v mempalace)" | sed 's/^#!//')
+"$MPY" skills/dreaming/scripts/dream_harvest.py --palace <p> --task gaps \
+  [--target-subject "<entity id or name>"] [--rules <p>/ontology.json] \
+  [--max-candidates 500] --out worklist.json
+```
+
+- **Transitive-only.** A "missing premise" only exists for the transitive family
+  (the sole multi-premise rule); inverse/symmetric rules never yield gaps.
+- **No hallucinated entities.** Both endpoints of a proposed gap edge must already
+  exist in the KG.
+- **Goal-directed (optional).** `--target-subject` restricts gaps to conclusions
+  about that subject; without it, gaps are ranked across the whole KG.
+- **Empty ontology ⇒ zero gaps**, exactly like `--task derive`.
+
+Each `gap` item carries a `hypothesis` (the missing edge), the `rule`, and
+`evidence.duc` + `evidence.unblocks` (the conclusions it would enable). This is
+**reconnaissance only**: it writes nothing to the KG, retrieves no sources, and
+asserts no facts. It just tells the agent *which* missing fact is worth
+investigating separately.
+
+## Focused inquiry (instruction-only deep-dive)
+
+When the user wants to **focus** contemplation on a topic/question and go
+**deeper than a single shallow search**, do not reach for a script — the depth
+comes from *you issuing better queries*, not from machinery. This is a
+cognition-only protocol: run it inline with `mempalace_search`, then use the
+dreaming skill's `reflect` task to promote any load-bearing findings.
+
+A by-hand benchmark (structured inquiry vs a plain-search baseline) showed the
+value is created almost entirely by **agent-driven query expansion** —
+world-knowledge concepts and one contrastive query surface load-bearing drawers
+that a direct search misses and can *change the conclusion*. Multi-hop neighbor
+traversal, KG bridging, and a similarity floor added no measured value on this
+palace (the KG is too sparse, ~40 triples) and are deliberately **not** part of
+this protocol.
+
+Steps:
+
+1. **Direct pass.** `mempalace_search` the focus as stated; skim the top hits.
+2. **Conceptual expansion (the depth mechanism).** Issue 2–4 more searches for
+   *adjacent/implied concepts you know are related but that the focus wording
+   does not contain* — bridge the vocabulary gap using your own knowledge, not
+   the focus's words.
+3. **One contrastive query.** Search explicitly for a counterexample,
+   contradiction, or constraint on the focus ("when is X false / when did the
+   opposite hold"). This is what flips a one-sided finding into a real tension.
+4. **Evidence-led follow-up (optional).** If one drawer is clearly pivotal,
+   run one query seeded by *its* specific vocabulary. Do not fan out
+   automatically.
+5. **Dedup + brief.** Deduplicate drawer IDs in context and write a short,
+   **quote-grounded** brief: findings, tensions, connections, open questions —
+   every asserted finding must carry an exact drawer quote. Label the brief a
+   set of hypotheses, not conclusions. If grounding is thin, **abstain** rather
+   than pad it.
+6. **Promote the load-bearing findings.** For any finding that names a changed
+   decision or a falsifiable prediction and *requires ≥2 distinct drawers*,
+   materialize it via the dreaming skill's `reflect` task (invoke that skill
+   and follow its `--task reflect` flow: harvest → adjudicate → adopt). Only
+   gate-passing insights get written to the palace.
+
+The brief itself is a **session artifact** — keep it in context or the session
+workspace; do not materialize it as a drawer. Only gate-passing insights get
+written to the palace.
 
 ## The 5-phase pipeline
 
@@ -56,7 +189,7 @@ MPY=$(head -1 "$(command -v mempalace)" | sed 's/^#!//')
 
 | # | Phase | Who | Command / action |
 |---|-------|-----|------------------|
-| 1 | Harvest | script | Read active KG triples and `ontology.json`; compute bounded closure; write `worklist.json`. **Read-only**: writes nothing to the palace |
+| 1 | Harvest | script | Read active KG triples and `ontology.json`; compute bounded closure; write `worklist.json`. No new conclusions adopted; legacy premise loading may reconcile provenance |
 | 2 | Adjudicate | **you** | For each `derive` item, choose `materialize`, `skip`, or `reject_rule` |
 | 3 | Approve rules | human/config | If a rule is wrong, do not trust the candidate. `reject_rule` suppresses this worklist under the current ontology; edit `ontology.json` for the durable fix |
 | 4 | Adopt | script | Materialize approved facts and lineage, append skip-markers for skips/rejected rules |
@@ -142,6 +275,21 @@ enabling candidates improves multi-session task success more than it adds drift,
 using LongMemEval/LoCoMo-style methodology. This change only proposes rules for
 human review.
 
+### Plain-language ontology proposals
+
+For inline review of ontology candidates, prefer the proposal commands:
+
+```bash
+MPY=$(head -1 "$(command -v mempalace)" | sed 's/^#!//')
+"$MPY" skills/dreaming/scripts/dream_contemplate.py --palace <p> --propose
+"$MPY" skills/dreaming/scripts/dream_contemplate.py --palace <p> --enable-rule <rule-id>
+"$MPY" skills/dreaming/scripts/dream_contemplate.py --palace <p> --disable-rule <rule-id>
+```
+
+`--propose` shows plain-language disabled ontology candidates for review.
+`--enable-rule` and `--disable-rule` are deliberate operator choices; generated
+rules are never auto-enabled.
+
 ## Invariants to preserve
 
 - **Entity identity** — closure keys on entity IDs, not display names. Current
@@ -162,12 +310,47 @@ human review.
   `candidate_id + ontology_version`, so deliberate skips stop resurfacing until
   the ontology changes.
 
-## Deferred (Track B)
+## Scope limits
 
-v1 ships Track A only: bounded deductive closure over active KG facts. The
-ACQUIRE loop, gap/question worklists, external research, clarification queues,
-and abduction/best-explanation reasoning are deferred future work. Do not claim
-that `contemplate` v1 asks questions, researches gaps, or performs abduction.
+`contemplate` does not automatically materialize conclusions. Explicit ontology
+changes and legacy premise reconciliation can write; do not call the whole
+surface strictly read-only. It has four retained KG/reconnaissance
+surfaces:
+
+- `--task derive` — bounded deductive closure over active KG facts under
+  explicitly enabled ontology rules (read-only reconnaissance; adjudication +
+  materialization use the 5-phase `dream_harvest.py` / `dream_adopt.py` flow).
+- `--task gaps` — standalone read-only gap reconnaissance; it ranks missing KG
+  edges but does not retrieve sources or assert facts.
+- `--recall` — relevance-ranked past-session reconnaissance for inline
+  grounding; it does not run the derive scan or materialize anything.
+- `--propose` / `--enable-rule` / `--disable-rule` — ontology proposal review
+  and deliberate rule toggling.
+
+**Constructive synthesis** (distill, generalize, name_gap, connect, tension,
+shared_constraint, converge) is **not** part of contemplate. Use the dreaming
+skill's `reflect` task for on-demand meditation or scheduled generative
+consolidation.
+
+## Optional procedural advice: no authority transfer
+
+When the user has opted into repository-scoped procedural learning, you may
+consult `dream_procedure.py guidance --palace <p> --wing <w> --repository
+owner/repository --task "<question>"` after ordinary recall. Inspect `explain`
+and the original sources before applying advice. This separate CLI has strict
+read-only/budget/source gates; it is not the legacy premise loader.
+
+**Invariant:** a procedural statement, relevance score, helpful outcome or
+`proven` maturity label is never an enabled ontology rule or durable KG premise.
+Do not feed procedural event drawers or their summaries back as independent
+observations. Quote grounding proves neither semantic entailment nor causality.
+Consulting advice supplies no helpful feedback. Candidate trials require
+explicit `--include-candidates` and deliberate safe selection; unresolved
+harm/conflicts remain suppressed. Structural KG proofs and reviewed empirical
+usefulness are separate authority domains.
+
+For exact schemas, model/backend/read-only limitations and examples, see
+[`../dreaming/references/procedural.md`](../dreaming/references/procedural.md).
 
 See [`references/derive.md`](references/derive.md) for the contract, schemas,
 and guardrails.

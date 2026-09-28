@@ -1,0 +1,1997 @@
+"""Unit tests for the dreaming pure core. Stdlib unittest runner.
+
+Run: cd skills/dreaming/scripts && python3 -m unittest -v
+"""
+from datetime import datetime
+import json
+import random
+import unittest
+from unittest import mock
+
+import dream_lib as dl
+
+
+def _reference_cosine(a, b):
+    if len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    na = sum(x * x for x in a) ** 0.5
+    nb = sum(y * y for y in b) ** 0.5
+    if na == 0.0 or nb == 0.0:
+        return 0.0
+    return dot / (na * nb)
+
+
+def _reference_clusters(items, tau):
+    uf = dl._UnionFind(len(items))
+    sims = {}
+    for i in range(len(items)):
+        for j in range(i + 1, len(items)):
+            s = _reference_cosine(items[i].get("embedding") or [], items[j].get("embedding") or [])
+            if s >= tau:
+                uf.union(i, j)
+                sims[(i, j)] = s
+
+    comps = {}
+    for i in range(len(items)):
+        comps.setdefault(uf.find(i), []).append(i)
+
+    clusters = []
+    for members in comps.values():
+        if len(members) < 2:
+            continue
+        members.sort()
+        clusters.append({
+            "member_ids": [items[k]["id"] for k in members],
+            "pair_sims": [
+                {"a": items[i]["id"], "b": items[j]["id"], "sim": round(sims[(i, j)], 4)}
+                for i in members
+                for j in members
+                if i < j and (i, j) in sims
+            ],
+        })
+    return clusters
+
+
+def _reference_redundancy(items):
+    scores = {d["id"]: 0.0 for d in items}
+    for i in range(len(items)):
+        for j in range(i + 1, len(items)):
+            s = max(0.0, _reference_cosine(items[i].get("embedding") or [], items[j].get("embedding") or []))
+            scores[items[i]["id"]] = max(scores[items[i]["id"]], s)
+            scores[items[j]["id"]] = max(scores[items[j]["id"]], s)
+    return scores
+
+
+def _reference_themes(entries, tau, min_support, support_key="session_id"):
+    themes = []
+    for cluster in _reference_clusters(entries, tau):
+        member_ids = set(cluster["member_ids"])
+        members = [entry for entry in entries if entry["id"] in member_ids]
+        support_ids = sorted(
+            {entry.get(support_key) for entry in members if entry.get(support_key) is not None}
+        )
+        support = len(support_ids)
+        if support >= min_support:
+            themes.append({
+                "member_ids": [entry["id"] for entry in members],
+                "support": support,
+                "support_ids": support_ids,
+                "pair_sims": cluster["pair_sims"],
+            })
+    return sorted(themes, key=lambda t: (-t["support"], min(t["member_ids"])))
+
+
+def _normalise_clusters(clusters):
+    return [
+        {
+            "member_ids": [m["id"] for m in c["members"]],
+            "pair_sims": c["pair_sims"],
+        }
+        for c in clusters
+    ]
+
+
+def _normalise_themes(themes):
+    return [
+        {
+            "member_ids": [m["id"] for m in t["members"]],
+            "support": t["support"],
+            "support_ids": t["support_ids"],
+            "pair_sims": t["pair_sims"],
+        }
+        for t in themes
+    ]
+
+
+class TestCosine(unittest.TestCase):
+    def test_identical_is_one(self):
+        self.assertAlmostEqual(dl.cosine_similarity([1.0, 2.0, 3.0], [1.0, 2.0, 3.0]), 1.0)
+
+    def test_orthogonal_is_zero(self):
+        self.assertAlmostEqual(dl.cosine_similarity([1.0, 0.0], [0.0, 1.0]), 0.0)
+
+    def test_zero_vector_is_zero(self):
+        self.assertEqual(dl.cosine_similarity([0.0, 0.0], [1.0, 1.0]), 0.0)
+
+    def test_length_mismatch_raises(self):
+        with self.assertRaises(ValueError):
+            dl.cosine_similarity([1.0], [1.0, 2.0])
+
+
+class TestGroupLogical(unittest.TestCase):
+    def test_chunks_merge_by_parent_ordered(self):
+        rows = [
+            {"id": "c1", "text": "beta", "embedding": [0.0, 2.0],
+             "metadata": {"parent_drawer_id": "p", "chunk_index": 1, "wing": "w", "room": "r"}},
+            {"id": "c0", "text": "alpha", "embedding": [2.0, 0.0],
+             "metadata": {"parent_drawer_id": "p", "chunk_index": 0, "wing": "w", "room": "r"}},
+        ]
+        logical = dl.group_logical_drawers(rows)
+        self.assertEqual(len(logical), 1)
+        d = logical[0]
+        self.assertEqual(d["id"], "p")
+        self.assertEqual(d["member_ids"], ["c0", "c1"])
+        self.assertEqual(d["text"], "alpha\nbeta")   # ordered by chunk_index
+        self.assertEqual(d["embedding"], [1.0, 1.0])  # mean
+        self.assertEqual(d["wing"], "w")
+
+    def test_singleton_passes_through(self):
+        rows = [{"id": "x", "text": "solo", "embedding": [1.0],
+                 "metadata": {"wing": "w", "room": "r"}}]
+        logical = dl.group_logical_drawers(rows)
+        self.assertEqual(len(logical), 1)
+        self.assertEqual(logical[0]["id"], "x")
+        self.assertEqual(logical[0]["member_ids"], ["x"])
+
+
+class TestCluster(unittest.TestCase):
+    def _d(self, _id, emb):
+        return {"id": _id, "member_ids": [_id], "text": _id, "embedding": emb,
+                "wing": "w", "room": "r"}
+
+    def test_identical_pair_clusters(self):
+        drawers = [self._d("a", [1.0, 0.0]), self._d("b", [1.0, 0.0])]
+        clusters = dl.cluster_duplicates(drawers, tau=0.9)
+        self.assertEqual(len(clusters), 1)
+        self.assertEqual({m["id"] for m in clusters[0]["members"]}, {"a", "b"})
+
+    def test_orthogonal_not_clustered(self):
+        drawers = [self._d("a", [1.0, 0.0]), self._d("b", [0.0, 1.0])]
+        self.assertEqual(dl.cluster_duplicates(drawers, tau=0.9), [])
+
+    def test_singleton_dropped(self):
+        drawers = [self._d("a", [1.0, 0.0]), self._d("b", [1.0, 0.0]), self._d("c", [0.0, 1.0])]
+        clusters = dl.cluster_duplicates(drawers, tau=0.9)
+        self.assertEqual(len(clusters), 1)
+        self.assertEqual({m["id"] for m in clusters[0]["members"]}, {"a", "b"})
+
+    def test_non_transitive_chain_one_component(self):
+        # a~b and b~c by threshold, a and c below threshold: still one component.
+        drawers = [
+            self._d("a", [1.0, 0.0]),
+            self._d("b", [0.92, 0.39]),   # close to a and to c
+            self._d("c", [0.7, 0.71]),
+        ]
+        clusters = dl.cluster_duplicates(drawers, tau=0.9)
+        self.assertEqual(len(clusters), 1)
+        self.assertEqual({m["id"] for m in clusters[0]["members"]}, {"a", "b", "c"})
+
+    def test_vectorized_path_matches_reference_for_random_and_edge_cases(self):
+        rng = random.Random(12345)
+        drawers = [
+            self._d(f"r{i}", [rng.uniform(-1.0, 1.0) for _ in range(4)])
+            for i in range(8)
+        ] + [
+            self._d("identical-a", [1.0, 2.0, 3.0, 4.0]),
+            self._d("identical-b", [1.0, 2.0, 3.0, 4.0]),
+            self._d("orthogonal-a", [1.0, 0.0, 0.0, 0.0]),
+            self._d("orthogonal-b", [0.0, 1.0, 0.0, 0.0]),
+            self._d("zero", [0.0, 0.0, 0.0, 0.0]),
+            self._d("empty", []),
+            self._d("different-dim", [1.0, 2.0]),
+        ]
+        expected = _reference_clusters(drawers, tau=0.75)
+
+        with mock.patch.object(dl, "cosine_similarity", side_effect=AssertionError("scalar path called")):
+            actual = _normalise_clusters(dl.cluster_duplicates(drawers, tau=0.75))
+
+        self.assertEqual(actual, expected)
+        self.assertEqual(dl.cluster_duplicates([], tau=0.75), [])
+        self.assertEqual(dl.cluster_duplicates([self._d("solo", [1.0, 0.0])], tau=0.75), [])
+
+
+class TestBuildWorklist(unittest.TestCase):
+    def _d(self, _id, emb, room="r"):
+        return {"id": _id, "member_ids": [_id], "text": _id, "embedding": emb,
+                "wing": "w", "room": room}
+
+    def test_shape_and_null_decision(self):
+        drawers = [self._d("a", [1.0, 0.0]), self._d("b", [1.0, 0.0])]
+        wl = dl.build_worklist(drawers, tau=0.9, scope={"wing": "w"}, instructions="focus")
+        self.assertEqual(wl["version"], dl.WORKLIST_VERSION)
+        self.assertEqual(wl["scope"], {"wing": "w"})
+        self.assertEqual(wl["params"]["tau"], 0.9)
+        self.assertEqual(wl["instructions"], "focus")
+        self.assertEqual(len(wl["items"]), 1)
+        item = wl["items"][0]
+        self.assertEqual(item["kind"], "merge")
+        self.assertIsNone(item["decision"])
+        self.assertEqual(item["evidence"]["size"], 2)
+
+    def test_cross_room_cluster_is_partitioned_and_singletons_dropped(self):
+        drawers = [
+            self._d("a", [1.0, 0.0], room="a"),
+            self._d("b", [1.0, 0.0], room="b"),
+        ]
+
+        wl = dl.build_worklist(drawers, tau=0.9, scope={"wing": "w"})
+
+        self.assertEqual(wl["items"], [])
+
+    def test_mixed_room_split_keeps_same_room_subcluster(self):
+        drawers = [
+            self._d("a", [1.0, 0.0], room="a"),
+            self._d("b", [1.0, 0.0], room="a"),
+            self._d("c", [1.0, 0.0], room="b"),
+        ]
+
+        wl = dl.build_worklist(drawers, tau=0.9, scope={"wing": "w"})
+
+        self.assertEqual(len(wl["items"]), 1)
+        self.assertEqual([m["id"] for m in wl["items"][0]["members"]], ["a", "b"])
+        self.assertTrue(wl["items"][0]["mixed_room_split"])
+
+
+class TestGroupContradictions(unittest.TestCase):
+    def test_groups_same_subject_predicate_with_distinct_objects(self):
+        triples = [
+            {"subject": "Alice", "predicate": "lives_in", "object": "Portland",
+             "valid_from": "2024-01-01", "extracted_at": "2024-01-02"},
+            {"subject": "Alice", "predicate": "lives_in", "object": "Seattle",
+             "valid_from": "2025-01-01", "extracted_at": "2025-01-02"},
+            {"subject": "Alice", "predicate": "lives_in", "object": "Seattle",
+             "valid_from": "2025-01-01", "extracted_at": "2025-01-02"},
+            {"subject": "Bob", "predicate": "lives_in", "object": "Portland",
+             "valid_from": "2025-01-01", "extracted_at": "2025-01-02"},
+            {"subject": "Alice", "predicate": "works_at", "object": "Contoso",
+             "valid_from": "2025-01-01", "extracted_at": "2025-01-02"},
+        ]
+
+        clusters = dl.group_contradictions(triples)
+
+        self.assertEqual(len(clusters), 1)
+        self.assertEqual(clusters[0]["subject"], "Alice")
+        self.assertEqual(clusters[0]["predicate"], "lives_in")
+        self.assertEqual(clusters[0]["newest_object"], "Seattle")
+        self.assertEqual([c["object"] for c in clusters[0]["candidates"]], ["Seattle", "Portland"])
+
+    def test_distinct_groups_stay_separate_and_order_deterministically(self):
+        triples = [
+            {"subject": "Zoe", "predicate": "status_is", "object": "active",
+             "valid_from": None, "extracted_at": "2025-01-02"},
+            {"subject": "Zoe", "predicate": "status_is", "object": "paused",
+             "valid_from": None, "extracted_at": "2025-01-01"},
+            {"subject": "Alice", "predicate": "lives_in", "object": "Seattle",
+             "valid_from": "2025-01-01", "extracted_at": "2025-01-01"},
+            {"subject": "Alice", "predicate": "lives_in", "object": "Portland",
+             "valid_from": "2024-01-01", "extracted_at": "2024-01-01"},
+        ]
+
+        clusters = dl.group_contradictions(triples)
+
+        self.assertEqual([(c["subject"], c["predicate"]) for c in clusters],
+                         [("Alice", "lives_in"), ("Zoe", "status_is")])
+        self.assertEqual(clusters[1]["newest_object"], "active")
+
+    def test_groups_by_subject_id_not_display_name(self):
+        triples = [
+            {"triple_id": "t1", "subject": "Alice", "subject_id": "entity-1",
+             "predicate": "lives_in", "object": "Portland", "object_id": "city-portland",
+             "valid_from": "2024-01-01", "extracted_at": "2024-01-02"},
+            {"triple_id": "t2", "subject": "Alice", "subject_id": "entity-2",
+             "predicate": "lives_in", "object": "Seattle", "object_id": "city-seattle",
+             "valid_from": "2024-01-01", "extracted_at": "2024-01-02"},
+            {"triple_id": "t3", "subject": "Alice", "subject_id": "entity-1",
+             "predicate": "lives_in", "object": "Vancouver", "object_id": "city-vancouver",
+             "valid_from": "2025-01-01", "extracted_at": "2025-01-02"},
+        ]
+
+        clusters = dl.group_contradictions(triples)
+
+        self.assertEqual(len(clusters), 1)
+        self.assertEqual(clusters[0]["subject"], "Alice")
+        self.assertEqual(clusters[0]["subject_id"], "entity-1")
+        self.assertEqual([c["object_id"] for c in clusters[0]["candidates"]],
+                         ["city-vancouver", "city-portland"])
+        self.assertEqual([c["triple_id"] for c in clusters[0]["candidates"]], ["t3", "t1"])
+        self.assertEqual([c["triple_ids"] for c in clusters[0]["candidates"]], [["t3"], ["t1"]])
+
+    def test_future_valid_from_is_excluded(self):
+        triples = [
+            {"triple_id": "t1", "subject": "Alice", "subject_id": "entity-1",
+             "predicate": "lives_in", "object": "Portland", "object_id": "city-portland",
+             "valid_from": "2026-01-01", "extracted_at": "2025-01-01"},
+            {"triple_id": "t2", "subject": "Alice", "subject_id": "entity-1",
+             "predicate": "lives_in", "object": "Seattle", "object_id": "city-seattle",
+             "valid_from": "2026-07-01", "extracted_at": "2025-01-02"},
+        ]
+
+        clusters = dl.group_contradictions(triples, now="2026-02-01T00:00:00")
+
+        self.assertEqual(clusters, [])
+
+
+class TestBuildContradictionWorklist(unittest.TestCase):
+    def test_shape_and_evidence(self):
+        triples = [
+            {"subject": "Alice", "predicate": "lives_in", "object": "Portland",
+             "valid_from": "2024-01-01", "extracted_at": "2024-01-02"},
+            {"subject": "Alice", "predicate": "lives_in", "object": "Seattle",
+             "valid_from": "2025-01-01", "extracted_at": "2025-01-02"},
+        ]
+
+        wl = dl.build_contradiction_worklist(
+            triples,
+            scope={"palace": "/p", "task": "contradiction"},
+            instructions="prefer sourced facts",
+        )
+
+        self.assertEqual(wl["version"], dl.WORKLIST_VERSION)
+        self.assertEqual(wl["task"], "contradiction")
+        self.assertEqual(wl["scope"], {"palace": "/p", "task": "contradiction"})
+        self.assertEqual(wl["params"], {})
+        self.assertEqual(wl["instructions"], "prefer sourced facts")
+        self.assertEqual(len(wl["items"]), 1)
+        item = wl["items"][0]
+        self.assertEqual(item["kind"], "contradiction")
+        self.assertIsNone(item["decision"])
+        self.assertEqual(item["evidence"]["size"], 2)
+        self.assertEqual(item["evidence"]["newest_object"], "Seattle")
+
+
+class TestExtractSessionId(unittest.TestCase):
+    def test_finds_hyphenated_guid(self):
+        text = "session note SESSION_ID: 123e4567-e89b-12d3-a456-426614174000 done"
+        self.assertEqual(dl.extract_session_id(text), "123e4567-e89b-12d3-a456-426614174000")
+
+    def test_returns_none_when_absent(self):
+        self.assertIsNone(dl.extract_session_id("session note without an id"))
+
+    def test_returns_first_when_multiple(self):
+        text = (
+            "SESSION_ID: 11111111-1111-1111-1111-111111111111 "
+            "SESSION_ID: 22222222-2222-2222-2222-222222222222"
+        )
+        self.assertEqual(dl.extract_session_id(text), "11111111-1111-1111-1111-111111111111")
+        self.assertEqual(
+            dl.extract_all_session_ids(text),
+            [
+                "11111111-1111-1111-1111-111111111111",
+                "22222222-2222-2222-2222-222222222222",
+            ],
+        )
+
+    def test_label_is_case_insensitive_and_uuid_is_canonical(self):
+        self.assertIsNone(dl.extract_session_id("session_id: deadbeef"))
+        self.assertEqual(
+            dl.extract_session_id("session_id: ABCDEF12-3456-7890-abcd-EF1234567890"),
+            "ABCDEF12-3456-7890-abcd-EF1234567890",
+        )
+
+    def test_extract_all_session_ids_dedupes_preserving_order(self):
+        text = (
+            "SESSION_ID: 11111111-1111-1111-1111-111111111111 "
+            "SESSION_ID: 22222222-2222-2222-2222-222222222222 "
+            "SESSION_ID: 11111111-1111-1111-1111-111111111111"
+        )
+        self.assertEqual(
+            dl.extract_all_session_ids(text),
+            [
+                "11111111-1111-1111-1111-111111111111",
+                "22222222-2222-2222-2222-222222222222",
+            ],
+        )
+
+
+class TestGroupObservationThemes(unittest.TestCase):
+    def _e(self, _id, emb, session_id, text=None):
+        return {
+            "id": _id,
+            "text": text or _id,
+            "embedding": emb,
+            "session_id": session_id,
+            "agent": "copilot",
+            "date": "2026-07-03",
+            "topic": "dreaming",
+        }
+
+    def test_similar_entries_from_distinct_sessions_form_theme(self):
+        entries = [
+            self._e("a", [1.0, 0.0], "s2"),
+            self._e("b", [0.99, 0.01], "s1"),
+        ]
+
+        themes = dl.group_observation_themes(entries, tau=0.9, min_support=2)
+
+        self.assertEqual(len(themes), 1)
+        self.assertEqual(themes[0]["support"], 2)
+        self.assertEqual(themes[0]["support_ids"], ["s1", "s2"])
+        self.assertEqual({m["id"] for m in themes[0]["members"]}, {"a", "b"})
+        self.assertEqual(themes[0]["pair_sims"][0]["a"], "a")
+        self.assertEqual(themes[0]["pair_sims"][0]["b"], "b")
+
+    def test_similar_entries_from_same_session_are_dropped_by_support(self):
+        entries = [
+            self._e("a", [1.0, 0.0], "s1"),
+            self._e("b", [0.99, 0.01], "s1"),
+        ]
+
+        self.assertEqual(dl.group_observation_themes(entries, tau=0.9, min_support=2), [])
+
+    def test_dissimilar_entries_do_not_form_theme(self):
+        entries = [
+            self._e("a", [1.0, 0.0], "s1"),
+            self._e("b", [0.0, 1.0], "s2"),
+        ]
+
+        self.assertEqual(dl.group_observation_themes(entries, tau=0.9, min_support=2), [])
+
+    def test_support_counts_distinct_sessions(self):
+        entries = [
+            self._e("a", [1.0, 0.0], "s1"),
+            self._e("b", [0.99, 0.01], "s1"),
+            self._e("c", [0.98, 0.02], "s2"),
+        ]
+
+        themes = dl.group_observation_themes(entries, tau=0.9, min_support=2)
+
+        self.assertEqual(len(themes), 1)
+        self.assertEqual(themes[0]["support"], 2)
+        self.assertEqual(themes[0]["support_ids"], ["s1", "s2"])
+        self.assertEqual(len(themes[0]["members"]), 3)
+
+    def test_ordering_is_deterministic_by_support_then_smallest_member_id(self):
+        entries = [
+            self._e("z", [1.0, 0.0], "s1"),
+            self._e("y", [0.99, 0.01], "s2"),
+            self._e("a", [0.0, 1.0], "s3"),
+            self._e("b", [0.01, 0.99], "s4"),
+            self._e("c", [0.02, 0.98], "s5"),
+        ]
+
+        themes = dl.group_observation_themes(entries, tau=0.9, min_support=2)
+
+        self.assertEqual([[m["id"] for m in t["members"]] for t in themes],
+                         [["a", "b", "c"], ["z", "y"]])
+        self.assertEqual([t["support"] for t in themes], [3, 2])
+
+    def test_vectorized_path_matches_reference_for_random_and_edge_cases(self):
+        rng = random.Random(67890)
+        entries = [
+            self._e(f"r{i}", [rng.uniform(-1.0, 1.0) for _ in range(5)], f"s{i % 3}")
+            for i in range(9)
+        ] + [
+            self._e("identical-a", [3.0, 1.0, 4.0, 1.0, 5.0], "same-a"),
+            self._e("identical-b", [3.0, 1.0, 4.0, 1.0, 5.0], "same-b"),
+            self._e("orthogonal-a", [1.0, 0.0, 0.0, 0.0, 0.0], "orth-a"),
+            self._e("orthogonal-b", [0.0, 1.0, 0.0, 0.0, 0.0], "orth-b"),
+            self._e("zero", [0.0, 0.0, 0.0, 0.0, 0.0], "zero-s"),
+            self._e("empty", [], "empty-s"),
+            self._e("different-dim", [1.0, 2.0], "diff-s"),
+        ]
+        expected = _reference_themes(entries, tau=0.8, min_support=2)
+
+        with mock.patch.object(dl, "cosine_similarity", side_effect=AssertionError("scalar path called")):
+            actual = _normalise_themes(dl.group_observation_themes(entries, tau=0.8, min_support=2))
+
+        self.assertEqual(actual, expected)
+        self.assertEqual(dl.group_observation_themes([], tau=0.8, min_support=2), [])
+        self.assertEqual(
+            dl.group_observation_themes([self._e("solo", [1.0, 0.0], "s1")], tau=0.8, min_support=2),
+            [],
+        )
+
+
+class TestBuildPatternWorklist(unittest.TestCase):
+    def test_shape_evidence_and_params(self):
+        themes = [
+            {
+                "members": [
+                    {"id": "a", "text": "alpha", "session_id": "s1",
+                     "agent": "copilot", "date": "2026-07-03", "topic": "t"},
+                    {"id": "b", "text": "beta", "session_id": "s2",
+                     "agent": "copilot", "date": "2026-07-04", "topic": "t"},
+                ],
+                "support": 2,
+                "support_ids": ["s1", "s2"],
+                "pair_sims": [{"a": "a", "b": "b", "sim": 0.98}],
+            }
+        ]
+        params = {"tau": 0.65, "min_support": 2}
+
+        wl = dl.build_pattern_worklist(
+            themes,
+            scope={"wing": "w"},
+            params=params,
+            instructions="induce rules",
+        )
+
+        self.assertEqual(wl["version"], dl.WORKLIST_VERSION)
+        self.assertEqual(wl["task"], "pattern")
+        self.assertEqual(wl["scope"], {"wing": "w"})
+        self.assertIs(wl["params"], params)
+        self.assertEqual(wl["instructions"], "induce rules")
+        self.assertEqual(len(wl["items"]), 1)
+        item = wl["items"][0]
+        self.assertEqual(item["kind"], "pattern")
+        self.assertEqual(item["cluster_id"], 0)
+        self.assertIsNone(item["decision"])
+        self.assertEqual(item["evidence"]["size"], 2)
+        self.assertEqual(item["evidence"]["support"], 2)
+        self.assertEqual(item["evidence"]["support_ids"], ["s1", "s2"])
+        self.assertEqual(item["members"][0]["session_id"], "s1")
+
+
+class TestComputeRedundancy(unittest.TestCase):
+    def test_identical_pair_scores_one_each(self):
+        drawers = [
+            {"id": "a", "embedding": [1.0, 0.0]},
+            {"id": "b", "embedding": [1.0, 0.0]},
+        ]
+
+        redundancy = dl.compute_redundancy(drawers)
+
+        self.assertAlmostEqual(redundancy["a"], 1.0)
+        self.assertAlmostEqual(redundancy["b"], 1.0)
+
+    def test_orthogonal_pair_scores_zero_each(self):
+        drawers = [
+            {"id": "a", "embedding": [1.0, 0.0]},
+            {"id": "b", "embedding": [0.0, 1.0]},
+        ]
+
+        self.assertEqual(dl.compute_redundancy(drawers), {"a": 0.0, "b": 0.0})
+
+    def test_singleton_scores_zero(self):
+        self.assertEqual(dl.compute_redundancy([{"id": "a", "embedding": [1.0]}]), {"a": 0.0})
+
+    def test_vectorized_path_matches_reference_for_random_and_edge_cases(self):
+        rng = random.Random(24680)
+        drawers = [
+            {"id": f"r{i}", "embedding": [rng.uniform(-1.0, 1.0) for _ in range(6)]}
+            for i in range(10)
+        ] + [
+            {"id": "identical-a", "embedding": [2.0, 7.0, 1.0, 8.0, 2.0, 8.0]},
+            {"id": "identical-b", "embedding": [2.0, 7.0, 1.0, 8.0, 2.0, 8.0]},
+            {"id": "orthogonal-a", "embedding": [1.0, 0.0, 0.0, 0.0, 0.0, 0.0]},
+            {"id": "orthogonal-b", "embedding": [0.0, 1.0, 0.0, 0.0, 0.0, 0.0]},
+            {"id": "zero", "embedding": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]},
+            {"id": "empty", "embedding": []},
+            {"id": "missing"},
+            {"id": "different-dim", "embedding": [1.0, 2.0]},
+        ]
+        expected = _reference_redundancy(drawers)
+
+        with mock.patch.object(dl, "cosine_similarity", side_effect=AssertionError("scalar path called")):
+            actual = dl.compute_redundancy(drawers)
+
+        for drawer_id, expected_score in expected.items():
+            self.assertAlmostEqual(actual[drawer_id], expected_score, places=9)
+        self.assertEqual(dl.compute_redundancy([]), {})
+
+
+class TestDrawerSalience(unittest.TestCase):
+    def setUp(self):
+        self.now = datetime.fromisoformat("2026-07-03T20:20:12")
+
+    def _drawer(self, filed_at="2026-01-04T20:20:12", text="durable memory"):
+        return {"id": "d1", "text": text, "filed_at": filed_at}
+
+    def test_kg_degree_increases_salience(self):
+        low = dl.drawer_salience(self._drawer(), redundancy=0.0, kg_degree=0, now=self.now)
+        high = dl.drawer_salience(self._drawer(), redundancy=0.0, kg_degree=5, now=self.now)
+
+        self.assertGreaterEqual(high["v"], low["v"])
+
+    def test_redundancy_decreases_salience(self):
+        low = dl.drawer_salience(self._drawer(), redundancy=0.0, kg_degree=0, now=self.now)
+        high = dl.drawer_salience(self._drawer(), redundancy=1.0, kg_degree=0, now=self.now)
+
+        self.assertLessEqual(high["v"], low["v"])
+
+    def test_age_decreases_salience(self):
+        recent = dl.drawer_salience(
+            self._drawer(filed_at="2026-07-01T20:20:12"),
+            redundancy=0.0,
+            kg_degree=0,
+            now=self.now,
+        )
+        old = dl.drawer_salience(
+            self._drawer(filed_at="2025-07-03T20:20:12"),
+            redundancy=0.0,
+            kg_degree=0,
+            now=self.now,
+        )
+
+        self.assertLessEqual(old["v"], recent["v"])
+
+    def test_ephemeral_negative_decreases_salience(self):
+        durable = dl.drawer_salience(
+            self._drawer(text="durable memory"),
+            redundancy=0.0,
+            kg_degree=0,
+            now=self.now,
+        )
+        ephemeral = dl.drawer_salience(
+            self._drawer(text="keep this for now in this session"),
+            redundancy=0.0,
+            kg_degree=0,
+            now=self.now,
+        )
+
+        self.assertTrue(ephemeral["negatives"])
+        self.assertLess(ephemeral["v"], durable["v"])
+
+    def test_salience_is_clamped_between_zero_and_one(self):
+        high = dl.drawer_salience(
+            self._drawer(filed_at="2026-07-03T20:20:12"),
+            redundancy=0.0,
+            kg_degree=100,
+            now=self.now,
+            weights={"recency": 1.0, "kg_degree": 1.0, "redundancy": 0.0, "negatives": 0.0},
+        )
+        low = dl.drawer_salience(
+            self._drawer(text="throwaway scratch just for this"),
+            redundancy=1.0,
+            kg_degree=0,
+            now=self.now,
+            weights={"recency": 0.0, "kg_degree": 0.0, "redundancy": 1.0, "negatives": 1.0},
+        )
+
+        self.assertGreaterEqual(high["v"], 0.0)
+        self.assertLessEqual(high["v"], 1.0)
+        self.assertGreaterEqual(low["v"], 0.0)
+        self.assertLessEqual(low["v"], 1.0)
+
+    def test_detects_all_ephemeral_markers(self):
+        markers = ["for now", "this session", "temporarily", "one-off", "throwaway", "scratch", "just for this"]
+        for marker in markers:
+            with self.subTest(marker=marker):
+                scored = dl.drawer_salience(self._drawer(text=f"Keep {marker}"), 0.0, 0, self.now)
+                self.assertTrue(scored["negatives"])
+
+    def test_age_days_from_filed_at_and_missing_is_zero(self):
+        scored = dl.drawer_salience(
+            self._drawer(filed_at="2026-06-03T20:20:12Z"),
+            redundancy=0.0,
+            kg_degree=0,
+            now=self.now,
+        )
+        missing = dl.drawer_salience(
+            self._drawer(filed_at=None),
+            redundancy=0.0,
+            kg_degree=0,
+            now=self.now,
+        )
+
+        self.assertEqual(scored["age_days"], 30)
+        self.assertEqual(missing["age_days"], 0)
+
+    def test_missing_or_zero_access_usage_preserves_original_scoring_exactly(self):
+        for usage in (None, {}, {"strength": 5.0},
+                      {"access_count": 0, "strength": 5.0, "stability": 200,
+                       "last_activated": "2026-07-03T20:20:11Z"}):
+            with self.subTest(usage=usage):
+                score = dl.drawer_salience(self._drawer(), 0.2, 1, self.now, usage=usage)
+
+                self.assertEqual(score, {
+                    "id": "d1", "age_days": 180, "kg_degree": 1,
+                    "redundancy": 0.2, "negatives": False, "v": 0.1672,
+                    "usage": usage or {}, "usage_boost": 0.0,
+                })
+
+    def test_usage_normalizes_strength_on_native_floor_to_cap_scale(self):
+        for strength, expected_boost, expected_v in (
+            (0, 0.05, 0.1972), (0.05, 0.05, 0.1972),
+            (2.525, 0.1, 0.2472), (5, 0.15, 0.2972), (50, 0.15, 0.2972),
+        ):
+            with self.subTest(strength=strength):
+                score = dl.drawer_salience(
+                    self._drawer(), 0.0, 0, self.now,
+                    usage={"access_count": 1, "strength": strength},
+                )
+
+                self.assertEqual(score["usage_boost"], expected_boost)
+                self.assertEqual(score["v"], expected_v)
+
+    def test_access_count_monotonically_increases_protection(self):
+        scores = [
+            dl.drawer_salience(
+                self._drawer(), 0.0, 0, self.now,
+                usage={"access_count": count, "strength": 0.05},
+            )
+            for count in (0, 1, 4, 9)
+        ]
+
+        self.assertEqual([score["usage_boost"] for score in scores], [0.0, 0.05, 0.08, 0.09])
+        self.assertEqual([score["v"] for score in scores], [0.1472, 0.1972, 0.2272, 0.2372])
+
+    def test_usage_only_increases_scores_and_keeps_original_safety_gates(self):
+        drawers = [
+            {"id": "used", "filed_at": "2025-07-03", "text": "durable", "room": "r"},
+            {"id": "pinned", "filed_at": "2025-07-03", "text": "durable", "room": "r", "pinned": True},
+            {"id": "kg", "filed_at": "2025-07-03", "text": "durable", "room": "r"},
+            {"id": "recent", "filed_at": "2026-07-03", "text": "durable", "room": "r"},
+            {"id": "unique", "filed_at": "2025-07-03", "text": "durable", "room": "only"},
+        ]
+        for drawer in drawers:
+            degree = 1 if drawer["id"] == "kg" else 0
+            without = dl.drawer_salience(drawer, 0.0, degree, self.now)
+            drawer["salience"] = dl.drawer_salience(
+                drawer, 0.0, degree, self.now,
+                usage={"access_count": 9, "strength": 5.0},
+            )
+            self.assertGreaterEqual(drawer["salience"]["v"], without["v"])
+
+        self.assertEqual(dl.select_prune_candidates(drawers, 0.2, 180), [])
+
+    def test_custom_usage_weight_is_protection_only_and_can_be_disabled(self):
+        usage = {"access_count": 1, "strength": 2.525}
+        disabled = dl.drawer_salience(
+            self._drawer(), 0.0, 0, self.now, weights={"usage": 0.0}, usage=usage,
+        )
+        custom = dl.drawer_salience(
+            self._drawer(), 0.0, 0, self.now, weights={"usage": 0.4}, usage=usage,
+        )
+        saturated = dl.drawer_salience(
+            self._drawer(), 0.0, 0, self.now, weights={"usage": 4.0}, usage=usage,
+        )
+
+        self.assertEqual(disabled["v"], 0.1472)
+        self.assertEqual(disabled["usage_boost"], 0.0)
+        self.assertEqual(custom["v"], 0.3472)
+        self.assertEqual(saturated["v"], 1.0)
+        for weight in (-0.2, True, "0.2", None, float("nan"), float("inf")):
+            with self.subTest(weight=weight), self.assertRaisesRegex(ValueError, "usage"):
+                dl.drawer_salience(
+                    self._drawer(), 0.0, 0, self.now, weights={"usage": weight}, usage=usage,
+                )
+
+    def test_usage_snapshot_retains_telemetry_without_mutating_input(self):
+        usage = {"access_count": 1, "strength": 0.05, "stability": 2.0,
+                 "last_activated": "2026-07-03T20:20:11Z"}
+
+        score = dl.drawer_salience(self._drawer(), 0.0, 0, self.now, usage=usage)
+
+        self.assertEqual(score["usage"], usage)
+        self.assertEqual(score["usage_boost"], 0.05)
+        self.assertEqual(usage, {"access_count": 1, "strength": 0.05, "stability": 2.0,
+                                "last_activated": "2026-07-03T20:20:11Z"})
+        self.assertIsNot(score["usage"], usage)
+
+    def test_malformed_present_usage_is_rejected_even_with_zero_access(self):
+        malformed = [
+            [], "", False,
+            *({"access_count": value} for value in
+              (None, "1", True, -1, 1.5, float("nan"), float("inf"))),
+            *({"access_count": 0, "strength": value} for value in
+              (None, "1", True, -1, float("nan"), float("inf"), float("-inf"))),
+            *({"access_count": 0, "stability": value} for value in
+              (None, "1", True, -1, float("nan"), float("inf"))),
+            *({"access_count": 0, "last_activated": value} for value in
+              ("bad timestamp", "", 42, float("nan"), [])),
+        ]
+        for usage in malformed:
+            with self.subTest(usage=usage), self.assertRaisesRegex(ValueError, "usage"):
+                dl.drawer_salience(self._drawer(), 0.0, 0, self.now, usage=usage)
+
+    def test_absent_optional_usage_fields_are_not_invented(self):
+        score = dl.drawer_salience(
+            self._drawer(), 0.0, 0, self.now,
+            usage={"access_count": 1, "last_activated": None},
+        )
+
+        self.assertEqual(score["usage_boost"], 0.05)
+        self.assertEqual(score["usage"], {"access_count": 1, "last_activated": None})
+
+
+class TestSelectPruneCandidates(unittest.TestCase):
+    def _drawer(self, _id, v, age_days, kg_degree=0, pinned=False, topic=None, room="r"):
+        return {
+            "id": _id,
+            "text": _id,
+            "member_ids": [_id],
+            "wing": "w",
+            "room": room,
+            "pinned": pinned,
+            "metadata": {"topic": topic} if topic is not None else {},
+            "salience": {
+                "id": _id,
+                "age_days": age_days,
+                "kg_degree": kg_degree,
+                "redundancy": 1.0,
+                "negatives": True,
+                "v": v,
+            },
+        }
+
+    def test_selects_only_when_all_gates_hold(self):
+        selected = dl.select_prune_candidates(
+            [
+                self._drawer("qualifies", v=0.1, age_days=365),
+                self._drawer("has_kg", v=0.1, age_days=365, kg_degree=1),
+                self._drawer("too_recent", v=0.1, age_days=10),
+                self._drawer("pinned", v=0.1, age_days=365, pinned=True),
+                self._drawer("high_value", v=0.9, age_days=365),
+            ],
+            v_min=0.2,
+            age_floor_days=180,
+        )
+
+        self.assertEqual([d["id"] for d in selected], ["qualifies"])
+
+    def test_last_drawer_on_topic_is_protected(self):
+        selected = dl.select_prune_candidates(
+            [
+                self._drawer("shared-a", v=0.1, age_days=365, topic="shared"),
+                self._drawer("shared-b", v=0.1, age_days=365, topic="shared"),
+                self._drawer("unique", v=0.1, age_days=365, topic="unique"),
+            ],
+            v_min=0.2,
+            age_floor_days=180,
+        )
+
+        self.assertEqual([d["id"] for d in selected], ["shared-a", "shared-b"])
+
+
+class TestBuildPruneWorklist(unittest.TestCase):
+    def test_shape_and_salience(self):
+        candidate = {
+            "id": "d1",
+            "member_ids": ["p1"],
+            "text": "old scratch",
+            "wing": "w",
+            "room": "r",
+            "metadata": {"topic": "dreaming", "pinned": True},
+            "salience": {"id": "d1", "age_days": 365, "kg_degree": 0, "redundancy": 1.0, "negatives": True, "v": 0.0},
+        }
+
+        wl = dl.build_prune_worklist(
+            [candidate],
+            scope={"wing": "w"},
+            params={"v_min": 0.2, "age_floor_days": 180},
+            instructions="review carefully",
+        )
+
+        self.assertEqual(wl["version"], dl.WORKLIST_VERSION)
+        self.assertEqual(wl["task"], "prune")
+        self.assertEqual(wl["scope"], {"wing": "w"})
+        self.assertEqual(wl["params"], {"v_min": 0.2, "age_floor_days": 180})
+        self.assertEqual(wl["instructions"], "review carefully")
+        self.assertEqual(len(wl["items"]), 1)
+        item = wl["items"][0]
+        self.assertEqual(item["kind"], "prune")
+        self.assertEqual(item["id"], "d1")
+        self.assertEqual(item["member_ids"], ["p1"])
+        self.assertEqual(item["text"], "old scratch")
+        self.assertEqual(item["wing"], "w")
+        self.assertEqual(item["room"], "r")
+        self.assertEqual(item["topic"], "dreaming")
+        self.assertTrue(item["pinned"])
+        self.assertEqual(item["salience"], candidate["salience"])
+        self.assertIsNone(item["decision"])
+
+
+class _FakeArchiver:
+    def __init__(self, fail_ids=None):
+        self.calls = []
+        self.archived = []
+        self.deleted = []
+        self.fail_ids = set(fail_ids or [])
+
+    def archive_then_delete(self, record):
+        self.calls.append(record)
+        if record["id"] in self.fail_ids:
+            raise RuntimeError(f"archive failed for {record['id']}")
+        self.archived.append(record)
+        self.deleted.extend(record["member_ids"])
+        return {"archived": record["id"]}
+
+
+class TestApplyPruneDecisions(unittest.TestCase):
+    def _prune_decision(self, _id="d1", kg_degree=0, pinned=False):
+        return {
+            "action": "prune",
+            "id": _id,
+            "member_ids": [f"{_id}-p"],
+            "wing": "w",
+            "room": "r",
+            "text": "old scratch",
+            "pinned": pinned,
+            "salience": {"id": _id, "age_days": 365, "kg_degree": kg_degree, "redundancy": 1.0, "negatives": True, "v": 0.0},
+        }
+
+    def test_valid_prune_archives_then_deletes_once(self):
+        archiver = _FakeArchiver()
+
+        report = dl.apply_prune_decisions([self._prune_decision()], archiver)
+
+        self.assertEqual(report["pruned"], 1)
+        self.assertEqual(report["kept"], 0)
+        self.assertEqual(len(archiver.calls), 1)
+        self.assertEqual(len(report["archived"]), 1)
+        record = archiver.calls[0]
+        self.assertEqual(record["id"], "d1")
+        self.assertEqual(record["member_ids"], ["d1-p"])
+        self.assertEqual(record["wing"], "w")
+        self.assertEqual(record["room"], "r")
+        self.assertEqual(record["text"], "old scratch")
+        self.assertEqual(record["salience"]["kg_degree"], 0)
+        self.assertIn("pruned_at", record)
+        self.assertEqual(archiver.deleted, ["d1-p"])
+
+    def test_keep_is_counted_without_archiver_call(self):
+        archiver = _FakeArchiver()
+
+        report = dl.apply_prune_decisions([{"action": "keep"}], archiver)
+
+        self.assertEqual(report["kept"], 1)
+        self.assertEqual(report["pruned"], 0)
+        self.assertEqual(archiver.calls, [])
+
+    def test_protected_kg_decision_records_error_without_archiver_call(self):
+        archiver = _FakeArchiver()
+
+        report = dl.apply_prune_decisions([self._prune_decision(kg_degree=1)], archiver)
+
+        self.assertEqual(report["pruned"], 0)
+        self.assertEqual(archiver.calls, [])
+        self.assertEqual(report["errors"][0]["stage"], "protected")
+        self.assertEqual(report["errors"][0]["error"], "protected drawer")
+
+    def test_protected_pinned_decision_records_error_without_archiver_call(self):
+        archiver = _FakeArchiver()
+
+        report = dl.apply_prune_decisions([self._prune_decision(pinned=True)], archiver)
+
+        self.assertEqual(report["pruned"], 0)
+        self.assertEqual(archiver.calls, [])
+        self.assertEqual(report["errors"][0]["stage"], "protected")
+
+    def test_archive_failure_is_recorded_and_later_decisions_continue(self):
+        archiver = _FakeArchiver(fail_ids={"bad"})
+        decisions = [
+            self._prune_decision(_id="bad"),
+            self._prune_decision(_id="good"),
+        ]
+
+        report = dl.apply_prune_decisions(decisions, archiver)
+
+        self.assertEqual(report["pruned"], 1)
+        self.assertEqual(len(report["errors"]), 1)
+        self.assertEqual(report["errors"][0]["stage"], "archive")
+        self.assertIn("archive failed for bad", report["errors"][0]["error"])
+        self.assertEqual([r["id"] for r in archiver.archived], ["good"])
+        self.assertEqual(archiver.deleted, ["good-p"])
+
+
+class _FakeWriter:
+    def __init__(self, fail_add=False):
+        self.calls = []
+        self.fail_add = fail_add
+
+    def add_drawer(self, wing, room, content, metadata=None):
+        self.calls.append(("add", wing, room, content, metadata))
+        if self.fail_add:
+            raise RuntimeError("boom")
+        return {"drawer_id": "new1"}
+
+    def delete_drawer(self, drawer_id):
+        self.calls.append(("delete", drawer_id))
+        return {"success": True}
+
+
+class _FakeKgWriter:
+    def __init__(self, fail_triple_ids=None):
+        self.calls = []
+        self.fail_triple_ids = set(fail_triple_ids or [])
+
+    def invalidate_triples(self, triple_ids):
+        self.calls.append(list(triple_ids))
+        failed = self.fail_triple_ids.intersection(triple_ids)
+        if failed:
+            raise RuntimeError(f"cannot invalidate {sorted(failed)[0]}")
+        return len(triple_ids)
+
+
+class _FakePatternWriter:
+    def __init__(self, fail_texts=None):
+        self.calls = []
+        self.fail_texts = set(fail_texts or [])
+        self.delete_called = False
+
+    def add_drawer(self, wing, room, content, metadata=None):
+        self.calls.append(("add", wing, room, content, metadata))
+        if content in self.fail_texts:
+            raise RuntimeError("boom")
+        return {"drawer_id": f"new{len(self.calls)}"}
+
+    def delete_drawer(self, drawer_id):
+        self.delete_called = True
+        self.calls.append(("delete", drawer_id))
+        raise AssertionError("delete_drawer must not be called")
+
+
+class TestApplyDecisions(unittest.TestCase):
+    def test_add_then_archive_order(self):
+        w = _FakeWriter()
+        archiver = _FakeArchiver()
+        decisions = [{"action": "merge", "wing": "w", "room": "r", "text": "merged",
+                      "supersedes": ["a", "b"]}]
+        report = dl.apply_merge_decisions(decisions, w, archiver)
+        self.assertEqual(report["merged"], 1)
+        self.assertEqual(w.calls[0][0], "add")
+        self.assertEqual(w.calls[0][4], {"supersedes": ["a", "b"], "kind": "merged"})
+        self.assertEqual([c for c in w.calls if c[0] == "delete"], [])
+        self.assertEqual(len(archiver.calls), 1)
+        self.assertEqual(archiver.calls[0]["member_ids"], ["a", "b"])
+        self.assertEqual(archiver.calls[0]["reason"], "merge")
+        self.assertEqual(report["deleted"], ["a", "b"])
+
+    def test_skip_ignored(self):
+        w = _FakeWriter()
+        archiver = _FakeArchiver()
+        report = dl.apply_merge_decisions([{"action": "skip"}], w, archiver)
+        self.assertEqual(report["skipped"], 1)
+        self.assertEqual(w.calls, [])
+        self.assertEqual(archiver.calls, [])
+
+    def test_add_failure_skips_archive(self):
+        w = _FakeWriter(fail_add=True)
+        archiver = _FakeArchiver()
+        decisions = [{"action": "merge", "wing": "w", "room": "r", "text": "m",
+                      "supersedes": ["a"]}]
+        report = dl.apply_merge_decisions(decisions, w, archiver)
+        self.assertEqual(report["merged"], 0)
+        self.assertEqual(len(report["errors"]), 1)
+        self.assertEqual(archiver.calls, [])  # non-destructive on add failure
+
+    def test_empty_text_or_supersedes_records_soundness_error_without_writes(self):
+        w = _FakeWriter()
+        archiver = _FakeArchiver()
+
+        report = dl.apply_merge_decisions(
+            [
+                {"action": "merge", "wing": "w", "room": "r", "text": "", "supersedes": ["a"]},
+                {"action": "merge", "wing": "w", "room": "r", "text": "merged", "supersedes": []},
+            ],
+            w,
+            archiver,
+        )
+
+        self.assertEqual(report["merged"], 0)
+        self.assertEqual([e["stage"] for e in report["errors"]], ["soundness", "soundness"])
+        self.assertEqual(w.calls, [])
+        self.assertEqual(archiver.calls, [])
+
+
+class TestApplyPatternDecisions(unittest.TestCase):
+    def test_surface_adds_drawer_and_counts_skip(self):
+        w = _FakePatternWriter()
+        decisions = [
+            {"action": "surface", "wing": "w", "room": "r", "text": "rule",
+             "supported_by": ["s1", "s2"]},
+            {"action": "skip"},
+        ]
+
+        report = dl.apply_pattern_decisions(decisions, w, min_support=2)
+
+        self.assertEqual(report["surfaced"], 1)
+        self.assertEqual(report["skipped"], 1)
+        self.assertEqual(w.calls, [("add", "w", "r", "rule",
+                                    {"supported_by": ["s1", "s2"], "kind": "lesson"})])
+        self.assertEqual(report["added"], [{"drawer_id": "new1"}])
+        self.assertFalse(w.delete_called)
+
+    def test_ungrounded_surface_is_rejected_without_add(self):
+        w = _FakePatternWriter()
+        decisions = [{"action": "surface", "wing": "w", "room": "r", "text": "rule",
+                      "supported_by": []}]
+
+        report = dl.apply_pattern_decisions(decisions, w, min_support=2)
+
+        self.assertEqual(report["surfaced"], 0)
+        self.assertEqual(report["skipped"], 0)
+        self.assertEqual(w.calls, [])
+        self.assertEqual(report["errors"][0]["stage"], "groundedness")
+        self.assertEqual(report["errors"][0]["error"], "unsupported rule")
+        self.assertFalse(w.delete_called)
+
+    def test_surface_with_too_few_distinct_support_ids_is_rejected(self):
+        w = _FakePatternWriter()
+        decisions = [{"action": "surface", "wing": "w", "room": "r", "text": "rule",
+                      "supported_by": ["s1", "s1"], "allowed_support": ["s1", "s2"]}]
+
+        report = dl.apply_pattern_decisions(decisions, w, min_support=2)
+
+        self.assertEqual(report["surfaced"], 0)
+        self.assertEqual(w.calls, [])
+        self.assertEqual(report["errors"][0]["stage"], "groundedness")
+
+    def test_surface_support_must_be_subset_of_allowed_support(self):
+        w = _FakePatternWriter()
+        decisions = [{"action": "surface", "wing": "w", "room": "r", "text": "rule",
+                      "supported_by": ["s1", "s3"], "allowed_support": ["s1", "s2"]}]
+
+        report = dl.apply_pattern_decisions(decisions, w, min_support=2)
+
+        self.assertEqual(report["surfaced"], 0)
+        self.assertEqual(w.calls, [])
+        self.assertEqual(report["errors"][0]["stage"], "groundedness")
+
+    def test_add_error_is_recorded_and_later_decisions_continue(self):
+        w = _FakePatternWriter(fail_texts={"bad"})
+        decisions = [
+            {"action": "surface", "wing": "w", "room": "r", "text": "bad",
+             "supported_by": ["s1", "s2"]},
+            {"action": "surface", "wing": "w", "room": "r", "text": "good",
+             "supported_by": ["s2", "s3"]},
+        ]
+
+        report = dl.apply_pattern_decisions(decisions, w, min_support=2)
+
+        self.assertEqual(report["surfaced"], 1)
+        self.assertEqual(len(report["errors"]), 1)
+        self.assertEqual(report["errors"][0]["stage"], "add")
+        self.assertIn("boom", report["errors"][0]["error"])
+        self.assertEqual([c[:4] for c in w.calls], [("add", "w", "r", "bad"), ("add", "w", "r", "good")])
+        self.assertFalse(w.delete_called)
+
+
+class TestApplyContradictionDecisions(unittest.TestCase):
+    def _supersede_decision(self, **changes):
+        return {
+            "action": "supersede", "subject": "project", "predicate": "uses",
+            "old_object": "old runtime", "new_object": "current runtime",
+            "invalidate": [11, 12], "keep_triple_ids": [21],
+            **changes,
+        }
+
+    def _supersede_result(self, **changes):
+        return {
+            "invalidated": 2, "retired_ids": [11, 12], "kept_ids": [21],
+            "cascaded_ids": [31, 32, 33], "survived_ids": [41],
+            **changes,
+        }
+
+    def test_supersede_forwards_canonical_identity_and_counts_only_roots(self):
+        writer = mock.Mock(spec=["supersede", "invalidate_triples"])
+        result = self._supersede_result()
+        writer.supersede.return_value = result
+        decision = self._supersede_decision(
+            invalidate=[11, 12, 11], keep_triple_ids=[21, 21],
+        )
+
+        report = dl.apply_contradiction_decisions([decision], writer)
+
+        writer.supersede.assert_called_once_with(
+            "project", "uses", "old runtime", "current runtime",
+            old_triple_ids=[11, 12], keep_triple_ids=[21],
+        )
+        writer.invalidate_triples.assert_not_called()
+        self.assertEqual(report["invalidated"], 2)
+        self.assertEqual(report["invalidated_facts"], [
+            {"triple_id": 11}, {"triple_id": 12},
+        ])
+        self.assertEqual(report["superseded"], [result])
+        self.assertEqual(report["skipped"], 0)
+        self.assertEqual(report["errors"], [])
+
+    def test_supersede_passes_explicit_boundary_without_inventing_one(self):
+        writer = mock.Mock(spec=["supersede"])
+        writer.supersede.return_value = self._supersede_result()
+
+        report = dl.apply_contradiction_decisions(
+            [self._supersede_decision(at="2026-09-28T12:00:00")], writer,
+        )
+
+        self.assertEqual(writer.supersede.call_args.kwargs["at"], "2026-09-28T12:00:00")
+        self.assertEqual(report["errors"], [])
+
+    def test_supersede_kept_successor_may_also_have_a_surviving_alternate_proof(self):
+        writer = mock.Mock(spec=["supersede"])
+        result = self._supersede_result(survived_ids=[21, 41])
+        writer.supersede.return_value = result
+
+        report = dl.apply_contradiction_decisions([self._supersede_decision()], writer)
+
+        self.assertEqual(report["errors"], [])
+        self.assertEqual(report["invalidated"], 2)
+        self.assertEqual(report["superseded"], [result])
+
+    def test_supersede_shortfall_reports_actual_root_ids_not_cascades(self):
+        for retired in ([], [12]):
+            with self.subTest(retired=retired):
+                writer = mock.Mock(spec=["supersede"])
+                result = self._supersede_result(invalidated=len(retired), retired_ids=retired)
+                writer.supersede.return_value = result
+
+                report = dl.apply_contradiction_decisions(
+                    [self._supersede_decision()], writer,
+                )
+
+                self.assertEqual(report["invalidated"], len(retired))
+                self.assertEqual(report["invalidated_facts"], [
+                    {"triple_id": tid} for tid in retired
+                ])
+                self.assertEqual(report["superseded"], [result])
+                self.assertEqual(report["errors"][0]["stage"], "failed_adopt")
+                self.assertEqual(report["errors"][0]["expected"], 2)
+                self.assertEqual(report["errors"][0]["actual"], len(retired))
+
+    def test_supersede_writer_failure_does_not_claim_mutation(self):
+        writer = mock.Mock(spec=["supersede", "invalidate_triples"])
+        writer.supersede.side_effect = RuntimeError("target drifted")
+        writer.invalidate_triples.return_value = 1
+
+        report = dl.apply_contradiction_decisions([
+            self._supersede_decision(),
+            {"action": "invalidate", "invalidate": [99]},
+        ], writer)
+
+        self.assertEqual(report["invalidated"], 1)
+        self.assertEqual(report["invalidated_facts"], [{"triple_id": 99}])
+        self.assertEqual(report["superseded"], [])
+        self.assertEqual(report["errors"][0]["stage"], "supersede")
+        self.assertIn("target drifted", report["errors"][0]["error"])
+
+    def test_supersede_missing_or_malformed_identity_is_rejected_before_write(self):
+        changes = (
+            {"subject": None}, {"predicate": ""}, {"old_object": []},
+            {"new_object": " "}, {"keep_triple_ids": []},
+            {"keep_triple_ids": [11]}, {"invalidate": []},
+            {"invalidate": "11"}, {"keep_triple_ids": [None]},
+        )
+        for change in changes:
+            with self.subTest(change=change):
+                writer = mock.Mock(spec=["supersede", "invalidate_triples"])
+
+                report = dl.apply_contradiction_decisions(
+                    [self._supersede_decision(**change)], writer,
+                )
+
+                writer.supersede.assert_not_called()
+                writer.invalidate_triples.assert_not_called()
+                self.assertEqual(report["invalidated"], 0)
+                self.assertEqual(report["errors"][0]["stage"], "groundedness")
+
+    def test_supersede_invalid_result_is_not_success(self):
+        malformed = [
+            None, 2, {}, self._supersede_result(invalidated=True),
+            self._supersede_result(invalidated=3),
+            self._supersede_result(invalidated=1),
+            self._supersede_result(retired_ids=[11, 11]),
+            self._supersede_result(retired_ids=[11, 99]),
+            self._supersede_result(kept_ids=[]),
+            self._supersede_result(cascaded_ids=[21]),
+            self._supersede_result(cascaded_ids=[11]),
+            self._supersede_result(survived_ids=[31]),
+            self._supersede_result(survived_ids=[11]),
+            self._supersede_result(survived_ids=None),
+        ]
+        for result in malformed:
+            with self.subTest(result=result):
+                writer = mock.Mock(spec=["supersede"])
+                writer.supersede.return_value = result
+
+                report = dl.apply_contradiction_decisions(
+                    [self._supersede_decision()], writer,
+                )
+
+                self.assertEqual(report["invalidated"], 0)
+                self.assertEqual(report["invalidated_facts"], [])
+                self.assertEqual(report["superseded"], [])
+                self.assertEqual(report["errors"][0]["stage"], "failed_adopt")
+
+    def test_zero_or_partial_rowcount_is_failed_adopt_without_guessed_ids(self):
+        for affected in (0, 1):
+            with self.subTest(affected=affected):
+                writer = mock.Mock(spec=["invalidate_triples"])
+                writer.invalidate_triples.return_value = affected
+                decision = {"action": "invalidate", "invalidate": ["a", "b"]}
+
+                report = dl.apply_contradiction_decisions([decision], writer)
+
+                self.assertEqual(report["invalidated"], affected)
+                self.assertEqual(report["invalidated_facts"], [])
+                self.assertEqual(report["errors"][0]["stage"], "failed_adopt")
+                self.assertEqual(report["errors"][0]["triple_ids"], ["a", "b"])
+                self.assertEqual(report["errors"][0]["expected"], 2)
+                self.assertEqual(report["errors"][0]["actual"], affected)
+
+    def test_partial_result_keeps_only_known_ids_from_other_decisions(self):
+        writer = mock.Mock(spec=["invalidate_triples"])
+        writer.invalidate_triples.side_effect = [1, 1, 1]
+        decisions = [
+            {"action": "invalidate", "invalidate": ["before"]},
+            {"action": "invalidate", "invalidate": ["a", "b"]},
+            {"action": "invalidate", "invalidate": ["after"]},
+        ]
+
+        report = dl.apply_contradiction_decisions(decisions, writer)
+
+        self.assertEqual(report["invalidated"], 3)
+        self.assertEqual(report["invalidated_facts"], [
+            {"triple_id": "before"}, {"triple_id": "after"},
+        ])
+        self.assertEqual(len(report["errors"]), 1)
+
+    def test_duplicate_ids_are_written_and_counted_once_in_request_order(self):
+        writer = _FakeKgWriter()
+        decision = {"action": "invalidate", "invalidate": ["b", "a", "b", "a"]}
+
+        report = dl.apply_contradiction_decisions([decision], writer)
+
+        self.assertEqual(writer.calls, [["b", "a"]])
+        self.assertEqual(report["invalidated"], 2)
+        self.assertEqual(report["invalidated_facts"], [
+            {"triple_id": "b"}, {"triple_id": "a"},
+        ])
+        self.assertEqual(report["errors"], [])
+
+    def test_invalid_rowcounts_fail_explicitly_without_claiming_success(self):
+        for affected in (None, True, False, -1, 3, 1.0, "1", float("nan"),
+                         float("inf"), {"invalidated": 1}):
+            with self.subTest(affected=affected):
+                writer = mock.Mock(spec=["invalidate_triples"])
+                writer.invalidate_triples.return_value = affected
+
+                report = dl.apply_contradiction_decisions(
+                    [{"action": "invalidate", "invalidate": ["a", "b"]}], writer,
+                )
+
+                self.assertEqual(report["invalidated"], 0)
+                self.assertEqual(report["invalidated_facts"], [])
+                self.assertEqual(report["errors"][0]["stage"], "failed_adopt")
+                self.assertIn("rowcount", report["errors"][0]["error"])
+
+    def test_invalidate_calls_writer_for_exact_triple_ids_and_counts_skip(self):
+        w = _FakeKgWriter()
+        decisions = [
+            {"action": "invalidate", "invalidate": ["triple-1", "triple-2"]},
+            {"action": "skip"},
+        ]
+
+        report = dl.apply_contradiction_decisions(decisions, w)
+
+        self.assertEqual(report["invalidated"], 2)
+        self.assertEqual(report["skipped"], 1)
+        self.assertEqual(w.calls, [["triple-1", "triple-2"]])
+        self.assertEqual(report["invalidated_facts"], [
+            {"triple_id": "triple-1"},
+            {"triple_id": "triple-2"},
+        ])
+
+    def test_writer_error_is_recorded_and_later_decisions_still_process(self):
+        w = _FakeKgWriter(fail_triple_ids={"triple-1"})
+        decisions = [
+            {"action": "invalidate", "invalidate": ["triple-1", "triple-2"]},
+            {"action": "invalidate", "invalidate": ["triple-3"]},
+        ]
+
+        report = dl.apply_contradiction_decisions(decisions, w)
+
+        self.assertEqual(report["invalidated"], 1)
+        self.assertEqual(len(report["errors"]), 1)
+        self.assertEqual(report["errors"][0]["triple_ids"], ["triple-1", "triple-2"])
+        self.assertIn("cannot invalidate triple-1", report["errors"][0]["error"])
+        self.assertEqual(report["invalidated_facts"], [
+            {"triple_id": "triple-3"},
+        ])
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# Task 1: Ontology rule model + config normalization
+# ---------------------------------------------------------------------------
+
+import dream_lib as dream_lib  # noqa: E402 (alias for plan-compatible access)
+
+
+class OntologyConfigTests(unittest.TestCase):
+    def test_normalize_predicate_lowercases_and_underscores(self):
+        self.assertEqual(dream_lib.normalize_predicate("Depends On"), "depends_on")
+        self.assertEqual(dream_lib.normalize_predicate("depends-on"), "depends_on")
+
+    def test_ontology_version_is_stable_content_hash(self):
+        rules = [{"id": "transitive:depends_on", "family": "transitive",
+                  "predicate": "depends_on", "enabled": True}]
+        v1 = dream_lib.ontology_version(rules)
+        v2 = dream_lib.ontology_version(list(rules))
+        self.assertEqual(v1, v2)
+        self.assertNotEqual(v1, dream_lib.ontology_version([]))
+
+    def test_enabled_rules_filters_disabled_and_unknown_family(self):
+        rules = [
+            {"id": "a", "family": "transitive", "predicate": "p", "enabled": True},
+            {"id": "b", "family": "transitive", "predicate": "q", "enabled": False},
+            {"id": "c", "family": "bogus", "predicate": "r", "enabled": True},
+        ]
+        got = [r["id"] for r in dream_lib.enabled_rules(rules)]
+        self.assertEqual(got, ["a"])
+
+    def test_derived_predicate_defaults_to_closure_suffix(self):
+        rule = {"id": "a", "family": "transitive", "predicate": "depends_on", "enabled": True}
+        self.assertEqual(dream_lib.derived_predicate_for(rule), "depends_on_closure")
+        rule2 = dict(rule, derived_predicate="reaches")
+        self.assertEqual(dream_lib.derived_predicate_for(rule2), "reaches")
+
+
+# ---------------------------------------------------------------------------
+# Task 2: Canonical triple keys + stable candidate id
+# ---------------------------------------------------------------------------
+
+class DeriveKeyTests(unittest.TestCase):
+    def test_triple_id_key_uses_entity_ids_not_names(self):
+        t = {"subject_id": 7, "predicate": "Depends On", "object_id": 9,
+             "subject": "A", "object": "B"}
+        self.assertEqual(dream_lib.triple_id_key(t), (7, "depends_on", 9))
+
+    def test_candidate_id_is_stable_and_order_independent_on_premises(self):
+        concl = {"subject_id": 1, "predicate": "depends_on_closure", "object_id": 3}
+        c1 = dream_lib.derive_candidate_id(concl, "transitive:depends_on", [101, 102], "onto:x")
+        c2 = dream_lib.derive_candidate_id(concl, "transitive:depends_on", [102, 101], "onto:x")
+        self.assertEqual(c1, c2)
+        self.assertTrue(c1.startswith("derive:"))
+
+    def test_candidate_id_changes_with_ontology_version(self):
+        concl = {"subject_id": 1, "predicate": "depends_on_closure", "object_id": 3}
+        a = dream_lib.derive_candidate_id(concl, "r", [1], "onto:x")
+        b = dream_lib.derive_candidate_id(concl, "r", [1], "onto:y")
+        self.assertNotEqual(a, b)
+
+
+# ---------------------------------------------------------------------------
+# Task 3: Interval-overlap temporal validity
+# ---------------------------------------------------------------------------
+
+class IntervalOverlapTests(unittest.TestCase):
+    def test_overlap_of_open_intervals_is_max_start_none_end(self):
+        got = dream_lib.premise_interval([
+            {"valid_from": "2026-01-01", "valid_to": None},
+            {"valid_from": "2026-03-01", "valid_to": None},
+        ])
+        self.assertEqual(got, ("2026-03-01T00:00:00", None))
+
+    def test_overlap_with_bounded_end_takes_min_end(self):
+        got = dream_lib.premise_interval([
+            {"valid_from": "2026-01-01", "valid_to": "2026-06-01"},
+            {"valid_from": "2026-02-01", "valid_to": "2026-05-01"},
+        ])
+        self.assertEqual(got, ("2026-02-01T00:00:00", "2026-05-01T00:00:00"))
+
+    def test_disjoint_intervals_return_none(self):
+        got = dream_lib.premise_interval([
+            {"valid_from": "2026-01-01", "valid_to": "2026-02-01"},
+            {"valid_from": "2026-03-01", "valid_to": None},
+        ])
+        self.assertIsNone(got)  # max_start (2026-03) >= min_end (2026-02) => empty
+
+    def test_touching_intervals_are_empty(self):
+        # max_start == min_end is a zero-width (empty) intersection
+        got = dream_lib.premise_interval([
+            {"valid_from": "2026-01-01", "valid_to": "2026-03-01"},
+            {"valid_from": "2026-03-01", "valid_to": None},
+        ])
+        self.assertIsNone(got)
+
+    def test_mixed_aware_and_naive_timestamps_do_not_crash(self):
+        got = dream_lib.premise_interval([
+            {"valid_from": "2026-01-01T00:00:00+00:00", "valid_to": None},
+            {"valid_from": "2026-02-01", "valid_to": None},
+        ])
+        self.assertEqual(got, ("2026-02-01T00:00:00", None))
+
+
+# ---------------------------------------------------------------------------
+# Task 4: deductive_closure — bounded semi-naive forward chaining
+# ---------------------------------------------------------------------------
+
+def _t(tid, s, p, o, sid=None, oid=None, vf=None, vt=None, conf=1.0, **extra):
+    row = {"triple_id": tid, "subject": s, "predicate": p, "object": o,
+           "subject_id": sid if sid is not None else s, "object_id": oid if oid is not None else o,
+           "valid_from": vf, "valid_to": vt, "confidence": conf, "source_drawer_id": f"d{tid}"}
+    row.update(extra)
+    return row
+
+TRANS_RULES = [{"id": "transitive:depends_on", "family": "transitive",
+                "predicate": "depends_on", "enabled": True, "max_depth": 3}]
+
+class DeductiveClosureTests(unittest.TestCase):
+    def test_transitive_chain_emits_closure_predicate(self):
+        triples = [_t(1, "A", "depends_on", "B"), _t(2, "B", "depends_on", "C")]
+        cands = dream_lib.deductive_closure(triples, TRANS_RULES,
+                                            max_depth=3, max_iterations=10, max_candidates=500)
+        self.assertEqual(len(cands), 1)
+        c = cands[0]
+        self.assertEqual(c["conclusion"]["predicate"], "depends_on_closure")
+        self.assertEqual((c["conclusion"]["subject"], c["conclusion"]["object"]), ("A", "C"))
+        self.assertEqual(sorted(c["proof"]["premise_ids"]), [1, 2])
+        self.assertEqual(c["proof"]["depth"], 2)
+        self.assertEqual(c["rule"]["id"], "transitive:depends_on")
+
+    def test_proof_depth_reflects_chain_length(self):
+        triples = [_t(1, "A", "depends_on", "B"), _t(2, "B", "depends_on", "C"),
+                   _t(3, "C", "depends_on", "D")]
+        cands = dream_lib.deductive_closure(triples, TRANS_RULES,
+                                            max_depth=3, max_iterations=10, max_candidates=500)
+        depth_by_pair = {(c["conclusion"]["subject"], c["conclusion"]["object"]): c["proof"]["depth"]
+                         for c in cands}
+        self.assertEqual(depth_by_pair[("A", "D")], 3)
+        self.assertEqual(depth_by_pair[("A", "C")], 2)
+
+    def test_longer_chain_reaches_full_closure_via_closure_edges(self):
+        triples = [_t(1, "A", "depends_on", "B"), _t(2, "B", "depends_on", "C"),
+                   _t(3, "C", "depends_on", "D")]
+        cands = dream_lib.deductive_closure(triples, TRANS_RULES,
+                                            max_depth=3, max_iterations=10, max_candidates=500)
+        pairs = {(c["conclusion"]["subject"], c["conclusion"]["object"]) for c in cands}
+        self.assertEqual(pairs, {("A", "C"), ("A", "D"), ("B", "D")})
+
+    def test_reflexive_conclusions_suppressed_by_default(self):
+        triples = [_t(1, "A", "depends_on", "B"), _t(2, "B", "depends_on", "A")]
+        cands = dream_lib.deductive_closure(triples, TRANS_RULES,
+                                            max_depth=3, max_iterations=10, max_candidates=500)
+        for c in cands:
+            self.assertNotEqual(c["conclusion"]["subject_id"], c["conclusion"]["object_id"])
+
+    def test_excludes_already_active_closure_fact(self):
+        triples = [_t(1, "A", "depends_on", "B"), _t(2, "B", "depends_on", "C"),
+                   _t(9, "A", "depends_on_closure", "C")]
+        cands = dream_lib.deductive_closure(triples, TRANS_RULES,
+                                            max_depth=3, max_iterations=10, max_candidates=500)
+        self.assertEqual(cands, [])
+
+    def test_inverse_rule_emits_inverse_predicate(self):
+        rules = [{"id": "inverse:depends_on:dependency_of", "family": "inverse",
+                  "predicate": "depends_on", "inverse_predicate": "dependency_of", "enabled": True}]
+        triples = [_t(1, "A", "depends_on", "B")]
+        cands = dream_lib.deductive_closure(triples, rules, max_depth=1,
+                                            max_iterations=10, max_candidates=500)
+        self.assertEqual(len(cands), 1)
+        c = cands[0]["conclusion"]
+        self.assertEqual((c["subject"], c["predicate"], c["object"]), ("B", "dependency_of", "A"))
+
+    def test_symmetric_rule_emits_swapped_pair(self):
+        rules = [{"id": "symmetric:collaborates_with", "family": "symmetric",
+                  "predicate": "collaborates_with", "enabled": True}]
+        triples = [_t(1, "A", "collaborates_with", "B")]
+        cands = dream_lib.deductive_closure(triples, rules, max_depth=1,
+                                            max_iterations=10, max_candidates=500)
+        self.assertEqual(len(cands), 1)
+        c = cands[0]["conclusion"]
+        self.assertEqual((c["subject"], c["object"]), ("B", "A"))
+
+    def test_disabled_and_empty_config_yield_nothing(self):
+        triples = [_t(1, "A", "depends_on", "B"), _t(2, "B", "depends_on", "C")]
+        self.assertEqual(dream_lib.deductive_closure(triples, [], max_depth=3,
+                          max_iterations=10, max_candidates=500), [])
+
+    def test_disjoint_temporal_premises_produce_no_candidate(self):
+        triples = [_t(1, "A", "depends_on", "B", vf="2026-01-01", vt="2026-02-01"),
+                   _t(2, "B", "depends_on", "C", vf="2026-03-01", vt=None)]
+        cands = dream_lib.deductive_closure(triples, TRANS_RULES, max_depth=3,
+                                            max_iterations=10, max_candidates=500)
+        self.assertEqual(cands, [])
+
+    def test_confidence_is_min_of_premises(self):
+        triples = [_t(1, "A", "depends_on", "B", conf=0.9), _t(2, "B", "depends_on", "C", conf=0.6)]
+        cands = dream_lib.deductive_closure(triples, TRANS_RULES, max_depth=3,
+                                            max_iterations=10, max_candidates=500)
+        self.assertAlmostEqual(cands[0]["evidence"]["confidence"], 0.6)
+
+    def test_candidate_cap_truncates_and_marks_all(self):
+        # 8-node path A..H -> 21 non-adjacent closure pairs; cap far below that
+        nodes = [chr(65 + i) for i in range(8)]  # A..H
+        triples = [_t(i + 1, nodes[i], "depends_on", nodes[i + 1]) for i in range(7)]
+        cands = dream_lib.deductive_closure(triples, TRANS_RULES, max_depth=8,
+                                            max_iterations=20, max_candidates=3)
+        self.assertEqual(len(cands), 3)
+        self.assertTrue(all(c.get("truncated") for c in cands))
+
+    def test_disjoint_short_path_does_not_block_valid_longer_path(self):
+        # A->B disjoint with B->D (depth-2 path has empty interval);
+        # A->X->Y->D is all open (valid depth-3 path).
+        # The closure MUST emit A depends_on_closure D via the valid path.
+        triples = [
+            _t(1, "A", "depends_on", "B", vf="2026-01-01", vt="2026-02-01"),   # ends Feb
+            _t(2, "B", "depends_on", "D", vf="2026-03-01", vt=None),            # starts Mar → disjoint
+            _t(3, "A", "depends_on", "X", vf=None, vt=None),
+            _t(4, "X", "depends_on", "Y", vf=None, vt=None),
+            _t(5, "Y", "depends_on", "D", vf=None, vt=None),
+        ]
+        cands = dream_lib.deductive_closure(triples, TRANS_RULES,
+                                            max_depth=5, max_iterations=10, max_candidates=500)
+        pairs = {(c["conclusion"]["subject"], c["conclusion"]["object"]) for c in cands}
+        self.assertIn(("A", "D"), pairs)
+
+    def test_null_confidence_treated_as_1_not_crash(self):
+        # confidence=None can come from sqlite REAL DEFAULT 1.0 (nullable); must not crash
+        triples = [_t(1, "A", "depends_on", "B", conf=None),
+                   _t(2, "B", "depends_on", "C", conf=0.8)]
+        triples[0]["confidence"] = None  # ensure key present with None value
+        cands = dream_lib.deductive_closure(triples, TRANS_RULES, max_depth=3,
+                                            max_iterations=10, max_candidates=500)
+        self.assertEqual(len(cands), 1)
+        self.assertAlmostEqual(cands[0]["evidence"]["confidence"], 0.8)
+
+    def test_duplicate_base_triples_yield_one_inverse_candidate(self):
+        # Two triples with same subject/object but different triple_ids under inverse rule
+        rules = [{"id": "inverse:depends_on:dependency_of", "family": "inverse",
+                  "predicate": "depends_on", "inverse_predicate": "dependency_of", "enabled": True}]
+        triples = [
+            _t(10, "A", "depends_on", "B"),
+            _t(11, "A", "depends_on", "B"),  # duplicate conclusion but different triple_id
+        ]
+        cands = dream_lib.deductive_closure(triples, rules, max_depth=1,
+                                            max_iterations=10, max_candidates=500)
+        self.assertEqual(len(cands), 1)
+
+    def test_duplicate_base_triples_yield_one_symmetric_candidate(self):
+        rules = [{"id": "symmetric:collaborates_with", "family": "symmetric",
+                  "predicate": "collaborates_with", "enabled": True}]
+        triples = [
+            _t(20, "A", "collaborates_with", "B"),
+            _t(21, "A", "collaborates_with", "B"),
+        ]
+        cands = dream_lib.deductive_closure(triples, rules, max_depth=1,
+                                            max_iterations=10, max_candidates=500)
+        self.assertEqual(len(cands), 1)
+
+
+class EpistemicTaintRound1Tests(unittest.TestCase):
+    def _strip_additive_taint(self, item):
+        stripped = json.loads(json.dumps(item))
+        stripped.get("evidence", {}).pop("epistemic_status", None)
+        stripped.get("evidence", {}).pop("inherited_status", None)
+        stripped.get("proof", {}).pop("entailed_given", None)
+        return stripped
+
+    def test_min_status_returns_weakest_lattice_status(self):
+        self.assertEqual(dream_lib._min_status([]), "asserted")
+        self.assertEqual(dream_lib._min_status(["deduced", "abduced"]), "abduced")
+        self.assertEqual(dream_lib._min_status(["asserted", "deduced"]), "deduced")
+        self.assertEqual(dream_lib._min_status(["asserted"]), "asserted")
+        self.assertEqual(dream_lib._min_status(["asserted", "surprise"]), "unknown")
+
+    def test_all_trusted_candidate_is_deduced_without_entailed_given(self):
+        triples = [
+            _t("1", "A", "depends_on", "B", epistemic_status="asserted"),
+            _t("2", "B", "depends_on", "C", inherited_status="deduced"),
+        ]
+
+        cands = dream_lib.deductive_closure(
+            triples, TRANS_RULES, max_depth=3, max_iterations=10, max_candidates=500
+        )
+
+        self.assertEqual(len(cands), 1)
+        self.assertEqual(cands[0]["evidence"]["epistemic_status"], "deduced")
+        self.assertEqual(cands[0]["evidence"]["inherited_status"], "deduced")
+        self.assertEqual(cands[0]["proof"]["entailed_given"], [])
+
+    def test_abduced_premise_taints_candidate_with_premise_id(self):
+        rule = {"id": "inverse:depends_on:dependency_of", "family": "inverse",
+                "predicate": "depends_on", "inverse_predicate": "dependency_of", "enabled": True}
+        triples = [_t("p-abduced", "A", "depends_on", "B", epistemic_status="abduced")]
+
+        cands = dream_lib.deductive_closure(
+            triples, [rule], max_depth=1, max_iterations=10, max_candidates=500
+        )
+
+        self.assertEqual(len(cands), 1)
+        self.assertEqual(cands[0]["evidence"]["epistemic_status"], "entailed_given")
+        self.assertEqual(cands[0]["evidence"]["inherited_status"], "abduced")
+        self.assertEqual(cands[0]["proof"]["entailed_given"], ["p-abduced"])
+
+    def test_malformed_conditional_on_is_treated_as_empty(self):
+        rule = {"id": "inverse:depends_on:dependency_of", "family": "inverse",
+                "predicate": "depends_on", "inverse_predicate": "dependency_of", "enabled": True}
+        triples = [_t("p-trusted", "A", "depends_on", "B", conditional_on="not-json")]
+
+        cands = dream_lib.deductive_closure(
+            triples, [rule], max_depth=1, max_iterations=10, max_candidates=500
+        )
+
+        self.assertEqual(cands[0]["evidence"]["epistemic_status"], "deduced")
+        self.assertEqual(cands[0]["proof"]["entailed_given"], [])
+
+    def test_existing_derive_candidate_is_unchanged_after_dropping_additive_taint(self):
+        triples = [_t(1, "A", "depends_on", "B"), _t(2, "B", "depends_on", "C")]
+        cands = dream_lib.deductive_closure(
+            triples, TRANS_RULES, max_depth=3, max_iterations=10, max_candidates=500
+        )
+
+        self.assertEqual(self._strip_additive_taint(cands[0]), {
+            "kind": "derive",
+            "candidate_id": dream_lib.derive_candidate_id(
+                {
+                    "subject_id": "A",
+                    "predicate": "depends_on_closure",
+                    "object_id": "C",
+                    "subject": "A",
+                    "object": "C",
+                },
+                "transitive:depends_on",
+                [1, 2],
+                dream_lib.ontology_version(TRANS_RULES),
+            ),
+            "conclusion": {
+                "subject_id": "A",
+                "predicate": "depends_on_closure",
+                "object_id": "C",
+                "subject": "A",
+                "object": "C",
+            },
+            "rule": {
+                "id": "transitive:depends_on",
+                "family": "transitive",
+                "predicate": "depends_on",
+            },
+            "proof": {
+                "depth": 2,
+                "premise_ids": [1, 2],
+                "premise_drawer_ids": ["d1", "d2"],
+            },
+            "evidence": {
+                "already_active": False,
+                "confidence": 1.0,
+                "valid_from": None,
+                "valid_to": None,
+            },
+            "decision": None,
+        })
+
+
+# ---------------------------------------------------------------------------
+# Task 5: build_contemplate_worklist + skip-marker filtering
+# ---------------------------------------------------------------------------
+
+class ContemplateWorklistTests(unittest.TestCase):
+    def test_worklist_shape_and_version(self):
+        cands = [{"kind": "derive", "candidate_id": "derive:x", "conclusion": {}, "decision": None}]
+        wl = dream_lib.build_contemplate_worklist(cands, scope={"palace": "/p"},
+                  params={"max_depth": 3}, rules=[], onto_version="onto:v")
+        self.assertEqual(wl["task"], "contemplate")
+        self.assertEqual(wl["version"], dream_lib.WORKLIST_VERSION)
+        self.assertEqual(wl["ontology_version"], "onto:v")
+        self.assertEqual(len(wl["items"]), 1)
+
+    def test_filter_skipped_candidates_removes_by_id(self):
+        cands = [{"candidate_id": "derive:a"}, {"candidate_id": "derive:b"}]
+        skips = [{"candidate_id": "derive:a", "ontology_version": "onto:v"}]
+        got = dream_lib.filter_skipped(cands, skips, "onto:v")
+        self.assertEqual([c["candidate_id"] for c in got], ["derive:b"])
+
+    def test_filter_skipped_ignores_markers_from_other_ontology_version(self):
+        cands = [{"candidate_id": "derive:a"}]
+        skips = [{"candidate_id": "derive:a", "ontology_version": "onto:OLD"}]
+        got = dream_lib.filter_skipped(cands, skips, "onto:v")
+        self.assertEqual([c["candidate_id"] for c in got], ["derive:a"])
+
+
+# ---------------------------------------------------------------------------
+# Task 6: apply_derive_decisions (pure)
+# ---------------------------------------------------------------------------
+
+class FakeDeriveWriter:
+    def __init__(self): self.added = []
+    def add_derived(self, conclusion, rule_id, premise_ids, premise_drawer_ids,
+                    onto_version, confidence, valid_from, valid_to):
+        self.added.append((conclusion["subject_id"], conclusion["predicate"],
+                           conclusion["object_id"], rule_id, tuple(premise_ids), valid_from, valid_to))
+        return {"ok": True}
+
+class ApplyDeriveTests(unittest.TestCase):
+    def test_materialize_calls_writer_and_counts(self):
+        w = FakeDeriveWriter()
+        decisions = [{"action": "materialize", "candidate_id": "derive:a",
+            "conclusion": {"subject_id": 1, "predicate": "depends_on_closure", "object_id": 3},
+            "rule": {"id": "transitive:depends_on"},
+            "proof": {"premise_ids": [1, 2], "premise_drawer_ids": ["d1", "d2"]},
+            "evidence": {"confidence": 0.7, "valid_from": "2026-01-01", "valid_to": None},
+            "ontology_version": "onto:v"}]
+        report, skips = dream_lib.apply_derive_decisions(decisions, w)
+        self.assertEqual(report["materialized"], 1)
+        self.assertEqual(len(w.added), 1)
+        self.assertEqual(skips, [])
+
+    def test_materialize_propagates_valid_to(self):
+        w = FakeDeriveWriter()
+        decisions = [{"action": "materialize", "candidate_id": "derive:a",
+            "conclusion": {"subject_id": 1, "predicate": "p", "object_id": 3},
+            "rule": {"id": "r"}, "proof": {"premise_ids": [1], "premise_drawer_ids": ["d1"]},
+            "evidence": {"confidence": 1.0, "valid_from": "2026-01-01", "valid_to": "2026-05-01"},
+            "ontology_version": "onto:v"}]
+        dream_lib.apply_derive_decisions(decisions, w)
+        self.assertEqual(w.added[0][-1], "2026-05-01")
+
+    def test_skip_emits_marker_no_write(self):
+        w = FakeDeriveWriter()
+        decisions = [{"action": "skip", "candidate_id": "derive:a", "ontology_version": "onto:v",
+                      "reason": "cheaply re-derivable"}]
+        report, skips = dream_lib.apply_derive_decisions(decisions, w)
+        self.assertEqual(report["skipped"], 1)
+        self.assertEqual(w.added, [])
+        self.assertEqual(skips, [{"candidate_id": "derive:a", "ontology_version": "onto:v",
+                                  "reason": "cheaply re-derivable"}])
+
+    def test_reject_rule_recorded_no_write(self):
+        w = FakeDeriveWriter()
+        decisions = [{"action": "reject_rule", "rule": {"id": "transitive:depends_on"},
+                      "reason": "not transitive here"}]
+        report, skips = dream_lib.apply_derive_decisions(decisions, w)
+        self.assertEqual(report["rejected_rules"], ["transitive:depends_on"])
+        self.assertEqual(w.added, [])
+
+    def test_materialize_writer_error_recorded_soft(self):
+        class Boom(FakeDeriveWriter):
+            def add_derived(self, *a, **k): raise RuntimeError("db locked")
+        decisions = [{"action": "materialize", "candidate_id": "derive:a",
+            "conclusion": {"subject_id": 1, "predicate": "p", "object_id": 3},
+            "rule": {"id": "r"}, "proof": {"premise_ids": [1], "premise_drawer_ids": ["d1"]},
+            "evidence": {"confidence": 1.0, "valid_from": None, "valid_to": None},
+            "ontology_version": "onto:v"}]
+        report, skips = dream_lib.apply_derive_decisions(decisions, Boom())
+        self.assertEqual(report["materialized"], 0)
+        self.assertEqual(report["errors"][0]["stage"], "materialize")
+
+    def test_unknown_action_skips_softly(self):
+        report, skips = dream_lib.apply_derive_decisions([{"action": "frobnicate"}], FakeDeriveWriter())
+        self.assertEqual(report["ignored"], 1)
+
+    def test_skip_markers_for_rejected_rules_covers_all_matching_items(self):
+        items = [
+            {"candidate_id": "derive:a", "rule": {"id": "transitive:depends_on"}},
+            {"candidate_id": "derive:b", "rule": {"id": "transitive:depends_on"}},
+            {"candidate_id": "derive:c", "rule": {"id": "symmetric:x"}},
+        ]
+        markers = dream_lib.skip_markers_for_rejected_rules(
+            items, ["transitive:depends_on"], "onto:v")
+        self.assertEqual({m["candidate_id"] for m in markers}, {"derive:a", "derive:b"})
+        self.assertTrue(all(m["ontology_version"] == "onto:v" for m in markers))
+        self.assertTrue(all(m.get("reason") == "reject_rule" for m in markers))
+
+
+# ---------------------------------------------------------------------------
+# Track B phase B0: find_transitive_gaps — sole-missing-base-edge reconnaissance
+# ---------------------------------------------------------------------------
+
+class FindTransitiveGapsTests(unittest.TestCase):
+    def _gaps(self, triples, rules=None, **kw):
+        rules = rules if rules is not None else TRANS_RULES
+        return dream_lib.find_transitive_gaps(triples, rules, max_candidates=500, **kw)
+
+    def _edges(self, gaps):
+        return {(g["hypothesis"]["subject_id"], g["hypothesis"]["object_id"]) for g in gaps}
+
+    def test_no_enabled_transitive_rules_yields_no_gaps(self):
+        triples = [_t(1, "A", "depends_on", "B")]
+        self.assertEqual(self._gaps(triples, rules=[]), [])
+        disabled = [{"id": "x", "family": "transitive", "predicate": "depends_on", "enabled": False}]
+        self.assertEqual(self._gaps(triples, rules=disabled), [])
+        # inverse/symmetric families never produce missing-premise gaps
+        inv = [{"id": "i", "family": "inverse", "predicate": "depends_on",
+                "inverse_predicate": "dependency_of", "enabled": True}]
+        self.assertEqual(self._gaps(triples, rules=inv), [])
+
+    def test_tail_gap_unblocks_two_hop_conclusion(self):
+        # A->B present; hypothesizing B->C would yield A ->closure C.
+        triples = [_t(1, "A", "depends_on", "B")]
+        gaps = self._gaps(triples)
+        tail = [g for g in gaps if (g["hypothesis"]["subject_id"], g["hypothesis"]["object_id"]) == ("B", "C")]
+        # C is not an entity in the graph yet, so (B,C) should NOT be proposed (no hallucinated entities).
+        self.assertEqual(tail, [])
+
+    def test_gap_completes_broken_chain_A_B__C_D(self):
+        # A->B and C->D present, B and C distinct: the sole missing edge B->C
+        # unblocks A->closure D (and A->closure C, B->closure D).
+        triples = [_t(1, "A", "depends_on", "B"), _t(2, "C", "depends_on", "D")]
+        gaps = self._gaps(triples)
+        edges = self._edges(gaps)
+        self.assertIn(("B", "C"), edges)
+        bc = next(g for g in gaps if (g["hypothesis"]["subject_id"], g["hypothesis"]["object_id"]) == ("B", "C"))
+        # unblocked closure conclusions with subject A: (A,C) and (A,D)
+        subj_obj = {(u["subject"], u["object"]) for u in bc["evidence"]["unblocks"]}
+        self.assertIn(("A", "C"), subj_obj)
+        self.assertIn(("A", "D"), subj_obj)
+        self.assertEqual(bc["evidence"]["duc"], len(subj_obj))
+        self.assertEqual(bc["rule"]["id"], "transitive:depends_on")
+        self.assertTrue(bc["gap_id"].startswith("gap:"))
+        self.assertIsNone(bc["decision"])
+
+    def test_existing_edge_is_not_a_gap(self):
+        triples = [_t(1, "A", "depends_on", "B"), _t(2, "B", "depends_on", "C")]
+        # (A,B) and (B,C) already present; neither should be proposed as a gap.
+        edges = self._edges(self._gaps(triples))
+        self.assertNotIn(("A", "B"), edges)
+        self.assertNotIn(("B", "C"), edges)
+
+    def test_already_derivable_conclusion_not_counted(self):
+        # A->B->C already gives A->closure C; a gap must not claim to unblock it.
+        triples = [_t(1, "A", "depends_on", "B"), _t(2, "B", "depends_on", "C"),
+                   _t(3, "C", "depends_on", "D")]
+        gaps = self._gaps(triples)
+        for g in gaps:
+            for u in g["evidence"]["unblocks"]:
+                # (A,C),(A,D),(B,D) are already derivable and must never appear as "unblocked"
+                self.assertNotIn((u["subject"], u["object"]),
+                                 {("A", "C"), ("A", "D"), ("B", "D")})
+
+    def test_reflexive_conclusions_never_unblocked(self):
+        triples = [_t(1, "A", "depends_on", "B"), _t(2, "C", "depends_on", "A")]
+        for g in self._gaps(triples):
+            for u in g["evidence"]["unblocks"]:
+                self.assertNotEqual(u["subject"], u["object"])
+
+    def test_ranked_by_duc_descending(self):
+        # Two chains into a hub. A->B, X->B present, plus B is hub; hypothesize B->Z.
+        # Gap (B,Z) unblocks A->Z and X->Z (duc=2). A lone Y->? gives duc=1.
+        triples = [_t(1, "A", "depends_on", "B"), _t(2, "X", "depends_on", "B"),
+                   _t(3, "Y", "depends_on", "W")]
+        gaps = self._gaps(triples)
+        ducs = [g["evidence"]["duc"] for g in gaps]
+        self.assertEqual(ducs, sorted(ducs, reverse=True))
+        top = gaps[0]
+        self.assertGreaterEqual(top["evidence"]["duc"], 2)
+
+    def test_target_subject_filters_to_conclusions_about_target(self):
+        triples = [_t(1, "A", "depends_on", "B"), _t(2, "C", "depends_on", "D")]
+        gaps = self._gaps(triples, target_subject="A")
+        # every unblocked conclusion must have subject A
+        for g in gaps:
+            for u in g["evidence"]["unblocks"]:
+                self.assertEqual(u["subject"], "A")
+        # a target absent from the graph yields nothing
+        self.assertEqual(self._gaps(triples, target_subject="ZZZ"), [])
+
+    def test_gap_id_stable_and_worklist_shape(self):
+        triples = [_t(1, "A", "depends_on", "B"), _t(2, "C", "depends_on", "D")]
+        g1 = self._gaps(triples)
+        g2 = self._gaps(triples)
+        self.assertEqual([g["gap_id"] for g in g1], [g["gap_id"] for g in g2])
+        wl = dream_lib.build_gap_worklist(
+            g1, scope={"palace": "/p", "task": "gaps"},
+            params={"target_subject": None},
+            rules=TRANS_RULES, onto_version="onto:v")
+        self.assertEqual(wl["task"], "gaps")
+        self.assertEqual(wl["items"], g1)
+        self.assertEqual(wl["scope"], {"palace": "/p", "task": "gaps"})
+        self.assertEqual(wl["ontology_version"], "onto:v")
+
+    def test_max_candidates_truncates_and_marks(self):
+        # Build a fan: many distinct chains needing distinct gap edges.
+        triples = []
+        tid = 0
+        for i in range(30):
+            tid += 1
+            triples.append(_t(tid, f"S{i}", "depends_on", f"M{i}"))
+            tid += 1
+            triples.append(_t(tid, f"N{i}", "depends_on", f"T{i}"))
+        gaps = dream_lib.find_transitive_gaps(triples, TRANS_RULES, max_candidates=5)
+        self.assertLessEqual(len(gaps), 5)
+        self.assertTrue(all(g.get("truncated") for g in gaps))
+
+
+class TestBuildReflectWorklist(unittest.TestCase):
+    def test_envelope_and_items(self):
+        items = [{"kind": "reflect", "seed_id": "d1", "member_ids": ["d1", "d2"],
+                  "coverage": 2, "score": 0.8, "decision": None}]
+        wl = dl.build_reflect_worklist(items, scope={"wing": None}, params={"top_k": 10})
+        self.assertEqual(wl["task"], "reflect")
+        self.assertEqual(wl["items"], items)
+        for key in ("version", "scope", "params", "instructions", "items"):
+            self.assertIn(key, wl)

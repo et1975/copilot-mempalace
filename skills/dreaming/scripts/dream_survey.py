@@ -30,9 +30,9 @@ import dream_harvest
 import dream_ontology
 import dream_palace
 
-DEFAULT_TASKS = ["contradiction", "induce-rules", "pattern", "merge", "prune"]
+DEFAULT_TASKS = ["contradiction", "induce-rules", "pattern", "reflect", "merge", "prune"]
 PALACE_WIDE = {"contradiction", "induce-rules"}
-WING_SCOPED = {"merge", "pattern", "prune"}
+WING_SCOPED = {"merge", "pattern", "reflect", "prune"}
 
 
 def _default_palace() -> str | None:
@@ -87,6 +87,14 @@ def _example_for(kind: str, item: dict) -> dict:
         return {
             "support": ev.get("support"),
             "support_ids": ev.get("support_ids"),
+            "sample": _snippet((members[0] if members else {}).get("text", "")),
+        }
+    if kind == "reflect":
+        members = item.get("members") or [{}]
+        return {
+            "reflect_kind": item.get("reflect_kind"),
+            "coverage": item.get("coverage"),
+            "score": item.get("score"),
             "sample": _snippet((members[0] if members else {}).get("text", "")),
         }
     if kind == "prune":
@@ -182,20 +190,25 @@ def _format_example(task: str, ex: dict) -> str:
         return f"{ex.get('subject')} -{ex.get('predicate')}-> {ex.get('objects')} (newest={ex.get('newest')})"
     if task == "pattern":
         return f"support={ex.get('support')} :: {ex.get('sample')}"
+    if task == "reflect":
+        kind = ex.get("reflect_kind") or "cluster-seed"
+        return (f"kind={kind} coverage={ex.get('coverage')} "
+                f"score={ex.get('score')} :: {ex.get('sample')}")
     if task == "prune":
         return f"{ex.get('wing')}/{ex.get('room')} v={ex.get('v')} age={ex.get('age_days')}d :: {ex.get('id')}"
     return json.dumps(ex, ensure_ascii=False)
 
 
 # --------------------------------------------------------------------------
-# Orchestration (palace-facing) — validated by live smoke test
+# Orchestration (palace-facing)
 # --------------------------------------------------------------------------
 def _run_main(argv: list) -> None:
     """Call dream_harvest.main in-process, suppressing its stderr chatter."""
-    with contextlib.redirect_stderr(io.StringIO()):
+    stderr = io.StringIO()
+    with contextlib.redirect_stderr(stderr):
         rc = dream_harvest.main(argv)
     if rc != 0:
-        raise RuntimeError(f"dream_harvest.main {argv} returned {rc}")
+        raise RuntimeError(f"dream_harvest.main {argv} returned {rc}: {stderr.getvalue().strip()}")
 
 
 def harvest(task: str, palace: str, wing: str | None = None, *, tau: float = 0.9,
@@ -210,6 +223,12 @@ def harvest(task: str, palace: str, wing: str | None = None, *, tau: float = 0.9
                 argv += ["--wing", wing]
         elif task == "pattern":
             argv += ["--min-support", str(min_support)]
+            if wing:
+                argv += ["--wing", wing]
+        elif task == "reflect":
+            # Constructive cluster path (no --source); recurrence/converge is
+            # already covered by the pattern task. Bound clusters for a survey.
+            argv += ["--min-support", str(min_support), "--max-candidates", "10"]
             if wing:
                 argv += ["--wing", wing]
         elif task == "prune":

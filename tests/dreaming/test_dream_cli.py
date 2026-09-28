@@ -1,0 +1,2075 @@
+"""CLI routing tests for dreaming harvest/adopt."""
+from __future__ import annotations
+
+import contextlib
+import hashlib
+import io
+import json
+import os
+import sqlite3
+import tempfile
+import unittest
+from unittest import mock
+
+import dream_adopt
+import dream_harvest
+from test_dream_procedural_palace import DrawerCollection, installed_palace
+
+try:
+    from mempalace.knowledge_graph import KnowledgeGraph as _RealKG
+    _HAS_MEMPALACE = True
+except Exception:
+    _HAS_MEMPALACE = False
+
+
+def _test_tmpdir():
+    return tempfile.TemporaryDirectory(
+        prefix="dream-cli-",
+        dir=os.environ.get("DREAMING_TEST_TMPDIR", os.getcwd()),
+    )
+
+
+def _load_json(path):
+    with open(path, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def _dump_json(path, value):
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(value, fh)
+
+
+class TestHarvestContradictionTask(unittest.TestCase):
+    def test_contradiction_task_writes_contradiction_worklist(self):
+        triples = [
+            {"subject": "Alice", "predicate": "lives_in", "object": "Portland",
+             "valid_from": "2024-01-01", "extracted_at": "2024-01-02"},
+            {"subject": "Alice", "predicate": "lives_in", "object": "Seattle",
+             "valid_from": "2025-01-01", "extracted_at": "2025-01-02"},
+        ]
+        with _test_tmpdir() as td:
+            out = os.path.join(td, "worklist.json")
+            stderr = io.StringIO()
+            with mock.patch.object(dream_harvest.dream_palace, "bind_palace", return_value="/bound"), \
+                 mock.patch.object(dream_harvest.dream_palace, "load_premises", return_value=triples), \
+                 contextlib.redirect_stderr(stderr):
+                rc = dream_harvest.main([
+                    "--palace", "/palace",
+                    "--task", "contradiction",
+                    "--wing", "ignored-for-kg",
+                    "--tau", "0.1",
+                    "--out", out,
+                ])
+
+            self.assertEqual(rc, 0)
+            with open(out, encoding="utf-8") as fh:
+                worklist = json.load(fh)
+            self.assertEqual(worklist["task"], "contradiction")
+            self.assertEqual(worklist["scope"], {"palace": "/bound", "task": "contradiction"})
+            self.assertEqual(worklist["items"][0]["kind"], "contradiction")
+            self.assertIn("harvested 2 active triples -> 1 contradiction candidate group(s)", stderr.getvalue())
+
+
+class TestHarvestPatternTask(unittest.TestCase):
+    def test_pattern_task_writes_pattern_worklist(self):
+        entries = [
+            {
+                "id": "entry-1",
+                "text": "SESSION_ID: abcdef12 repeated observation",
+                "embedding": [1.0, 0.0],
+                "session_id": "abcdef12",
+                "agent": "Copilot CLI",
+                "date": "2026-07-03",
+                "topic": "dreaming",
+            },
+            {
+                "id": "entry-2",
+                "text": "SESSION_ID: abcdef13 repeated observation again",
+                "embedding": [1.0, 0.0],
+                "session_id": "abcdef13",
+                "agent": "Copilot CLI",
+                "date": "2026-07-04",
+                "topic": "dreaming",
+            },
+        ]
+        with _test_tmpdir() as td:
+            out = os.path.join(td, "worklist.json")
+            stderr = io.StringIO()
+            with mock.patch.object(dream_harvest.dream_palace, "bind_palace", return_value="/bound"), \
+                 mock.patch.object(dream_harvest.dream_palace, "load_observation_entries", return_value=entries) as load_entries, \
+                 contextlib.redirect_stderr(stderr):
+                rc = dream_harvest.main([
+                    "--palace", "/palace",
+                    "--task", "pattern",
+                    "--wing", "wing_copilot-cli",
+                    "--rooms", "diary,signals",
+                    "--tau", "0.8",
+                    "--min-support", "2",
+                    "--out", out,
+                ])
+
+            self.assertEqual(rc, 0)
+            load_entries.assert_called_once_with(
+                "/bound",
+                wing="wing_copilot-cli",
+                rooms=("diary", "signals"),
+            )
+            with open(out, encoding="utf-8") as fh:
+                worklist = json.load(fh)
+            # pattern is now aliased to reflect, produces reflect worklist
+            self.assertEqual(worklist["task"], "reflect")
+            self.assertEqual(
+                worklist["scope"],
+                {"wing": "wing_copilot-cli", "room": None, "source": "diary"},
+            )
+            self.assertEqual(worklist["params"], {"tau": 0.8, "min_support": 2, "top_k": 500, "min_coverage": 2})
+            # items now use reflect envelope with reflect_kind=converge
+            self.assertEqual(worklist["items"][0]["kind"], "reflect")
+            self.assertEqual(worklist["items"][0]["reflect_kind"], "converge")
+            self.assertEqual(worklist["items"][0]["evidence"]["support"], 2)
+
+    def test_pattern_task_excludes_already_surfaced_lessons(self):
+        entries = [
+            {
+                "id": "entry-1",
+                "text": "SESSION_ID: s1 repeated observation",
+                "embedding": [1.0, 0.0],
+                "session_id": "s1",
+            },
+            {
+                "id": "entry-2",
+                "text": "SESSION_ID: s2 repeated observation again",
+                "embedding": [1.0, 0.0],
+                "session_id": "s2",
+            },
+            {
+                "id": "lesson-meta",
+                "text": "SESSION_ID: s3 surfaced lesson",
+                "embedding": [1.0, 0.0],
+                "session_id": "s3",
+                "metadata": {"kind": "lesson"},
+            },
+            {
+                "id": "lesson-trailer",
+                "text": 'SESSION_ID: s4 surfaced lesson\n<!--dreaming-meta: {"kind":"lesson"}-->',
+                "embedding": [1.0, 0.0],
+                "session_id": "s4",
+            },
+        ]
+        with _test_tmpdir() as td:
+            out = os.path.join(td, "worklist.json")
+            stderr = io.StringIO()
+            with mock.patch.object(dream_harvest.dream_palace, "bind_palace", return_value="/bound"), \
+                 mock.patch.object(dream_harvest.dream_palace, "load_observation_entries", return_value=entries), \
+                 contextlib.redirect_stderr(stderr):
+                rc = dream_harvest.main([
+                    "--palace", "/palace",
+                    "--task", "pattern",
+                    "--wing", "wing_copilot-cli",
+                    "--min-support", "2",
+                    "--out", out,
+                ])
+
+            self.assertEqual(rc, 0)
+            with open(out, encoding="utf-8") as fh:
+                worklist = json.load(fh)
+            # surfaced lessons (s3, s4) excluded => only s1, s2 remain
+            self.assertEqual(worklist["items"][0]["evidence"]["support_ids"], ["s1", "s2"])
+
+
+    def test_pattern_task_sessions_source_uses_host_sessions(self):
+        session_entries = [
+            {
+                "id": "session:s1", "member_ids": ["session:s1"],
+                "text": "make this repo a copilot marketplace skillset",
+                "embedding": [1.0, 0.0], "session_id": "s1",
+                "agent": None, "date": "2026-07-01", "topic": "packaging",
+                "wing": None, "room": "__session__",
+            },
+            {
+                "id": "session:s2", "member_ids": ["session:s2"],
+                "text": "package this repo for the copilot marketplace",
+                "embedding": [1.0, 0.0], "session_id": "s2",
+                "agent": None, "date": "2026-07-02", "topic": "packaging",
+                "wing": None, "room": "__session__",
+            },
+        ]
+        with _test_tmpdir() as td:
+            out = os.path.join(td, "worklist.json")
+            stderr = io.StringIO()
+            with mock.patch.object(dream_harvest.dream_palace, "bind_palace", return_value="/bound"), \
+                 mock.patch.object(dream_harvest.dream_palace, "load_observation_entries") as load_diary, \
+                 mock.patch.object(
+                     dream_harvest.dream_palace, "load_session_observation_entries", return_value=session_entries
+                 ) as load_sessions, \
+                 contextlib.redirect_stderr(stderr):
+                rc = dream_harvest.main([
+                    "--palace", "/palace",
+                    "--task", "pattern",
+                    "--source", "sessions",
+                    "--repository", "copilot-mempalace",
+                    "--since", "2026-07-01",
+                    "--limit-sessions", "50",
+                    "--tau", "0.8",
+                    "--min-support", "2",
+                    "--out", out,
+                ])
+
+            self.assertEqual(rc, 0)
+            load_diary.assert_not_called()
+            load_sessions.assert_called_once_with(
+                "/bound",
+                repository="copilot-mempalace",
+                since="2026-07-01",
+                limit_sessions=50,
+            )
+            worklist = _load_json(out)
+            self.assertEqual(worklist["scope"]["source"], "sessions")
+            # now produces reflect items with converge kind
+            self.assertEqual(worklist["items"][0]["kind"], "reflect")
+            self.assertEqual(worklist["items"][0]["reflect_kind"], "converge")
+            self.assertEqual(worklist["items"][0]["evidence"]["support_ids"], ["s1", "s2"])
+
+    def test_pattern_task_both_source_unions_diary_and_sessions(self):
+        diary_entries = [
+            {
+                "id": "diary-1", "text": "SESSION_ID: d1 dreaming pipeline design",
+                "embedding": [1.0, 0.0], "session_id": "d1",
+            },
+        ]
+        session_entries = [
+            {
+                "id": "session:s2", "member_ids": ["session:s2"],
+                "text": "dreaming pipeline design notes",
+                "embedding": [1.0, 0.0], "session_id": "s2", "room": "__session__",
+            },
+        ]
+        with _test_tmpdir() as td:
+            out = os.path.join(td, "worklist.json")
+            stderr = io.StringIO()
+            with mock.patch.object(dream_harvest.dream_palace, "bind_palace", return_value="/bound"), \
+                 mock.patch.object(
+                     dream_harvest.dream_palace, "load_observation_entries", return_value=diary_entries
+                 ) as load_diary, \
+                 mock.patch.object(
+                     dream_harvest.dream_palace, "load_session_observation_entries", return_value=session_entries
+                 ) as load_sessions, \
+                 contextlib.redirect_stderr(stderr):
+                rc = dream_harvest.main([
+                    "--palace", "/palace",
+                    "--task", "pattern",
+                    "--source", "both",
+                    "--tau", "0.8",
+                    "--min-support", "2",
+                    "--out", out,
+                ])
+
+            self.assertEqual(rc, 0)
+            load_diary.assert_called_once()
+            load_sessions.assert_called_once()
+            worklist = _load_json(out)
+            self.assertEqual(worklist["scope"]["source"], "both")
+            # theme spans one diary session (d1) and one host session (s2) => support 2
+            self.assertEqual(worklist["items"][0]["evidence"]["support_ids"], ["d1", "s2"])
+
+
+class TestHarvestPruneTask(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(mock.patch.object(dream_harvest.dream_palace, "protection_collection",
+                                           return_value=DrawerCollection()))
+        self.enterContext(mock.patch.object(dream_harvest.dream_palace, "load_drawer_usage",
+                                           create=True, return_value={}))
+
+    def test_prune_task_writes_prune_worklist(self):
+        drawers = [
+            {
+                "id": "drawer-1",
+                "member_ids": ["drawer-1"],
+                "text": "temporary note for now",
+                "embedding": [1.0, 0.0],
+                "metadata": {"filed_at": "2000-01-01T00:00:00", "pinned": False},
+                "wing": "wing",
+                "room": "room",
+            },
+            {
+                "id": "drawer-2",
+                "member_ids": ["drawer-2"],
+                "text": "temporary note for now duplicate",
+                "embedding": [1.0, 0.0],
+                "metadata": {"filed_at": "2000-01-01T00:00:00", "pinned": True},
+                "wing": "wing",
+                "room": "room",
+            },
+        ]
+        with _test_tmpdir() as td:
+            out = os.path.join(td, "worklist.json")
+            stderr = io.StringIO()
+            with mock.patch.object(dream_harvest.dream_palace, "bind_palace", return_value="/bound"), \
+                 mock.patch.object(dream_harvest.dream_palace, "load_logical_drawers", return_value=drawers) as load_drawers, \
+                 mock.patch.object(dream_harvest.dream_palace, "kg_source_degree", return_value={}), \
+                 contextlib.redirect_stderr(stderr):
+                rc = dream_harvest.main([
+                    "--palace", "/palace",
+                    "--task", "prune",
+                    "--wing", "wing",
+                    "--room", "room",
+                    "--v-min", "0.35",
+                    "--age-floor-days", "30",
+                    "--out", out,
+                ])
+
+            self.assertEqual(rc, 0)
+            load_drawers.assert_called_once_with("/bound", wing="wing", room="room")
+            with open(out, encoding="utf-8") as fh:
+                worklist = json.load(fh)
+            self.assertEqual(worklist["task"], "prune")
+            self.assertEqual(
+                worklist["scope"],
+                {"palace": "/bound", "wing": "wing", "room": "room", "task": "prune"},
+            )
+            self.assertEqual(worklist["params"], {"v_min": 0.35, "age_floor_days": 30})
+            self.assertEqual([item["id"] for item in worklist["items"]], ["drawer-1"])
+            self.assertEqual(worklist["items"][0]["kind"], "prune")
+            self.assertEqual(worklist["items"][0]["salience"]["kg_degree"], 0)
+            self.assertEqual(
+                worklist["items"][0]["content_hash"],
+                hashlib.sha256("temporary note for now".encode("utf-8")).hexdigest(),
+            )
+            self.assertIn(
+                "harvested 2 drawers -> 1 prune candidate(s) (v<v_min, age>=floor, kg_degree=0)",
+                stderr.getvalue(),
+            )
+
+
+class TestHarvestOntologyTasks(unittest.TestCase):
+    def _palace_with_kg(self, td):
+        palace = os.path.join(td, "palace")
+        os.makedirs(palace)
+        con = sqlite3.connect(os.path.join(palace, "knowledge_graph.sqlite3"))
+        con.executescript(
+            """
+            CREATE TABLE entities (id TEXT PRIMARY KEY, name TEXT NOT NULL);
+            CREATE TABLE triples (
+                id TEXT PRIMARY KEY,
+                subject TEXT,
+                predicate TEXT,
+                object TEXT,
+                valid_from TEXT,
+                valid_to TEXT,
+                confidence REAL,
+                source_closet TEXT,
+                source_file TEXT,
+                source_drawer_id TEXT,
+                adapter_name TEXT,
+                extracted_at TEXT
+            );
+            INSERT INTO entities (id, name) VALUES
+                ('a', 'Author'), ('x', 'Post'), ('b', 'ModuleB'), ('c', 'ModuleC'),
+                ('friend1', 'FriendOne'), ('friend2', 'FriendTwo');
+            INSERT INTO triples (
+                id, subject, predicate, object, valid_from, valid_to,
+                confidence, source_closet, source_file, source_drawer_id,
+                adapter_name, extracted_at
+            ) VALUES
+                ('t1', 'a', 'authored', 'x', '2026-01-01', NULL, 1.0, NULL, NULL, NULL, NULL, '2026-01-01'),
+                ('t2', 'x', 'authored_by', 'a', '2026-01-01', NULL, 1.0, NULL, NULL, NULL, NULL, '2026-01-01'),
+                ('t3', 'a', 'depends_on', 'b', '2026-01-01', NULL, 1.0, NULL, NULL, NULL, NULL, '2026-01-01'),
+                ('t4', 'b', 'depends_on', 'c', '2026-01-01', NULL, 1.0, NULL, NULL, NULL, NULL, '2026-01-01'),
+                ('t5', 'friend1', 'collaborates_with', 'friend2', '2026-01-01', NULL, 1.0, NULL, NULL, NULL, NULL, '2026-01-01'),
+                ('t6', 'friend2', 'collaborates_with', 'friend1', '2026-01-01', NULL, 1.0, NULL, NULL, NULL, NULL, '2026-01-01');
+            """
+        )
+        con.commit()
+        con.close()
+        return palace
+
+    def _run_harvest(self, argv):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            rc = dream_harvest.main(argv)
+        return rc, stderr.getvalue()
+
+    def _read_rules(self, path):
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)["rules"]
+
+    def test_suggest_rules_writes_disabled_heuristic_candidates(self):
+        with _test_tmpdir() as td:
+            palace = self._palace_with_kg(td)
+            ontology = os.path.join(td, "ontology.json")
+
+            rc, stderr = self._run_harvest([
+                "--task", "suggest-rules",
+                "--palace", palace,
+                "--ontology-out", ontology,
+            ])
+
+            self.assertEqual(rc, 0)
+            rules = self._read_rules(ontology)
+            self.assertTrue(rules)
+            self.assertTrue(all(rule["enabled"] is False for rule in rules))
+            self.assertIn("transitive:depends_on", {rule["id"] for rule in rules})
+            self.assertIn("inverse:authored:authored_by", {rule["id"] for rule in rules})
+            self.assertIn("symmetric:collaborates_with", {rule["id"] for rule in rules})
+            self.assertIn("suggest-rules: proposed", stderr)
+            self.assertIn("all candidates written DISABLED", stderr)
+
+    def test_induce_rules_writes_disabled_evidence_candidates(self):
+        with _test_tmpdir() as td:
+            palace = self._palace_with_kg(td)
+            ontology = os.path.join(td, "ontology.json")
+
+            rc, stderr = self._run_harvest([
+                "--task", "induce-rules",
+                "--palace", palace,
+                "--min-support", "1",
+                "--ontology-out", ontology,
+            ])
+
+            self.assertEqual(rc, 0)
+            rules = self._read_rules(ontology)
+            self.assertTrue(rules)
+            self.assertTrue(all(rule["enabled"] is False for rule in rules))
+            ids = {rule["id"] for rule in rules}
+            self.assertIn("inverse:authored:authored_by", ids)
+            self.assertIn("symmetric:collaborates_with", ids)
+            self.assertIn("transitive:depends_on", ids)
+            self.assertIn("induce-rules: min_support=1 proposed", stderr)
+            self.assertIn("all candidates written DISABLED", stderr)
+
+    def test_suggest_rules_is_idempotent_and_reports_existing_skips(self):
+        with _test_tmpdir() as td:
+            palace = self._palace_with_kg(td)
+            ontology = os.path.join(td, "ontology.json")
+
+            rc, stderr = self._run_harvest([
+                "--task", "suggest-rules",
+                "--palace", palace,
+                "--ontology-out", ontology,
+            ])
+            self.assertEqual(rc, 0)
+            with open(ontology, encoding="utf-8") as fh:
+                first_doc = json.load(fh)
+            first_count = len(first_doc["rules"])
+
+            rc, stderr = self._run_harvest([
+                "--task", "suggest-rules",
+                "--palace", palace,
+                "--ontology-out", ontology,
+            ])
+
+            self.assertEqual(rc, 0)
+            with open(ontology, encoding="utf-8") as fh:
+                second_doc = json.load(fh)
+            self.assertEqual(second_doc, first_doc)
+            self.assertIn(f"added 0 (skipped {first_count} existing)", stderr)
+
+    def test_suggest_rules_preserves_preexisting_enabled_colliding_rule(self):
+        with _test_tmpdir() as td:
+            palace = self._palace_with_kg(td)
+            ontology = os.path.join(td, "ontology.json")
+            existing_rule = {
+                "id": "transitive:depends_on",
+                "family": "transitive",
+                "predicate": "depends_on",
+                "derived_predicate": "depends_on_closure",
+                "enabled": True,
+                "rationale": "human approved",
+            }
+            with open(ontology, "w", encoding="utf-8") as fh:
+                json.dump({"version": 1, "rules": [existing_rule]}, fh)
+
+            rc, _stderr = self._run_harvest([
+                "--task", "suggest-rules",
+                "--palace", palace,
+                "--ontology-out", ontology,
+            ])
+
+            self.assertEqual(rc, 0)
+            rules = self._read_rules(ontology)
+            self.assertEqual(rules[0], existing_rule)
+            self.assertTrue(rules[0]["enabled"])
+
+
+class TestAdoptContradictionTask(unittest.TestCase):
+    def test_resolve_defaults_invalidate_to_all_candidates_except_keep(self):
+        worklist = {
+            "task": "contradiction",
+            "items": [
+                {
+                    "kind": "contradiction",
+                    "subject": "Alice",
+                    "predicate": "lives_in",
+                    "candidates": [
+                        {"object": "Seattle", "object_id": "city-sea", "triple_id": "t-sea", "triple_ids": ["t-sea"]},
+                        {"object": "Portland", "object_id": "city-pdx", "triple_id": "t-pdx", "triple_ids": ["t-pdx"]},
+                    ],
+                    "decision": {"action": "invalidate", "keep": "Seattle"},
+                },
+                {
+                    "kind": "contradiction",
+                    "subject": "Alice",
+                    "predicate": "knows",
+                    "candidates": [
+                        {"object": "Bob"},
+                        {"object": "Carol"},
+                    ],
+                    "decision": {"action": "skip"},
+                },
+            ],
+        }
+
+        decisions = dream_adopt._resolve_contradiction_decisions(worklist)
+
+        self.assertEqual(decisions, [
+            {"action": "supersede", "subject": "Alice", "predicate": "lives_in",
+             "old_object": "city-pdx", "new_object": "city-sea",
+             "invalidate": ["t-pdx"], "keep_triple_ids": ["t-sea"]},
+            {"action": "skip"},
+        ])
+
+    def _worklist(self, keep="Seattle", **decision):
+        return {"task": "contradiction", "items": [{
+            "subject": "Alice", "subject_id": "person-alice", "predicate": "lives_in",
+            "candidates": [
+                {"object": "Seattle", "object_id": "city-sea", "triple_ids": ["s1", "s2"]},
+                {"object": "Portland", "object_id": "city-pdx", "triple_ids": ["p1", "p2"]},
+            ],
+            "decision": {"action": "invalidate", "keep": keep, **decision},
+        }]}
+
+    def test_keep_selectors_resolve_canonical_identity_and_exact_retired_ids(self):
+        for keep in ("Seattle", "city-sea", "s1"):
+            with self.subTest(keep=keep):
+                result = dream_adopt._resolve_contradiction_decisions(
+                    self._worklist(keep, invalidate=["p1"]))
+                self.assertEqual(result, [{
+                    "action": "supersede", "subject": "person-alice", "predicate": "lives_in",
+                    "old_object": "city-pdx", "new_object": "city-sea",
+                    "invalidate": ["p1"], "keep_triple_ids": ["s1", "s2"],
+                }])
+
+    def test_bad_keep_selectors_refuse_before_any_write(self):
+        for keep in ("missing", None, "", [], {}, True):
+            with self.subTest(keep=keep), self.assertRaisesRegex(ValueError, "keep"):
+                dream_adopt._resolve_contradiction_decisions(self._worklist(keep))
+
+    def test_ambiguous_keep_selector_refuses(self):
+        worklist = self._worklist()
+        worklist["items"][0]["candidates"][1]["object"] = "Seattle"
+        with self.assertRaisesRegex(ValueError, "ambiguous"):
+            dream_adopt._resolve_contradiction_decisions(worklist)
+
+    def test_keep_requires_canonical_identity_even_for_multi_retire(self):
+        worklist = self._worklist("s1")
+        worklist["items"][0]["candidates"][0].update(object=None, object_id=None)
+        worklist["items"][0]["candidates"].append(
+            {"object": "Boston", "object_id": "city-bos", "triple_ids": ["b1"]})
+        with self.assertRaisesRegex(ValueError, "canonical"):
+            dream_adopt._resolve_contradiction_decisions(worklist)
+
+    def test_cannot_retire_kept_candidate_or_unknown_id(self):
+        for selected in (["s1"], ["unknown"], "p1"):
+            with self.subTest(selected=selected), self.assertRaises(ValueError):
+                dream_adopt._resolve_contradiction_decisions(
+                    self._worklist(invalidate=selected))
+
+    def test_legacy_explicit_ids_are_not_expanded(self):
+        worklist = self._worklist(invalidate=["p1", "p1"])
+        del worklist["items"][0]["decision"]["keep"]
+        result = dream_adopt._resolve_contradiction_decisions(worklist)
+        self.assertEqual(result[0]["action"], "invalidate")
+        self.assertEqual(result[0]["invalidate"], ["p1"])
+
+    def test_multi_old_resolution_stays_explicit_invalidation(self):
+        worklist = self._worklist()
+        worklist["items"][0]["candidates"].append(
+            {"object": "Boston", "object_id": "city-bos", "triple_ids": ["b1"]})
+        result = dream_adopt._resolve_contradiction_decisions(worklist)
+        self.assertEqual(result[0]["action"], "invalidate")
+        self.assertEqual(result[0]["invalidate"], ["p1", "p2", "b1"])
+
+    def test_actual_kg_supersession_keeps_original_successor_evidence(self):
+        for selector_kind in ("object", "object_id", "triple_id"):
+            with self.subTest(selector=selector_kind), _test_tmpdir() as td:
+                db = os.path.join(td, "knowledge_graph.sqlite3")
+                kg = _RealKG(db_path=db)
+                kg.add_triple("Alice", "lives_in", "Portland", valid_from="2020-01-01")
+                kg.add_triple("Alice", "lives_in", "Seattle", valid_from="2021-01-01")
+                kg.close()
+                dream_adopt.dream_palace.ensure_firewall_schema(db)
+                with sqlite3.connect(db) as con:
+                    tids = [row[0] for row in con.execute("SELECT id FROM triples")]
+                    for tid in tids:
+                        con.execute(
+                            "INSERT INTO kg_triple_supports "
+                            "(support_id,triple_id,status,source_trust,inherited_status,source_ref,created_at) "
+                            "VALUES (?,?,'asserted','verified_source','asserted','original evidence','2020-01-01')",
+                            ("support:" + tid, tid))
+                path = os.path.join(td, "wl.json")
+                with contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(dream_harvest.main([
+                        "--palace", td, "--task", "contradiction", "--out", path]), 0)
+                worklist = _load_json(path)
+                item = worklist["items"][0]
+                kept = next(c for c in item["candidates"] if c["object"] == "Seattle")
+                retired = next(c for c in item["candidates"] if c["object"] == "Portland")
+                with sqlite3.connect(db) as con:
+                    before = con.execute("SELECT * FROM triples WHERE id=?", (kept["triple_id"],)).fetchone()
+                    support = con.execute("SELECT * FROM kg_triple_supports WHERE triple_id=?",
+                                          (kept["triple_id"],)).fetchall()
+                item["decision"] = {"action": "invalidate", "keep": kept[selector_kind],
+                                    "invalidate": [retired["triple_id"]]}
+                _dump_json(path, worklist)
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    rc = dream_adopt.main(["--palace", td, "--decisions", path])
+                self.assertEqual(rc, 0, stderr.getvalue())
+                self.assertIn("invalidated 1", stderr.getvalue())
+                with sqlite3.connect(db) as con:
+                    self.assertEqual(con.execute("SELECT * FROM triples WHERE id=?",
+                                                 (kept["triple_id"],)).fetchone(), before)
+                    self.assertEqual(con.execute("SELECT * FROM kg_triple_supports WHERE triple_id=?",
+                                                 (kept["triple_id"],)).fetchall(), support)
+                    self.assertIsNotNone(con.execute("SELECT valid_to FROM triples WHERE id=?",
+                                                     (retired["triple_id"],)).fetchone()[0])
+
+    def test_dry_run_prints_contradiction_invalidations(self):
+        worklist = {
+            "task": "contradiction",
+            "items": [
+                {
+                    "kind": "contradiction",
+                    "subject": "Alice",
+                    "predicate": "lives_in",
+                    "candidates": [
+                        {"object": "Portland", "object_id": "city-pdx", "triple_id": "t-pdx", "triple_ids": ["t-pdx"]},
+                        {"object": "Seattle", "object_id": "city-sea", "triple_id": "t-sea", "triple_ids": ["t-sea"]},
+                    ],
+                    "decision": {
+                        "action": "invalidate",
+                        "keep": "Seattle",
+                        "invalidate": ["t-pdx"],
+                    },
+                }
+            ],
+        }
+        with _test_tmpdir() as td:
+            decisions_path = os.path.join(td, "decisions.json")
+            with open(decisions_path, "w", encoding="utf-8") as fh:
+                json.dump(worklist, fh)
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            with mock.patch.object(dream_adopt.dream_palace, "bind_palace", return_value="/bound"), \
+                 contextlib.redirect_stdout(stdout), \
+                 contextlib.redirect_stderr(stderr):
+                rc = dream_adopt.main([
+                    "--palace", "/palace",
+                    "--decisions", decisions_path,
+                    "--dry-run",
+                ])
+
+            self.assertEqual(rc, 0)
+            self.assertIn("SUPERSEDE", stdout.getvalue())
+            self.assertIn("t-pdx", stdout.getvalue())
+            self.assertIn("[dry-run] would invalidate 1, skip 0", stderr.getvalue())
+
+
+class TestAdoptPatternTask(unittest.TestCase):
+    def test_pattern_support_subset_rejects_laundering_and_surfaces_valid_subset(self):
+        worklist = {
+            "task": "pattern",
+            "params": {"min_support": 2},
+            "items": [
+                {
+                    "kind": "pattern",
+                    "members": [
+                        {
+                            "id": "entry-1",
+                            "text": "SESSION_ID: abcdef12 repeated observation",
+                            "session_id": "abcdef12",
+                            "wing": "wing_copilot-cli",
+                            "room": "diary",
+                        }
+                    ],
+                    "evidence": {"support_ids": ["abcdef12", "abcdef13", "abcdef14"]},
+                    "decision": {
+                        "action": "surface",
+                        "text": "Undersupported pattern must be rejected.",
+                        "supported_by": ["abcdef12"],
+                    },
+                },
+                {
+                    "kind": "pattern",
+                    "members": [
+                        {
+                            "id": "entry-2",
+                            "text": "SESSION_ID: abcdef13 repeated observation",
+                            "session_id": "abcdef13",
+                            "wing": "wing_copilot-cli",
+                            "room": "diary",
+                        }
+                    ],
+                    "evidence": {"support_ids": ["abcdef12", "abcdef13", "abcdef14"]},
+                    "decision": {
+                        "action": "surface",
+                        "text": "Recurring pattern worth surfacing.",
+                        "supported_by": ["abcdef12", "abcdef14"],
+                    },
+                },
+                {
+                    "kind": "pattern",
+                    "members": [],
+                    "evidence": {"support_ids": ["abcdef14", "abcdef15"]},
+                    "decision": {"action": "skip"},
+                },
+            ],
+        }
+
+        decisions = dream_adopt._resolve_pattern_decisions(worklist)
+
+        self.assertEqual(decisions[0]["supported_by"], ["abcdef12"])
+        self.assertEqual(decisions[0]["allowed_support"], ["abcdef12", "abcdef13", "abcdef14"])
+        self.assertEqual(decisions[1]["supported_by"], ["abcdef12", "abcdef14"])
+        writer = mock.Mock()
+        writer.add_drawer.return_value = {"drawer_id": "lesson-1"}
+        report = dream_adopt.apply_pattern_decisions(decisions, writer, min_support=2)
+        self.assertEqual(report["surfaced"], 1)
+        self.assertEqual(len(report["errors"]), 1)
+        writer.add_drawer.assert_called_once_with(
+            "wing_copilot-cli",
+            "diary",
+            "Recurring pattern worth surfacing.",
+            metadata={"supported_by": ["abcdef12", "abcdef14"], "kind": "lesson"},
+        )
+
+    def test_dry_run_pattern_adds_only_and_never_deletes(self):
+        worklist = {
+            "task": "pattern",
+            "params": {"min_support": 2},
+            "items": [
+                {
+                    "kind": "pattern",
+                    "members": [
+                        {
+                            "id": "entry-1",
+                            "text": "SESSION_ID: abcdef12 repeated observation",
+                            "session_id": "abcdef12",
+                            "wing": "wing_copilot-cli",
+                            "room": "diary",
+                        }
+                    ],
+                    "evidence": {"support_ids": ["abcdef12", "abcdef13"]},
+                    "decision": {
+                        "action": "surface",
+                        "text": "Recurring pattern worth surfacing.",
+                        "supported_by": ["abcdef12", "abcdef13"],
+                    },
+                }
+            ],
+        }
+        with _test_tmpdir() as td:
+            decisions_path = os.path.join(td, "decisions.json")
+            with open(decisions_path, "w", encoding="utf-8") as fh:
+                json.dump(worklist, fh)
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            with mock.patch.object(dream_adopt.dream_palace, "bind_palace", return_value="/bound"), \
+                 contextlib.redirect_stdout(stdout), \
+                 contextlib.redirect_stderr(stderr):
+                rc = dream_adopt.main([
+                    "--palace", "/palace",
+                    "--decisions", decisions_path,
+                    "--dry-run",
+                ])
+
+            self.assertEqual(rc, 0)
+            self.assertIn("ADD  wing_copilot-cli/diary: Recurring pattern worth surfacing....", stdout.getvalue())
+            self.assertNotIn("DEL", stdout.getvalue())
+            self.assertIn("[dry-run] would surface 1, skip 0, errors 0", stderr.getvalue())
+
+
+class TestAdoptMergeArchiveAndVerify(unittest.TestCase):
+    """Regression: --archive-file must reach the live merge Archiver; --verify re-harvests."""
+
+    def _merge_decisions(self):
+        return {
+            "task": "merge",
+            "scope": {"palace": "/palace", "wing": "wing", "room": "room"},
+            "params": {"tau": 0.9},
+            "items": [{
+                "kind": "merge",
+                "members": [
+                    {"id": "drawer-1", "member_ids": ["chunk-1"], "wing": "wing", "room": "room", "text": "old A"},
+                    {"id": "drawer-2", "member_ids": ["chunk-2"], "wing": "wing", "room": "room", "text": "old B"},
+                ],
+                "supersedes": ["chunk-1", "chunk-2"],
+                "decision": {"action": "merge", "text": "merged fact"},
+            }],
+        }
+
+    def test_live_merge_passes_archive_file_to_archiver(self):
+        report = {"merged": 1, "skipped": 0, "deleted": ["chunk-1", "chunk-2"], "errors": []}
+        with _test_tmpdir() as td:
+            decisions_path = os.path.join(td, "decisions.json")
+            with open(decisions_path, "w", encoding="utf-8") as fh:
+                json.dump(self._merge_decisions(), fh)
+            archive_path = os.path.join(td, "custom-archive.jsonl")
+            with mock.patch.object(dream_adopt.dream_palace, "bind_palace", return_value=td), \
+                 mock.patch.object(dream_adopt.dream_palace, "MempalaceWriter", return_value=mock.MagicMock()), \
+                 mock.patch.object(dream_adopt.dream_palace, "Archiver") as archiver_cls, \
+                 mock.patch.object(dream_adopt, "_preflight_merge_decisions", side_effect=lambda p, d: (d, [])), \
+                 mock.patch.object(dream_adopt, "apply_merge_decisions", return_value=report), \
+                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                rc = dream_adopt.main([
+                    "--palace", "/palace", "--decisions", decisions_path,
+                    "--archive-file", archive_path,
+                ])
+            self.assertEqual(rc, 0)
+            _, kwargs = archiver_cls.call_args
+            self.assertEqual(kwargs.get("archive_path"), archive_path)
+
+    def test_verify_reharvests_merge_and_reports_residual(self):
+        report = {"merged": 1, "skipped": 0, "deleted": ["chunk-1", "chunk-2"], "errors": []}
+
+        with _test_tmpdir() as td:
+            decisions_path = os.path.join(td, "decisions.json")
+            with open(decisions_path, "w", encoding="utf-8") as fh:
+                json.dump(self._merge_decisions(), fh)
+            stderr = io.StringIO()
+            with mock.patch.object(dream_adopt.dream_palace, "bind_palace", return_value=td), \
+                 mock.patch.object(dream_adopt.dream_palace, "MempalaceWriter", return_value=mock.MagicMock()), \
+                 mock.patch.object(dream_adopt.dream_palace, "Archiver", return_value=mock.MagicMock()), \
+                 mock.patch.object(dream_adopt, "_preflight_merge_decisions", side_effect=lambda p, d: (d, [])), \
+                 mock.patch.object(dream_adopt, "apply_merge_decisions", return_value=report), \
+                 mock.patch.object(dream_adopt.dream_harvest, "harvest_merge_worklist",
+                                   return_value={"task": "merge", "items": []}) as harvest_main, \
+                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr):
+                rc = dream_adopt.main([
+                    "--palace", td, "--decisions", decisions_path, "--verify",
+                ])
+            self.assertEqual(rc, 0)
+            self.assertIn("verify: 0 residual", stderr.getvalue())
+            # re-harvest reconstructed the merge scope from the worklist
+            harvest_main.assert_called_once_with(td, wing="wing", room="room", tau=.9)
+
+    def test_actual_chunked_merge_archive_roundtrip(self):
+        from mempalace.palace import get_collection
+        with _test_tmpdir() as td, installed_palace(td) as server:
+            writer = dream_adopt.dream_palace.MempalaceWriter()
+            common = "The cluster uses stable canonical identities and archives evidence. "
+            prefix = common * (server._config.chunk_size // len(common) + 2)
+            originals = [prefix + "First observation.", prefix + "Second observation."]
+            written = [writer.add_drawer("w", "r", text) for text in originals]
+            self.assertTrue(all(result["chunks"] > 1 for result in written))
+            decisions_path = os.path.join(td, "worklist.json")
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(dream_harvest.main([
+                    "--palace", td, "--wing", "w", "--room", "r", "--tau", ".8",
+                    "--out", decisions_path]), 0)
+            worklist = _load_json(decisions_path)
+            self.assertEqual(len(worklist["items"]), 1)
+            item = worklist["items"][0]
+            expected_ids = {pid for result in written for pid in result["chunk_ids"]}
+            self.assertEqual(set(item["supersedes"]), expected_ids)
+            self.assertEqual({m["text"] for m in item["members"]}, set(originals))
+            self.assertEqual(
+                {m["content_hash"] for m in item["members"]},
+                {hashlib.sha256(text.encode()).hexdigest() for text in originals})
+            item["decision"] = {"action": "merge", "text": "Canonical identity evidence was consolidated."}
+            _dump_json(decisions_path, worklist)
+            archive_path = os.path.join(td, "archive.jsonl")
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                rc = dream_adopt.main(["--palace", td, "--decisions", decisions_path,
+                                       "--archive-file", archive_path, "--verify", "--strict"])
+            self.assertEqual(rc, 0, stderr.getvalue())
+            self.assertIn("0 residual", stderr.getvalue())
+            with open(archive_path, encoding="utf-8") as fh:
+                archives = [json.loads(line) for line in fh]
+            rows = [row for archive in archives for row in archive["rows"]]
+            self.assertEqual({row["id"] for row in rows}, expected_ids)
+            self.assertTrue(all(archive["reason"] == "merge" for archive in archives))
+            self.assertEqual(get_collection(td).get(ids=sorted(expected_ids))["ids"], [])
+            # Restore the archived physical rows, then compare canonical logical content.
+            get_collection(td).add(
+                ids=[row["id"] for row in rows], documents=[row["document"] for row in rows],
+                metadatas=[row["metadata"] for row in rows], embeddings=[row["embedding"] for row in rows])
+            for result, text in zip(written, originals):
+                restored = dream_adopt.dream_palace.load_drawer_by_id(td, result["drawer_id"])
+                self.assertEqual(restored["text"], text)
+                self.assertEqual(set(restored["member_ids"]), set(result["chunk_ids"]))
+
+
+class TestAdoptMergeTask(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(mock.patch.object(dream_adopt.dream_palace, "protection_collection",
+                                           return_value=DrawerCollection()))
+
+    def test_adopt_uses_mempalace_config_when_palace_is_omitted(self):
+        with _test_tmpdir() as td:
+            configured_palace = os.path.join(td, "configured-palace")
+            config_path = os.path.join(td, "config.json")
+            _dump_json(config_path, {"palace_path": configured_palace})
+            decisions_path = os.path.join(td, "decisions.json")
+            _dump_json(decisions_path, {"task": "merge", "items": []})
+
+            with mock.patch.dict(os.environ, {"MEMPALACE_CONFIG": config_path}), \
+                 mock.patch.object(dream_adopt.dream_palace, "bind_palace", return_value=td) as bind_palace, \
+                 contextlib.redirect_stdout(io.StringIO()), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                rc = dream_adopt.main(["--decisions", decisions_path, "--dry-run"])
+
+            self.assertEqual(rc, 0)
+            bind_palace.assert_called_once_with(configured_palace)
+
+    def test_default_palace_helper_reads_mempalace_config(self):
+        with _test_tmpdir() as td:
+            configured_palace = os.path.join(td, "configured-palace")
+            config_path = os.path.join(td, "config.json")
+            _dump_json(config_path, {"palace_path": configured_palace})
+
+            with mock.patch.dict(os.environ, {"MEMPALACE_CONFIG": config_path}):
+                self.assertEqual(dream_adopt._default_palace_from_config(), configured_palace)
+
+    def test_adopt_without_palace_or_config_returns_clear_error(self):
+        with _test_tmpdir() as td:
+            decisions_path = os.path.join(td, "decisions.json")
+            _dump_json(decisions_path, {"task": "merge", "items": []})
+            stderr = io.StringIO()
+
+            with mock.patch.dict(os.environ, {"MEMPALACE_CONFIG": os.path.join(td, "missing.json")}), \
+                 contextlib.redirect_stderr(stderr):
+                rc = dream_adopt.main(["--decisions", decisions_path])
+
+        self.assertEqual(rc, 2)
+        self.assertIn("--palace omitted", stderr.getvalue())
+        self.assertIn("palace_path", stderr.getvalue())
+
+    def test_dry_run_merge_archives_without_real_writes_or_deletes(self):
+        worklist = {
+            "task": "merge",
+            "items": [
+                {
+                    "kind": "merge",
+                    "members": [
+                        {"id": "drawer-1", "member_ids": ["chunk-1"], "wing": "wing", "room": "room", "text": "old A"},
+                        {"id": "drawer-2", "member_ids": ["chunk-2"], "wing": "wing", "room": "room", "text": "old B"},
+                    ],
+                    "supersedes": ["chunk-1", "chunk-2"],
+                    "decision": {"action": "merge", "text": "merged fact"},
+                }
+            ],
+        }
+        with _test_tmpdir() as td:
+            decisions_path = os.path.join(td, "decisions.json")
+            with open(decisions_path, "w", encoding="utf-8") as fh:
+                json.dump(worklist, fh)
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            with mock.patch.object(dream_adopt.dream_palace, "bind_palace", return_value="/bound"), \
+                 mock.patch.object(dream_adopt.dream_palace, "MempalaceWriter", side_effect=AssertionError("real writer used")), \
+                 mock.patch.object(dream_adopt.dream_palace, "Archiver", side_effect=AssertionError("real archiver used")), \
+                 contextlib.redirect_stdout(stdout), \
+                 contextlib.redirect_stderr(stderr):
+                rc = dream_adopt.main([
+                    "--palace", "/palace",
+                    "--decisions", decisions_path,
+                    "--archive-file", os.path.join(td, "archive.jsonl"),
+                    "--dry-run",
+                ])
+
+            self.assertEqual(rc, 0)
+            self.assertIn("ADD  wing/room: merged fact...", stdout.getvalue())
+            self.assertIn("ARCHIVE+DELETE ['chunk-1', 'chunk-2']", stdout.getvalue())
+            self.assertNotIn("DEL  ", stdout.getvalue())
+            self.assertIn("[dry-run] would merge 1, skip 0, errors 0", stderr.getvalue())
+
+
+class TestAdoptPruneTask(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(mock.patch.object(dream_adopt.dream_palace, "protection_collection",
+                                           return_value=DrawerCollection()))
+        self.enterContext(mock.patch.object(dream_adopt.dream_palace, "load_drawer_usage",
+                                           create=True, return_value={}))
+        self.enterContext(mock.patch.object(dream_adopt.dream_palace, "load_logical_drawers",
+                                           return_value=[
+            {"id": drawer_id, "member_ids": [drawer_id], "text": "forgettable",
+             "wing": "wing", "room": "room", "embedding": [1., 0.],
+             "metadata": {"filed_at": "2000-01-01"}}
+            for drawer_id in ("drawer-1", "peer")
+        ]))
+
+    def test_resolve_prune_decisions_defaults_to_item_fields_and_keeps_by_default(self):
+        salience = {"v": 0.12, "age_days": 400, "kg_degree": 0}
+        worklist = {
+            "task": "prune",
+            "items": [
+                {
+                    "kind": "prune",
+                    "id": "drawer-1",
+                    "member_ids": ["chunk-1", "chunk-2"],
+                    "wing": "wing",
+                    "room": "room",
+                    "text": "forgettable",
+                    "content_hash": "hash-1",
+                    "pinned": False,
+                    "salience": salience,
+                    "decision": {"action": "prune"},
+                },
+                {
+                    "kind": "prune",
+                    "id": "drawer-2",
+                    "member_ids": ["drawer-2"],
+                    "wing": "wing",
+                    "room": "room",
+                    "text": "conservative default",
+                    "salience": salience,
+                    "decision": {"action": "keep"},
+                },
+                {
+                    "kind": "prune",
+                    "id": "drawer-3",
+                    "member_ids": ["drawer-3"],
+                    "wing": "wing",
+                    "room": "room",
+                    "text": "omitted decision",
+                    "salience": salience,
+                    "decision": None,
+                },
+            ],
+        }
+
+        decisions = dream_adopt._resolve_prune_decisions(worklist)
+
+        self.assertEqual(decisions, [
+            {
+                "action": "prune",
+                "id": "drawer-1",
+                "member_ids": ["chunk-1", "chunk-2"],
+                "wing": "wing",
+                "room": "room",
+                "text": "forgettable",
+                "content_hash": "hash-1",
+                "pinned": False,
+                "topic": None,
+                "salience": salience,
+            },
+            {"action": "keep"},
+            {"action": "keep"},
+        ])
+
+    def test_dry_run_prune_records_archive_delete_plan_without_real_archiver(self):
+        worklist = {
+            "task": "prune",
+            "items": [
+                {
+                    "kind": "prune",
+                    "id": "drawer-1",
+                    "member_ids": ["chunk-1"],
+                    "wing": "wing",
+                    "room": "room",
+                    "text": "forgettable",
+                    "content_hash": "expected-hash",
+                    "pinned": False,
+                    "salience": {"v": 0.12, "age_days": 400, "kg_degree": 0},
+                    "decision": {"action": "prune"},
+                }
+            ],
+        }
+        with _test_tmpdir() as td:
+            decisions_path = os.path.join(td, "decisions.json")
+            with open(decisions_path, "w", encoding="utf-8") as fh:
+                json.dump(worklist, fh)
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            with mock.patch.object(dream_adopt.dream_palace, "bind_palace", return_value="/bound"), \
+                 mock.patch.object(dream_adopt.dream_palace, "load_drawer_by_id", return_value={
+                     "id": "drawer-1",
+                     "text": "forgettable",
+                     "metadata": {"pinned": False},
+                     "content_hash": "expected-hash",
+                 }), \
+                 mock.patch.object(dream_adopt.dream_palace, "kg_source_degree", return_value={}), \
+                 mock.patch.object(dream_adopt.dream_palace, "Archiver", side_effect=AssertionError("real archiver used")), \
+                 contextlib.redirect_stdout(stdout), \
+                 contextlib.redirect_stderr(stderr):
+                rc = dream_adopt.main([
+                    "--palace", "/palace",
+                    "--decisions", decisions_path,
+                    "--archive-file", os.path.join(td, "archive.jsonl"),
+                    "--dry-run",
+                ])
+
+            self.assertEqual(rc, 0)
+            self.assertIn("PRUNE drawer-1 (archive+delete)", stdout.getvalue())
+            self.assertIn("[dry-run] would prune 1, keep 0, errors 0", stderr.getvalue())
+
+    def test_dry_run_prune_skips_drifted_drawer(self):
+        worklist = {
+            "task": "prune",
+            "items": [
+                {
+                    "kind": "prune",
+                    "id": "drawer-1",
+                    "member_ids": ["chunk-1"],
+                    "wing": "wing",
+                    "room": "room",
+                    "text": "old text",
+                    "content_hash": "old-hash",
+                    "pinned": False,
+                    "salience": {"v": 0.12, "age_days": 400, "kg_degree": 0},
+                    "decision": {"action": "prune"},
+                }
+            ],
+        }
+        with _test_tmpdir() as td:
+            decisions_path = os.path.join(td, "decisions.json")
+            with open(decisions_path, "w", encoding="utf-8") as fh:
+                json.dump(worklist, fh)
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            with mock.patch.object(dream_adopt.dream_palace, "bind_palace", return_value="/bound"), \
+                 mock.patch.object(dream_adopt.dream_palace, "load_drawer_by_id", return_value={
+                     "id": "drawer-1",
+                     "text": "new text",
+                     "metadata": {"pinned": False},
+                     "content_hash": "new-hash",
+                 }), \
+                 mock.patch.object(dream_adopt.dream_palace, "kg_source_degree", return_value={}), \
+                 contextlib.redirect_stdout(stdout), \
+                 contextlib.redirect_stderr(stderr):
+                rc = dream_adopt.main([
+                    "--palace", "/palace",
+                    "--decisions", decisions_path,
+                    "--archive-file", os.path.join(td, "archive.jsonl"),
+                    "--dry-run",
+                ])
+
+            self.assertEqual(rc, 1)
+            self.assertNotIn("PRUNE drawer-1", stdout.getvalue())
+            self.assertIn("drift", stderr.getvalue())
+
+    def test_dry_run_prune_aborts_now_pinned_or_kg_connected_drawers(self):
+        worklist = {
+            "task": "prune",
+            "items": [
+                {
+                    "kind": "prune",
+                    "id": "pinned",
+                    "member_ids": ["pinned"],
+                    "wing": "wing",
+                    "room": "room",
+                    "text": "still important",
+                    "content_hash": "hash-pinned",
+                    "pinned": False,
+                    "salience": {"v": 0.12, "age_days": 400, "kg_degree": 0},
+                    "decision": {"action": "prune"},
+                },
+                {
+                    "kind": "prune",
+                    "id": "connected",
+                    "member_ids": ["connected"],
+                    "wing": "wing",
+                    "room": "room",
+                    "text": "kg source",
+                    "content_hash": "hash-connected",
+                    "pinned": False,
+                    "salience": {"v": 0.12, "age_days": 400, "kg_degree": 0},
+                    "decision": {"action": "prune"},
+                },
+            ],
+        }
+
+        def load_live(_palace, drawer_id):
+            return {
+                "id": drawer_id,
+                "text": drawer_id,
+                "metadata": {"pinned": drawer_id == "pinned"},
+                "content_hash": f"hash-{drawer_id}",
+            }
+
+        with _test_tmpdir() as td:
+            decisions_path = os.path.join(td, "decisions.json")
+            with open(decisions_path, "w", encoding="utf-8") as fh:
+                json.dump(worklist, fh)
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            with mock.patch.object(dream_adopt.dream_palace, "bind_palace", return_value="/bound"), \
+                 mock.patch.object(dream_adopt.dream_palace, "load_drawer_by_id", side_effect=load_live), \
+                 mock.patch.object(dream_adopt.dream_palace, "kg_source_degree", return_value={"connected": 1}), \
+                 contextlib.redirect_stdout(stdout), \
+                 contextlib.redirect_stderr(stderr):
+                rc = dream_adopt.main([
+                    "--palace", "/palace",
+                    "--decisions", decisions_path,
+                    "--archive-file", os.path.join(td, "archive.jsonl"),
+                    "--dry-run",
+                ])
+
+            self.assertEqual(rc, 1)
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertIn("protected", stderr.getvalue())
+
+
+class TestPruneUsageSafety(unittest.TestCase):
+    def setUp(self):
+        self.drawers = [
+            {"id": "old", "member_ids": ["old-chunk"], "text": "archival note",
+             "wing": "w", "room": "r", "embedding": [1., 0.],
+             "metadata": {"filed_at": "2000-01-01"}},
+            {"id": "peer", "member_ids": ["peer"], "text": "other note",
+             "wing": "w", "room": "r", "embedding": [0., 1.],
+             "metadata": {"filed_at": "2000-01-01"}},
+        ]
+        self.old_usage = {"access_count": 1, "strength": 1., "stability": 2.,
+                          "last_activated": "2020-01-01T00:00:00Z"}
+        self.enterContext(mock.patch.object(dream_harvest.dream_palace, "protection_collection",
+                                           return_value=DrawerCollection()))
+        self.enterContext(mock.patch.object(dream_harvest.dream_palace, "load_logical_drawers",
+                                           return_value=self.drawers))
+        self.enterContext(mock.patch.object(dream_harvest.dream_palace, "kg_protection_degree",
+                                           return_value={}))
+        self.enterContext(mock.patch.object(dream_harvest.dream_palace, "load_drawer_by_id",
+                                           return_value=self.drawers[0]))
+        self.load_usage = self.enterContext(mock.patch.object(
+            dream_harvest.dream_palace, "load_drawer_usage", create=True,
+            return_value={"old": self.old_usage}))
+
+    def _decision(self, usage=None):
+        salience = {"v": 0., "age_days": 9000, "kg_degree": 0}
+        if usage is not None:
+            salience["usage"] = usage
+        return {"action": "prune", "id": "old", "member_ids": ["old-chunk"],
+                "text": "archival note", "wing": "w", "room": "r", "salience": salience}
+
+    def test_harvest_records_complete_usage_and_uses_core_protection_score(self):
+        self.load_usage.return_value = {"old": {**self.old_usage, "access_count": 101, "strength": 5.}}
+        with _test_tmpdir() as td, contextlib.redirect_stderr(io.StringIO()):
+            out = os.path.join(td, "wl.json")
+            dream_harvest.main(["--palace", td, "--task", "prune",
+                                "--wing", "w", "--room", "r", "--v-min", ".1", "--out", out])
+            worklist = _load_json(out)
+        self.assertEqual([d["id"] for d in worklist["items"]], ["peer"])
+        self.assertEqual(worklist["items"][0]["salience"]["usage"], {})
+
+    def test_harvest_snapshot_is_not_overridden_by_decision(self):
+        decision = self._decision(self.old_usage)
+        worklist = {"items": [{**decision, "decision": {
+            "action": "prune", "salience": {"usage": {"access_count": 999}}}}]}
+        resolved = dream_adopt._resolve_prune_decisions(worklist)[0]
+        self.assertEqual(resolved["salience"]["usage"], self.old_usage)
+
+    def test_usage_advancing_after_harvest_refuses_prune(self):
+        for change in ({"access_count": 2}, {"last_activated": "2025-01-01T00:00:00Z"},
+                       {"strength": 2.}, {"stability": 3.}):
+            with self.subTest(change=change):
+                self.load_usage.return_value = {"old": {**self.old_usage, **change}}
+                filtered, errors = dream_adopt._preflight_prune_decisions(
+                    "/palace", [self._decision(self.old_usage)])
+                self.assertEqual(filtered, [{"action": "keep"}])
+                self.assertIn("usage", errors[0]["error"])
+
+    def test_unchanged_usage_still_must_meet_recorded_threshold(self):
+        worklist = {"scope": {"wing": "w", "room": "r"},
+                    "params": {"v_min": .01, "age_floor_days": 30}}
+        filtered, errors = dream_adopt._preflight_prune_decisions(
+            "/palace", [self._decision(self.old_usage)], worklist)
+        self.assertEqual(filtered, [{"action": "keep"}])
+        self.assertIn("eligible", errors[0]["error"])
+
+    def test_legacy_worklist_with_usage_requires_reharvest(self):
+        filtered, errors = dream_adopt._preflight_prune_decisions("/palace", [self._decision()])
+        self.assertEqual(filtered, [{"action": "keep"}])
+        self.assertIn("usage", errors[0]["error"])
+
+    def test_legacy_unknown_usage_is_rescored_without_invented_activity(self):
+        self.load_usage.return_value = {}
+        filtered, errors = dream_adopt._preflight_prune_decisions("/palace", [self._decision()])
+        self.assertEqual(errors, [])
+        self.assertEqual(filtered[0]["action"], "prune")
+        self.assertEqual(filtered[0]["salience"]["usage"], {})
+
+    def test_usage_load_failure_refuses_instead_of_defaulting_empty(self):
+        self.load_usage.side_effect = RuntimeError("usage incomplete")
+        filtered, errors = dream_adopt._preflight_prune_decisions("/palace", [self._decision()])
+        self.assertEqual(filtered, [{"action": "keep"}])
+        self.assertIn("usage incomplete", errors[0]["error"])
+
+    def test_live_chunk_kg_protection_and_topic_singleton_remain_safe(self):
+        self.load_usage.return_value = {}
+        with mock.patch.object(dream_harvest.dream_palace, "kg_protection_degree",
+                               return_value={"old-chunk": 1}):
+            filtered, errors = dream_adopt._preflight_prune_decisions("/palace", [self._decision()])
+        self.assertEqual(filtered, [{"action": "keep"}])
+        self.assertIn("kg-connected", errors[0]["error"])
+        self.drawers.pop()
+        filtered, errors = dream_adopt._preflight_prune_decisions("/palace", [self._decision()])
+        self.assertEqual(filtered, [{"action": "keep"}])
+        self.assertIn("eligible", errors[0]["error"])
+
+    def test_fresh_usage_check_runs_under_live_apply_lock(self):
+        held = []
+        @contextlib.contextmanager
+        def lock(_):
+            held.append(True)
+            try:
+                yield
+            finally:
+                held.pop()
+        def usage(*args, **kwargs):
+            self.assertTrue(held, "usage check must run under apply lock")
+            return {"old": {**self.old_usage, "access_count": 2}}
+        self.load_usage.side_effect = usage
+        item = self._decision(self.old_usage)
+        item["decision"] = {"action": "prune"}
+        with _test_tmpdir() as td:
+            path = os.path.join(td, "decisions.json")
+            _dump_json(path, {"task": "prune", "items": [item]})
+            with mock.patch.object(dream_adopt.dream_palace, "palace_mutation_lock", lock), \
+                 mock.patch.object(dream_adopt.dream_palace, "Archiver") as archiver, \
+                 contextlib.redirect_stderr(io.StringIO()):
+                rc = dream_adopt.main(["--palace", td, "--decisions", path])
+        self.assertEqual(rc, 1)
+        archiver.return_value.archive_then_delete.assert_not_called()
+
+
+class TestNativePruneUsage(unittest.TestCase):
+    def test_actual_retrieval_after_harvest_refuses_prune(self):
+        from mempalace.palace import get_collection
+        with _test_tmpdir() as td, installed_palace(td) as server:
+            meta = {"wing": "w", "room": "r", "filed_at": "2000-01-01",
+                    "access_count": 0, "strength": .05, "stability": 1.,
+                    "last_activated": "2000-01-01T00:00:00Z"}
+            get_collection(td).add(
+                ids=["old-a", "old-b"], documents=["Old source context."] * 2,
+                metadatas=[meta, meta])
+            path = os.path.join(td, "wl.json")
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(dream_harvest.main([
+                    "--palace", td, "--task", "prune", "--wing", "w", "--room", "r",
+                    "--out", path]), 0)
+            worklist = _load_json(path)
+            target = next(item for item in worklist["items"] if item["id"] == "old-a")
+            self.assertEqual(target["salience"]["usage"]["access_count"], 0)
+            target["decision"] = {"action": "prune"}
+            _dump_json(path, worklist)
+            with mock.patch.dict(os.environ, {server._SALIENCE_POTENTIATE_ENV: "1"}):
+                retrieved = server.tool_search("Old source context.", wing="w")
+            self.assertIn("old-a", [hit["drawer_id"] for hit in retrieved["results"]])
+            self.assertGreater(
+                dream_adopt.dream_palace.load_drawer_usage(td)["old-a"]["access_count"], 0)
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                rc = dream_adopt.main(["--palace", td, "--decisions", path])
+            self.assertEqual(rc, 1, stderr.getvalue())
+            self.assertIn("usage changed since harvest", stderr.getvalue())
+            self.assertEqual(get_collection(td).get(ids=["old-a"])["ids"], ["old-a"])
+            self.assertFalse(os.path.exists(os.path.join(td, "dream-archive.jsonl")))
+
+
+class TestAdoptDeriveTask(unittest.TestCase):
+    def _derive_item(self):
+        return {
+            "kind": "derive",
+            "candidate_id": "cand-1",
+            "conclusion": {
+                "subject_id": "A",
+                "predicate": "depends_on_closure",
+                "object_id": "C",
+            },
+            "rule": {"id": "transitive:depends_on"},
+            "proof": {"premise_ids": ["t1", "t2"], "premise_drawer_ids": ["d1"]},
+            "evidence": {"confidence": 1.0, "valid_from": "2026-01-01"},
+            "ontology_version": "onto:test",
+        }
+
+    def _apply_resolved(self, worklist):
+        decisions = dream_adopt._resolve_derive_decisions(worklist)
+        return dream_adopt.apply_derive_decisions(decisions, dream_adopt._DryRunKgWriter())[0]
+
+    class _RecordingKgWriter:
+        def __init__(self):
+            self.added = []
+
+        def add_derived(self, *args, **kwargs):
+            self.added.append((args, kwargs))
+            return {"ok": True, "triple_id": f"t-derived-{len(self.added)}"}
+
+    def test_entailed_given_materialize_is_rejected_without_writer_call(self):
+        item = self._derive_item()
+        item["action"] = "materialize"
+        item["evidence"]["epistemic_status"] = "entailed_given"
+        item["proof"]["entailed_given"] = ["t_x"]
+        writer = self._RecordingKgWriter()
+
+        report, markers = dream_adopt.apply_derive_decisions([item], writer)
+
+        self.assertEqual(writer.added, [])
+        self.assertEqual(report["materialized"], 0)
+        self.assertEqual(markers, [])
+        self.assertEqual(len(report["errors"]), 1)
+        self.assertEqual(report["errors"][0]["stage"], "materialize")
+        self.assertIn("refused to materialize entailed_given candidate cand-1", report["errors"][0]["error"])
+
+    def test_deduced_materialize_still_calls_writer(self):
+        item = self._derive_item()
+        item["action"] = "materialize"
+        item["evidence"]["epistemic_status"] = "deduced"
+        item["proof"]["entailed_given"] = []
+        writer = self._RecordingKgWriter()
+
+        report, markers = dream_adopt.apply_derive_decisions([item], writer)
+
+        self.assertEqual(len(writer.added), 1)
+        self.assertEqual(report["materialized"], 1)
+        self.assertEqual(report["errors"], [])
+        self.assertEqual(markers, [])
+
+    def test_nested_derive_decision_materializes(self):
+        item = self._derive_item()
+        item["decision"] = {"action": "materialize", "reason": "approved"}
+        report = self._apply_resolved({"task": "contemplate", "items": [item]})
+
+        self.assertEqual(report["materialized"], 1)
+        self.assertEqual(report["skipped"], 0)
+        self.assertEqual(report["errors"], [])
+
+    def test_top_level_derive_action_still_materializes(self):
+        item = self._derive_item()
+        item["action"] = "materialize"
+        report = self._apply_resolved({"task": "contemplate", "items": [item]})
+
+        self.assertEqual(report["materialized"], 1)
+        self.assertEqual(report["errors"], [])
+
+    def test_derive_item_without_decision_or_action_is_noop(self):
+        report = self._apply_resolved({"task": "contemplate", "items": [self._derive_item()]})
+
+        self.assertEqual(report["materialized"], 0)
+        self.assertEqual(report["skipped"], 0)
+        self.assertEqual(report["ignored"], 0)
+        self.assertEqual(report["errors"], [])
+
+    def test_live_derive_adopt_prints_final_summary_line_to_stderr(self):
+        report = {
+            "materialized": 1,
+            "skipped": 0,
+            "ignored": 0,
+            "rejected_rules": [],
+            "materialized_facts": [],
+            "errors": [],
+        }
+        with _test_tmpdir() as td:
+            decisions_path = os.path.join(td, "decisions.json")
+            _dump_json(
+                decisions_path,
+                {"task": "contemplate", "ontology_version": "onto:test", "items": [self._derive_item()]},
+            )
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            writer = mock.MagicMock()
+
+            with mock.patch.object(dream_adopt.dream_palace, "bind_palace", return_value=td), \
+                 mock.patch.object(dream_adopt.dream_palace, "KgDeriveWriter", return_value=writer), \
+                 mock.patch.object(dream_adopt, "apply_derive_decisions", return_value=(report, [])), \
+                 mock.patch.object(dream_adopt.dream_palace, "append_skip_markers"), \
+                 contextlib.redirect_stdout(stdout), \
+                 contextlib.redirect_stderr(stderr):
+                rc = dream_adopt.main([
+                    "--task", "derive",
+                    "--palace", "/palace",
+                    "--decisions", decisions_path,
+                ])
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(stdout.getvalue()), report)
+        self.assertEqual(
+            stderr.getvalue().splitlines()[-1],
+            "adopt: task=derive materialized=1 skipped=0 errors=0",
+        )
+
+
+@unittest.skipUnless(_HAS_MEMPALACE, "requires mempalace interpreter")
+class DeriveCliTests(unittest.TestCase):
+    def _palace(self, td):
+        palace = os.path.join(td, "palace"); os.makedirs(palace)
+        kg = _RealKG(db_path=os.path.join(palace, "knowledge_graph.sqlite3"))
+        kg.add_triple("A", "depends_on", "B", valid_from="2026-01-01")
+        kg.add_triple("B", "depends_on", "C", valid_from="2026-01-01")
+        kg.close()
+        with open(os.path.join(palace, "ontology.json"), "w") as f:
+            json.dump({"version": 1, "rules": [{"id": "transitive:depends_on",
+                "family": "transitive", "predicate": "depends_on", "enabled": True,
+                "max_depth": 3}]}, f)
+        return palace
+
+    def test_harvest_derive_emits_one_closure_candidate(self):
+        with _test_tmpdir() as td:
+            palace = self._palace(td); out = os.path.join(td, "wl.json")
+            dream_harvest.main(["--task", "derive", "--palace", palace, "--out", out])
+            wl = _load_json(out)
+            self.assertEqual(wl["task"], "contemplate")
+            self.assertEqual(len(wl["items"]), 1)
+            self.assertEqual(wl["items"][0]["conclusion"]["predicate"], "depends_on_closure")
+
+    def test_adopt_materialize_then_verify_reaches_fixpoint(self):
+        with _test_tmpdir() as td:
+            palace = self._palace(td); out = os.path.join(td, "wl.json")
+            dream_harvest.main(["--task", "derive", "--palace", palace, "--out", out])
+            wl = _load_json(out)
+            wl["items"][0]["action"] = "materialize"
+            dec = os.path.join(td, "dec.json"); _dump_json(dec, wl)
+            rc = dream_adopt.main(["--task", "derive", "--palace", palace,
+                                   "--decisions", dec, "--verify", "--strict"])
+            self.assertEqual(rc, 0)
+            # re-harvest: candidate now active => 0 residual
+            dream_harvest.main(["--task", "derive", "--palace", palace, "--out", out])
+            self.assertEqual(len(_load_json(out)["items"]), 0)
+
+    def test_adopt_skip_then_reharvest_is_empty_via_skip_marker(self):
+        with _test_tmpdir() as td:
+            palace = self._palace(td); out = os.path.join(td, "wl.json")
+            dream_harvest.main(["--task", "derive", "--palace", palace, "--out", out])
+            wl = _load_json(out); wl["items"][0]["action"] = "skip"
+            wl["items"][0]["reason"] = "noise"
+            dec = os.path.join(td, "dec.json"); _dump_json(dec, wl)
+            dream_adopt.main(["--task", "derive", "--palace", palace, "--decisions", dec])
+            dream_harvest.main(["--task", "derive", "--palace", palace, "--out", out])
+            self.assertEqual(len(_load_json(out)["items"]), 0)  # skip-marker suppresses
+
+    def test_adopt_reject_rule_suppresses_via_skip_markers(self):
+        with _test_tmpdir() as td:
+            palace = self._palace(td); out = os.path.join(td, "wl.json")
+            dream_harvest.main(["--task", "derive", "--palace", palace, "--out", out])
+            wl = _load_json(out); wl["items"][0]["action"] = "reject_rule"
+            dec = os.path.join(td, "dec.json"); _dump_json(dec, wl)
+            dream_adopt.main(["--task", "derive", "--palace", palace, "--decisions", dec])
+            dream_harvest.main(["--task", "derive", "--palace", palace, "--out", out])
+            self.assertEqual(len(_load_json(out)["items"]), 0)  # operational fixpoint
+
+    def test_dry_run_materialize_previews_without_writing(self):
+        with _test_tmpdir() as td:
+            palace = self._palace(td); out = os.path.join(td, "wl.json")
+            dream_harvest.main(["--task", "derive", "--palace", palace, "--out", out])
+            wl = _load_json(out); wl["items"][0]["action"] = "materialize"
+            dec = os.path.join(td, "dec.json"); _dump_json(dec, wl)
+            rc = dream_adopt.main(["--task", "derive", "--palace", palace,
+                                   "--decisions", dec, "--dry-run"])
+            self.assertEqual(rc, 0)
+            # palace must be unmutated: re-harvest still yields 1 candidate
+            dream_harvest.main(["--task", "derive", "--palace", palace, "--out", out])
+            self.assertEqual(len(_load_json(out)["items"]), 1)
+
+    def test_live_adopt_materialize_error_returns_nonzero(self):
+        # Corrupt object_id so KgDeriveWriter raises; errors should surface in exit code
+        with _test_tmpdir() as td:
+            palace = self._palace(td); out = os.path.join(td, "wl.json")
+            dream_harvest.main(["--task", "derive", "--palace", palace, "--out", out])
+            wl = _load_json(out)
+            wl["items"][0]["action"] = "materialize"
+            wl["items"][0]["conclusion"]["object_id"] = 999999  # bogus entity id
+            dec = os.path.join(td, "dec.json"); _dump_json(dec, wl)
+            rc = dream_adopt.main(["--task", "derive", "--palace", palace, "--decisions", dec])
+            self.assertEqual(rc, 1)
+
+    def test_empty_contemplate_worklist_dispatches_without_task_flag(self):
+        # Zero-item contemplate worklist should adopt as a clean no-op (rc 0) without --task
+        with _test_tmpdir() as td:
+            palace = os.path.join(td, "palace"); os.makedirs(palace)
+            _RealKG(db_path=os.path.join(palace, "knowledge_graph.sqlite3")).close()
+            out = os.path.join(td, "wl.json")
+            dream_harvest.main(["--task", "derive", "--palace", palace, "--out", out])
+            wl = _load_json(out)
+            self.assertEqual(len(wl["items"]), 0)
+            dec = os.path.join(td, "dec.json"); _dump_json(dec, wl)
+            rc = dream_adopt.main(["--palace", palace, "--decisions", dec])
+            self.assertEqual(rc, 0)
+
+
+@unittest.skipUnless(_HAS_MEMPALACE, "requires mempalace interpreter")
+class DeriveHarvestCliTests(unittest.TestCase):
+    def _palace(self, td):
+        palace = os.path.join(td, "palace"); os.makedirs(palace)
+        kg = _RealKG(db_path=os.path.join(palace, "knowledge_graph.sqlite3"))
+        kg.add_triple("A", "depends_on", "B", valid_from="2026-01-01")
+        kg.add_triple("B", "depends_on", "C", valid_from="2026-01-01")
+        kg.close()
+        with open(os.path.join(palace, "ontology.json"), "w") as f:
+            json.dump({"version": 1, "rules": [{"id": "transitive:depends_on",
+                "family": "transitive", "predicate": "depends_on", "enabled": True,
+                "max_depth": 3}]}, f)
+        return palace
+
+    def test_harvest_derive_emits_one_closure_candidate(self):
+        with _test_tmpdir() as td:
+            palace = self._palace(td); out = os.path.join(td, "wl.json")
+            rc = dream_harvest.main(["--task", "derive", "--palace", palace, "--out", out])
+            self.assertEqual(rc, 0)
+            wl = _load_json(out)
+            self.assertEqual(wl["task"], "contemplate")
+            self.assertEqual(len(wl["items"]), 1)
+            self.assertEqual(wl["items"][0]["conclusion"]["predicate"], "depends_on_closure")
+
+    def test_harvest_derive_empty_config_yields_zero(self):
+        with _test_tmpdir() as td:
+            palace = os.path.join(td, "palace"); os.makedirs(palace)
+            _RealKG(db_path=os.path.join(palace, "knowledge_graph.sqlite3")).close()
+            out = os.path.join(td, "wl.json")
+            rc = dream_harvest.main(["--task", "derive", "--palace", palace, "--out", out])
+            self.assertEqual(rc, 0)
+            self.assertEqual(len(_load_json(out)["items"]), 0)
+
+
+@unittest.skipUnless(_HAS_MEMPALACE, "requires mempalace KnowledgeGraph")
+class GapsCliTests(unittest.TestCase):
+    def _palace(self, td):
+        palace = os.path.join(td, "palace"); os.makedirs(palace)
+        kg = _RealKG(db_path=os.path.join(palace, "knowledge_graph.sqlite3"))
+        # broken chain: A->B and C->D; the sole missing edge B->C would unblock closure facts
+        kg.add_triple("A", "depends_on", "B", valid_from="2026-01-01")
+        kg.add_triple("C", "depends_on", "D", valid_from="2026-01-01")
+        kg.close()
+        with open(os.path.join(palace, "ontology.json"), "w") as f:
+            json.dump({"version": 1, "rules": [{"id": "transitive:depends_on",
+                "family": "transitive", "predicate": "depends_on", "enabled": True,
+                "max_depth": 3}]}, f)
+        return palace
+
+    def test_harvest_gaps_emits_bridging_gap(self):
+        with _test_tmpdir() as td:
+            palace = self._palace(td); out = os.path.join(td, "wl.json")
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                rc = dream_harvest.main(["--task", "gaps", "--palace", palace, "--out", out])
+            self.assertEqual(rc, 0)
+            wl = _load_json(out)
+            self.assertEqual(wl["task"], "gaps")
+            self.assertEqual(wl["scope"]["task"], "gaps")
+            self.assertIsNone(wl["scope"]["target_subject"])
+            edges = {(g["hypothesis"]["subject"], g["hypothesis"]["object"]) for g in wl["items"]}
+            self.assertIn(("B", "C"), edges)
+            bc = next(g for g in wl["items"] if (g["hypothesis"]["subject"], g["hypothesis"]["object"]) == ("B", "C"))
+            self.assertEqual(bc["kind"], "gap")
+            self.assertGreaterEqual(bc["evidence"]["duc"], 1)
+            self.assertIn("gaps:", stderr.getvalue())
+
+    def test_harvest_gaps_empty_ontology_yields_zero(self):
+        with _test_tmpdir() as td:
+            palace = os.path.join(td, "palace"); os.makedirs(palace)
+            kg = _RealKG(db_path=os.path.join(palace, "knowledge_graph.sqlite3"))
+            kg.add_triple("A", "depends_on", "B", valid_from="2026-01-01")
+            kg.close()
+            out = os.path.join(td, "wl.json")
+            rc = dream_harvest.main(["--task", "gaps", "--palace", palace, "--out", out])
+            self.assertEqual(rc, 0)
+            self.assertEqual(_load_json(out)["items"], [])
+
+    def test_harvest_gaps_target_subject_filters(self):
+        with _test_tmpdir() as td:
+            palace = self._palace(td); out = os.path.join(td, "wl.json")
+            dream_harvest.main(["--task", "gaps", "--palace", palace,
+                                "--target-subject", "A", "--out", out])
+            wl = _load_json(out)
+            self.assertEqual(wl["scope"]["target_subject"], "A")
+            for g in wl["items"]:
+                for u in g["evidence"]["unblocks"]:
+                    self.assertEqual(u["subject"], "A")
+
+
+@unittest.skipUnless(_HAS_MEMPALACE, "requires mempalace KnowledgeGraph")
+class B11RewireCliTests(unittest.TestCase):
+    def _derive_palace(self, td):
+        palace = os.path.join(td, "palace")
+        os.makedirs(palace)
+        kg = _RealKG(db_path=os.path.join(palace, "knowledge_graph.sqlite3"))
+        kg.add_triple("A", "depends_on", "B", valid_from="2026-01-01")
+        kg.add_triple("B", "depends_on", "C", valid_from="2026-01-01")
+        kg.close()
+        with open(os.path.join(palace, "ontology.json"), "w", encoding="utf-8") as fh:
+            json.dump({"version": 1, "rules": [{"id": "transitive:depends_on",
+                "family": "transitive", "predicate": "depends_on", "enabled": True,
+                "max_depth": 3}]}, fh)
+        return palace
+
+    def _gaps_palace(self, td):
+        palace = os.path.join(td, "palace")
+        os.makedirs(palace)
+        kg = _RealKG(db_path=os.path.join(palace, "knowledge_graph.sqlite3"))
+        kg.add_triple("A", "depends_on", "B", valid_from="2026-01-01")
+        kg.add_triple("C", "depends_on", "D", valid_from="2026-01-01")
+        kg.close()
+        with open(os.path.join(palace, "ontology.json"), "w", encoding="utf-8") as fh:
+            json.dump({"version": 1, "rules": [{"id": "transitive:depends_on",
+                "family": "transitive", "predicate": "depends_on", "enabled": True,
+                "max_depth": 3}]}, fh)
+        return palace
+
+    def _audit_palace(self, td):
+        palace = os.path.join(td, "palace")
+        os.makedirs(palace)
+        kg = _RealKG(db_path=os.path.join(palace, "knowledge_graph.sqlite3"))
+        kg.add_triple("Alice", "lives_in", "Portland", valid_from="2024-01-01")
+        kg.add_triple("Alice", "lives_in", "Seattle", valid_from="2025-01-01")
+        kg.add_triple("Author", "authored", "Post", valid_from="2026-01-01")
+        kg.add_triple("Post", "authored_by", "Author", valid_from="2026-01-01")
+        kg.add_triple("ModuleA", "depends_on", "ModuleB", valid_from="2026-01-01")
+        kg.add_triple("ModuleB", "depends_on", "ModuleC", valid_from="2026-01-01")
+        kg.add_triple("FriendOne", "collaborates_with", "FriendTwo", valid_from="2026-01-01")
+        kg.add_triple("FriendTwo", "collaborates_with", "FriendOne", valid_from="2026-01-01")
+        kg.close()
+        return palace
+
+    def test_durable_derive_harvest_preserves_single_closure_candidate(self):
+        with _test_tmpdir() as td:
+            palace = self._derive_palace(td)
+            out = os.path.join(td, "wl.json")
+
+            with mock.patch.object(
+                dream_harvest.dream_palace,
+                "load_premises",
+                wraps=dream_harvest.dream_palace.load_premises,
+            ) as load_premises:
+                rc = dream_harvest.main(["--task", "derive", "--palace", palace, "--out", out])
+
+            self.assertEqual(rc, 0)
+            load_premises.assert_called_once_with(palace, purpose="durable")
+            wl = _load_json(out)
+            self.assertEqual(wl["task"], "contemplate")
+            self.assertEqual(len(wl["items"]), 1)
+            conclusion = wl["items"][0]["conclusion"]
+            self.assertEqual((conclusion["subject"], conclusion["predicate"], conclusion["object"]),
+                             ("A", "depends_on_closure", "C"))
+
+    def test_durable_gaps_harvest_preserves_bridging_gap(self):
+        with _test_tmpdir() as td:
+            palace = self._gaps_palace(td)
+            out = os.path.join(td, "wl.json")
+
+            with mock.patch.object(
+                dream_harvest.dream_palace,
+                "load_premises",
+                wraps=dream_harvest.dream_palace.load_premises,
+            ) as load_premises:
+                rc = dream_harvest.main(["--task", "gaps", "--palace", palace, "--out", out])
+
+            self.assertEqual(rc, 0)
+            load_premises.assert_called_once_with(palace, purpose="durable")
+            wl = _load_json(out)
+            self.assertEqual(wl["task"], "gaps")
+            edges = {(item["hypothesis"]["subject"], item["hypothesis"]["object"]) for item in wl["items"]}
+            self.assertIn(("B", "C"), edges)
+
+    def test_durable_derive_materialize_verify_reaches_fixpoint(self):
+        with _test_tmpdir() as td:
+            palace = self._derive_palace(td)
+            out = os.path.join(td, "wl.json")
+            rc = dream_harvest.main(["--task", "derive", "--palace", palace, "--out", out])
+            self.assertEqual(rc, 0)
+            wl = _load_json(out)
+            wl["items"][0]["action"] = "materialize"
+            decisions = os.path.join(td, "decisions.json")
+            _dump_json(decisions, wl)
+            stderr = io.StringIO()
+
+            with mock.patch.object(
+                dream_adopt.dream_palace,
+                "load_premises",
+                wraps=dream_adopt.dream_palace.load_premises,
+            ) as load_premises, contextlib.redirect_stderr(stderr):
+                rc = dream_adopt.main([
+                    "--task", "derive",
+                    "--palace", palace,
+                    "--decisions", decisions,
+                    "--verify",
+                    "--strict",
+                ])
+
+            self.assertEqual(rc, 0)
+            # adopt now calls the durable loader for BOTH the C4 premise re-validation
+            # (during materialize) and the verify re-harvest.
+            load_premises.assert_any_call(palace, purpose="durable")
+            self.assertIn("verify: 0 residual candidate(s)", stderr.getvalue())
+
+    def test_deduced_derive_adopt_verify_reaches_fixpoint_after_firewall(self):
+        with _test_tmpdir() as td:
+            palace = self._derive_palace(td)
+            out = os.path.join(td, "wl.json")
+            rc = dream_harvest.main(["--task", "derive", "--palace", palace, "--out", out])
+            self.assertEqual(rc, 0)
+            wl = _load_json(out)
+            self.assertEqual(wl["items"][0]["evidence"]["epistemic_status"], "deduced")
+            self.assertEqual(wl["items"][0]["proof"]["entailed_given"], [])
+            wl["items"][0]["action"] = "materialize"
+            decisions = os.path.join(td, "decisions.json")
+            _dump_json(decisions, wl)
+            stderr = io.StringIO()
+
+            with contextlib.redirect_stderr(stderr):
+                rc = dream_adopt.main([
+                    "--task", "derive",
+                    "--palace", palace,
+                    "--decisions", decisions,
+                    "--verify",
+                    "--strict",
+                ])
+
+            self.assertEqual(rc, 0)
+            self.assertIn("verify: 0 residual candidate(s)", stderr.getvalue())
+
+    def test_audit_contradiction_harvest_preserves_worklist_shape(self):
+        with _test_tmpdir() as td:
+            palace = self._audit_palace(td)
+            out = os.path.join(td, "contradictions.json")
+
+            with mock.patch.object(
+                dream_harvest.dream_palace,
+                "load_premises",
+                wraps=dream_harvest.dream_palace.load_premises,
+            ) as load_premises:
+                rc = dream_harvest.main(["--task", "contradiction", "--palace", palace, "--out", out])
+
+            self.assertEqual(rc, 0)
+            load_premises.assert_called_once_with(palace, purpose="audit")
+            wl = _load_json(out)
+            self.assertEqual(wl["task"], "contradiction")
+            self.assertEqual(wl["items"][0]["kind"], "contradiction")
+            self.assertEqual(wl["items"][0]["evidence"]["size"], 2)
+            self.assertEqual(len(wl["items"][0]["candidates"]), 2)
+
+    def test_audit_suggest_rules_preserves_rule_doc_shape(self):
+        with _test_tmpdir() as td:
+            palace = self._audit_palace(td)
+            ontology = os.path.join(td, "ontology.json")
+
+            with mock.patch.object(
+                dream_harvest.dream_palace,
+                "load_premises",
+                wraps=dream_harvest.dream_palace.load_premises,
+            ) as load_premises:
+                rc = dream_harvest.main([
+                    "--task", "suggest-rules",
+                    "--palace", palace,
+                    "--ontology-out", ontology,
+                ])
+
+            self.assertEqual(rc, 0)
+            load_premises.assert_called_once_with(palace, purpose="audit")
+            rules = _load_json(ontology)["rules"]
+            self.assertTrue(rules)
+            self.assertTrue(all(rule["enabled"] is False for rule in rules))
+            self.assertIn("transitive:depends_on", {rule["id"] for rule in rules})
+
+    def test_audit_induce_rules_preserves_rule_doc_shape(self):
+        with _test_tmpdir() as td:
+            palace = self._audit_palace(td)
+            ontology = os.path.join(td, "ontology.json")
+
+            with mock.patch.object(
+                dream_harvest.dream_palace,
+                "load_premises",
+                wraps=dream_harvest.dream_palace.load_premises,
+            ) as load_premises:
+                rc = dream_harvest.main([
+                    "--task", "induce-rules",
+                    "--palace", palace,
+                    "--min-support", "1",
+                    "--ontology-out", ontology,
+                ])
+
+            self.assertEqual(rc, 0)
+            load_premises.assert_called_once_with(palace, purpose="audit")
+            rules = _load_json(ontology)["rules"]
+            self.assertTrue(rules)
+            self.assertTrue(all(rule["enabled"] is False for rule in rules))
+            self.assertIn("transitive:depends_on", {rule["id"] for rule in rules})
+
+
+class TestHarvestReflectTask(unittest.TestCase):
+    def test_reflect_task_writes_reflect_worklist(self):
+        import dream_reflect
+        seeds = [{"anchor_id": "d1", "member_ids": ["d1", "d2"], "members": [], "snippets": [],
+                  "coverage": 2, "score": 0.9},
+                 {"anchor_id": "d3", "member_ids": ["d3"], "members": [], "snippets": [],
+                  "coverage": 1, "score": 0.99}]  # dropped: coverage<2
+        orig = dream_reflect.gather_reflect_seeds
+        dream_reflect.gather_reflect_seeds = lambda p, **kw: seeds
+        try:
+            with _test_tmpdir() as td:
+                out = os.path.join(td, "wl.json")
+                rc = dream_harvest.main(["--palace", td, "--task", "reflect",
+                                         "--max-candidates", "10", "--out", out])
+                self.assertEqual(rc, 0)
+                wl = json.load(open(out))
+                self.assertEqual(wl["task"], "reflect")
+                self.assertEqual([i["seed_id"] for i in wl["items"]], ["d1"])  # coverage gate
+        finally:
+            dream_reflect.gather_reflect_seeds = orig
+
+
+from dream_lib import apply_reflect_decisions
+
+
+class _FakeWriter:
+    def __init__(self):
+        self.calls = []
+        self.deleted = []
+    def add_drawer(self, wing, room, content, added_by="dreaming", metadata=None):
+        self.calls.append((wing, room, content, metadata))
+        return {"id": "drw"}
+    def delete_drawer(self, drawer_id):
+        self.deleted.append(drawer_id)
+
+
+class _FakeTunneler:
+    def __init__(self):
+        self.tunnels = []
+    def create_tunnel(self, source_wing, source_room, target_wing, target_room, label):
+        self.tunnels.append((source_wing, source_room, target_wing, target_room, label))
+        return {"ok": True}
+
+
+class _FailingTunneler:
+    def create_tunnel(self, *a, **k):
+        raise RuntimeError("tunnel down")
+
+
+class ApplyReflectDecisionsTests(unittest.TestCase):
+    def _dec(self, **o):
+        d = {"action": "surface", "reflect_kind": "generalize", "text": "alpha relies on gamma",
+             "conclusion": {"text": "alpha relies on gamma", "kind": "generalize",
+                            "decision_or_prediction": "track gamma"},
+             "premises": [{"drawer_id": "d1", "quote": "a"}, {"drawer_id": "d2", "quote": "b"}],
+             "wing": "copilot-mempalace", "room": "reflections"}
+        d.update(o)
+        return d
+
+    def test_surface_writes_drawer_with_reflect_metadata(self):
+        w = _FakeWriter()
+        report = apply_reflect_decisions([self._dec()], w)
+        self.assertEqual(report["surfaced"], 1)
+        self.assertEqual(report["errors"], [])
+        _, _, _, meta = w.calls[0]
+        self.assertEqual(meta["kind"], "reflect")
+        self.assertEqual(meta["reflect_kind"], "generalize")
+        self.assertEqual(meta["supported_by"], ["d1", "d2"])
+
+    def test_skip_writes_nothing(self):
+        w = _FakeWriter()
+        report = apply_reflect_decisions([{"action": "skip"}], w)
+        self.assertEqual(report["surfaced"], 0)
+        self.assertEqual(w.calls, [])
+
+    def test_connect_creates_room_tunnel(self):
+        w = _FakeWriter()
+        t = _FakeTunneler()
+        dec = self._dec(reflect_kind="connect",
+                        conclusion={"text": "link", "kind": "connect", "decision_or_prediction": "x"},
+                        tunnel={"source_wing": "wa", "source_room": "ra", "target_wing": "wb",
+                                "target_room": "rb", "label": "relates-to"})
+        report = apply_reflect_decisions([dec], w, tunneler=t)
+        self.assertEqual(t.tunnels, [("wa", "ra", "wb", "rb", "relates-to")])
+        self.assertEqual(report["surfaced"], 1)
+
+    def test_connect_tunnel_failure_rolls_back_drawer(self):
+        w = _FakeWriter()
+        dec = self._dec(reflect_kind="connect",
+                        conclusion={"text": "link", "kind": "connect", "decision_or_prediction": "x"},
+                        tunnel={"source_wing": "wa", "source_room": "ra", "target_wing": "wb",
+                                "target_room": "rb", "label": "relates-to"})
+        report = apply_reflect_decisions([dec], w, tunneler=_FailingTunneler())
+        self.assertEqual(report["surfaced"], 0)
+        self.assertEqual(w.deleted, ["drw"])
+        self.assertEqual(report["errors"][0]["reason"], "tunnel_failed")
+
+    def test_converge_supported_by_from_recurrence(self):
+        w = _FakeWriter()
+        dec = {"action": "surface", "reflect_kind": "converge", "text": "team converges on farmer",
+               "conclusion": {"text": "team converges on farmer", "kind": "converge",
+                              "decision_or_prediction": "standardize"},
+               "premises": [], "evidence": {"support_ids": ["s1", "s2"]},
+               "member_ids": ["session:s1", "session:s2"], "wing": "w", "room": "reflections"}
+        apply_reflect_decisions([dec], w)
+        self.assertEqual(w.calls[0][3]["supported_by"], ["s1", "s2"])
+
+
+class PreflightReflectTests(unittest.TestCase):
+    def _wl(self, quote):
+        return {"task": "reflect", "scope": {}, "items": [{
+            "kind": "reflect", "member_ids": ["d1", "d2"], "decision": {
+                "action": "surface", "reflect_kind": "generalize",
+                "conclusion": {"text": "alpha relies on gamma", "kind": "generalize",
+                               "decision_or_prediction": "track gamma"},
+                "premises": [{"drawer_id": "d1", "quote": quote},
+                             {"drawer_id": "d2", "quote": "gamma crypto"}],
+                "wing": "w", "room": "reflections"}}]}
+
+    def _patch_palace(self):
+        drawers = [{"id": "d1", "text": "alpha depends on beta", "embedding": [1.0, 0.0]},
+                   {"id": "d2", "text": "beta wraps gamma crypto", "embedding": [0.0, 1.0]}]
+        for target, repl in (("load_logical_drawers", lambda p, wing=None, room=None: drawers),
+                             ("_palace_embed", lambda p, texts: [[0.7, 0.7]])):
+            patcher = mock.patch.object(dream_adopt, target, repl)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_ungrounded_decision_becomes_error_and_skip(self):
+        self._patch_palace()
+        decisions = dream_adopt._resolve_reflect_decisions(self._wl("NOT IN DRAWER"))
+        kept, errors = dream_adopt._preflight_reflect_decisions("P", decisions)
+        self.assertTrue(errors)
+        self.assertTrue(all(d.get("action") == "skip" for d in kept))
+
+    def test_grounded_novel_decision_survives(self):
+        self._patch_palace()
+        decisions = dream_adopt._resolve_reflect_decisions(self._wl("depends on beta"))
+        kept, errors = dream_adopt._preflight_reflect_decisions("P", decisions)
+        self.assertEqual(errors, [])
+        self.assertEqual(kept[0]["action"], "surface")
+
+    def test_converge_grounded_by_recurrence_not_quotes(self):
+        from dream_metadata import content_hash
+        import dream_sessions
+        self._patch_palace()
+        wl = {"task": "reflect", "scope": {}, "params": {"min_support": 2}, "items": [{
+            "kind": "reflect", "member_ids": ["session:s1", "session:s2"],
+            "members": [{"id": f"session:{sid}", "session_id": sid,
+                         "content_hash": content_hash(f"deploy with farmer {sid}")}
+                        for sid in ("s1", "s2")],
+            "evidence": {"support": 2, "support_ids": ["s1", "s2"]},
+            "decision": {"action": "surface", "reflect_kind": "converge",
+                         "conclusion": {"text": "team converges on farmer deploys", "kind": "converge",
+                                        "decision_or_prediction": "standardize"},
+                         "premises": [], "wing": "w", "room": "reflections"}}]}
+        decisions = dream_adopt._resolve_reflect_decisions(wl)
+        with mock.patch.object(dream_sessions, "load_session_turns", side_effect=lambda sid: [
+                {"turn_index": 0, "user_message": f"deploy with farmer {sid}",
+                 "assistant_response": "", "timestamp": "2026-09-01T00:00:00Z"}]):
+            kept, errors = dream_adopt._preflight_reflect_decisions("P", decisions)
+        self.assertEqual(errors, [])
+        self.assertEqual(kept[0]["action"], "surface")
+
+    def test_connect_without_tunnel_is_skipped(self):
+        self._patch_palace()
+        wl = {"task": "reflect", "scope": {}, "items": [{
+            "kind": "reflect", "member_ids": ["d1", "d2"],
+            "decision": {"action": "surface", "reflect_kind": "connect",
+                         "conclusion": {"text": "alpha relies on beta", "kind": "connect",
+                                        "decision_or_prediction": "link them"},
+                         "premises": [{"drawer_id": "d1", "quote": "depends on beta"},
+                                      {"drawer_id": "d2", "quote": "wraps gamma crypto"}],
+                         "wing": "w", "room": "reflections"}}]}  # no tunnel
+        decisions = dream_adopt._resolve_reflect_decisions(wl)
+        kept, errors = dream_adopt._preflight_reflect_decisions("P", decisions)
+        self.assertEqual(errors[0]["reason"], "connect_missing_tunnel")
+        self.assertEqual(kept[0]["action"], "skip")
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -18,25 +18,321 @@ import inspect
 import re
 import sqlite3
 import sys
-from datetime import datetime, timezone
-from typing import Any
+import math
+import threading
+import time
+from contextlib import contextmanager
+from collections import defaultdict, deque
+from datetime import datetime, timedelta, timezone
+from typing import Any, Iterator
+from uuid import uuid4
+
+from dream_lib import TRUSTED_STATUSES, cosine_similarity, normalize_predicate
 
 SESSION_ID_RE = re.compile(
     r"SESSION_ID:\s*([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})",
     re.IGNORECASE,
 )
 
+ALLOWED_PREMISE_PAIRS = {
+    ("asserted", "trusted_legacy"),
+    ("asserted", "trusted_user"),
+    ("asserted", "verified_source"),
+    ("deduced", "trusted_rule"),
+}
+SUPPORT_ACTIVE_NOW_SQL = "s.ended_at IS NULL AND s.valid_to IS NULL"
+def _support_active_now(row) -> bool:
+    return row["ended_at"] is None and row["valid_to"] is None
+
+KG_DERIVATIONS_DDL = (
+    "CREATE TABLE IF NOT EXISTS kg_derivations("
+    " id INTEGER PRIMARY KEY,"
+    " candidate_id TEXT UNIQUE,"
+    " conclusion_triple_id TEXT,"
+    " rule_id TEXT,"
+    " ontology_version TEXT,"
+    " premise_triple_ids TEXT,"
+    " premise_drawer_ids TEXT,"
+    " confidence REAL,"
+    " created_at TEXT)"
+)
+
+FIREWALL_SCHEMA_DDL = (
+    KG_DERIVATIONS_DDL,
+    """
+    CREATE TABLE IF NOT EXISTS kg_triple_supports (
+      support_id TEXT PRIMARY KEY,
+      triple_id  TEXT NOT NULL,
+      status TEXT NOT NULL,
+      source_trust TEXT NOT NULL,
+      inherited_status TEXT NOT NULL,
+      conditional_on_triple_ids TEXT NOT NULL DEFAULT '[]',
+      scope TEXT NOT NULL DEFAULT 'durable',
+      source_kind TEXT, source_ref TEXT,
+      valid_from TEXT, valid_to TEXT,
+      created_at TEXT NOT NULL, ended_at TEXT);
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_supports_triple ON kg_triple_supports(triple_id)",
+    "CREATE INDEX IF NOT EXISTS idx_supports_status ON kg_triple_supports(status)",
+    """
+    CREATE TABLE IF NOT EXISTS kg_derivation_premises (
+      derivation_id INTEGER NOT NULL,
+      premise_triple_id TEXT NOT NULL,
+      PRIMARY KEY (derivation_id, premise_triple_id));
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_derivprem_premise ON kg_derivation_premises(premise_triple_id)",
+    "CREATE INDEX IF NOT EXISTS idx_derivations_conclusion ON kg_derivations(conclusion_triple_id)",
+    """
+    CREATE TABLE IF NOT EXISTS kg_firewall_meta (
+      key TEXT PRIMARY KEY, value TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS contemplate_runs (
+      run_id TEXT PRIMARY KEY,
+      status TEXT NOT NULL DEFAULT 'active',
+      created_at TEXT NOT NULL, last_seen_at TEXT NOT NULL, expires_at TEXT NOT NULL,
+      expired_at TEXT, metadata_json TEXT NOT NULL DEFAULT '{}');
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_runs_expiry ON contemplate_runs(status, expires_at)",
+    """
+    CREATE TABLE IF NOT EXISTS contemplate_run_events (
+      event_id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL,
+      version_before INTEGER NOT NULL,
+      version_after INTEGER NOT NULL,
+      from_state TEXT NOT NULL,
+      to_state TEXT NOT NULL,
+      action TEXT NOT NULL,
+      actor TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY(run_id) REFERENCES contemplate_runs(run_id));
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_run_events_run ON contemplate_run_events(run_id, version_after)",
+    """
+    CREATE TABLE IF NOT EXISTS contemplate_approvals (
+      approval_id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL,
+      run_version_issued INTEGER NOT NULL,
+      approval_kind TEXT NOT NULL,
+      tool_name TEXT NOT NULL,
+      args_hash TEXT NOT NULL,
+      token_hash TEXT NOT NULL UNIQUE,
+      status TEXT NOT NULL DEFAULT 'issued',
+      issued_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      consumed_at TEXT,
+      FOREIGN KEY(run_id) REFERENCES contemplate_runs(run_id));
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_approvals_run ON contemplate_approvals(run_id, status)",
+    """
+    CREATE TABLE IF NOT EXISTS contemplate_provisional_facts (
+      provisional_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, fact_key TEXT NOT NULL,
+      subject TEXT, predicate TEXT, object TEXT,
+      subject_id TEXT, object_id TEXT,
+      status TEXT NOT NULL DEFAULT 'abduced',
+      confidence REAL, source_kind TEXT, source_ref TEXT,
+      created_at TEXT NOT NULL, last_seen_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL, expired_at TEXT, fact_status TEXT NOT NULL DEFAULT 'active',
+      UNIQUE(run_id, fact_key),
+      FOREIGN KEY(run_id) REFERENCES contemplate_runs(run_id));
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_prov_active ON contemplate_provisional_facts(run_id, fact_status, expires_at)",
+    """
+    CREATE TABLE IF NOT EXISTS kg_verification_events (
+      event_id TEXT PRIMARY KEY,
+      provisional_id TEXT,
+      new_support_id TEXT NOT NULL,
+      triple_id TEXT NOT NULL,
+      verification_kind TEXT NOT NULL,
+      claim_digest TEXT NOT NULL,
+      run_id TEXT, evidence_ref TEXT, evidence_quote TEXT,
+      created_at TEXT NOT NULL);
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_verif_support ON kg_verification_events(new_support_id)",
+)
+
 
 def bind_palace(palace_path: str) -> str:
-    """Point mempalace at ``palace_path`` for this process. Call before imports."""
+    """Bind an explicit palace, including an already imported embedded server."""
     abspath = os.path.abspath(os.path.expanduser(palace_path))
+    server = sys.modules.get("mempalace.mcp_server")
+    if server is not None:
+        _rebind_mcp_server(server, abspath)
     os.environ["MEMPALACE_PALACE_PATH"] = abspath
     return abspath
+
+
+def _rebind_mcp_server(server, palace_path: str) -> None:
+    path = os.path.realpath(os.path.expanduser(palace_path))
+    current = os.path.realpath(os.path.expanduser(server._config.palace_path))
+    if current != path:
+        if server._MCP_WRITER_LOCK_CM is not None:
+            raise RuntimeError("cannot change MCP palace binding while a writer owns it")
+        from mempalace.config import MempalaceConfig
+
+        server._discard_mcp_storage_handles()
+        previous = os.environ.get("MEMPALACE_PALACE_PATH")
+        os.environ["MEMPALACE_PALACE_PATH"] = path
+        try:
+            config = MempalaceConfig()
+            if os.path.realpath(os.path.expanduser(config.palace_path)) != path:
+                raise RuntimeError("MCP configuration refused explicit palace binding")
+            server._config = config
+        finally:
+            if previous is None:
+                os.environ.pop("MEMPALACE_PALACE_PATH", None)
+            else:
+                os.environ["MEMPALACE_PALACE_PATH"] = previous
+    server._palace_flag_given = True
+
+
+def _embedded_mcp_server(palace_path: str | None = None):
+    """Import MCP without stealing embedded callers' Python or native stdout."""
+    if palace_path is not None:
+        bind_palace(palace_path)
+    stdout, fd = sys.stdout, os.dup(1)
+    try:
+        from mempalace import mcp_server
+    finally:
+        os.dup2(fd, 1)
+        os.close(fd)
+        sys.stdout = stdout
+    if palace_path is not None:
+        _rebind_mcp_server(mcp_server, palace_path)
+    return mcp_server
+
+
+_mutation_locks = threading.local()
+
+
+@contextmanager
+def palace_mutation_lock(palace: str, *, timeout_seconds: float = 5) -> Iterator[None]:
+    """Cooperative POSIX lock on the canonical directory, with no lock file.
+
+    Reentrant within one thread/process so a multi-delete adoption and its
+    archiver share one lock. This is not a transaction or protection from
+    external writers that do not use this package.
+    """
+    import fcntl
+
+    if isinstance(timeout_seconds, bool) or not math.isfinite(timeout_seconds) \
+            or not 0 <= timeout_seconds <= 5:
+        raise ValueError("lock timeout must be finite and between zero and five seconds")
+    path = os.path.realpath(os.path.expanduser(palace))
+    key = (os.getpid(), path)
+    held = getattr(_mutation_locks, "held", {})
+    if key in held:
+        yield
+        return
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    acquired = False
+    deadline = time.monotonic() + timeout_seconds
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except BlockingIOError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"palace mutation lock timeout: {path}") from None
+                time.sleep(min(.01, remaining))
+        held[key] = fd
+        _mutation_locks.held = held
+        yield
+    finally:
+        held.pop(key, None)
+        try:
+            if acquired:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def _check_read_sidecars(palace: str) -> None:
+    """Do not let a cached immutable reader conceal an incomplete live WAL."""
+    sidecars = [os.path.join(palace, "sqlite_exact.sqlite3" + suffix) for suffix in ("-wal", "-shm")]
+    present = [os.path.lexists(path) for path in sidecars]
+    if any(present) and (not all(present) or not all(os.path.isfile(path) for path in sidecars)):
+        raise RuntimeError("incomplete WAL sidecar set; read requires coherent existing -wal and -shm files")
+
+
+def procedural_collection(palace: str):
+    """Open existing drawer storage without schema, KG, or embedder writes.
+
+    The installed Chroma adapter ignores read_only; refuse it rather than
+    silently initialize/migrate a supposedly read-only palace. sqlite_exact is
+    the verified local backend. No new tables or backend conversion are done.
+    """
+    from mempalace.palace import get_backend_for_palace, get_collection
+
+    path = os.path.realpath(os.path.expanduser(palace))
+    if not os.path.isdir(path):
+        raise ValueError(f"palace directory does not exist: {path}")
+    backend = get_backend_for_palace(path)
+    if backend.name != "sqlite_exact":
+        raise RuntimeError(f"procedural read-only storage unsupported by backend: {backend.name}")
+    _check_read_sidecars(path)
+    return get_collection(path, create=False, read_only=True)
+
+
+def protection_collection(palace: str):
+    """Reuse legacy storage semantics solely for existing destructive paths.
+
+    These operations already open the backend for mutation. This is not a
+    read-only guarantee; new procedural commands must use procedural_collection.
+    """
+    from mempalace.palace import get_collection
+    return get_collection(palace)
+
+
+def load_source_drawer(
+    palace: str, drawer_id: str, *, collection=None, include_embeddings: bool = False,
+) -> dict[str, Any] | None:
+    """Read a complete original drawer by either logical or physical ID."""
+    col = collection if collection is not None else procedural_collection(palace)
+    include = ["documents", "metadatas"]
+    if include_embeddings:
+        include.append("embeddings")
+    exact = _rows_from_collection_result(col.get(ids=[drawer_id], include=include))
+    parent = ((exact[0].get("metadata") or {}).get("parent_drawer_id") if exact else None) or drawer_id
+    children = _rows_from_collection_result(col.get(where={"parent_drawer_id": parent}, include=include))
+    rows = {row["id"]: row for row in exact + children}
+    if not rows:
+        return None
+    logical = _group_by_parent(list(rows.values()), ("parent_drawer_id",))[0]
+    return _canonical_drawer(logical, rows)
+
+
+def _canonical_drawer(logical: dict, rows: dict[str, dict]) -> dict:
+    parent = logical["id"]
+    members = [rows[member_id] for member_id in logical["member_ids"]]
+    # MCP add_drawer slices verbatim characters; mined chunks retain the
+    # legacy newline convention. Recipe/author alone are shared by both.
+    handler_chunks = all(
+        (meta := row.get("metadata") or {}).get("id_recipe") in {"v2", "v3"}
+        and isinstance(meta.get("added_by"), str) and meta["added_by"].strip()
+        and "normalize_version" not in meta and "ingest_mode" not in meta
+        and meta.get("parent_drawer_id") == parent
+        and type(meta.get("chunk_index")) is int
+        and row["id"] == f"{parent}_chunk_{meta['chunk_index']:06d}"
+        for row in members
+    )
+    if handler_chunks:
+        if [row["metadata"]["chunk_index"] for row in members] != list(range(len(members))):
+            raise ValueError(f"incomplete source drawer chunks: {parent}")
+        logical["text"] = "".join(row["text"] for row in members)
+    logical["content_hash"] = hashlib.sha256(logical["text"].encode("utf-8")).hexdigest()
+    return logical
 
 
 def _resolve_kg_path(palace_path: str) -> str | None:
     """Resolve the KG SQLite path for palace-local and home-level layouts."""
     palace_dir = os.path.abspath(os.path.expanduser(palace_path))
+    if palace_dir.endswith(".sqlite3"):
+        return palace_dir
     palace_local = os.path.join(palace_dir, "knowledge_graph.sqlite3")
     home_level = os.path.abspath(os.path.join(palace_dir, os.pardir, "knowledge_graph.sqlite3"))
     for db_path in (palace_local, home_level):
@@ -44,6 +340,550 @@ def _resolve_kg_path(palace_path: str) -> str | None:
             print(f"dream_palace: KG resolved to {db_path}", file=sys.stderr)
             return db_path
     return palace_local
+
+
+def ensure_firewall_schema(db_path: str) -> None:
+    """Create B1.0 epistemic-firewall sidecars in the KG SQLite database."""
+    con = sqlite3.connect(db_path)
+    try:
+        for ddl in FIREWALL_SCHEMA_DDL:
+            con.execute(ddl)
+        if "expires_at" not in _table_columns(con, "kg_triple_supports"):
+            con.execute("ALTER TABLE kg_triple_supports ADD COLUMN expires_at TEXT")
+        _ensure_provisional_entity_columns(con)
+        _ensure_controlled_run_columns(con)
+        con.commit()
+    finally:
+        con.close()
+
+
+def _utc_now_iso(now: datetime | str | None = None) -> str:
+    if now is None:
+        dt = datetime.now(timezone.utc)
+    elif isinstance(now, datetime):
+        dt = now
+    elif isinstance(now, str):
+        text = now[:-1] + "+00:00" if now.endswith("Z") else now
+        dt = datetime.fromisoformat(text)
+    else:
+        raise TypeError("now must be None, datetime, or ISO timestamp string")
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat()
+
+
+def _add_hours_iso(now_iso: str, ttl_hours: float) -> str:
+    dt = datetime.fromisoformat(now_iso)
+    return (dt + timedelta(hours=ttl_hours)).isoformat()
+
+
+def _provisional_fact_key(
+    subject: Any,
+    predicate: Any,
+    object: Any,
+    source_kind: Any,
+    source_ref: Any,
+) -> str:
+    parts = [subject, predicate, object, source_kind, source_ref]
+    text = "|".join("" if part is None else str(part) for part in parts)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _entity_id(name: Any) -> str:
+    return str(name).lower().replace(" ", "_").replace("'", "")
+
+
+def _entity_exists(con: sqlite3.Connection, entity_id: str) -> bool:
+    if not _has_table(con, "entities"):
+        return False
+    return con.execute("SELECT 1 FROM entities WHERE id=? LIMIT 1", (entity_id,)).fetchone() is not None
+
+
+def _ensure_provisional_entity_columns(con: sqlite3.Connection) -> None:
+    columns = _table_columns(con, "contemplate_provisional_facts")
+    if "subject_id" not in columns:
+        con.execute("ALTER TABLE contemplate_provisional_facts ADD COLUMN subject_id TEXT")
+    if "object_id" not in columns:
+        con.execute("ALTER TABLE contemplate_provisional_facts ADD COLUMN object_id TEXT")
+
+
+def _ensure_controlled_run_columns(con: sqlite3.Connection) -> None:
+    columns = _table_columns(con, "contemplate_runs")
+    if "state" not in columns:
+        con.execute("ALTER TABLE contemplate_runs ADD COLUMN state TEXT NOT NULL DEFAULT 'open'")
+    if "version" not in columns:
+        con.execute("ALTER TABLE contemplate_runs ADD COLUMN version INTEGER NOT NULL DEFAULT 0")
+    if "owner_token_hash" not in columns:
+        con.execute("ALTER TABLE contemplate_runs ADD COLUMN owner_token_hash TEXT")
+    if "lease_expires_at" not in columns:
+        con.execute("ALTER TABLE contemplate_runs ADD COLUMN lease_expires_at TEXT")
+    if "lease_ttl_seconds" not in columns:
+        con.execute(
+            "ALTER TABLE contemplate_runs ADD COLUMN lease_ttl_seconds INTEGER NOT NULL DEFAULT 300"
+        )
+
+
+def _check_provisional_endpoints(con: sqlite3.Connection, subject: Any, object: Any) -> tuple[str, str]:
+    subject_id = _entity_id(subject)
+    object_id = _entity_id(object)
+    subject_exists = _entity_exists(con, subject_id)
+    object_exists = _entity_exists(con, object_id)
+    if not subject_exists:
+        raise ValueError(f"provisional subject does not exist in KG entities: {subject!r}")
+    if not object_exists:
+        raise ValueError(f"provisional object does not exist in KG entities: {object!r}")
+    return subject_id, object_id
+
+
+def _write_provisional_row(
+    con: sqlite3.Connection,
+    run_id: str,
+    subject: Any,
+    predicate: Any,
+    object: Any,
+    *,
+    status: str,
+    confidence: float | None,
+    source_kind: str | None,
+    source_ref: str | None,
+    now_iso: str,
+    run_expires_at: str,
+) -> str:
+    subject_id, object_id = _check_provisional_endpoints(con, subject, object)
+    fact_key = _provisional_fact_key(subject, predicate, object, source_kind, source_ref)
+    provisional_id = str(uuid4())
+    con.execute(
+        """
+        INSERT INTO contemplate_provisional_facts(
+            provisional_id, run_id, fact_key,
+            subject, predicate, object, subject_id, object_id,
+            status, confidence, source_kind, source_ref,
+            created_at, last_seen_at, expires_at, expired_at, fact_status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'active')
+        ON CONFLICT(run_id, fact_key) DO UPDATE SET
+            subject=excluded.subject,
+            predicate=excluded.predicate,
+            object=excluded.object,
+            subject_id=excluded.subject_id,
+            object_id=excluded.object_id,
+            status=excluded.status,
+            confidence=excluded.confidence,
+            source_kind=excluded.source_kind,
+            source_ref=excluded.source_ref,
+            last_seen_at=excluded.last_seen_at,
+            expires_at=excluded.expires_at,
+            expired_at=NULL,
+            fact_status='active'
+        """,
+        (
+            provisional_id,
+            run_id,
+            fact_key,
+            subject,
+            predicate,
+            object,
+            subject_id,
+            object_id,
+            status,
+            confidence,
+            source_kind,
+            source_ref,
+            now_iso,
+            now_iso,
+            run_expires_at,
+        ),
+    )
+    row = con.execute(
+        """
+        SELECT provisional_id
+        FROM contemplate_provisional_facts
+        WHERE run_id=? AND fact_key=?
+        """,
+        (run_id, fact_key),
+    ).fetchone()
+    return str(row["provisional_id"])
+
+
+def create_or_resume_run(
+    palace_path,
+    run_id: str | None = None,
+    *,
+    ttl_hours: float = 24,
+    now: datetime | str | None = None,
+) -> str:
+    """Create a contemplate run or refresh last_seen_at for an active unexpired run."""
+    db_path = _resolve_kg_path(palace_path)
+    ensure_firewall_schema(db_path)
+    now_iso = _utc_now_iso(now)
+    expires_at = _add_hours_iso(now_iso, ttl_hours)
+    chosen_run_id = run_id or str(uuid4())
+
+    con = sqlite3.connect(db_path)
+    con.row_factory = sqlite3.Row
+    try:
+        con.execute("PRAGMA busy_timeout = 5000")
+        con.execute("BEGIN IMMEDIATE")
+        row = con.execute(
+            "SELECT status, expires_at FROM contemplate_runs WHERE run_id=?",
+            (chosen_run_id,),
+        ).fetchone()
+        if row is not None:
+            if row["status"] != "active" or row["expires_at"] <= now_iso:
+                raise ValueError(f"contemplate run is not active: {chosen_run_id}")
+            con.execute(
+                "UPDATE contemplate_runs SET last_seen_at=? WHERE run_id=?",
+                (now_iso, chosen_run_id),
+            )
+        else:
+            con.execute(
+                """
+                INSERT INTO contemplate_runs(
+                    run_id, status, created_at, last_seen_at, expires_at, expired_at, metadata_json
+                ) VALUES (?, 'active', ?, ?, ?, NULL, '{}')
+                """,
+                (chosen_run_id, now_iso, now_iso, expires_at),
+            )
+        con.commit()
+        return chosen_run_id
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+
+
+def assert_provisional(
+    palace_path,
+    run_id,
+    subject,
+    predicate,
+    object,
+    *,
+    status: str = "abduced",
+    confidence: float | None = None,
+    source_kind: str | None = None,
+    source_ref: str | None = None,
+    now: datetime | str | None = None,
+) -> str:
+    """Record a tainted, run-scoped provisional fact without touching the durable KG."""
+    if status in TRUSTED_STATUSES:
+        raise ValueError(f"provisional facts cannot use trusted status: {status!r}")
+
+    db_path = _resolve_kg_path(palace_path)
+    ensure_firewall_schema(db_path)
+    now_iso = _utc_now_iso(now)
+
+    con = sqlite3.connect(db_path)
+    con.row_factory = sqlite3.Row
+    try:
+        con.execute("PRAGMA busy_timeout = 5000")
+        _ensure_provisional_entity_columns(con)
+        con.execute("BEGIN IMMEDIATE")
+        run = con.execute(
+            """
+            SELECT expires_at, owner_token_hash
+            FROM contemplate_runs
+            WHERE run_id=?
+              AND status='active'
+              AND expires_at > ?
+            """,
+            (run_id, now_iso),
+        ).fetchone()
+        if run is None:
+            raise ValueError(f"contemplate run is not active: {run_id}")
+        if run["owner_token_hash"] is not None:
+            raise ValueError(f"controlled runs do not accept direct provisional assertions: {run_id}")
+
+        provisional_id = _write_provisional_row(
+            con,
+            run_id,
+            subject,
+            predicate,
+            object,
+            status=status,
+            confidence=confidence,
+            source_kind=source_kind,
+            source_ref=source_ref,
+            now_iso=now_iso,
+            run_expires_at=run["expires_at"],
+        )
+        con.commit()
+        return provisional_id
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+
+
+def assert_user_fact_from_provisional(
+    palace_path,
+    provisional_id,
+    *,
+    confirmation_token,
+    run_id,
+    evidence_ref=None,
+    evidence_quote=None,
+    now: datetime | str | None = None,
+) -> dict:
+    """Promote a human-confirmed provisional fact into a durable trusted-user support."""
+    if run_id is None:
+        raise ValueError("run_id is required to promote a provisional fact")
+
+    db_path = _resolve_kg_path(palace_path)
+    ensure_firewall_schema(db_path)
+    now_iso = _utc_now_iso(now)
+
+    con = sqlite3.connect(db_path)
+    con.row_factory = sqlite3.Row
+    try:
+        row = con.execute(
+            """
+            SELECT f.provisional_id, f.run_id, f.subject, f.predicate, f.object,
+                   f.subject_id, f.object_id, f.confidence, f.created_at, f.expires_at
+            FROM contemplate_provisional_facts f
+            JOIN contemplate_runs r ON r.run_id = f.run_id
+            WHERE f.provisional_id=?
+              AND f.run_id=?
+              AND f.fact_status='active'
+              AND r.status='active'
+              AND f.expires_at > ?
+              AND r.expires_at > ?
+            """,
+            (provisional_id, run_id, now_iso, now_iso),
+        ).fetchone()
+    finally:
+        con.close()
+
+    if row is None:
+        raise ValueError(f"active provisional fact not found: {provisional_id}")
+
+    subject_id = row["subject_id"] or _entity_id(row["subject"])
+    object_id = row["object_id"] or _entity_id(row["object"])
+    con = sqlite3.connect(db_path)
+    try:
+        if not _entity_exists(con, subject_id):
+            raise ValueError(f"provisional subject entity no longer exists: {subject_id!r}")
+        if not _entity_exists(con, object_id):
+            raise ValueError(f"provisional object entity no longer exists: {object_id!r}")
+    finally:
+        con.close()
+
+    predicate = normalize_predicate(row["predicate"])
+    claim_digest = hashlib.sha256(
+        f"{subject_id}|{predicate}|{object_id}".encode("utf-8")
+    ).hexdigest()
+    expected_token = hashlib.sha256(
+        f"{provisional_id}|{claim_digest}|{run_id}".encode("utf-8")
+    ).hexdigest()
+    if confirmation_token != expected_token:
+        raise ValueError("confirmation token does not match provisional claim")
+
+    from mempalace.knowledge_graph import KnowledgeGraph  # lazy
+
+    valid_from = _normalize_dt_for_kg(row["created_at"] or now_iso)
+    valid_to = None
+    kg = KnowledgeGraph(db_path=db_path)
+    try:
+        triple_id = str(
+            kg.add_triple(
+                row["subject"],
+                predicate,
+                row["object"],
+                valid_from=valid_from,
+                valid_to=valid_to,
+                confidence=row["confidence"] if row["confidence"] is not None else 1.0,
+                adapter_name="contemplate:user_assert",
+                source_drawer_id="promote:" + str(provisional_id),
+            )
+        )
+    finally:
+        kg.close()
+
+    support_id = "sup:user:" + hashlib.sha256(
+        f"{triple_id}|{provisional_id}".encode("utf-8")
+    ).hexdigest()[:32]
+    event_id = str(uuid4())
+
+    con = sqlite3.connect(db_path)
+    try:
+        con.execute("PRAGMA busy_timeout = 5000")
+        con.execute("BEGIN IMMEDIATE")
+        con.execute(
+            """
+            INSERT OR IGNORE INTO kg_triple_supports(
+                support_id, triple_id, status, source_trust, inherited_status,
+                conditional_on_triple_ids, scope, source_kind, source_ref,
+                valid_from, valid_to, created_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                support_id,
+                triple_id,
+                "asserted",
+                "trusted_user",
+                "asserted",
+                "[]",
+                "durable",
+                "contemplate:user_assert",
+                "promote:" + str(provisional_id),
+                valid_from,
+                valid_to,
+                now_iso,
+            ),
+        )
+        con.execute(
+            """
+            INSERT INTO kg_verification_events(
+                event_id, provisional_id, new_support_id, triple_id,
+                verification_kind, claim_digest, run_id, evidence_ref,
+                evidence_quote, created_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                event_id,
+                provisional_id,
+                support_id,
+                triple_id,
+                "user_confirmed",
+                claim_digest,
+                run_id,
+                evidence_ref,
+                evidence_quote,
+                now_iso,
+            ),
+        )
+        cur = con.execute(
+            """
+            UPDATE contemplate_provisional_facts
+            SET fact_status='promoted',
+                expired_at=?
+            WHERE provisional_id=?
+              AND fact_status='active'
+            """,
+            (now_iso, provisional_id),
+        )
+        if cur.rowcount != 1:
+            raise ValueError(f"provisional fact is no longer active: {provisional_id}")
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+
+    return {
+        "triple_id": triple_id,
+        "support_id": support_id,
+        "event_id": event_id,
+        "promoted": True,
+    }
+
+
+def startup_cleanup(palace_path, *, now: datetime | str | None = None) -> dict:
+    """Expire stale contemplate state and expired materialized-abduced supports."""
+    db_path = _resolve_kg_path(palace_path)
+    ensure_firewall_schema(db_path)
+    now_iso = _utc_now_iso(now)
+    counts = {
+        "runs_expired": 0,
+        "provisional_expired": 0,
+        "abduced_supports_expired": 0,
+        "abduced_triples_cascaded": 0,
+    }
+    cascade_roots: list[str] = []
+
+    con = sqlite3.connect(db_path)
+    con.row_factory = sqlite3.Row
+    try:
+        con.execute("PRAGMA busy_timeout = 5000")
+        con.execute("BEGIN IMMEDIATE")
+        cur = con.execute(
+            """
+            UPDATE contemplate_runs
+            SET status='expired',
+                expired_at=COALESCE(expired_at, ?)
+            WHERE status='active'
+              AND expires_at <= ?
+            """,
+            (now_iso, now_iso),
+        )
+        counts["runs_expired"] = cur.rowcount
+
+        cur = con.execute(
+            """
+            UPDATE contemplate_provisional_facts
+            SET fact_status='expired',
+                expired_at=COALESCE(expired_at, ?)
+            WHERE fact_status='active'
+              AND expires_at <= ?
+            """,
+            (now_iso, now_iso),
+        )
+        counts["provisional_expired"] = cur.rowcount
+
+        expired_supports = con.execute(
+            """
+            SELECT support_id, triple_id
+            FROM kg_triple_supports
+            WHERE status='materialized_abduced'
+              AND expires_at IS NOT NULL
+              AND expires_at <= ?
+              AND ended_at IS NULL
+            ORDER BY support_id
+            """,
+            (now_iso,),
+        ).fetchall()
+        ended_triple_ids: list[str] = []
+        for support in expired_supports:
+            cur = con.execute(
+                """
+                UPDATE kg_triple_supports
+                SET ended_at=?
+                WHERE support_id=?
+                  AND ended_at IS NULL
+                """,
+                (now_iso, support["support_id"]),
+            )
+            if cur.rowcount:
+                counts["abduced_supports_expired"] += cur.rowcount
+                ended_triple_ids.append(str(support["triple_id"]))
+
+        for triple_id in sorted(set(ended_triple_ids)):
+            has_active_support = con.execute(
+                f"""
+                SELECT 1
+                FROM kg_triple_supports
+                WHERE triple_id=?
+                  AND {_active_support_clause()}
+                LIMIT 1
+                """,
+                (triple_id,),
+            ).fetchone()
+            if has_active_support is None:
+                cascade_roots.append(triple_id)
+
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+
+    for triple_id in cascade_roots:
+        invalidate_triples_cascade(palace_path, [triple_id], now_iso)
+        counts["abduced_triples_cascaded"] += 1
+
+    return counts
+
+
+def _derived_support_id(triple_id: str, rule_id: str, candidate_id: str) -> str:
+    key = f"{triple_id}|{rule_id}|{candidate_id}".encode("utf-8")
+    return "sup:" + hashlib.sha256(key).hexdigest()[:32]
+
+
+def _legacy_support_id(triple_id: str) -> str:
+    return "sup:legacy:" + triple_id
 
 
 def _where(wing: str | None, room: str | None) -> dict[str, Any] | None:
@@ -135,6 +975,76 @@ def _session_id_state(text: str) -> tuple[str | None, bool]:
     return None, False
 
 
+# Injected framework context that pollutes raw host-session user messages. These
+# blocks describe the harness (skills, reminders, environment), not the user's
+# intent, so they are stripped before embedding session observations.
+_CONTEXT_TAGS = (
+    "skill-context",
+    "system_reminder",
+    "system-reminder",
+    "system_notification",
+    "available_skills",
+    "current_datetime",
+    "session_context",
+    "environment_context",
+    "custom_instruction",
+    "functions",
+)
+_CONTEXT_BLOCK_RES = [
+    re.compile(rf"<{tag}\b[^>]*>.*?</{tag}>", re.DOTALL | re.IGNORECASE)
+    for tag in _CONTEXT_TAGS
+]
+_UNCLOSED_CONTEXT_RE = re.compile(
+    r"<(?:skill-context|system_reminder|system-reminder)\b.*",
+    re.DOTALL | re.IGNORECASE,
+)
+_HOOK_LINE_RE = re.compile(
+    r"^\s*(?:Additional context from preToolUse hook:.*|\[palace-reflex\].*|\[fsx-[a-z]+\].*)$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _strip_context_boilerplate(text: str) -> str:
+    """Remove injected skill/hook/system context from a raw session message."""
+    if not text:
+        return ""
+    cleaned = text
+    for pattern in _CONTEXT_BLOCK_RES:
+        cleaned = pattern.sub(" ", cleaned)
+    cleaned = _UNCLOSED_CONTEXT_RE.sub(" ", cleaned)
+    cleaned = _HOOK_LINE_RE.sub(" ", cleaned)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _resolve_embed_fn(collection: Any):
+    """Resolve the palace collection's embedding function.
+
+    Prefers any public wrapper attribute; falls back to the underlying Chroma
+    collection's private embedding function. Isolated here so a future public
+    mempalace embed API is a one-line swap.
+    """
+    for attr in ("embedding_function", "_embedding_function"):
+        fn = getattr(collection, attr, None)
+        if callable(fn):
+            return fn
+    inner = getattr(collection, "_collection", None)
+    if inner is not None:
+        fn = getattr(inner, "_embedding_function", None)
+        if callable(fn):
+            return fn
+    raise RuntimeError("could not resolve palace embedding function for session observations")
+
+
+def _palace_embed(palace_path: str, texts: list[str]) -> list[list[float]]:
+    """Embed ``texts`` in the palace's own embedding space (same as drawers)."""
+    if not texts:
+        return []
+    from mempalace.palace import get_collection  # lazy: heavy import
+
+    embed_fn = _resolve_embed_fn(get_collection(palace_path))
+    return [[float(value) for value in vector] for vector in embed_fn(list(texts))]
+
+
 def load_logical_drawers(
     palace_path: str, wing: str | None = None, room: str | None = None
 ) -> list[dict[str, Any]]:
@@ -147,7 +1057,14 @@ def load_logical_drawers(
     if where:
         kwargs["where"] = where
     res = col.get(**kwargs)
-    return _group_by_parent(_rows_from_collection_result(res), ("parent_drawer_id",))
+    rows = _rows_from_collection_result(res)
+    from dream_metadata import decode_procedural_chunks
+    procedural = [r for r in rows if (r.get("metadata") or {}).get("room") == "procedural"]
+    ordinary = [r for r in rows if (r.get("metadata") or {}).get("room") != "procedural"]
+    by_id = {row["id"]: row for row in ordinary}
+    logicals = [_canonical_drawer(logical, by_id)
+                for logical in _group_by_parent(ordinary, ("parent_drawer_id",))]
+    return logicals + decode_procedural_chunks(procedural)
 
 
 def list_wings(palace_path: str) -> list[str]:
@@ -165,146 +1082,200 @@ def load_drawer_by_id(palace_path: str, drawer_id: str) -> dict[str, Any] | None
     """Read a current logical drawer by id, reassembling chunks and hashing text."""
     from mempalace.palace import get_collection  # lazy: heavy import
 
-    col = get_collection(palace_path)
-    include = ["documents", "metadatas", "embeddings"]
-    rows: list[dict[str, Any]] = []
-    seen: set[str] = set()
-
-    for kwargs in (
-        {"where": {"parent_drawer_id": drawer_id}, "include": include},
-        {"ids": [drawer_id], "include": include},
-    ):
-        for row in _rows_from_collection_result(col.get(**kwargs)):
-            if row["id"] not in seen:
-                rows.append(row)
-                seen.add(row["id"])
-
-    if not rows:
-        return None
-
-    logicals = _group_by_parent(rows, ("parent_drawer_id",))
-    logical = next((item for item in logicals if item["id"] == drawer_id), None)
-    if logical is None:
-        if len(logicals) != 1:
-            return None
-        logical = logicals[0]
-
-    text = logical["text"]
-    return {
-        "id": logical["id"],
-        "text": text,
-        "metadata": logical["metadata"],
-        "embedding": logical["embedding"],
-        "content_hash": hashlib.sha256(text.encode("utf-8")).hexdigest(),
-    }
+    return load_source_drawer(
+        palace_path, drawer_id, collection=get_collection(palace_path), include_embeddings=True)
 
 
-def _drawer_record_text(record: Any) -> str:
-    for key in ("text", "content", "document"):
-        value = _field(record, key)
-        if value is not None:
-            return str(value)
-    return ""
+def _complete_drawer_rows(collection, *, wing=None, room=None) -> list[dict]:
+    """Page metadata without assuming that a backend honors our page size."""
+    total = collection.count()
+    if type(total) is not int or total < 0:
+        raise RuntimeError("invalid collection count")
+    rows, seen = [], set()
+    where = _where(wing, room)
+    for _ in range(total + 1):
+        result = collection.get(
+            where=where, include=["documents", "metadatas"], limit=1000, offset=len(rows))
+        ids, docs, metas = (_field(result, field) for field in ("ids", "documents", "metadatas"))
+        if (not isinstance(ids, list) or not isinstance(docs, list)
+                or not isinstance(metas, list) or len(ids) != len(docs) or len(ids) != len(metas)):
+            raise RuntimeError("incomplete drawer metadata page")
+        if not ids:
+            if not where and len(rows) != total:
+                raise RuntimeError("incomplete drawer metadata scan")
+            return rows
+        for did, doc, meta in zip(ids, docs, metas):
+            if (not isinstance(did, str) or not did or did in seen
+                    or not isinstance(doc, str) or not isinstance(meta, dict)):
+                raise RuntimeError("malformed or repeated drawer metadata row")
+            if (wing is not None and meta.get("wing") != wing
+                    or room is not None and meta.get("room") != room):
+                raise RuntimeError("drawer metadata escaped requested scope")
+            seen.add(did)
+            rows.append({"id": did, "text": doc, "metadata": meta})
+        if len(rows) > total:
+            raise RuntimeError("drawer metadata changed during scan")
+    raise RuntimeError("incomplete drawer metadata pagination")
 
 
 def find_duplicate_clusters(
-    palace_path: str,
-    wing: str | None = None,
-    room: str | None = None,
-    tau: float = 0.9,
-    max_clusters: int | None = None,
-) -> list[dict[str, Any]]:
-    """Read logical duplicate clusters from mempalace's native duplicate finder."""
-    bind_palace(palace_path)
-    from mempalace.mcp_server import TOOLS  # lazy
+    palace_path: str, *, wing=None, room=None, threshold=.1, exclude_ids=None, max_clusters=None,
+) -> list[dict]:
+    """Validate exhaustive native discovery, then rebuild scoped logical components."""
+    if (isinstance(threshold, bool) or not isinstance(threshold, (int, float))
+            or not math.isfinite(threshold) or not 0 <= threshold <= 2):
+        raise ValueError("threshold must be finite cosine distance between zero and two")
+    if max_clusters is not None and (type(max_clusters) is not int or max_clusters < 1):
+        raise ValueError("max_clusters must be a positive integer")
+    server = _embedded_mcp_server(palace_path)
+    from mempalace.palace import get_collection
+    from dream_metadata import is_procedural_record
 
-    # The custom mempalace find_duplicates builds a raw multi-key ChromaDB where
-    # filter, which Chroma rejects when both wing AND room are set ("Expected
-    # where to have exactly one operator"). Pass a single scope key to the
-    # handler and apply the remaining scope client-side below.
-    handler_room = None if (wing and room) else room
-    res = TOOLS["mempalace_find_duplicates"]["handler"](
-        wing=wing,
-        room=handler_room,
-        threshold=1.0 - tau,
-        max_clusters=max_clusters,
-    )
-    get_drawer = TOOLS["mempalace_get_drawer"]["handler"]
-
-    clusters = []
-    for cluster in _field(res, "clusters") or []:
-        members = []
-        for drawer_id in list(_field(cluster, "drawer_ids") or []):
-            record = get_drawer(drawer_id=drawer_id)
-            metadata = _field(record, "metadata") or {}
-            # find_duplicates and get_drawer both operate at logical-drawer
-            # granularity in the custom build; delete_drawer accepts that same
-            # logical drawer_id, so member_ids intentionally contains it.
-            members.append(
-                {
-                    "id": _field(record, "id") or drawer_id,
-                    "member_ids": [drawer_id],
-                    "text": _drawer_record_text(record),
-                    "wing": _field(record, "wing") or metadata.get("wing"),
-                    "room": _field(record, "room") or metadata.get("room"),
-                }
-            )
-
-        # Client-side scope filter for the key we could not pass to the handler.
-        if wing and room:
-            members = [m for m in members if m["wing"] == wing and m["room"] == room]
-        if len(members) < 2:
-            continue  # a cluster needs >=2 members to be a merge candidate
-        surviving = {m["id"] for m in members} | {mid for m in members for mid in m["member_ids"]}
-
-        pair_sims = []
-        for pair in _field(cluster, "pairs") or []:
-            a, b = _field(pair, "a"), _field(pair, "b")
-            if a not in surviving or b not in surviving:
+    # Native discovery's raw two-key where is not valid for every backend.
+    native_room = None if wing else room
+    collection = get_collection(palace_path)
+    rows = _complete_drawer_rows(collection, wing=wing, room=native_room)
+    handler = server.TOOLS.get("mempalace_find_duplicates", {}).get("handler")
+    if not callable(handler):
+        raise RuntimeError("native duplicate discovery unavailable")
+    result = handler(wing=wing, room=native_room, threshold=threshold, max_clusters=None)
+    if not isinstance(result, dict):
+        raise RuntimeError("malformed native duplicate result")
+    if result.get("error") or result.get("success") is False:
+        raise RuntimeError(f"native duplicate discovery failed: {result}")
+    if result.get("vector_disabled") or result.get("truncated"):
+        raise RuntimeError(f"incomplete native duplicate scan: {result}")
+    params, clusters = result.get("params"), result.get("clusters")
+    if (not isinstance(params, dict) or not isinstance(clusters, list)
+            or params.get("wing") != wing or params.get("room") != native_room
+            or params.get("threshold") != threshold or params.get("max_clusters") is not None):
+        raise RuntimeError("missing or mismatched native duplicate scan scope")
+    bound = params.get("neighbor_bound")
+    if type(bound) is not int or bound < len(rows):
+        raise RuntimeError(
+            "incomplete native duplicate scan: installed backend "
+            f"neighbor_bound={bound!r}, physical_rows={len(rows)}, "
+            f"queried scope wing={wing!r}, room={native_room!r}; "
+            "complete discovery is not established; narrow the native scan scope")
+    physical_ids = {row["id"] for row in rows}
+    logical_ids = {
+        (row["metadata"].get("parent_drawer_id") or row["id"]) for row in rows}
+    excluded = set(exclude_ids or ())
+    members, edges, reported = {}, {}, set()
+    for cluster in clusters:
+        if not isinstance(cluster, dict):
+            raise RuntimeError("malformed native duplicate cluster")
+        ids, pairs = cluster.get("drawer_ids"), cluster.get("pairs")
+        if (not isinstance(ids, list) or len(ids) < 2
+                or any(not isinstance(did, str) or did not in logical_ids for did in ids)
+                or len(set(ids)) != len(ids) or reported.intersection(ids)
+                or not isinstance(pairs, list) or not pairs):
+            raise RuntimeError("malformed or out-of-scope native duplicate cluster")
+        reported.update(ids)
+        for did in ids:
+            drawer = load_source_drawer(palace_path, did, collection=collection)
+            if (drawer is None or drawer["id"] != did
+                    or not set(drawer["member_ids"]).issubset(physical_ids)):
+                raise RuntimeError(f"native duplicate drawer drifted: {did}")
+            scopes = {(r["metadata"].get("wing"), r["metadata"].get("room"))
+                      for r in rows if r["id"] in drawer["member_ids"]}
+            if len(scopes) != 1:
+                raise RuntimeError(f"native duplicate chunks span scopes: {did}")
+            if (not is_procedural_record(drawer)
+                    and not excluded.intersection([did, *drawer["member_ids"]])
+                    and (room is None or drawer["room"] == room)):
+                members[did] = drawer
+        for pair in pairs:
+            if not isinstance(pair, dict):
+                raise RuntimeError("malformed native duplicate pair")
+            a, b, distance = pair.get("a"), pair.get("b"), pair.get("distance")
+            if (not isinstance(a, str) or not isinstance(b, str)
+                    or a not in ids or b not in ids or a == b
+                    or isinstance(distance, bool) or not isinstance(distance, (int, float))
+                    or not math.isfinite(distance) or not 0 <= distance <= 2):
+                raise RuntimeError("malformed native duplicate pair")
+            if distance >= threshold or a not in members or b not in members:
                 continue
-            distance = _field(pair, "distance")
-            pair_sims.append(
-                {
-                    "a": a,
-                    "b": b,
-                    "sim": None if distance is None else 1.0 - float(distance),
-                }
-            )
-
-        clusters.append(
-            {
-                "members": members,
-                "pair_sims": pair_sims,
-                "size": len(members),
-            }
-        )
-    return clusters
-
-
-def load_drawer_usage(
-    palace_path: str,
-    wing: str | None = None,
-    room: str | None = None,
-) -> dict[str, dict[str, Any]]:
-    """Return lazy-decayed drawer salience keyed by logical drawer id."""
-    bind_palace(palace_path)
-    from mempalace.mcp_server import TOOLS  # lazy
-
-    res = TOOLS["mempalace_drawer_salience"]["handler"](
-        wing=wing,
-        room=room,
-        limit=100000,
-    )
-    usage = {}
-    for drawer in _field(res, "drawers") or []:
-        drawer_id = _field(drawer, "id")
-        if not drawer_id:
+            if (members[a]["wing"], members[a]["room"]) != (members[b]["wing"], members[b]["room"]):
+                continue
+            key = tuple(sorted((a, b)))
+            edges[key] = max(edges.get(key, -1.), 1. - distance)
+    adjacency = defaultdict(set)
+    for a, b in edges:
+        adjacency[a].add(b)
+        adjacency[b].add(a)
+    output, visited = [], set()
+    for start in sorted(adjacency):
+        if start in visited:
             continue
-        usage[drawer_id] = {
-            "strength": _field(drawer, "strength"),
-            "access_count": _field(drawer, "access_count"),
-            "last_activated": _field(drawer, "last_activated"),
-        }
+        component, pending = set(), [start]
+        while pending:
+            did = pending.pop()
+            if did not in component:
+                component.add(did)
+                pending.extend(adjacency[did] - component)
+        visited.update(component)
+        output.append({
+            "members": [members[did] for did in sorted(component)],
+            "pair_sims": [{"a": a, "b": b, "sim": sim} for (a, b), sim in sorted(edges.items())
+                          if a in component and b in component],
+        })
+    output.sort(key=lambda c: (-len(c["members"]), [m["id"] for m in c["members"]]))
+    if max_clusters is not None and len(output) > max_clusters:
+        raise RuntimeError("bounded duplicate scan would be incomplete at requested cluster limit")
+    return output
+
+
+def load_drawer_usage(palace_path: str, wing=None, room=None) -> dict[str, dict]:
+    """Read all scoped telemetry, lazily decaying copies without retrieving drawers."""
+    from mempalace.palace import get_collection
+    from mempalace.dynamics import drawer_salience as native_salience
+
+    rows = _complete_drawer_rows(
+        get_collection(palace_path, create=False, read_only=True), wing=wing, room=room)
+    now = datetime.now(timezone.utc)
+    usage, activation_times, scopes = {}, {}, {}
+    fields = {"access_count", "strength", "stability", "last_activated"}
+    for row in rows:
+        meta = row["metadata"]
+        did = meta.get("parent_drawer_id") or row["id"]
+        if not isinstance(did, str):
+            raise ValueError("invalid logical drawer ID in telemetry")
+        scope = (meta.get("wing"), meta.get("room"))
+        if did in scopes and scopes[did] != scope:
+            raise ValueError(f"telemetry chunks span scopes: {did}")
+        scopes[did] = scope
+        present = fields.intersection(meta)
+        if not present:
+            continue
+        snapshot = {key: meta[key] for key in present}
+        for key in ("access_count", "strength", "stability"):
+            if key not in snapshot:
+                continue
+            value = snapshot[key]
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value) or value < 0
+                    or key == "access_count" and type(value) is not int
+                    or key == "stability" and value == 0):
+                raise ValueError(f"invalid {key} telemetry for drawer {did}")
+        activated = None
+        if "last_activated" in snapshot:
+            value = snapshot["last_activated"]
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"invalid last_activated telemetry for drawer {did}")
+            try:
+                activated = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError as exc:
+                raise ValueError(f"invalid last_activated telemetry for drawer {did}") from exc
+            if activated.tzinfo is None:
+                activated = activated.replace(tzinfo=timezone.utc)
+        decayed = native_salience(snapshot, now=now)
+        combined = usage.setdefault(did, {})
+        for key in present - {"last_activated"}:
+            combined[key] = max(combined.get(key, decayed[key]), decayed[key])
+        if activated is not None and (did not in activation_times or activated > activation_times[did]):
+            activation_times[did] = activated
+            combined["last_activated"] = snapshot["last_activated"]
     return usage
 
 
@@ -328,7 +1299,8 @@ def load_observation_entries(
 
     entries = []
     for logical in _group_by_parent(rows, ("parent_entry_id", "parent_drawer_id")):
-        meta = logical.get("metadata") or {}
+        from dream_metadata import decode_dream_metadata, content_hash
+        meta = decode_dream_metadata(logical)
         text = logical["text"]
         session_id, ambiguous = _session_id_state(text)
         entry = {
@@ -342,11 +1314,106 @@ def load_observation_entries(
             "topic": meta.get("topic"),
             "wing": meta.get("wing"),
             "room": meta.get("room"),
+            "metadata": meta,
+            "content_hash": content_hash(text),
         }
         if ambiguous:
             entry["ambiguous"] = True
         entries.append(entry)
     return entries
+
+
+def load_session_observation_entries(
+    palace_path: str,
+    repository: str | None = None,
+    since: str | None = None,
+    limit_sessions: int | None = None,
+) -> list[dict[str, Any]]:
+    """Read raw Copilot host sessions as pattern-mining observation entries.
+
+    Bridges the host-only ``dream_sessions`` adapter into the palace embedding
+    space: strips injected framework boilerplate, embeds each session's user
+    text with the palace's own embedder, and returns entries shaped exactly like
+    :func:`load_observation_entries` so both pools cluster together. Each entry's
+    support key is the real host-minted ``session_id``.
+    """
+    import dream_sessions  # host-only adapter; never imports mempalace
+
+    observations = dream_sessions.load_session_observations(
+        repository=repository,
+        since=since,
+        limit_sessions=limit_sessions,
+    )
+
+    cleaned: list[tuple[dict[str, Any], str]] = []
+    for obs in observations:
+        text = _strip_context_boilerplate(obs.get("text") or "")
+        if text:
+            cleaned.append((obs, text))
+    if not cleaned:
+        return []
+
+    vectors = _palace_embed(palace_path, [text for _obs, text in cleaned])
+
+    entries = []
+    for (obs, text), embedding in zip(cleaned, vectors):
+        session_id = obs.get("session_id")
+        entry_id = f"session:{session_id}"
+        entries.append(
+            {
+                "id": entry_id,
+                "member_ids": [entry_id],
+                "text": text,
+                "embedding": embedding,
+                "session_id": str(session_id) if session_id is not None else None,
+                "agent": None,
+                "date": obs.get("created_at"),
+                "topic": obs.get("summary"),
+                "wing": None,
+                "room": "__session__",
+                "metadata": {"source_kind": "session"},
+                "content_hash": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            }
+        )
+    return entries
+
+
+def retrieve_relevant_session_observations(
+    palace_path: str,
+    query: str,
+    *,
+    k: int = 5,
+    repository: str | None = None,
+    since: str | None = None,
+    limit_sessions: int | None = None,
+    min_similarity: float = 0.0,
+) -> list[dict]:
+    """Return the top-k host-session observations most relevant to ``query``."""
+    if k <= 0:
+        return []
+
+    entries = load_session_observation_entries(
+        palace_path,
+        repository=repository,
+        since=since,
+        limit_sessions=limit_sessions,
+    )
+    if not entries:
+        return []
+
+    query_vec = _palace_embed(palace_path, [query])[0]
+    ranked = []
+    for entry in entries:
+        embedding = entry.get("embedding") or []
+        similarity = 0.0 if not query_vec or not embedding else float(cosine_similarity(query_vec, embedding))
+        if similarity < min_similarity:
+            continue
+        result = dict(entry)
+        result["similarity"] = similarity
+        ranked.append(result)
+
+    ranked.sort(key=lambda entry: -entry["similarity"])
+    return ranked[:k]
 
 
 def load_active_triples(palace_path: str) -> list[dict[str, Any]]:
@@ -388,6 +1455,439 @@ def load_active_triples(palace_path: str) -> list[dict[str, Any]]:
         con.close()
 
 
+def load_premises(
+    palace_path: str,
+    *,
+    purpose: str = "durable",
+    run_id: str | None = None,
+    strict_schema: bool = True,
+) -> list[dict]:
+    """Load KG triples through the B1.1 epistemic firewall premise contract."""
+    if purpose == "audit":
+        return load_active_triples(palace_path)
+    if purpose == "simulation":
+        if run_id is None:
+            raise ValueError("load_premises(purpose='simulation') requires run_id")
+        durable = load_premises(palace_path, purpose="durable", strict_schema=strict_schema)
+        db_path = _resolve_kg_path(palace_path)
+        if not os.path.exists(db_path):
+            return durable
+        ensure_firewall_schema(db_path)
+        try:
+            con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        except sqlite3.OperationalError:
+            con = sqlite3.connect(db_path)
+        try:
+            con.row_factory = sqlite3.Row
+            rows = con.execute(
+                """
+                SELECT f.provisional_id, f.subject, f.predicate, f.object,
+                       f.subject_id, f.object_id, f.status
+                FROM contemplate_provisional_facts f
+                JOIN contemplate_runs r ON r.run_id = f.run_id
+                WHERE f.run_id=?
+                  AND r.status='active'
+                  AND f.fact_status='active'
+                  AND r.expires_at > r.last_seen_at
+                  AND f.expires_at > r.last_seen_at
+                ORDER BY f.provisional_id
+                """,
+                (run_id,),
+            ).fetchall()
+        finally:
+            con.close()
+        durable.extend(
+            {
+                "triple_id": "prov:" + str(row["provisional_id"]),
+                "subject": row["subject"],
+                "object": row["object"],
+                "subject_id": row["subject_id"] or row["subject"],
+                "object_id": row["object_id"] or row["object"],
+                "predicate": row["predicate"],
+                "epistemic_status": row["status"],
+                "inherited_status": row["status"],
+                "conditional_on": "[]",
+                "source_trust": "hypothesis",
+                "tainted": True,
+            }
+            for row in rows
+        )
+        return durable
+    if purpose != "durable":
+        raise ValueError(f"unknown load_premises purpose: {purpose!r}")
+
+    db_path = _resolve_kg_path(palace_path)
+    if not os.path.exists(db_path):
+        return []
+
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except sqlite3.OperationalError:
+        con = sqlite3.connect(db_path)
+    try:
+        row = con.execute(
+            "SELECT value FROM kg_firewall_meta WHERE key='epoch_committed_at'"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        row = None
+    finally:
+        con.close()
+
+    if row is None:
+        reconcile_firewall_provenance(palace_path)
+
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except sqlite3.OperationalError:
+        con = sqlite3.connect(db_path)
+
+    try:
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            f"""
+            SELECT
+                t.id AS triple_id,
+                subj.name AS subject,
+                t.subject AS subject_id,
+                t.predicate AS predicate,
+                obj.name AS object,
+                t.object AS object_id,
+                t.valid_from AS valid_from,
+                t.valid_to AS valid_to,
+                t.extracted_at AS extracted_at,
+                t.source_drawer_id AS source_drawer_id,
+                t.confidence AS confidence,
+                s.status AS epistemic_status,
+                s.source_trust AS source_trust,
+                s.inherited_status AS inherited_status,
+                s.conditional_on_triple_ids AS conditional_on
+            FROM triples t
+            JOIN kg_triple_supports s ON s.triple_id = t.id
+            JOIN entities subj ON t.subject = subj.id
+            JOIN entities obj ON t.object = obj.id
+            WHERE t.valid_to IS NULL
+              AND {SUPPORT_ACTIVE_NOW_SQL}
+              AND s.status IN ('asserted', 'deduced')
+              AND s.inherited_status IN ('asserted', 'deduced')
+              AND s.conditional_on_triple_ids = '[]'
+              AND (
+                (s.status = 'asserted' AND s.source_trust IN ('trusted_legacy', 'trusted_user', 'verified_source'))
+                OR (s.status = 'deduced' AND s.source_trust = 'trusted_rule')
+              )
+            GROUP BY t.id
+            ORDER BY t.id
+            """
+        ).fetchall()
+        return [dict(row) for row in rows]
+    except sqlite3.OperationalError:
+        if strict_schema:
+            raise
+        return []
+    finally:
+        con.close()
+
+
+def _eligible_triple_ids(palace_path: str) -> set[str]:
+    """Return durable-premise-eligible active triple ids via the authoritative loader."""
+    return {
+        str(triple["triple_id"])
+        for triple in load_premises(palace_path, purpose="durable")
+    }
+
+
+def _revalidate_premise_ids(palace_path: str, premise_ids: list[Any]) -> None:
+    """B1.2/3 C4: independently reject any premise that is provisional or not
+    durable-premise-eligible. Never mutates the ids; fails closed."""
+    eligible = _eligible_triple_ids(palace_path)
+    for premise_id in premise_ids:
+        pid = str(premise_id)
+        if pid.startswith("prov:") or pid not in eligible:
+            raise ValueError(f"premise not grounded/eligible: {pid}")
+
+
+def _support_ids(con: sqlite3.Connection) -> set[str]:
+    if not _has_table(con, "kg_triple_supports"):
+        return set()
+    return {
+        str(row[0])
+        for row in con.execute("SELECT support_id FROM kg_triple_supports").fetchall()
+    }
+
+
+def _parse_derivation_premise_ids(raw: Any, derivation_id: Any) -> list[str]:
+    try:
+        parsed = json.loads(raw or "[]")
+    except (TypeError, json.JSONDecodeError) as ex:
+        raise ValueError(f"malformed premise_triple_ids for derivation {derivation_id}") from ex
+    if not isinstance(parsed, list):
+        raise ValueError(f"malformed premise_triple_ids for derivation {derivation_id}")
+    return [str(premise_id) for premise_id in parsed if premise_id]
+
+
+def _active_support_clause() -> str:
+    return "ended_at IS NULL AND valid_to IS NULL"
+
+
+def _is_independently_asserted(con: sqlite3.Connection, triple_id: str) -> bool:
+    row = con.execute(
+        f"""
+        SELECT 1
+        FROM kg_triple_supports s
+        WHERE s.triple_id = ?
+          AND s.status = 'asserted'
+          AND {_active_support_clause()}
+        LIMIT 1
+        """,
+        (triple_id,),
+    ).fetchone()
+    return row is not None
+
+
+def _load_derivation_graph(con: sqlite3.Connection) -> tuple[dict[int, dict[str, Any]], dict[str, list[dict[str, Any]]], dict[str, list[dict[str, Any]]]]:
+    derivations_by_id: dict[int, dict[str, Any]] = {}
+    derivations_by_conclusion: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    derivations_by_premise: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    seen_by_premise: dict[str, set[int]] = defaultdict(set)
+
+    rows = con.execute(
+        """
+        SELECT id, candidate_id, conclusion_triple_id, rule_id, premise_triple_ids
+        FROM kg_derivations
+        ORDER BY id
+        """
+    ).fetchall()
+    for row in rows:
+        derivation_id = int(row["id"])
+        premise_ids = _parse_derivation_premise_ids(row["premise_triple_ids"], derivation_id)
+        derivation = {
+            "id": derivation_id,
+            "candidate_id": row["candidate_id"],
+            "conclusion_triple_id": str(row["conclusion_triple_id"]),
+            "rule_id": row["rule_id"],
+            "premise_ids": premise_ids,
+        }
+        derivations_by_id[derivation_id] = derivation
+        derivations_by_conclusion[derivation["conclusion_triple_id"]].append(derivation)
+        for premise_id in premise_ids:
+            derivations_by_premise[premise_id].append(derivation)
+            seen_by_premise[premise_id].add(derivation_id)
+
+    sidecar_rows = con.execute(
+        """
+        SELECT derivation_id, premise_triple_id
+        FROM kg_derivation_premises
+        ORDER BY derivation_id, premise_triple_id
+        """
+    ).fetchall()
+    for row in sidecar_rows:
+        derivation_id = int(row["derivation_id"])
+        derivation = derivations_by_id.get(derivation_id)
+        if derivation is None:
+            raise ValueError(f"kg_derivation_premises references missing derivation {derivation_id}")
+        premise_id = str(row["premise_triple_id"])
+        if derivation_id not in seen_by_premise[premise_id]:
+            derivations_by_premise[premise_id].append(derivation)
+            seen_by_premise[premise_id].add(derivation_id)
+
+    return derivations_by_id, derivations_by_conclusion, derivations_by_premise
+
+
+def _active_triple_intervals(con: sqlite3.Connection) -> dict[str, dict[str, Any]]:
+    columns = _table_columns(con, "triples")
+    valid_from_expr = "valid_from" if "valid_from" in columns else "NULL AS valid_from"
+    valid_to_expr = "valid_to" if "valid_to" in columns else "NULL AS valid_to"
+    rows = con.execute(
+        f"""
+        SELECT id, {valid_from_expr}, {valid_to_expr}
+        FROM triples
+        WHERE valid_to IS NULL
+        """
+    ).fetchall()
+    return {
+        str(row["id"]): {"valid_from": row["valid_from"], "valid_to": row["valid_to"]}
+        for row in rows
+    }
+
+
+def _premise_interval_nonempty(triple_intervals: dict[str, dict[str, Any]], premise_ids: list[str]) -> bool:
+    if not premise_ids:
+        return False
+    premises = []
+    for premise_id in premise_ids:
+        row = triple_intervals.get(str(premise_id))
+        if row is None:
+            return False
+        premises.append(row)
+    from dream_lib import premise_interval
+
+    return premise_interval(premises) is not None
+
+
+def _cascade_plan(con: sqlite3.Connection, roots: list[str]) -> dict:
+    """Compute proof loss without changing facts or their support provenance."""
+    _, by_conclusion, by_premise = _load_derivation_graph(con)
+    affected, queue = set(), deque(roots)
+    while queue:
+        for derivation in by_premise.get(queue.popleft(), []):
+            tid = derivation["conclusion_triple_id"]
+            if tid not in affected:
+                affected.add(tid)
+                queue.append(tid)
+    intervals = {tid: row for tid, row in _active_triple_intervals(con).items() if tid not in roots}
+    independent = {tid for tid in affected if tid in intervals and _is_independently_asserted(con, tid)}
+    candidates = (affected & intervals.keys()) - independent
+    grounded = intervals.keys() - candidates
+    supports = {
+        row["support_id"]: row for row in con.execute("SELECT * FROM kg_triple_supports")
+    }
+    specific_support_ids = {
+        _derived_support_id(tid, d["rule_id"], d["candidate_id"])
+        for tid, derivations in by_conclusion.items() for d in derivations
+    }
+    supports_by_triple = defaultdict(list)
+    for support in supports.values():
+        if support["status"] == "deduced":
+            supports_by_triple[str(support["triple_id"])].append(support)
+
+    def proof_supports(derivation):
+        triple_id = derivation["conclusion_triple_id"]
+        specific_id = _derived_support_id(
+            triple_id, derivation["rule_id"], derivation["candidate_id"])
+        # Support IDs are opaque outside our per-derivation writer. Existing
+        # triple-level supports cover its recorded alternative derivations.
+        return [support for support in supports_by_triple.get(triple_id, [])
+                if support["support_id"] == specific_id
+                or support["support_id"] not in specific_support_ids]
+
+    def active_proof(derivation):
+        return any(
+            _support_active_now(support) and support["source_trust"] == "trusted_rule"
+            and support["inherited_status"] in TRUSTED_STATUSES
+            and support["conditional_on_triple_ids"] == "[]" and support["scope"] == "durable"
+            for support in proof_supports(derivation))
+
+    def grounded_proof(derivation):
+        premises = derivation["premise_ids"]
+        return (_premise_interval_nonempty(intervals, premises)
+                and all(tid in grounded for tid in premises))
+
+    changed = True
+    while changed:
+        changed = False
+        for tid in sorted(candidates - grounded):
+            if any(active_proof(d) and grounded_proof(d) for d in by_conclusion.get(tid, [])):
+                grounded.add(tid)
+                changed = True
+    proofs_by_support = defaultdict(list)
+    for tid in affected:
+        for derivation in by_conclusion.get(tid, []):
+            for support in proof_supports(derivation):
+                proofs_by_support[support["support_id"]].append(derivation)
+    # Migrated support is shared: losing one proof must not retire the others.
+    lost_supports = sorted(
+        sid for sid, derivations in proofs_by_support.items()
+        if _support_active_now(supports[sid])
+        and not any(grounded_proof(d) for d in derivations))
+    return {"to_end": sorted(candidates - grounded), "lost_supports": lost_supports,
+            "survived": sorted(candidates & grounded)}
+
+
+def invalidate_triples_cascade(
+    palace_path: str, root_triple_ids: list[str], ended_at: str, *,
+    _connection: sqlite3.Connection | None = None,
+) -> dict:
+    """Force-end roots and atomically invalidate derived dependents without an active proof."""
+    db_path = _resolve_kg_path(palace_path)
+    if not db_path or not os.path.exists(db_path):
+        return {
+            "roots_ended": [],
+            "cascade_invalidated": [],
+            "survived_by_alternate_proof": [],
+        }
+
+    if _connection is None:
+        ensure_firewall_schema(db_path)
+    roots = list(dict.fromkeys(str(root_id) for root_id in root_triple_ids))
+    con = _connection if _connection is not None else sqlite3.connect(db_path)
+    con.row_factory = sqlite3.Row
+    try:
+        if _connection is None:
+            con.execute("PRAGMA busy_timeout = 5000")
+            con.execute("BEGIN IMMEDIATE")
+
+        roots_ended = []
+        for root_id in roots:
+            cur = con.execute(
+                "UPDATE triples SET valid_to=? WHERE id=? AND valid_to IS NULL",
+                (ended_at, root_id),
+            )
+            if not cur.rowcount:
+                continue
+            roots_ended.append(root_id)
+            con.execute(
+                f"""
+                UPDATE kg_triple_supports
+                SET ended_at=?
+                WHERE triple_id=?
+                  AND {_active_support_clause()}
+                """,
+                (ended_at, root_id),
+            )
+
+        plan = _cascade_plan(con, roots_ended)
+        for support_id in plan["lost_supports"]:
+            con.execute(
+                f"UPDATE kg_triple_supports SET ended_at=? WHERE support_id=? "
+                f"AND {_active_support_clause()}",
+                (ended_at, support_id),
+            )
+
+        cascaded = []
+        for triple_id in plan["to_end"]:
+            con.execute(
+                f"""
+                UPDATE kg_triple_supports
+                SET ended_at=?
+                WHERE triple_id=?
+                  AND status='deduced'
+                  AND {_active_support_clause()}
+                """,
+                (ended_at, triple_id),
+            )
+            has_active_support = con.execute(
+                f"""
+                SELECT 1
+                FROM kg_triple_supports
+                WHERE triple_id=?
+                  AND {_active_support_clause()}
+                LIMIT 1
+                """,
+                (triple_id,),
+            ).fetchone()
+            if has_active_support is None:
+                cur = con.execute(
+                    "UPDATE triples SET valid_to=? WHERE id=? AND valid_to IS NULL",
+                    (ended_at, triple_id),
+                )
+                if cur.rowcount:
+                    cascaded.append(triple_id)
+
+        if _connection is None:
+            con.commit()
+        return {
+            "roots_ended": sorted(roots_ended),
+            "cascade_invalidated": cascaded,
+            "survived_by_alternate_proof": plan["survived"],
+        }
+    except Exception:
+        if _connection is None:
+            con.rollback()
+        raise
+    finally:
+        if _connection is None:
+            con.close()
+
+
 def kg_source_degree(palace_path: str) -> dict[str, int]:
     """Return per-drawer counts of KG triples sourced from each drawer id."""
     db_path = _resolve_kg_path(palace_path)
@@ -414,13 +1914,77 @@ def kg_source_degree(palace_path: str) -> dict[str, int]:
         con.close()
 
 
+def kg_protection_degree(palace_path: str) -> dict[str, int]:
+    """Return per-drawer counts that should block pruning KG-dependent drawers."""
+    degrees = dict(kg_source_degree(palace_path))
+    db_path = _resolve_kg_path(palace_path)
+    if not os.path.exists(db_path):
+        return degrees
+
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except sqlite3.OperationalError:
+        con = sqlite3.connect(db_path)
+
+    try:
+        con.row_factory = sqlite3.Row
+        if not (_has_table(con, "triples") and _has_table(con, "kg_derivations")):
+            return degrees
+        triple_columns = _table_columns(con, "triples")
+        derivation_columns = _table_columns(con, "kg_derivations")
+        if "valid_to" not in triple_columns or not {
+            "conclusion_triple_id",
+            "premise_drawer_ids",
+        }.issubset(derivation_columns):
+            return degrees
+
+        rows = con.execute(
+            """
+            SELECT d.id, d.premise_drawer_ids
+            FROM kg_derivations d
+            JOIN triples t ON t.id = d.conclusion_triple_id
+            WHERE t.valid_to IS NULL
+            ORDER BY d.id
+            """
+        ).fetchall()
+        for row in rows:
+            try:
+                premise_drawer_ids = json.loads(row["premise_drawer_ids"] or "[]")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(premise_drawer_ids, list):
+                continue
+            for drawer_id in {str(value) for value in premise_drawer_ids if value}:
+                degrees[drawer_id] = degrees.get(drawer_id, 0) + 1
+        return degrees
+    finally:
+        con.close()
+
+
 class MempalaceWriter:
     """Writes through the sanctioned MCP tool handlers against the bound palace."""
 
-    def __init__(self) -> None:
-        from mempalace.mcp_server import TOOLS  # lazy
+    def __init__(self, palace_path: str | None = None) -> None:
+        mcp_server = _embedded_mcp_server(palace_path)
+        self._server = mcp_server
+        self._tools = mcp_server.TOOLS
+        self.palace_path = os.path.realpath(os.path.expanduser(mcp_server._config.palace_path))
 
-        self._tools = TOOLS
+    @contextmanager
+    def mutation(self, tool_name: str = "mempalace_add_drawer") -> Iterator[None]:
+        """Honor MCP preflight and release only ownership acquired by this scope."""
+        server = self._server
+        if os.path.realpath(os.path.expanduser(server._config.palace_path)) != self.palace_path:
+            raise RuntimeError("MCP palace binding changed after writer construction")
+        already_owned = server._MCP_WRITER_LOCK_CM is not None
+        try:
+            refusal = server._mcp_tool_preflight_refusal(None, tool_name)
+            if refusal is not None:
+                raise RuntimeError(f"MCP mutation refused: {refusal['error']}")
+            yield
+        finally:
+            if not already_owned:
+                server._release_mcp_writer_lock()
 
     def add_drawer(
         self,
@@ -447,12 +2011,39 @@ class MempalaceWriter:
                 # provenance reversible by appending a machine-readable trailer.
                 meta_json = json.dumps(metadata, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
                 kwargs["content"] = f"{content}\n\n<!--dreaming-meta: {meta_json}-->"
-        return self._tools["mempalace_add_drawer"]["handler"](
-            **kwargs
-        )
+        with self.mutation():
+            result = handler(**kwargs)
+        if isinstance(result, dict) and result.get("success") is False:
+            raise RuntimeError(f"add_drawer failed: {result.get('error', result)}")
+        return result
 
     def delete_drawer(self, drawer_id: str) -> Any:
-        return self._tools["mempalace_delete_drawer"]["handler"](drawer_id=drawer_id)
+        from dream_procedural_palace import live_protected_drawer_ids
+
+        with self.mutation("mempalace_delete_drawer"), palace_mutation_lock(self.palace_path):
+            col = protection_collection(self.palace_path)
+            if drawer_id in live_protected_drawer_ids(self.palace_path, collection=col):
+                raise ValueError("procedural evidence/event drawer is protected")
+            result = self._tools["mempalace_delete_drawer"]["handler"](drawer_id=drawer_id)
+            if isinstance(result, dict) and result.get("success") is False:
+                raise RuntimeError(f"delete_drawer failed: {result.get('error', result)}")
+            if load_source_drawer(self.palace_path, drawer_id, collection=col) is not None:
+                raise RuntimeError(f"delete_drawer readback failed: {drawer_id}")
+            return result
+
+
+class MempalaceTunneler:
+    """Creates room-to-room tunnels via the sanctioned MCP handler."""
+    def __init__(self, palace_path: str | None = None) -> None:
+        self._server = _embedded_mcp_server(palace_path)
+        self._tools = self._server.TOOLS
+        self.palace_path = os.path.realpath(os.path.expanduser(self._server._config.palace_path))
+    def create_tunnel(self, source_wing, source_room, target_wing, target_room, label):
+        if os.path.realpath(os.path.expanduser(self._server._config.palace_path)) != self.palace_path:
+            raise RuntimeError("MCP palace binding changed after tunneler construction")
+        return self._tools["mempalace_create_tunnel"]["handler"](
+            source_wing=source_wing, source_room=source_room,
+            target_wing=target_wing, target_room=target_room, label=label)
 
 
 class Archiver:
@@ -479,7 +2070,8 @@ class Archiver:
         if self._collection is None:
             from mempalace.palace import get_collection  # lazy: heavy import
 
-            self._collection = get_collection(self.palace_path)
+            # The backend caches handles and retires them at lease boundaries.
+            return get_collection(self.palace_path)
         return self._collection
 
     def _reload_rows(self, member_ids: list[str]) -> list[dict[str, Any]]:
@@ -495,7 +2087,16 @@ class Archiver:
         return [by_id[drawer_id] for drawer_id in member_ids]
 
     def archive_then_delete(self, record: dict[str, Any]) -> dict[str, Any]:
+        with palace_mutation_lock(self.palace_path):
+            return self._archive_then_delete_locked(record)
+
+    def _archive_then_delete_locked(self, record: dict[str, Any]) -> dict[str, Any]:
+        from dream_procedural_palace import live_protected_drawer_ids
+
         member_ids = list(record.get("member_ids") or [record["id"]])
+        protected = live_protected_drawer_ids(self.palace_path, collection=self._get_collection())
+        if protected.intersection(member_ids + [record["id"]]):
+            raise ValueError("procedural evidence/event drawer is protected")
         rows = self._reload_rows(member_ids)
         archive_record = {
             "schema": 1,
@@ -530,12 +2131,18 @@ class Archiver:
         deleted = []
         for drawer_id in member_ids:
             try:
-                self._writer.delete_drawer(drawer_id)
+                result = self._writer.delete_drawer(drawer_id)
+                if isinstance(result, dict) and result.get("success") is False:
+                    raise RuntimeError(f"delete failed: {result}")
             except Exception as ex:
                 ex.args = (*ex.args, {"deleted": deleted.copy(), "failed": drawer_id})
                 raise
             else:
                 deleted.append(drawer_id)
+        remaining = _rows_from_collection_result(self._get_collection().get(
+            ids=member_ids, include=["metadatas"]))
+        if remaining:
+            raise RuntimeError(f"delete readback failed: {[r['id'] for r in remaining]}")
         return {"archived": record["id"], "deleted": deleted}
 
 
@@ -557,56 +2164,96 @@ class KgWriter:
     def invalidate(self, subject: str, predicate: str, object: str, ended: str | None = None) -> Any:
         return self._kg.invalidate(subject, predicate, object, ended=ended)
 
-    def supersede(
-        self,
-        subject: str,
-        predicate: str,
-        old_object: str,
-        new_object: str,
-        at: str | None = None,
-    ) -> Any:
-        ended_at = at or datetime.now(timezone.utc).isoformat()
-        for method_name in ("supersede", "replace"):
-            method = getattr(self._kg, method_name, None)
-            if method is not None:
-                try:
-                    return method(subject, predicate, old_object, new_object, at=ended_at)
-                except TypeError:
-                    return method(subject, predicate, old_object, new_object)
-
-        self._kg.invalidate(subject, predicate, old_object, ended=ended_at)
-        add_triple = self._kg.add_triple
-        kwargs: dict[str, Any] = {}
-        try:
-            params = inspect.signature(add_triple).parameters
-        except (TypeError, ValueError):
-            params = {}
-        if "valid_from" in params:
-            kwargs["valid_from"] = ended_at
-        elif "at" in params:
-            kwargs["at"] = ended_at
-        if "extracted_at" in params:
-            kwargs["extracted_at"] = ended_at
-        try:
-            return add_triple(subject, predicate, new_object, **kwargs)
-        except TypeError:
-            return add_triple(subject, predicate, new_object)
-
     def invalidate_triples(self, triple_ids: list[str], ended: str | None = None) -> int:
         if not os.path.exists(self._db_path):
             return 0
-        ended_at = ended or datetime.now(timezone.utc).isoformat()
+        result = invalidate_triples_cascade(
+            self._db_path, triple_ids, ended or datetime.now(timezone.utc).isoformat())
+        return len(result["roots_ended"])
+
+    def supersede(
+        self, subject, predicate, old_object, new_object, *,
+        old_triple_ids, keep_triple_ids, at=None,
+    ) -> dict:
+        """Retire exact contradictory facts without asserting a new successor."""
+        for ids in (old_triple_ids, keep_triple_ids):
+            if (not isinstance(ids, list) or not ids
+                    or any(not isinstance(tid, str) or not tid for tid in ids)
+                    or len(set(ids)) != len(ids)):
+                raise ValueError("supersede requires nonempty unique exact triple IDs")
+        if set(old_triple_ids) & set(keep_triple_ids):
+            raise ValueError("supersede old and kept IDs must be disjoint")
+        ended_at = _utc_now_iso(at)
         con = sqlite3.connect(self._db_path)
+        con.row_factory = sqlite3.Row
         try:
-            count = 0
-            for triple_id in triple_ids:
-                cur = con.execute(
-                    "UPDATE triples SET valid_to=? WHERE id=? AND valid_to IS NULL",
-                    (ended_at, triple_id),
-                )
-                count += cur.rowcount
+            con.execute("PRAGMA busy_timeout = 5000")
+            con.execute("BEGIN IMMEDIATE")
+
+            def entity_id(selector):
+                rows = con.execute(
+                    "SELECT id FROM entities WHERE id=? OR name=?",
+                    (selector, selector),
+                ).fetchall()
+                if len(rows) != 1:
+                    raise ValueError(f"unknown or ambiguous entity: {selector!r}")
+                return str(rows[0]["id"])
+
+            subject_id = entity_id(subject)
+            old_id, new_id = entity_id(old_object), entity_id(new_object)
+            if old_id == new_id:
+                raise ValueError("supersede requires distinct canonical objects")
+            pred = normalize_predicate(predicate)
+            for ids, expected_object in ((old_triple_ids, old_id), (keep_triple_ids, new_id)):
+                for tid in ids:
+                    row = con.execute("SELECT * FROM triples WHERE id=?", (tid,)).fetchone()
+                    if (row is None or row["valid_to"] is not None
+                            or str(row["subject"]) != subject_id
+                            or row["predicate"] != pred or str(row["object"]) != expected_object):
+                        raise ValueError(f"supersede target missing, inactive or drifted: {tid}")
+
+            if not _has_table(con, "kg_triple_supports"):
+                raise ValueError("supersede requires successor support provenance")
+            kept_supports = {}
+            for tid in keep_triple_ids:
+                supports = con.execute(
+                    f"SELECT * FROM kg_triple_supports WHERE triple_id=? AND {_active_support_clause()} "
+                    "ORDER BY support_id", (tid,),
+                ).fetchall()
+                if not any(
+                    (s["status"], s["source_trust"]) in ALLOWED_PREMISE_PAIRS
+                    and s["inherited_status"] in TRUSTED_STATUSES
+                    and s["conditional_on_triple_ids"] == "[]" and s["scope"] == "durable"
+                    for s in supports
+                ):
+                    raise ValueError(f"supersede successor has no durable support: {tid}")
+                kept_supports[tid] = [tuple(s) for s in supports]
+
+            plan = _cascade_plan(con, old_triple_ids)
+            if (set(keep_triple_ids).intersection(plan["to_end"])
+                    or any(s[0] in plan["lost_supports"] for rows in kept_supports.values() for s in rows)):
+                raise ValueError("supersede would change kept support provenance")
+            result = invalidate_triples_cascade(
+                self._db_path, old_triple_ids, ended_at, _connection=con)
+            for tid, before in kept_supports.items():
+                row = con.execute("SELECT valid_to FROM triples WHERE id=?", (tid,)).fetchone()
+                after = con.execute(
+                    f"SELECT * FROM kg_triple_supports WHERE triple_id=? AND {_active_support_clause()} "
+                    "ORDER BY support_id", (tid,),
+                ).fetchall()
+                if row["valid_to"] is not None or [tuple(s) for s in after] != before:
+                    raise ValueError(f"supersede would change kept support provenance: {tid}")
             con.commit()
-            return count
+            return {
+                "invalidated": len(result["roots_ended"]),
+                "retired_ids": result["roots_ended"],
+                "kept_ids": list(keep_triple_ids),
+                "cascaded_ids": result["cascade_invalidated"],
+                "survived_ids": result["survived_by_alternate_proof"],
+            }
+        except Exception:
+            con.rollback()
+            raise
         finally:
             con.close()
 
@@ -656,6 +2303,7 @@ def _normalize_dt_for_kg(value):
     """
     if not value or not isinstance(value, str) or "T" not in value:
         return value
+    value = re.sub(r"\.\d+", "", value)  # add_triple wants second precision; drop fractional seconds
     if value.endswith("Z"):
         return value
     # naive datetime string: if midnight, return date-only; otherwise append Z (assume UTC)
@@ -666,6 +2314,160 @@ def _normalize_dt_for_kg(value):
     return value + "Z"
 
 
+def _table_columns(con: sqlite3.Connection, table_name: str) -> set[str]:
+    rows = con.execute(f"PRAGMA table_info({table_name})").fetchall()
+    return {row[1] for row in rows}
+
+
+def _has_table(con: sqlite3.Connection, table_name: str) -> bool:
+    return con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (table_name,),
+    ).fetchone() is not None
+
+
+def reconcile_firewall_provenance(palace_path: str) -> dict[str, int]:
+    """Backfill B1.0 support and reverse-index sidecars for an existing KG."""
+    db_path = _resolve_kg_path(palace_path)
+    ensure_firewall_schema(db_path)
+    now = datetime.now(timezone.utc).isoformat()
+    counts = {
+        "triples_scanned": 0,
+        "supports_inserted": 0,
+        "orphans_quarantined": 0,
+        "derivations_scanned": 0,
+        "derivation_premises_inserted": 0,
+        "malformed_derivations": 0,
+        "meta_written": 0,
+    }
+
+    con = sqlite3.connect(db_path)
+    con.row_factory = sqlite3.Row
+    try:
+        con.execute("PRAGMA busy_timeout = 5000")
+        con.execute("BEGIN IMMEDIATE")
+        epoch_present = con.execute(
+            "SELECT 1 FROM kg_firewall_meta WHERE key='epoch_committed_at' LIMIT 1"
+        ).fetchone() is not None
+        if _has_table(con, "triples"):
+            columns = _table_columns(con, "triples")
+            valid_from_expr = "t.valid_from" if "valid_from" in columns else "NULL"
+            valid_to_expr = "t.valid_to" if "valid_to" in columns else "NULL"
+            adapter_expr = "t.adapter_name" if "adapter_name" in columns else "NULL"
+            source_expr = "t.source_drawer_id" if "source_drawer_id" in columns else "NULL"
+            rows = con.execute(
+                f"""
+                SELECT
+                    t.id AS triple_id,
+                    {valid_from_expr} AS valid_from,
+                    {valid_to_expr} AS valid_to,
+                    {adapter_expr} AS adapter_name,
+                    {source_expr} AS source_drawer_id,
+                    EXISTS(
+                        SELECT 1 FROM kg_derivations d
+                        WHERE d.conclusion_triple_id = t.id
+                    ) AS has_derivation
+                FROM triples t
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM kg_triple_supports s WHERE s.triple_id = t.id
+                )
+                ORDER BY t.id
+                """
+            ).fetchall()
+            counts["triples_scanned"] = len(rows)
+            for row in rows:
+                triple_id = str(row["triple_id"])
+                adapter_name = row["adapter_name"]
+                source_drawer_id = row["source_drawer_id"]
+                quarantined = False
+                if epoch_present:
+                    status = "unknown"
+                    source_trust = "unknown"
+                    source_kind = adapter_name or "unknown"
+                    quarantined = True
+                else:
+                    is_derive = (
+                        bool(row["has_derivation"])
+                        or adapter_name == "contemplate:derive"
+                        or (isinstance(source_drawer_id, str) and source_drawer_id.startswith("derive:"))
+                    )
+                    if is_derive:
+                        status = "deduced"
+                        source_trust = "trusted_rule"
+                        source_kind = adapter_name or "contemplate:derive"
+                    else:
+                        status = "asserted"
+                        source_trust = "trusted_legacy"
+                        source_kind = adapter_name or "legacy"
+                cur = con.execute(
+                    "INSERT OR IGNORE INTO kg_triple_supports(support_id, triple_id, status,"
+                    " source_trust, inherited_status, conditional_on_triple_ids, scope,"
+                    " source_kind, source_ref, valid_from, valid_to, created_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        _legacy_support_id(triple_id),
+                        triple_id,
+                        status,
+                        source_trust,
+                        status,
+                        "[]",
+                        "durable",
+                        source_kind,
+                        source_drawer_id,
+                        row["valid_from"],
+                        row["valid_to"],
+                        now,
+                    ),
+                )
+                counts["supports_inserted"] += cur.rowcount
+                if quarantined:
+                    counts["orphans_quarantined"] += cur.rowcount
+
+        derivation_rows = con.execute("SELECT id, premise_triple_ids FROM kg_derivations ORDER BY id").fetchall()
+        counts["derivations_scanned"] = len(derivation_rows)
+        for row in derivation_rows:
+            try:
+                premise_ids = json.loads(row["premise_triple_ids"] or "[]")
+            except (TypeError, json.JSONDecodeError):
+                counts["malformed_derivations"] += 1
+                continue
+            if not isinstance(premise_ids, list):
+                counts["malformed_derivations"] += 1
+                continue
+            for premise_id in premise_ids:
+                if premise_id:
+                    cur = con.execute(
+                        "INSERT OR IGNORE INTO kg_derivation_premises(derivation_id, premise_triple_id)"
+                        " VALUES (?,?)",
+                        (row["id"], str(premise_id)),
+                    )
+                    counts["derivation_premises_inserted"] += cur.rowcount
+
+        con.execute(
+            """
+            INSERT OR IGNORE INTO kg_firewall_meta(key, value, created_at)
+            VALUES ('epoch_committed_at', ?, ?)
+            """,
+            (now, now),
+        )
+        cur = con.execute(
+            """
+            INSERT INTO kg_firewall_meta(key, value, created_at)
+            VALUES ('reconciled_at', ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            (now, now),
+        )
+        counts["meta_written"] = cur.rowcount
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+    return counts
+
+
 class KgDeriveWriter:
     """Writes derived triples + a kg_derivations lineage row to the resolved KG.
 
@@ -674,29 +2476,14 @@ class KgDeriveWriter:
     triple id (existing on dedupe, new otherwise) so no post-write re-query is needed.
     """
 
-    _DDL = (
-        "CREATE TABLE IF NOT EXISTS kg_derivations("
-        " id INTEGER PRIMARY KEY,"
-        " candidate_id TEXT UNIQUE,"
-        " conclusion_triple_id TEXT,"
-        " rule_id TEXT,"
-        " ontology_version TEXT,"
-        " premise_triple_ids TEXT,"
-        " premise_drawer_ids TEXT,"
-        " confidence REAL,"
-        " created_at TEXT)"
-    )
+    _DDL = KG_DERIVATIONS_DDL
 
     def __init__(self, palace_path):
         from mempalace.knowledge_graph import KnowledgeGraph  # lazy
+        self._palace_or_db = palace_path
         self._db_path = _resolve_kg_path(palace_path)
         self._kg = KnowledgeGraph(db_path=self._db_path)
-        con = sqlite3.connect(self._db_path)
-        try:
-            con.execute(self._DDL)
-            con.commit()
-        finally:
-            con.close()
+        ensure_firewall_schema(self._db_path)
 
     def _resolve_name(self, con, entity_id):
         row = con.execute("SELECT name FROM entities WHERE id=?", (entity_id,)).fetchone()
@@ -708,6 +2495,13 @@ class KgDeriveWriter:
     def add_derived(self, conclusion, rule_id, premise_ids, premise_drawer_ids,
                     ontology_version, confidence, valid_from, valid_to):
         from dream_lib import derive_candidate_id, normalize_predicate
+        preexisting_support_ids: set[str] = set()
+        if os.path.exists(self._db_path):
+            pre_con = sqlite3.connect(self._db_path)
+            try:
+                preexisting_support_ids = _support_ids(pre_con)
+            finally:
+                pre_con.close()
         candidate_id = derive_candidate_id(conclusion, rule_id, premise_ids, ontology_version)
         con = sqlite3.connect(self._db_path)
         try:
@@ -718,24 +2512,75 @@ class KgDeriveWriter:
             obj = self._resolve_name(con, conclusion["object_id"])
         finally:
             con.close()
+        # B1.2/3 C4: independently re-validate premises before any durable write.
+        # Never trust the caller; reject provisional or now-ineligible premises.
+        _revalidate_premise_ids(self._palace_or_db, premise_ids)
         pred = normalize_predicate(conclusion["predicate"])
+        normalized_valid_from = _normalize_dt_for_kg(valid_from)
+        normalized_valid_to = _normalize_dt_for_kg(valid_to)
         # add_triple resolves entities by NAME (mempalace is name-keyed) and RETURNS the id.
         triple_id = self._kg.add_triple(
             subj, pred, obj,
-            valid_from=_normalize_dt_for_kg(valid_from), valid_to=_normalize_dt_for_kg(valid_to),
+            valid_from=normalized_valid_from, valid_to=normalized_valid_to,
             confidence=confidence if confidence is not None else 1.0,
             source_drawer_id="derive:" + rule_id,
             adapter_name="contemplate:derive")
         con = sqlite3.connect(self._db_path)
         try:
+            now = datetime.now(timezone.utc).isoformat()
+            con.execute("BEGIN IMMEDIATE")
             con.execute(
                 "INSERT OR IGNORE INTO kg_derivations(candidate_id, conclusion_triple_id,"
                 " rule_id, ontology_version, premise_triple_ids, premise_drawer_ids,"
                 " confidence, created_at) VALUES (?,?,?,?,?,?,?,?)",
                 (candidate_id, str(triple_id), rule_id, ontology_version,
                  json.dumps(premise_ids), json.dumps(premise_drawer_ids),
-                 confidence, datetime.now(timezone.utc).isoformat()))
+                 confidence, now))
+            row = con.execute("SELECT id FROM kg_derivations WHERE candidate_id=?", (candidate_id,)).fetchone()
+            derivation_id = row[0]
+            con.execute(
+                "INSERT OR IGNORE INTO kg_triple_supports(support_id, triple_id, status,"
+                " source_trust, inherited_status, conditional_on_triple_ids, scope,"
+                " source_kind, source_ref, valid_from, valid_to, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    _derived_support_id(str(triple_id), rule_id, candidate_id),
+                    str(triple_id),
+                    "deduced",
+                    "trusted_rule",
+                    "deduced",
+                    "[]",
+                    "durable",
+                    "contemplate:derive",
+                    "derive:" + rule_id,
+                    normalized_valid_from,
+                    normalized_valid_to,
+                    now,
+                ),
+            )
+            legacy_support_id = _legacy_support_id(str(triple_id))
+            if legacy_support_id not in preexisting_support_ids:
+                con.execute(
+                    """
+                    DELETE FROM kg_triple_supports
+                    WHERE support_id=?
+                      AND triple_id=?
+                      AND status='asserted'
+                      AND source_trust='trusted_legacy'
+                    """,
+                    (legacy_support_id, str(triple_id)),
+                )
+            for premise_id in premise_ids:
+                if premise_id:
+                    con.execute(
+                        "INSERT OR IGNORE INTO kg_derivation_premises(derivation_id, premise_triple_id)"
+                        " VALUES (?,?)",
+                        (derivation_id, str(premise_id)),
+                    )
             con.commit()
+        except Exception:
+            con.rollback()
+            raise
         finally:
             con.close()
         return {"ok": True, "triple_id": triple_id}

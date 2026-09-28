@@ -145,6 +145,54 @@ def summarize_report(report: dict) -> str:
     return "\n".join(lines)
 
 
+def _recall_snippet(text: str, limit: int = 100) -> str:
+    normalized = " ".join(str(text or "").split())
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: limit - 3].rstrip() + "..."
+
+
+def build_recall_report(query: str, k: int, palace: str, hits: list[dict]) -> dict:
+    sanitized_hits = []
+    for hit in hits or []:
+        sanitized_hits.append({
+            "session_id": hit.get("session_id"),
+            "similarity": hit.get("similarity"),
+            "topic": hit.get("topic"),
+            "date": hit.get("date"),
+            "text": hit.get("text"),
+        })
+    return {
+        "query": query,
+        "k": k,
+        "palace": palace,
+        "count": len(sanitized_hits),
+        "hits": sanitized_hits,
+    }
+
+
+def summarize_recall_report(report: dict) -> str:
+    lines = [
+        f"recall query: {report.get('query')}",
+        f"k: {report.get('k')}",
+        f"palace: {report.get('palace')}",
+    ]
+    hits = report.get("hits") or []
+    if not hits:
+        lines.append("no relevant sessions found")
+        return "\n".join(lines)
+    for hit in hits:
+        session_id = str(hit.get("session_id") or "")
+        label = hit.get("topic") or hit.get("date") or ""
+        similarity = hit.get("similarity")
+        try:
+            similarity_text = f"{float(similarity):.4f}"
+        except (TypeError, ValueError):
+            similarity_text = "nan"
+        lines.append(f"  - {similarity_text} [{session_id[:8]}] {label}: {_recall_snippet(hit.get('text'))}")
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # Palace-facing orchestration
 # ---------------------------------------------------------------------------
@@ -159,7 +207,7 @@ def derive_worklist(
 ) -> tuple[dict, list[dict], list[dict]]:
     rules = dream_palace.load_ontology_config(rules_path)
     onto_ver = ontology_version(rules)
-    triples = dream_palace.load_active_triples_with_ids(palace)
+    triples = dream_palace.load_premises(palace, purpose="durable")
     candidates = deductive_closure(
         triples,
         rules,
@@ -211,6 +259,244 @@ def bootstrap_ontology(
     }
 
 
+def _ontology_rules_doc(doc: dict | list) -> tuple[list[dict], int]:
+    if isinstance(doc, dict):
+        return list(doc.get("rules") or []), int(doc.get("version", 1) or 1)
+    if isinstance(doc, list):
+        return list(doc), 1
+    return [], 1
+
+
+def _candidate_rules_from_triples(triples: list[dict], current_rules: list[dict], min_support: int) -> list[dict]:
+    predicates = sorted({
+        triple.get("predicate") for triple in triples
+        if isinstance(triple.get("predicate"), str) and triple.get("predicate")
+    })
+    candidates = []
+    candidates.extend(dream_ontology.suggest_rules_from_predicates(predicates))
+    base = dream_ontology.filter_base_triples(triples, current_rules)
+    candidates.extend(dream_ontology.induce_rules_from_triples(base, min_support=min_support))
+    merged_candidates, _candidate_stats = dream_ontology.merge_ontology_candidates([], candidates)
+    return merged_candidates
+
+
+def _preview_candidate_derivations(triples, candidate_rule, *, limit=3) -> list[str]:
+    """Return up to ``limit`` plain-language example conclusions this one candidate rule would derive."""
+    try:
+        max_depth = int(candidate_rule.get("max_depth", 8) or 8)
+        candidates = deductive_closure(
+            triples,
+            [{**candidate_rule, "enabled": True}],
+            max_depth=max_depth,
+            max_iterations=50,
+            max_candidates=max(limit, 10),
+        )
+        previews = []
+        for candidate in candidates:
+            conclusion = candidate.get("conclusion") or {}
+            subject = conclusion.get("subject") or conclusion.get("subject_id")
+            predicate = conclusion.get("predicate")
+            obj = conclusion.get("object") or conclusion.get("object_id")
+            if subject is None or predicate is None or obj is None:
+                continue
+            previews.append(f"{subject} {predicate} {obj}")
+            if len(previews) >= limit:
+                break
+        return previews
+    except Exception:
+        return []
+
+
+def _plain_evidence_text(evidence) -> str:
+    if isinstance(evidence, (list, tuple)):
+        text = ", ".join(str(item) for item in evidence)
+    else:
+        text = str(evidence or "")
+    replacements = {
+        "transitivity": "chain behavior",
+        "transitive": "chain",
+        "symmetry": "two-way behavior",
+        "symmetric": "two-way",
+        "inverse": "paired",
+        "family": "kind",
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new).replace(old.capitalize(), new.capitalize())
+    return text
+
+
+def propose_rules(palace, *, rules_path=None, min_support=2) -> dict:
+    path = dream_palace.bind_palace(palace)
+    effective_rules_path = rules_path or os.path.join(path, "ontology.json")
+    triples = dream_palace.load_premises(path, purpose="durable")
+    current_rules = dream_palace.load_ontology_config(effective_rules_path)
+    already_enabled = sorted(
+        str(rule.get("id"))
+        for rule in current_rules
+        if rule.get("id") and bool(rule.get("enabled", False))
+    )
+    enabled_ids = set(already_enabled)
+
+    candidates = _candidate_rules_from_triples(triples, current_rules, min_support)
+    proposals = []
+    for candidate in candidates:
+        rule_id = candidate.get("id")
+        if rule_id in enabled_ids:
+            continue
+        described = dream_ontology.describe_rule_candidate(candidate)
+        preview = _preview_candidate_derivations(triples, candidate)
+        proposals.append({
+            **described,
+            "would_derive_now": len(preview) > 0,
+            "example_derivations": preview,
+            "accept_command": f"--enable-rule {rule_id}",
+        })
+
+    return {
+        "palace": path,
+        "rules_path": effective_rules_path,
+        "triple_count": len(triples),
+        "proposals": proposals,
+        "already_enabled": already_enabled,
+    }
+
+
+def summarize_proposals(report) -> str:
+    lines = [
+        f"palace: {report.get('palace')}",
+        f"rules: {report.get('rules_path')}",
+        f"active triples: {report.get('triple_count')}",
+    ]
+    already_enabled = report.get("already_enabled") or []
+    if already_enabled:
+        lines.append(f"already enabled: {len(already_enabled)}")
+
+    proposals = report.get("proposals") or []
+    if not proposals:
+        lines.append("No rule proposals right now.")
+        return "\n".join(lines)
+
+    lines.append("rule proposals:")
+    for index, proposal in enumerate(proposals, start=1):
+        lines.append(f"{index}. {proposal.get('plain_question')}")
+        evidence = _plain_evidence_text(proposal.get("evidence"))
+        if evidence:
+            lines.append(f"   why: {evidence}")
+        else:
+            lines.append("   why: no evidence text available")
+        lines.append(f"   effect: {proposal.get('effect') or ''}")
+        lines.append(f"   would help right now: {'yes' if proposal.get('would_derive_now') else 'no'}")
+        examples = proposal.get("example_derivations") or []
+        if examples:
+            lines.append("   for example, enabling this would let me conclude:")
+            for example in examples:
+                lines.append(f"     - {example}")
+        else:
+            lines.append("   (no new conclusions from your current notes yet)")
+    lines.append("")
+    lines.append("To turn any of these on, just say the number (e.g. \"enable 1\") and I'll do it.")
+    return "\n".join(lines)
+
+
+def _summarize_enable_result(report: dict) -> str:
+    return "\n".join([
+        f"palace: {report.get('palace')}",
+        f"rules: {report.get('rules_path')}",
+        "enabled: " + (", ".join(report.get("enabled") or []) or "none"),
+        "unknown: " + (", ".join(report.get("unknown") or []) or "none"),
+        f"now enabled: {report.get('now_enabled_count')}",
+    ])
+
+
+def _summarize_disable_result(report: dict) -> str:
+    return "\n".join([
+        f"palace: {report.get('palace')}",
+        f"rules: {report.get('rules_path')}",
+        "disabled: " + (", ".join(report.get("disabled") or []) or "none"),
+        "unknown: " + (", ".join(report.get("unknown") or []) or "none"),
+        f"now enabled: {report.get('now_enabled_count')}",
+    ])
+
+
+def enable_rules(palace, rule_ids: list[str], *, rules_path=None, min_support=2) -> dict:
+    path = dream_palace.bind_palace(palace)
+    effective_rules_path = rules_path or os.path.join(path, "ontology.json")
+    doc = dream_ontology.read_ontology_doc(effective_rules_path)
+    current_rules, version = _ontology_rules_doc(doc)
+    triples = dream_palace.load_premises(path, purpose="durable")
+    candidates = {
+        rule.get("id"): rule
+        for rule in _candidate_rules_from_triples(triples, current_rules, min_support)
+        if rule.get("id")
+    }
+
+    existing_by_id = {rule.get("id"): rule for rule in current_rules if rule.get("id")}
+    enabled = []
+    unknown = []
+    seen_requested = set()
+    for rule_id in rule_ids:
+        if rule_id in seen_requested:
+            continue
+        seen_requested.add(rule_id)
+        existing = existing_by_id.get(rule_id)
+        if existing is not None:
+            existing["enabled"] = True
+            enabled.append(rule_id)
+            continue
+        candidate = candidates.get(rule_id)
+        if candidate is None:
+            unknown.append(rule_id)
+            continue
+        new_rule = dict(candidate)
+        new_rule["enabled"] = True
+        current_rules.append(new_rule)
+        existing_by_id[rule_id] = new_rule
+        enabled.append(rule_id)
+
+    updated_doc = dream_ontology.build_ontology_doc(current_rules, version)
+    dream_ontology.write_ontology_doc(effective_rules_path, updated_doc)
+    return {
+        "palace": path,
+        "rules_path": effective_rules_path,
+        "enabled": enabled,
+        "unknown": unknown,
+        "now_enabled_count": sum(1 for rule in current_rules if bool(rule.get("enabled", False))),
+    }
+
+
+def disable_rules(palace, rule_ids: list[str], *, rules_path=None) -> dict:
+    """Set enabled=false for the named rules in the palace ontology."""
+    path = dream_palace.bind_palace(palace)
+    effective_rules_path = rules_path or os.path.join(path, "ontology.json")
+    doc = dream_ontology.read_ontology_doc(effective_rules_path)
+    current_rules, version = _ontology_rules_doc(doc)
+
+    existing_by_id = {rule.get("id"): rule for rule in current_rules if rule.get("id")}
+    disabled = []
+    unknown = []
+    seen_requested = set()
+    for rule_id in rule_ids:
+        if rule_id in seen_requested:
+            continue
+        seen_requested.add(rule_id)
+        existing = existing_by_id.get(rule_id)
+        if existing is None:
+            unknown.append(rule_id)
+            continue
+        existing["enabled"] = False
+        disabled.append(rule_id)
+
+    updated_doc = dream_ontology.build_ontology_doc(current_rules, version)
+    dream_ontology.write_ontology_doc(effective_rules_path, updated_doc)
+    return {
+        "palace": path,
+        "rules_path": effective_rules_path,
+        "disabled": disabled,
+        "unknown": unknown,
+        "now_enabled_count": sum(1 for rule in current_rules if bool(rule.get("enabled", False))),
+    }
+
+
 def run(
     palace: str,
     *,
@@ -255,18 +541,50 @@ def run(
     )
 
 
+def run_recall(
+    palace: str,
+    query: str,
+    *,
+    k: int = 5,
+    repository: str | None = None,
+    since: str | None = None,
+    limit_sessions: int | None = None,
+    min_similarity: float = 0.0,
+) -> dict:
+    path = dream_palace.bind_palace(palace)
+    hits = dream_palace.retrieve_relevant_session_observations(
+        path,
+        query,
+        k=k,
+        repository=repository,
+        since=since,
+        limit_sessions=limit_sessions,
+        min_similarity=min_similarity,
+    )
+    return build_recall_report(query, k, path, hits)
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--palace", help="Path to the mempalace palace directory (default: mempalace config)")
     ap.add_argument("--rules", default=None, help="Path to ontology config (default: <palace>/ontology.json)")
     ap.add_argument("--min-support", type=int, default=2, help="Minimum support for induced bootstrap rules (default 2)")
     ap.add_argument("--bootstrap", action="store_true", help="Write disabled ontology candidates for review")
+    ap.add_argument("--propose", action="store_true", help="Show plain-language ontology rule proposals")
+    ap.add_argument("--enable-rule", action="append", default=[], metavar="ID", help="Enable one proposed ontology rule by id")
+    ap.add_argument("--disable-rule", action="append", default=[], metavar="ID", help="Disable one ontology rule by id")
     ap.add_argument(
         "--out",
         default=None,
         help="Ontology output path for --bootstrap (default: <palace>/ontology.json)",
     )
     ap.add_argument("--format", choices=["summary", "json"], default="summary", help="Output format (default summary)")
+    ap.add_argument("--recall", default=None, help="Reasoning query for relevance-ranked past session recall")
+    ap.add_argument("--k", type=int, default=5, help="Maximum relevant sessions to return (default 5)")
+    ap.add_argument("--repository", default=None, help="Repository filter passed through to --recall retrieval")
+    ap.add_argument("--since", default=None, help="Lower date/time bound passed through to --recall retrieval")
+    ap.add_argument("--limit-sessions", type=int, default=None, help="Maximum sessions to inspect for --recall")
+    ap.add_argument("--min-similarity", type=float, default=0.0, help="Minimum similarity for --recall (default 0.0)")
     ap.add_argument("--skips", default=None, help="Path to skip-markers file (default: <palace>/dream-derive-skips.jsonl)")
     ap.add_argument("--max-depth", type=int, default=3, help="Maximum derivation depth (default 3)")
     ap.add_argument("--max-iterations", type=int, default=10, help="Maximum closure iterations (default 10)")
@@ -278,6 +596,66 @@ def main(argv: list[str] | None = None) -> int:
         config_path = os.environ.get("MEMPALACE_CONFIG") or "~/.mempalace/config.json"
         print(f"error: no --palace given and {config_path} has no palace_path", file=sys.stderr)
         return 2
+
+    if args.recall is not None:
+        report = run_recall(
+            effective_palace,
+            args.recall,
+            k=args.k,
+            repository=args.repository,
+            since=args.since,
+            limit_sessions=args.limit_sessions,
+            min_similarity=args.min_similarity,
+        )
+        if args.format == "json":
+            print(json.dumps(report, indent=2, ensure_ascii=False))
+        else:
+            print(summarize_recall_report(report))
+        return 0
+
+    if args.propose:
+        report = propose_rules(
+            effective_palace,
+            rules_path=args.rules,
+            min_support=args.min_support,
+        )
+        if args.format == "json":
+            print(json.dumps(report, indent=2, ensure_ascii=False))
+        else:
+            print(summarize_proposals(report))
+        return 0
+
+    if args.enable_rule or args.disable_rule:
+        enable_report = None
+        if args.enable_rule:
+            enable_report = enable_rules(
+                effective_palace,
+                args.enable_rule,
+                rules_path=args.rules,
+                min_support=args.min_support,
+            )
+        disable_report = None
+        if args.disable_rule:
+            disable_report = disable_rules(
+                effective_palace,
+                args.disable_rule,
+                rules_path=args.rules,
+            )
+        if args.format == "json":
+            report = (
+                {"enable": enable_report, "disable": disable_report}
+                if enable_report is not None and disable_report is not None
+                else enable_report or disable_report
+            )
+            print(json.dumps(report, indent=2, ensure_ascii=False))
+        else:
+            sections = []
+            if enable_report is not None:
+                sections.append(_summarize_enable_result(enable_report))
+            if disable_report is not None:
+                sections.append(_summarize_disable_result(disable_report))
+            print("\n\n".join(sections))
+        return 0
 
     report = run(
         effective_palace,
