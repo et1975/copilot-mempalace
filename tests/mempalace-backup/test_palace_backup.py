@@ -4,7 +4,8 @@
 Split into pure-function unit tests (no external tools) and SQLite integration
 tests (stdlib sqlite3 module only — no CLI, no restic, no live palace).
 
-Run: ``python3 -m pytest test_palace_backup.py`` or ``python3 test_palace_backup.py``.
+From the repository root, with ``PYTHONDONTWRITEBYTECODE=1`` exported:
+``$TEST_PY -m pytest tests/mempalace-backup/test_palace_backup.py -q``.
 """
 from __future__ import annotations
 
@@ -21,8 +22,7 @@ from pathlib import Path
 from unittest.mock import patch
 from uuid import UUID, uuid5
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import palace_backup as pb  # noqa: E402
+import palace_backup as pb
 
 
 def _assert_raises(error, action, text):

@@ -3,6 +3,7 @@
 import os
 import select
 import unittest
+from runtime_support import isolated_fork_test
 
 from mempalace_tasks.runtime_clock import ClockError, RuntimeClock
 
@@ -153,6 +154,7 @@ class RuntimeClockTests(unittest.TestCase):
         self.assertEqual(clock.now(), "1970-01-01T00:00:04.000000Z")
 
     @unittest.skipUnless(hasattr(os, "fork"), "native POSIX fork")
+    @isolated_fork_test
     def test_inherited_clock_fails_instead_of_using_parent_incarnation(self):
         clock = self.samples.clock()
         read_end, write_end = os.pipe()

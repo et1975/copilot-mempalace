@@ -182,9 +182,23 @@ export RESTIC_PASSWORD_FILE=~/.config/mempalace-restic.pass
 
 Restore lives in the same script (see the `mempalace-restore` skill):
 `./scripts/palace_backup.py restore <snapshot> --in-place --offline`.
-Tests use the helper's standalone runner, not unittest discovery:
-`python3 -W error scripts/test_palace_backup.py`, with the repository's
-`sidecar/src` and `sidecar/tests` on `PYTHONPATH` and an external temporary root.
+Developer tests are repository-only under `tests/mempalace-backup`, not shipped
+with the installed skill. From the repository root, use a preprovisioned
+Python 3.11+ `TEST_PY` with pytest 8.4.2 and sidecar production dependencies:
+
+```bash
+export PYTHONDONTWRITEBYTECODE=1
+MPTASK_TEST_TMPDIR="$SESSION_FILES" TMPDIR="$SESSION_FILES" \
+  "$TEST_PY" -W error -m pytest --basetemp "$SESSION_FILES/pytest-backup" \
+  tests/mempalace-backup -q
+```
+
+`SESSION_FILES` must already exist outside the repository; pytest clears only
+the dedicated disposable basetemp child, never the session directory itself.
+Root pytest configuration supplies imports without `PYTHONPATH`. The backup
+subtree's fixtures isolate HOME/USERPROFILE and palace overrides for each test.
+See `tests/README.md` in the checkout for full-suite prerequisites and existing
+integration gates; a partial environment is not full-suite validation.
 
 ## See also
 

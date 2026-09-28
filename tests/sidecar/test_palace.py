@@ -182,6 +182,8 @@ class WireResponse:
 
 
 class TestHub:
+    __test__ = False
+
     def __init__(self, ordered=True):
         self.tools = tool_fixture(ordered)
         self.events = []

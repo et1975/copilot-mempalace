@@ -1,6 +1,10 @@
 """Runtime fixtures: real domain transitions, deterministic time, owned files."""
 import copy
+from functools import wraps
 import os
+from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import threading
 from datetime import datetime, timedelta, timezone
@@ -8,6 +12,30 @@ from uuid import uuid4
 
 from mempalace_tasks.domain import apply_event, decide
 from mempalace_tasks.model import new_state
+
+
+def isolated_fork_test(method):
+    """Keep native fork assertions outside process-lifetime model thread pools."""
+    @wraps(method)
+    def run(self):
+        module = type(self).__module__
+        if module == "__main__":
+            module = Path(method.__code__.co_filename).stem
+        identity = f"{module}.{type(self).__qualname__}.{method.__name__}"
+        if os.environ.get("MPTASK_FORK_TEST") == identity:
+            return method(self)
+        environment = {
+            **os.environ,
+            "MPTASK_FORK_TEST": identity,
+            "PYTHONPATH": os.pathsep.join(sys.path),
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+        result = subprocess.run(
+            [sys.executable, "-W", "error", "-m", "unittest", identity],
+            env=environment, capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+    return run
 
 
 def temporary_directory():

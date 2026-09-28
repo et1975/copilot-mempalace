@@ -325,7 +325,8 @@ class LiveContractTests(unittest.TestCase):
         config = load_config(str(config_path))
         expected_owner = None
         self.assertFalse(_owner_busy(config))
-        environment = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1] / "src"))
+        repository = Path(__file__).resolve().parents[2]
+        environment = dict(os.environ, PYTHONPATH=str(repository / "sidecar" / "src"))
         params = StdioServerParameters(
             command=sys.executable,
             args=["-W", "error", "-m", "mempalace_tasks", "mcp",

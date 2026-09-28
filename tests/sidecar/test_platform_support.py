@@ -12,6 +12,7 @@ import threading
 import time
 import unittest
 from unittest.mock import patch
+from runtime_support import isolated_fork_test
 
 from mempalace_tasks import platform_support as platform
 
@@ -318,6 +319,7 @@ class PosixPlatformTests(PlatformFilesTests):
             with self.assertRaises(platform.PlatformError):
                 platform.read_regular(self.path)
 
+    @isolated_fork_test
     def test_inherited_release_does_not_unlock_parent(self):
         lock = platform.LifetimeLock(self.path).acquire()
         self.addCleanup(lock.release)
@@ -333,6 +335,7 @@ class PosixPlatformTests(PlatformFilesTests):
             platform.LifetimeLock(self.path).acquire()
         self.assertEqual(caught.exception.code, "lock_busy")
 
+    @isolated_fork_test
     def test_child_does_not_keep_lock_alive_after_parent_release(self):
         lock = platform.LifetimeLock(self.path).acquire()
         self.addCleanup(lock.release)
