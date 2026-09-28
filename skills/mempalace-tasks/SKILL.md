@@ -242,7 +242,7 @@ reassess; cancelled-only work is not accepted success.
 | Treat remembered ownership or native acknowledgment as a claim | Verify the current sidecar generation, live lease and prepared execution. |
 | Close because the ready queue is empty or the shell exited | Establish acceptance evidence and the appropriate goal/execution barrier. |
 
-See [pressure scenarios](references/scenarios.md) for the baseline, parent-reported
-evaluation evidence and remaining checks. Workflow/decomposition policy belongs
+See [pressure scenarios](references/scenarios.md) for expected behavior,
+simulation coverage and remaining checks. Workflow/decomposition policy belongs
 to the opt-in `palace-task-workflow` agent; these instructions do not supply a
 native supervisor or host adapter.

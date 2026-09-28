@@ -2,87 +2,24 @@
 
 ## Evidence status
 
-A controller-run fresh-context baseline used six simulated cases without the
-proposed guidance. No real task tools or user data were used. These are the
-reported observations, not results of a with-guidance run:
+A fresh-context evaluator simulated six MCP-only workflow cases: unrelated-provider
+SQL, absent SQL, disconnected task MCP with local storage available, task-note/
+evidence/learning filing, ordinary untracked fleet, and an unresolved old-epoch
+mutation. Inspection of all six responses found no proposed SQL, direct task-file
+reads, todo repair or alternate storage. State and evidence operations stayed on
+their respective MCP servers, and ordinary dispatch remained available. Missing
+schemas and identities stayed explicit prerequisites.
 
-| Baseline case | Observed behavior |
-|---|---|
-| Expired successful claim receipt | Chose get/recover/reclaim/revalidate instead of immediate close. Safety direction was correct; called the completion enum `"done"` instead of `"closed"`. |
-| A discovers prerequisite B while active | Refused release-first, but chose expand(B, B blocks A) **while retaining A**, then separate release(A). **Failure:** the domain requires `source_disposition="yield"` in that expansion. |
-| Empty ready frontier with unfinished work | Refused goal completion. |
-| Creation times out | Retried identical command ID/payload. |
-| Local shell killed; cloud job still runs | Required actual external quiescence before recovery/reclaim. |
-| Final independent discovery races source close | Published before completing A. Atomic expansion with completion is also supported. |
+This was **one grouped simulation**, not live calls or repeated independent
+sampling. The remaining scenarios specify expected behavior unless separately
+tested. Simulation results do not certify live custom-agent tool availability,
+service deployment, native platform support or supervised fleet execution.
 
-The corrective guidance is deliberately a positive publication recipe, not a
-large new prohibition list. **The parent reported that the fresh-context
-with-guidance repeat passed all six cases**, including the exact atomic
-`source_disposition="yield"` recipe, on 2026-09-24. This is the parent's observed
-pressure-test result, not a local rerun or evidence of live deployment.
+## MCP storage boundary
 
-The additional cases below remain expected behavior unless separately tested.
-Current-get authorization, confirmed renewal-bound and native-memory tool wiring
-clarifications were added after that report; no further pressure-test result is
-claimed here. Full live tool-name/schema verification awaits the service.
-
-### Historical native fleet integration baseline (2026-09-26)
-
-The baseline and first revision below predate the MCP-only storage correction.
-Their SQL/todo-repair behavior is historical evidence, **not current guidance**.
-
-A fresh-context **grouped simulation** read the existing skill and workflow agent
-and returned intended actions for four cases. It did not invoke live task tools,
-launch workers or alter a palace.
-
-| Case | Observed baseline |
-|---|---|
-| B1: ordinary fleet with the workflow agent selected | Correctly avoided durable enrollment, but refused native dispatch and SQL because those tools were absent from the agent's allowlist. |
-| B2: explicitly requested durable planning, registered names but no native host | Allowed source-free coordinator planning once required inputs were supplied; did not infer supervision or execution permission from registration. |
-| B3: resume with a linked native todo marked done and a durable task still open | Recognized durable state as authoritative, but left the stale local done row unchanged because SQL was unavailable; no scoped reference-reconciliation recipe existed. |
-| B4: disconnected launcher-mode frontend and an unresolved old-epoch expansion | Preserved the original request scope, required operator transport restoration, and refused implicit writer startup for status inspection. |
-
-These observations originally motivated native tool access and scoped reference
-handling. The SQL/todo-mirroring part has since been removed. The already-correct
-no-supervisor and uncertain outcome behavior is retained. This is one grouped baseline, **not five independent
-samples per case**, and not a live native `/fleet` integration result.
-
-### Historical first-revision observations (2026-09-26)
-
-Two separate fresh-context evaluators read the revised guidance and synthetic
-inputs, without the assessor expectations: one returned B1-B4, the other E1-E10.
-The parent inspected all fourteen proposed-action results against the then-current
-cases. All matched those expectations, including the now-retired todo mirror:
-
-- B1 proposed ordinary native dispatch and local planning without enrollment.
-- B3 corrected the explicitly proven linked row from done to blocked, guarded by
-  its prior description and fresh authority/task/goal reads, without renaming it
-  or altering an unrelated row.
-- B2/B4/E1 retained distinct planning, transport and missing-host blockers.
-- E2 used the actual native task fields with a conditional host-supplied packet;
-  E4 and E9 supplied the complete atomic yield/complete expansion shapes.
-- E3/E5-E8/E10 preserved stale-result, closure, recovery and exact-request rules.
-
-Missing fixture inputs remained explicit prerequisites rather than invented
-arguments. The evaluator harness lacked `ask_user` and exercised the local-blocker
-fallback; interactive custom-agent tool availability was not tested. These are
-**two grouped simulations, not independent per-case samples**, statistical
-reliability evidence, actual SQL execution or native worker runs.
-
-Separately, the isolated updated task implementation ran 731 tests, with twelve
-native-Windows skips and no failures, including disposable real-hub coverage.
-Those runtime tests do not establish live Copilot registration, native macOS/
-Windows certification or the existence of a compatible native supervisor.
-Static review of the six-file integration delta reported no significant issues.
-
-### MCP-only storage correction
-
-User review rejected the generic `sql` dependency and required task/MemPalace
-storage interaction to go through MCP. The earlier B1/B3 simulations actually
-proposed native SQL calls, establishing the behavior being removed. The current
-contract requires neither SQL availability nor a native-todo synchronization
-scheme. Native dispatch remains available; storage uses only the appropriate
-server-qualified task or memory MCP operations.
+Task and MemPalace storage use the appropriate server-qualified MCP operations.
+The workflow requires neither SQL availability nor a native-todo synchronization
+scheme. Native dispatch remains independent of storage.
 
 | Pressure | Current expected behavior |
 |---|---|
@@ -90,16 +27,6 @@ server-qualified task or memory MCP operations.
 | No SQL tool exists; task MCP returns fresh open state while a session summary says done | Report the discrepancy and use MCP state. No storage setup blocker, duplicate bootstrap or completion claim from the summary. |
 | Task MCP is disconnected but SQL/local files appear to contain prior task state | Report unknown/blocked state in the conversation. No fallback query, database/file access, replacement ledger or write through ordinary memory tools. |
 | Durable context or evidence must be saved | Use the advertised memory/artifact MCP tool; use task MCP for task notes or state. Preserve actor/epoch/outcome rules and never replace task state with a drawer. |
-
-A fresh-context evaluator simulated six correction cases: unrelated-provider SQL,
-absent SQL, disconnected task MCP with local storage available, task-note/evidence/
-learning filing, ordinary untracked fleet, and an unresolved old-epoch mutation.
-The parent inspected all six responses: none proposed SQL, direct task-file reads,
-todo repair or alternate storage; state and evidence operations stayed on their
-respective MCP servers, and ordinary dispatch remained available. Missing schemas
-and identities stayed explicit prerequisites. This was one grouped simulation,
-not live calls or repeated independent sampling; no new runtime test result is
-claimed for this documentation-only correction.
 
 ## Green observation contract
 
@@ -208,9 +135,8 @@ long-lived frontend; human `start`/`connect` output is not a stdio MCP stream.
 - Service-scope regression must compare config-parent modes before/after diagnostic
   reads and verify invalid inputs are not repaired. This guidance records the
   expected behavior, not an executed service regression.
-- Report unrun cases and subsequent wording checks explicitly. The reported
-  six-case green result does not certify these additional cases, a native
-  `/fleet` adapter, or live deployment.
+- Report unrun cases and wording checks explicitly. Distinguish simulated
+  coverage from live tool availability, deployment and supervised execution.
 - Record grouped versus independent samples for native fleet cases. Verify
   ordinary untracked fleet remains usable with the workflow agent selected,
   and a read-only request cannot trigger launcher startup or claim recovery.
