@@ -17,7 +17,10 @@ Never hard-code a password. Keep the password file `chmod 600`, and avoid
 
 ## Supported task recovery boundary
 
-Use an already installed epoch-aware sidecar package, MemPalace CLI and restic.
+For task snapshots, use an already installed epoch-aware sidecar package,
+MemPalace CLI and restic. Memory-only restore needs no sidecar package; the
+stdlib-only backup helper and its `palace_restore_io.py` companion provide the
+same generic offline publication guards.
 Task truth is DATA/logstream.sqlite3 (events, artifacts and links), together
 with DATA/replica.json. There is no matching external pending/head/clock state.
 The helper's `--palace` names backup HOME; the MemPalace CLI's `--palace` names
@@ -37,6 +40,11 @@ Live/online task replacement, raw file replacement during maintenance and mesh
 rollback/failover are unsupported. Corrupted live SQLite/configuration that
 prevents exclusion/identification is refused rather than hidden by `--force`;
 staging-only validation remains available for inspection and controlled salvage.
+Logical task-protocol corruption in an otherwise identifiable/excludable live
+database does not block restoration of a validated snapshot. Only the selected
+stage must replay successfully; discarded live history is retained for inspection
+in the rollback directory. Existing or declared task storage still requires a
+task-bearing stage.
 Native Windows/macOS publication needs platform validation; the automated
 SQLite, lock, rollback and real staging-CLI integration checks run on Linux.
 

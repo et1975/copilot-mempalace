@@ -63,6 +63,8 @@ from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 
+import palace_restore_io
+
 DEFAULT_PALACE = Path("~/.mempalace").expanduser()
 
 # Do not snapshot control locks or replace their permanent live inodes.
@@ -396,6 +398,14 @@ def quiesce(
 # Subcommands.
 # --------------------------------------------------------------------------- #
 @contextmanager
+def restore_safety():
+    try:
+        yield palace_restore_io
+    except palace_restore_io.RestoreIOError as exc:
+        raise BackupError(f"{exc.code}: {exc}") from exc
+
+
+@contextmanager
 def task_safety():
     try:
         from mempalace_tasks import restore, snapshot
@@ -592,7 +602,7 @@ def publish_stage(palace, stage):
     """
     palace, stage = _covered_path(palace, palace), _covered_path(stage, stage)
     _disjoint(palace, stage)
-    with task_safety() as (restore, _):
+    with restore_safety() as restore:
         restore.ensure_private_tree(stage)
         if not palace.exists():
             palace.mkdir(mode=0o700)
@@ -695,7 +705,7 @@ def cmd_restore(args: argparse.Namespace) -> int:
         if rc:
             print(f"Materialization failed; target untouched, partial stage retained: {stage}", file=sys.stderr)
             return rc
-    with task_safety() as (restore, snapshot):
+    with restore_safety() as restore:
         restore.ensure_private_tree(stage)
         data = staged_data_path(stage, palace, args.data_path)
         summary = _validate_stage(stage, data, required=args.require_logstream,
@@ -730,14 +740,17 @@ def cmd_restore(args: argparse.Namespace) -> int:
                 known_tasks = bool(live_manifest and (
                     live_manifest["logstream_required"] or live_manifest["authorities"]))
                 for path in paths:
-                    if (path / "logstream.sqlite3").exists():
+                    # Preserve storage requirements without replaying the damaged
+                    # live history that the validated stage will replace.
+                    if any(_covered_path(palace, path / ("logstream.sqlite3" + suffix)).exists()
+                           for suffix in ("", "-wal", "-shm")):
                         known_tasks = True
-                        snapshot.validate_task_snapshot(path, require_logstream=True)
                 summary = _validate_stage(stage, data, required=args.require_logstream or known_tasks,
                                           expected=expected, allow_incomplete_preparation=True)
             # SQLite handles close before native Windows renames. The permanent
             # writer leases remain held; raw writers/new launches must stay offline.
-            preparation = (restore.task_restore_preparation(
+            task_restore = stack.enter_context(task_safety())[0] if summary is not None else None
+            preparation = (task_restore.task_restore_preparation(
                 data, private_stage=True, expected_authorities=sorted(summary["authorities"]),
                 live_data_path=target_data) if summary is not None else nullcontext(None))
             with preparation:
@@ -748,9 +761,11 @@ def cmd_restore(args: argparse.Namespace) -> int:
                 for path in paths:
                     restore.refuse_known_writers(path)
                 backup = publish_stage(palace, stage)
-        print(f"Published offline; previous contents retained at {backup}. No service started. "
-              "Keep admission stopped until the epoch-aware sidecar starts with a fresh successor "
-              "and reconciles inherited attempts/external effects.", file=sys.stderr)
+        print(f"Published offline; previous contents retained at {backup}. No service started.",
+              file=sys.stderr)
+        if summary is not None:
+            print("Keep admission stopped until the epoch-aware sidecar starts with a fresh successor "
+                  "and reconciles inherited attempts/external effects.", file=sys.stderr)
         return 0
 
 

@@ -60,9 +60,14 @@ state. For rollback, choose the specific snapshot before the bad write.
 
 ### 3. Materialize and validate private staging
 
-Use a preinstalled Python that can import the epoch-aware `mempalace_tasks`
-package (`PYTHONPATH=<repo>/sidecar/src` in a checkout), plus preinstalled restic
-and MemPalace CLI. Never install tools implicitly during restore.
+Memory-only restore uses Python's standard library and the backup skill's
+companion `palace_restore_io.py`; no task-sidecar package is required. Keep both
+helper files together when deploying the backup skill.
+
+For a snapshot containing task storage, use a preinstalled Python that can import
+the epoch-aware `mempalace_tasks` package (`PYTHONPATH=<repo>/sidecar/src` in a
+checkout). Task activation also requires the installed MemPalace CLI; restic is
+needed for materialization, not `--from-stage`. Never install tools implicitly.
 
 ```bash
 python3 ../mempalace-backup/scripts/palace_backup.py --palace ~/.mempalace \
@@ -110,6 +115,12 @@ stay in place. Old contents remain in a unique sibling `.bak-*` directory.
 SQLite writer probes are bounded; database handles close before native Windows
 renames while cooperative leases remain held. Uncooperative raw file writers or
 new launches invalidate the required offline boundary.
+
+The selected staged task history must validate completely. Logical corruption in
+the discarded live task history does not prevent replacing it with that valid
+snapshot; live-path identification and writer exclusion must still succeed.
+Existing logstream/WAL/SHM or declared task storage cannot be silently replaced
+with a task-free stage. Prior contents remain in the rollback directory.
 
 Any partial append or publication is an error, not success. Keep staging and
 rollback contents for inspection. See the administrative marker recovery steps

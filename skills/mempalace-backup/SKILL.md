@@ -53,6 +53,11 @@ The selected Python must already import the epoch-aware `mempalace_tasks`
 package. In a repository checkout, `PYTHONPATH=<repo>/sidecar/src` selects it.
 Require preinstalled tools; do not download/install during recovery.
 
+Memory-only backup/restore does not require that optional package. Deploy the
+helper together with its stdlib-only `scripts/palace_restore_io.py` companion,
+which provides generic private-stage, writer-exclusion and publication guards.
+Task history validation and epoch activation remain task-package operations.
+
 The helper refuses active or malformed/unreadable hub/daemon records, acquires
 the real current-user HOME-relative MemPalace writer lease, checkpoints existing
 KG/Chroma/logstream databases, then holds bounded-acquisition SQLite

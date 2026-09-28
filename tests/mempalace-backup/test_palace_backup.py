@@ -15,6 +15,7 @@ import json
 import os
 import shutil
 import sqlite3
+import subprocess
 import sys
 import time
 from datetime import datetime
@@ -600,6 +601,150 @@ def test_restore_staging_checks_origin_under_custom_data_path(tmp_path):
     assert home.is_dir()
 
 
+def _restore_without_sidecar(home, stage, *flags):
+    environment = dict(os.environ)
+    environment.pop("PYTHONPATH", None)
+    return subprocess.run(
+        [sys.executable, "-S", str(Path(pb.__file__).resolve()),
+         "--palace", str(home), "restore", "fixture", "--target", str(stage),
+         "--from-stage", *flags],
+        cwd=stage.parent, env=environment, capture_output=True, text=True,
+        timeout=10, check=False,
+    )
+
+
+def _memory_stage(stage):
+    data = stage / "palace"
+    (data / ".mempalace").mkdir(parents=True)
+    (data / ".mempalace/origin.json").write_text("{}", encoding="utf-8")
+    (data / "memory.txt").write_text("restored evidence", encoding="utf-8")
+    return data
+
+
+def test_memory_only_staging_does_not_require_sidecar_installation(tmp_path):
+    home, stage = tmp_path / "missing-home", tmp_path / "stage"
+    _memory_stage(stage)
+    result = _restore_without_sidecar(home, stage)
+    assert result.returncode == 0, result.stderr
+    assert "Validated private stage" in result.stderr
+    assert not home.exists()
+    assert (stage / "palace/memory.txt").read_text() == "restored evidence"
+
+
+def test_memory_only_publication_without_sidecar_preserves_control_inodes(tmp_path):
+    home, stage = tmp_path / "home", tmp_path / "stage"
+    (home / "locks").mkdir(parents=True)
+    (home / "locks/owned-control").write_text("keep", encoding="utf-8")
+    (home / "old-memory.txt").write_text("original evidence", encoding="utf-8")
+    inode = (home / "locks").stat().st_ino
+    _memory_stage(stage)
+    result = _restore_without_sidecar(home, stage, "--in-place", "--offline")
+    assert result.returncode == 0, result.stderr
+    assert (home / "palace/memory.txt").read_text() == "restored evidence"
+    assert (home / "locks").stat().st_ino == inode
+    assert (home / "locks/owned-control").read_text() == "keep"
+    backup, = home.parent.glob("home.bak-*")
+    assert (backup / "old-memory.txt").read_text() == "original evidence"
+    assert not (home / pb.RESTORE_MARKER).exists()
+
+
+def test_task_restore_without_sidecar_still_fails_without_publication(tmp_path):
+    home, stage = tmp_path / "home", tmp_path / "stage"
+    home.mkdir()
+    (home / "unchanged").write_text("live", encoding="utf-8")
+    _make_task_palace(stage, configured_home=home)
+    result = _restore_without_sidecar(home, stage, "--in-place", "--offline")
+    assert result.returncode == 1
+    assert "preinstalled epoch-aware" in result.stderr
+    assert (home / "unchanged").read_text() == "live"
+    assert not list(home.parent.glob("home.bak-*"))
+
+
+def test_memory_restore_without_sidecar_refuses_active_hub(tmp_path):
+    from mempalace_tasks import restore
+
+    home, stage = tmp_path / "home", tmp_path / "stage"
+    (home / "palace").mkdir(parents=True)
+    (home / "unchanged").write_text("live", encoding="utf-8")
+    _memory_stage(stage)
+    data = home / "palace"
+    registry = restore.serverinfo_path(data)
+    registry.parent.mkdir(parents=True)
+    registry.write_text(json.dumps({
+        "pid": os.getpid(), "host": "127.0.0.1", "port": 1234,
+        "palace_path": str(data), "read_only": False, "scheme": "http",
+    }), encoding="utf-8")
+    result = _restore_without_sidecar(home, stage, "--in-place", "--offline")
+    assert result.returncode == 1
+    assert "active" in result.stderr.lower(), result.stderr
+    assert (home / "unchanged").read_text() == "live"
+    assert not list(home.parent.glob("home.bak-*"))
+
+
+def test_memory_restore_without_sidecar_refuses_busy_sqlite_writer(tmp_path):
+    home, stage = tmp_path / "home", tmp_path / "stage"
+    data = home / "palace"
+    data.mkdir(parents=True)
+    _memory_stage(stage)
+    with contextlib.closing(sqlite3.connect(data / "chroma.sqlite3")) as writer:
+        writer.execute("CREATE TABLE memories (value TEXT)")
+        writer.commit()
+        writer.execute("BEGIN IMMEDIATE")
+        result = _restore_without_sidecar(home, stage, "--in-place", "--offline")
+    assert result.returncode == 1
+    assert "writer" in result.stderr.lower(), result.stderr
+    assert not list(home.parent.glob("home.bak-*"))
+
+
+def test_memory_restore_without_sidecar_obeys_the_same_writer_lease(tmp_path):
+    from mempalace_tasks import restore
+
+    home, stage = tmp_path / "home", tmp_path / "stage"
+    data = home / "palace"
+    data.mkdir(parents=True)
+    _memory_stage(stage)
+    with restore.writer_lease(data) as lock:
+        inode, contents = lock.stat().st_ino, lock.read_bytes()
+        result = _restore_without_sidecar(home, stage, "--in-place", "--offline")
+        assert result.returncode == 1
+        assert "writer lease" in result.stderr.lower(), result.stderr
+        assert (lock.stat().st_ino, lock.read_bytes()) == (inode, contents)
+    assert not list(home.parent.glob("home.bak-*"))
+    assert (stage / "palace/memory.txt").exists()
+
+
+def test_memory_restore_without_sidecar_rejects_linked_staging_files(tmp_path):
+    home, stage = tmp_path / "home", tmp_path / "stage"
+    data = _memory_stage(stage)
+    outside = tmp_path / "outside"
+    outside.write_text("do not read or publish", encoding="utf-8")
+    link = data / "linked"
+    link.symlink_to(outside)
+    result = _restore_without_sidecar(home, stage)
+    assert result.returncode == 1
+    assert "link" in result.stderr.lower(), result.stderr
+    link.unlink()
+    os.link(outside, link)
+    result = _restore_without_sidecar(home, stage)
+    assert result.returncode == 1
+    assert "regular" in result.stderr.lower(), result.stderr
+    assert outside.read_text() == "do not read or publish"
+    assert not home.exists()
+
+
+def test_memory_restore_without_sidecar_honors_explicit_task_requirement(tmp_path):
+    home, stage = tmp_path / "home", tmp_path / "stage"
+    _memory_stage(stage)
+    for flags in (
+        ("--require-logstream",),
+        ("--expected-authority", "11111111-1111-1111-1111-111111111111"),
+    ):
+        result = _restore_without_sidecar(home, stage, *flags)
+        assert result.returncode == 1
+        assert "logstream" in result.stderr.lower(), result.stderr
+    assert not home.exists()
+
+
 def test_restore_can_resolve_a_lost_home_without_creating_it(tmp_path):
     home = tmp_path / "lost-home"
     args = pb.build_parser().parse_args(
@@ -895,6 +1040,76 @@ def test_earlier_snapshot_does_not_require_later_live_authorities(tmp_path):
     assert restored["authorities"][authority_a]["epoch_id"] is not None
 
 
+def test_valid_snapshot_replaces_logically_corrupt_live_task_history(tmp_path):
+    from mempalace_tasks.snapshot import validate_task_snapshot
+
+    home, stage = tmp_path / "home", tmp_path / "stage"
+    data = _make_task_palace(home)
+    shutil.copytree(home, stage)
+    before = validate_task_snapshot(stage / "palace")
+    with contextlib.closing(sqlite3.connect(data / "logstream.sqlite3")) as con:
+        con.execute("UPDATE events SET body='{}' WHERE type='mptask.command'")
+        con.commit()
+        assert con.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    damaged = (data / "logstream.sqlite3").read_bytes()
+    args = pb.build_parser().parse_args(
+        ["--palace", str(home), "restore", "fixture", "--target", str(stage),
+         "--from-stage", "--in-place", "--offline"])
+    assert pb.cmd_restore(args) == 0
+    after = validate_task_snapshot(data)
+    authority = "11111111-1111-1111-1111-111111111111"
+    assert after["authorities"][authority]["tasks"] == before["authorities"][authority]["tasks"]
+    assert after["authorities"][authority]["epoch_id"] != before["authorities"][authority]["epoch_id"]
+    backup, = home.parent.glob("home.bak-*")
+    assert (backup / "palace/logstream.sqlite3").read_bytes() == damaged
+
+
+def test_corrupt_selected_task_snapshot_still_refuses_publication(tmp_path):
+    home, stage = tmp_path / "home", tmp_path / "stage"
+    data = _make_task_palace(home)
+    shutil.copytree(home, stage)
+    live = (data / "logstream.sqlite3").read_bytes()
+    with contextlib.closing(sqlite3.connect(stage / "palace/logstream.sqlite3")) as con:
+        con.execute("UPDATE events SET body='{}' WHERE type='mptask.command'")
+        con.commit()
+    args = pb.build_parser().parse_args(
+        ["--palace", str(home), "restore", "fixture", "--target", str(stage),
+         "--from-stage", "--in-place", "--offline"])
+    _assert_raises(pb.BackupError, lambda: pb.cmd_restore(args), "protocol")
+    assert (data / "logstream.sqlite3").read_bytes() == live
+    assert not list(home.parent.glob("home.bak-*"))
+
+
+def test_corrupt_live_history_does_not_bypass_sqlite_writer_exclusion(tmp_path):
+    home, stage = tmp_path / "home", tmp_path / "stage"
+    data = _make_task_palace(home)
+    shutil.copytree(home, stage)
+    args = pb.build_parser().parse_args(
+        ["--palace", str(home), "restore", "fixture", "--target", str(stage),
+         "--from-stage", "--in-place", "--offline"])
+    with contextlib.closing(sqlite3.connect(data / "logstream.sqlite3")) as writer:
+        writer.execute("UPDATE events SET body='{}' WHERE type='mptask.command'")
+        writer.commit()
+        writer.execute("BEGIN IMMEDIATE")
+        _assert_raises(pb.BackupError, lambda: pb.cmd_restore(args), "writer")
+    assert not list(home.parent.glob("home.bak-*"))
+    assert (stage / "palace/logstream.sqlite3").is_file()
+
+
+def test_orphan_live_logstream_sidecar_does_not_allow_task_free_restore(tmp_path):
+    home, stage = tmp_path / "home", tmp_path / "stage"
+    data = home / "palace"
+    data.mkdir(parents=True)
+    (data / "logstream.sqlite3-wal").write_bytes(b"unrecovered task storage")
+    _memory_stage(stage)
+    args = pb.build_parser().parse_args(
+        ["--palace", str(home), "restore", "fixture", "--target", str(stage),
+         "--from-stage", "--in-place", "--offline"])
+    _assert_raises(pb.BackupError, lambda: pb.cmd_restore(args), "logstream")
+    assert (data / "logstream.sqlite3-wal").read_bytes() == b"unrecovered task storage"
+    assert not list(home.parent.glob("home.bak-*"))
+
+
 def test_explicitly_required_later_authority_still_rejects_older_snapshot(tmp_path):
     authority_b = "22222222-2222-2222-2222-222222222222"
     home, stage = tmp_path / "home", tmp_path / "stage"
@@ -1011,20 +1226,19 @@ def test_publication_refuses_cross_filesystem_before_moving_contents(tmp_path):
     assert (home / "old").read_text(encoding="utf-8") == "keep"
 
 def test_publication_syncs_recovery_directory_parent_before_moving_old_contents(tmp_path):
-    from mempalace_tasks import restore
     home, stage = tmp_path / "home", tmp_path / "stage"
     home.mkdir()
     stage.mkdir()
     (home / "old").write_text("keep", encoding="utf-8")
     (stage / "new").write_text("snapshot", encoding="utf-8")
-    sync = restore.sync_directory
+    sync = pb.palace_restore_io.sync_directory
 
     def fail_parent(path):
         if path == home.parent:
             raise OSError("parent directory cannot be synchronized")
         sync(path)
 
-    with patch.object(restore, "sync_directory", side_effect=fail_parent):
+    with patch.object(pb.palace_restore_io, "sync_directory", side_effect=fail_parent):
         _assert_raises(OSError, lambda: pb.publish_stage(home, stage), "parent")
     assert (home / "old").read_text(encoding="utf-8") == "keep"
     assert (stage / "new").read_text(encoding="utf-8") == "snapshot"
