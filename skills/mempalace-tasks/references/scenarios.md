@@ -2,13 +2,11 @@
 
 ## Evidence status
 
-A fresh-context evaluator simulated six MCP-only workflow cases: unrelated-provider
-SQL, absent SQL, disconnected task MCP with local storage available, task-note/
-evidence/learning filing, ordinary untracked fleet, and an unresolved old-epoch
-mutation. Inspection of all six responses found no proposed SQL, direct task-file
-reads, todo repair or alternate storage. State and evidence operations stayed on
-their respective MCP servers, and ordinary dispatch remained available. Missing
-schemas and identities stayed explicit prerequisites.
+A fresh-context evaluation covered task lookup and resumption, service
+unavailability, task-note/evidence/learning filing, ordinary untracked fleet, and
+an unresolved old-epoch mutation. State and evidence operations stayed on their
+respective MCP servers, and ordinary dispatch remained available. Missing schemas
+and identities stayed explicit prerequisites.
 
 This was **one grouped simulation**, not live calls or repeated independent
 sampling. The remaining scenarios specify expected behavior unless separately
@@ -18,14 +16,13 @@ service deployment, native platform support or supervised fleet execution.
 ## MCP storage boundary
 
 Task and MemPalace storage use the appropriate server-qualified MCP operations.
-The workflow requires neither SQL availability nor a native-todo synchronization
-scheme. Native dispatch remains independent of storage.
+Native dispatch remains independent of storage.
 
 | Pressure | Current expected behavior |
 |---|---|
-| A different provider advertises `sql` while the user resumes a named tracked goal | Ignore that tool. Verify the explicit authority/goal/task through task MCP, with no SQL read/write or native-todo repair. |
-| No SQL tool exists; task MCP returns fresh open state while a session summary says done | Report the discrepancy and use MCP state. No storage setup blocker, duplicate bootstrap or completion claim from the summary. |
-| Task MCP is disconnected but SQL/local files appear to contain prior task state | Report unknown/blocked state in the conversation. No fallback query, database/file access, replacement ledger or write through ordinary memory tools. |
+| User resumes a named tracked goal | Verify the explicit authority/goal/task through the configured task MCP server. |
+| Task MCP returns fresh open state while a session summary says done | Report the discrepancy and use MCP state. No duplicate bootstrap or completion claim from the summary. |
+| Task MCP is disconnected | Report unknown/blocked state in the conversation; obtain a current authority response before making task-state decisions. |
 | Durable context or evidence must be saved | Use the advertised memory/artifact MCP tool; use task MCP for task notes or state. Preserve actor/epoch/outcome rules and never replace task state with a drawer. |
 
 ## Green observation contract
@@ -106,11 +103,11 @@ fixture does not establish that this repository ships one.
 |---|---|
 | B1: `/fleet Update docs and tests`; workflow agent selected and task tools available | Ordinary native work remains available; no automatic durable enrollment, claim, or supervisor demand. |
 | B2: explicit durable planning; fresh service, coordinator and registered supervisor/profile names, but no compatible native host | Obtain missing acceptance/scope/budget inputs, inspect for reuse, and permit authorized coordinator bootstrap/admission. Report tracked execution blocked; no claim or fabricated host. |
-| B3: resume named goal after compaction; session summary says done, fresh task MCP state is open | Refresh authority/goal/task through MCP, report the discrepancy and current state, and retain a bounded handoff reference. No native-todo read/write, duplicate bootstrap or execution from remembered tokens. |
+| B3: resume named goal after compaction; session summary says done, fresh task MCP state is open | Refresh authority/goal/task through MCP, report the discrepancy and current state, and retain a bounded handoff reference. No duplicate bootstrap or execution from remembered tokens. |
 | B4: launcher-mode frontend reports `connection_closed`; old expansion may have dispatched; replacement owner exists | Report transport blocker and require explicit reconnection. Status inspection must not start/restart a launcher. Resolve the original authority/epoch/command/payload through historical outcome lookup; replacement readiness does not upgrade that request or renew execution. |
 | E1: explicitly tracked request but missing task tools/schema/actor | Report the request/setup blocker in the conversation. No alternate storage, invented durable IDs, native delegation acknowledgment substitute, alternate writer, or untracked execution fallback. |
 | E2: separately supplied native host with matching fresh authorization and materialized inputs | Native parent dispatches a bounded packet through `task`, records the returned native agent ID, and follows notifications. Packet includes real authority/epoch/task/attempt/generation, acceptance/scope, inputs/base/checkpoint and required evidence. No fictitious working-directory API, model override or second coordinator. |
-| E3: native worker reports success but current authority has another epoch/attempt/generation | Preserve evidence through memory/artifact MCP when needed and report the stale result without changing native todos. Native success cannot close durable work or authorize the old worker. |
+| E3: native worker reports success but current authority has another epoch/attempt/generation | Preserve evidence through memory/artifact MCP when needed and report the stale result. Native success cannot close durable work or authorize the old worker. |
 | E4: A occupies the last slot and needs B | Use the exact atomic expand/yield prerequisite recipe above with the supplied durable checkpoint and `blocks(B,A)`; physical recovery remains the supervisor's responsibility. |
 | E5: all native workers ended and ready is empty, but proposal/recovery remains | Report those blockers; no goal completion without accepted sealed closure. |
 | E6: old request is terminal abandoned after an epoch change | Reassess with fresh state; use a new ID only if the operation is still authorized and needed, preserving the stable discovery intent. Do not revive old execution. |
@@ -140,5 +137,5 @@ long-lived frontend; human `start`/`connect` output is not a stdio MCP stream.
 - Record grouped versus independent samples for native fleet cases. Verify
   ordinary untracked fleet remains usable with the workflow agent selected,
   and a read-only request cannot trigger launcher startup or claim recovery.
-- Exercise absent and unrelated-provider `sql` tools. Neither may be needed or
-  called by the integration; all task/MemPalace storage reads and writes use MCP.
+- Verify that all task/MemPalace storage reads and writes use the configured,
+  server-qualified MCP operations.

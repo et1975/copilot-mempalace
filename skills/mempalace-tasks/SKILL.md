@@ -16,21 +16,20 @@ description: >-
 
 Tracking is **explicit opt-in per goal**. Selecting the workflow agent, available
 MCP tools, installed guidance, ordinary `/fleet`, or recalling an old goal does not
-enroll work. Ordinary native dispatch and local todos remain available without
+enroll work. Ordinary native dispatch and session planning remain available without
 task-service setup or durable task writes. Explicitly resuming a named tracked goal
 retains only that goal's scope; a different goal needs its own opt-in.
 
 Task truth belongs to the shared sidecar authority, not a drawer, KG projection,
-local todo, native worker result, or remembered assignment. Existing memory routing
+native worker result, or remembered assignment. Existing memory routing
 still applies to knowledge and conventions, not task ownership.
 
 Discover the sidecar's advertised `mptask_*` tools and argument schemas before
 calling them. Select tools by their configured MCP server and advertised name,
 not an unqualified name shared with another tool provider. All task storage reads
 and writes use `mempalace-tasks` MCP; MemPalace context and evidence storage use
-`mempalace` MCP. No generic `sql` tool, CLI/database/file fallback or native-todo
-mirror is required or used by this integration. If the needed MCP server is
-unavailable, report that storage operation as blocked.
+`mempalace` MCP. If the needed MCP server is unavailable, report that storage
+operation as blocked.
 Use the registered actor identity and actual fields; every mutation
 requires `command_id`, `actor`, and `expected_epoch`. Completion is
 `target="closed"`, not `"done"`. Obtain `expected_epoch` from a current
@@ -63,8 +62,8 @@ no second coordinator or external queue consumer.
 Owner failure or transport error can close the gateway. Reconnection is explicit
 operator/harness setup, not an invented workflow tool; it does not itself authorize
 mutation retry. Never restart launcher mode merely to inspect: use an already
-connected task MCP read or report the setup blocker, without a CLI/database
-fallback. Stdio EOF closes the frontend, not the shared owner. Canceling a native
+connected task MCP read or report the setup blocker. Stdio EOF closes the
+frontend, not the shared owner. Canceling a native
 worker neither cancels its durable task nor proves
 physical settlement.
 
@@ -179,13 +178,11 @@ Shared completion also needs accepted class-specific settlement.
 
 Resume from an explicitly identified authority and goal/task, verified with
 current task MCP reads. A conversation handoff or memory search can supply an
-identity hint; it cannot supply current authorization or completion. Missing or
-ambiguous references require clarification, not a query against a local task
-database or a guessed goal.
+identity hint; it cannot supply current authorization or completion. Clarify
+missing or ambiguous references before task operations.
 
 A worker handoff or status report can include this bounded reference packet,
-assembled from MCP observations. It is not a persisted mirror or required
-native todo record:
+assembled from MCP observations:
 
 ```text
 authority_id: <verified authority>
@@ -205,12 +202,11 @@ retry tokens, full graphs and unrelated memories out of the packet. Durable note
 and artifacts, when needed, are filed through the appropriate task/MemPalace MCP
 operation; do not copy task status into drawers or notes as a second authority.
 
-Native session planning belongs to the harness. This workflow does not read,
-write, synchronize or repair `todos`/`todo_deps`, even if a tool named `sql` is
-available. If a native result or remembered `done` conflicts with fresh MCP task
+Native session planning belongs to the harness. Use fresh MCP state for tracked
+task decisions. If a native result or remembered completion conflicts with that
 state, report the conflict and use the MCP state. Report accepted completion only
 after confirmed durable closure; an unavailable MCP service means unknown or
-blocked, not permission to reconstruct state from local storage.
+blocked.
 
 ## Views and completion
 

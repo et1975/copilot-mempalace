@@ -61,9 +61,8 @@ setup blockers to report, not permission to use native MemPalace delegation tool
 as task authority or install/start an alternate service.
 
 All task and MemPalace storage interactions use these server-qualified MCP tools.
-There is no generic `sql` dependency, CLI/database/file fallback, or native-todo
-mirror to maintain. If the needed MCP server is unavailable, report that storage
-operation as blocked. Native `task`, `read_agent` and `write_agent` handle dispatch
+If the needed MCP server is unavailable, report that storage operation as blocked.
+Native `task`, `read_agent` and `write_agent` handle dispatch
 and messages, not task or memory storage.
 
 For native fleet, use this deployment branch before arranging tracked execution:
@@ -136,10 +135,9 @@ planning task. Supply `project`, `title`, `description`, `acceptance`,
 `max_tasks`/`max_batch`. An empty starting queue calls for planning, not success.
 
 Build the skill's bounded handoff/report reference from fresh MCP observations.
-Do not create or repair native todo rows. If a session summary or native completion
-conflicts with current MCP state, report the discrepancy and use current MCP state
-for the next decision. A reference is not a second task ledger. When a durable
-task note or evidence artifact is needed, use the existing task-note or MemPalace
+If a session summary or native completion conflicts with current MCP state,
+report the discrepancy and use current MCP state for the next decision. When a
+durable task note or evidence artifact is needed, use the task-note or MemPalace
 artifact MCP operation with its advertised schema and actual authorization;
 neither is a substitute for task-state mutation.
 
@@ -235,7 +233,7 @@ version, summary and evidence only when execution-class completion requirements
 are met.
 After accepted durable task closure is confirmed through MCP, report that outcome
 and its evidence. Keep unaccepted or cancelled results distinct from successful
-completion; do not mirror these outcomes into native todo storage.
+completion.
 Integration failures are evidence for bounded follow-up work, not fabricated
 success. Resolve uncertain command outcomes using the skill's same-scoped-request
 versus terminal-abandoned/new-ID rules. Use `mptask_outcome` with
