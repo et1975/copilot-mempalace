@@ -96,15 +96,30 @@ For deeper workflow docs (init, mine, full search/status walkthrough), invoke th
 
 For an explicitly tracked sidecar task or a requested durable task workflow,
 invoke the [mempalace-tasks safety skill](skills/mempalace-tasks/SKILL.md) and use
-the separately configured `mptask_*` tools. For explicitly tracked native
-`/fleet` goals, select the existing
-[palace-task-workflow agent](agents/palace-task-workflow.agent.md) and follow the
-[per-goal workflow](sidecar/README.md#per-goal-native-fleet-workflow).
+the separately configured `mptask_*` tools. Treat native `/fleet` phrases such as
+`execute and track this as a goal`, `track this as a goal`, or an explicit named
+tracked-goal resume as the per-goal opt-in. Route the active native parent through
+the existing [palace-task-workflow agent](agents/palace-task-workflow.agent.md)
+guidance and follow the
+[per-goal workflow](sidecar/README.md#per-goal-native-fleet-workflow); the user
+does not need a separate `/agent` handoff.
 Each goal requires explicit tracking opt-in. Selecting the agent, installing
 this pack, available tools or an ordinary `/fleet` request do not enroll work.
 An explicitly named resume preserves only that goal's scope, not other goals.
 Ordinary native fleet and session planning remain available without
 task-service setup or durable writes.
+
+For a new opted-in goal, use the current approved native plan when present.
+Preserve that plan verbatim as the canonical MemPalace artifact and file a
+concise searchable drawer index with the objective, stage outline, artifact ID
+and SHA-256. The drawer is recall context, not task status or authority. Bootstrap
+a concise root goal and planning/import task, then publish independently
+actionable tasks, acceptance, stable intent keys, source references and real
+dependency edges in atomic bounded batches. No task may become runnable before
+its initial blockers are attached. Paragraph order alone is not a dependency.
+Keep rationale in plan memory or descriptions, express validation as
+acceptance/evidence unless independently actionable, and leave ambiguous or
+out-of-budget items non-runnable pending admission.
 
 Native fleet remains the orchestrator. All task and MemPalace storage interaction
 in this workflow uses the configured, server-qualified MCP tools. Build bounded

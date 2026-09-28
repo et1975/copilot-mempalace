@@ -19,6 +19,9 @@ MCP tools, installed guidance, ordinary `/fleet`, or recalling an old goal does 
 enroll work. Ordinary native dispatch and session planning remain available without
 task-service setup or durable task writes. Explicitly resuming a named tracked goal
 retains only that goal's scope; a different goal needs its own opt-in.
+Phrases such as `/fleet execute and track this as a goal` or `track this as a
+goal` are explicit opt-ins; they do not require the user to repeat the current
+approved plan or separately select the workflow agent.
 
 Task truth belongs to the shared sidecar authority, not a drawer, KG projection,
 native worker result, or remembered assignment. Existing memory routing
@@ -43,6 +46,55 @@ starting another writer, or substituting another store or direct KG, drawer, or
 event-log writes.
 Native `mempalace_task_create` / `mempalace_event_ack` delegation acknowledgments
 are not sidecar claims, leases, or completion evidence.
+
+## Native plan ingestion boundary
+
+An approved native plan is durable **input and provenance**, not task state.
+Preserve its verbatim content through the configured MemPalace artifact operation
+before decomposition. The artifact response's ID, SHA-256 and size identify the
+canonical exact plan. Then perform the ordinary duplicate check and file a
+bounded searchable drawer in the project wing's `plans` room containing the
+objective, stage outline, artifact ID and SHA-256. The drawer is a recall index:
+it must not copy task status, claims, leases, authorization or completion.
+If the drawer and artifact ever disagree, the artifact is canonical.
+
+Artifact failure blocks plan ingestion because exact provenance was not secured.
+Drawer indexing failure is reported explicitly but does not become task authority
+or invalidate an already stored artifact.
+
+The goal root contains a concise objective, aggregate acceptance, scope/budgets
+and the artifact reference; it does not duplicate the full multi-stage prose.
+
+Materialize the executable representation as a task graph:
+
+- Create independently actionable tasks with stable intent keys, task-level
+  acceptance, execution requirements and a source pointer into the plan artifact.
+- Publish each task's initial goal membership, definition/reuse and all known
+  blockers in the same accepted `mptask_expand`; no task may become runnable
+  before its initial blockers are attached.
+- Treat tasks as parallel by default. Formatting, paragraph order and stage
+  numbering are not dependencies. Add `blocks` only for explicit or necessary
+  prerequisite outputs; connect stage exit work to the next stage's entry work
+  rather than imposing an all-to-all stage barrier.
+- Keep rationale and explanatory prose in the artifact or descriptions. Express
+  validation as acceptance/evidence unless it is substantial independent work.
+- Publish ambiguous, unsupported or over-budget units with `admitted=false`
+  instead of guessing them into runnable work.
+
+If the graph exceeds the advertised `max_batch` or edge limit, publish
+topologically ordered, dependency-closed batches. Every admitted task in a batch
+must have all of its known prerequisites already present or declared in that same
+batch. Later batches may depend on earlier tasks when their own definitions and
+edges are published. Use bounded non-runnable proposals when complete runnable
+publication is not yet safe; never publish a task and plan to attach a newly
+discovered initial blocker afterward.
+
+`mptask_bootstrap` still creates the root and planning/import task. With a live,
+authorized planning source, publish the initial graph and complete that source
+only when the final required batch can include that completion atomically.
+Coordinator-only planning without a compatible host may publish authorized
+source-free batches, but it must not fabricate a claim or close the planning task;
+report that execution/closure blocker explicitly.
 
 ## Transport is not supervision
 
@@ -234,6 +286,8 @@ reassess; cancelled-only work is not accepted success.
 
 | Mistake | Correction |
 |---|---|
+| Copy the native plan into one giant goal/task | Preserve it as an artifact and publish an actionable graph with source references. |
+| Convert headings or paragraph order into blockers | Default to parallel work; add only real prerequisite edges. |
 | Expand a prerequisite while retaining A, then release | Use the complete atomic **yield** recipe above. |
 | Treat remembered ownership or native acknowledgment as a claim | Verify the current sidecar generation, live lease and prepared execution. |
 | Close because the ready queue is empty or the shell exited | Establish acceptance evidence and the appropriate goal/execution barrier. |
