@@ -12,6 +12,7 @@ from unittest.mock import patch
 from mempalace_tasks.authority import AuthorityError, TaskAuthority
 from mempalace_tasks.platform_support import LifetimeLock, PlatformError
 from mempalace_tasks.protocol import make_proposal, make_settlement
+from runtime_support import isolated_fork_test
 from authority_fixture import (
     AUTHORITY, Clock, LogClient, command, create, genesis, state_directory, uid,
 )
@@ -219,6 +220,7 @@ class AuthorityTests(unittest.TestCase):
                 authority.execute(genesis())
             self.assertEqual(caught.exception.code, "not_started")
 
+    @isolated_fork_test
     def test_forked_child_cannot_use_or_release_parent_authority(self):
         context = multiprocessing.get_context("fork")
         parent, child = context.Pipe(duplex=False)

@@ -1,9 +1,11 @@
 """Tests for the Copilot -> Claude transcript adapter (copilot_transcript.py).
 
-Pure translation/mapping tests run under any python3. The integration tests
+Run from the repository root with ``$TEST_PY -m pytest tests/hooks -q``
+and ``PYTHONDONTWRITEBYTECODE=1`` exported. Pure translation/mapping tests
+need only pytest. The integration tests
 prove mempalace's own claude-code parsers accept our translated output; they
-are skipped unless mempalace is importable (run under the mempalace interpreter,
-e.g. MPY=$(head -1 "$(command -v mempalace)" | sed 's/^#!//'); "$MPY" -m unittest).
+are skipped unless mempalace is importable; use a preprovisioned interpreter
+with both pytest and MemPalace to include them.
 """
 from __future__ import annotations
 

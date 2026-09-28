@@ -333,7 +333,8 @@ class InstalledCommandTests(GroundedFixture):
     def run_cli(self, command, event, *, env=None):
         artifact = Path(self.tmp.name, f"{command}.json")
         artifact.write_text(json.dumps(event_to_data(event)), encoding="utf-8")
-        return subprocess.run([sys.executable, str(Path(__file__).with_name("dream_procedure.py")),
+        script = Path(__file__).resolve().parents[2] / "skills" / "dreaming" / "scripts" / "dream_procedure.py"
+        return subprocess.run([sys.executable, str(script),
             command, "--palace", self.path, "--wing", "w", "--session-store", self.store,
             "--input", str(artifact)], capture_output=True, text=True, timeout=90, env=env)
 
