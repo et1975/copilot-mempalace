@@ -89,16 +89,20 @@ def _candidate_triple_ids(candidate: dict[str, Any]) -> list[Any]:
 
 
 def _candidate_matches(candidate: dict[str, Any], selected: Any) -> bool:
-    return selected in {
+    return selected is not None and selected in [
         candidate.get("object"),
         candidate.get("object_id"),
         candidate.get("triple_id"),
         *list(candidate.get("triple_ids") or []),
-    }
+    ]
+
+
+def _valid_selector(value: Any) -> bool:
+    return (isinstance(value, str) and bool(value.strip())) or type(value) is int
 
 
 def _resolve_contradiction_decisions(worklist: dict[str, Any]) -> list[dict[str, Any]]:
-    """Extract concrete KG invalidate/skip decisions from an adjudicated worklist."""
+    """Resolve public invalidate decisions to exact roots and canonical identities."""
     resolved = []
     for item in worklist.get("items", []):
         decision = item.get("decision")
@@ -106,34 +110,65 @@ def _resolve_contradiction_decisions(worklist: dict[str, Any]) -> list[dict[str,
             resolved.append({"action": "skip"})
             continue
         candidates = item.get("candidates", [])
+        kept = None
+        if "keep" in decision:
+            keep = decision["keep"]
+            if not _valid_selector(keep):
+                raise ValueError("invalid keep selector")
+            matches = [c for c in candidates if _candidate_matches(c, keep)]
+            if len(matches) != 1:
+                raise ValueError("unknown or ambiguous keep selector")
+            kept = matches[0]
+            if not _candidate_triple_ids(kept):
+                raise ValueError("keep candidate has no exact triple IDs")
+            new_object = kept.get("object_id") or kept.get("object")
+            if not _valid_selector(new_object):
+                raise ValueError("keep resolution requires a canonical object identity")
         selected = decision.get("invalidate")
         if selected is None:
-            keep = decision.get("keep")
+            if kept is None:
+                raise ValueError("invalidate requires a keep selector or explicit IDs")
             invalidate = [
                 triple_id
                 for c in candidates
-                if not _candidate_matches(c, keep)
+                if c is not kept
                 for triple_id in _candidate_triple_ids(c)
             ]
         else:
+            if not isinstance(selected, list) or not all(_valid_selector(v) for v in selected):
+                raise ValueError("invalidate must be a list of selectors")
             invalidate = []
             for value in selected:
                 matches = [c for c in candidates if _candidate_matches(c, value)]
+                if len(matches) > 1:
+                    raise ValueError("ambiguous invalidate selector")
                 if matches:
-                    invalidate.extend(
-                        triple_id for c in matches for triple_id in _candidate_triple_ids(c)
-                    )
+                    ids = _candidate_triple_ids(matches[0])
+                    # An explicit root ID never authorizes its sibling assertions.
+                    invalidate.extend([value] if value in ids else ids)
+                elif kept is not None:
+                    raise ValueError("unknown invalidate selector with keep")
                 else:
                     invalidate.append(value)
         invalidate = list(dict.fromkeys(invalidate))
-        resolved.append(
-            {
-                "action": "invalidate",
-                "subject": item["subject"],
-                "predicate": item["predicate"],
-                "invalidate": invalidate,
-            }
-        )
+        result = {
+            "action": "invalidate",
+            "subject": item.get("subject_id") or item["subject"],
+            "predicate": item["predicate"],
+            "invalidate": invalidate,
+        }
+        if kept is not None:
+            keep_ids = _candidate_triple_ids(kept)
+            if set(keep_ids).intersection(invalidate):
+                raise ValueError("cannot invalidate the keep candidate")
+            old = [c for c in candidates if set(_candidate_triple_ids(c)).intersection(invalidate)]
+            if len(old) == 1:
+                old_object = old[0].get("object_id") or old[0].get("object")
+                if not _valid_selector(old_object):
+                    raise ValueError("keep resolution requires canonical object identities")
+                result.update(action="supersede", old_object=old_object,
+                              new_object=new_object, keep_triple_ids=keep_ids)
+        resolved.append(result)
     return resolved
 
 
@@ -191,7 +226,7 @@ def _resolve_prune_decisions(worklist: dict[str, Any]) -> list[dict[str, Any]]:
                 "content_hash": decision.get("content_hash") or item.get("content_hash"),
                 "pinned": decision.get("pinned", item.get("pinned", False)),
                 "topic": decision.get("topic") or item.get("topic"),
-                "salience": decision.get("salience") or item.get("salience", {}),
+                "salience": item.get("salience", {}),
             }
         )
     return resolved
@@ -383,6 +418,14 @@ class _DryRunKgWriter:
         self.planned.append(f"INVALIDATE_TRIPLES {', '.join(str(tid) for tid in triple_ids)}")
         return len(triple_ids)
 
+    def supersede(self, subject, predicate, old_object, new_object, *,
+                  old_triple_ids, keep_triple_ids, at=None):
+        self.planned.append(
+            f"SUPERSEDE {subject} -{predicate}-> {old_object} with {new_object}; "
+            f"retire {old_triple_ids}, keep {keep_triple_ids}")
+        return {"invalidated": len(old_triple_ids), "retired_ids": list(old_triple_ids),
+                "kept_ids": list(keep_triple_ids), "cascaded_ids": [], "survived_ids": []}
+
     def add_derived(self, conclusion, rule_id, premise_ids, premise_drawer_ids,
                     ontology_version, confidence, valid_from, valid_to) -> dict[str, Any]:
         pred = conclusion.get("predicate", "?")
@@ -486,11 +529,36 @@ def _preflight_merge_decisions(path: str, decisions: list[dict[str, Any]]) -> tu
     return filtered, errors
 
 
-def _preflight_prune_decisions(path: str, decisions: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    from dream_procedural_palace import live_protected_drawer_ids
-    protected = live_protected_drawer_ids(path)
+def _usage_changed_since_harvest(before: dict, after: dict) -> bool:
+    if before and not after:
+        return True
+    if after.get("access_count", 0) != before.get("access_count", 0):
+        return True
+    if after.get("access_count", 0) == 0:
+        return False
+    return (
+        after.get("last_activated") != before.get("last_activated")
+        or any(after.get(key, 0) > before.get(key, 0) for key in ("strength", "stability"))
+    )
+
+
+def _preflight_prune_decisions(path: str, decisions: list[dict[str, Any]],
+                              worklist: dict | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    from dream_procedural_palace import live_protected_drawer_ids, exclude_protected_drawers
+    if not any(d.get("action") == "prune" for d in decisions):
+        return decisions, []
+    scope = (worklist or {}).get("scope") or {}
+    params = (worklist or {}).get("params") or {}
     try:
+        protected = live_protected_drawer_ids(path)
         degrees = dream_palace.kg_protection_degree(path)
+        usage = dream_palace.load_drawer_usage(path, wing=scope.get("wing"), room=scope.get("room"))
+        drawers = dream_palace.load_logical_drawers(path, wing=scope.get("wing"), room=scope.get("room"))
+        scored = dream_harvest.score_prune_drawers(exclude_protected_drawers(path, drawers), degrees, usage)
+        fresh_by_id = {d["id"]: d for d in scored}
+        eligible = {d["id"] for d in _dream_lib.select_prune_candidates(
+            scored, v_min=params.get("v_min", dream_harvest.DEFAULT_V_MIN),
+            age_floor_days=params.get("age_floor_days", dream_harvest.DEFAULT_AGE_FLOOR_DAYS))}
     except Exception as exc:  # noqa: BLE001
         return (
             [{"action": "keep"} if d.get("action") == "prune" else d for d in decisions],
@@ -523,15 +591,34 @@ def _preflight_prune_decisions(path: str, decisions: list[dict[str, Any]]) -> tu
             errors.append({"stage": "drift", "error": "content hash changed", "drawer_id": drawer_id, "decision": decision})
             filtered.append({"action": "keep"})
             continue
+        if protected.intersection([drawer_id, *live.get("member_ids", [])]) or is_procedural_record(live):
+            errors.append({"stage": "protected", "error": "procedural evidence/event drawer", "decision": decision})
+            filtered.append({"action": "keep"})
+            continue
         live_pinned = bool((live.get("metadata") or {}).get("pinned", False))
-        live_degree = int(degrees.get(drawer_id, 0))
+        live_degree = dream_harvest._degree_for(live, degrees)
         if live_pinned or live_degree > 0:
             reason = "pinned" if live_pinned else "kg-connected"
             errors.append({"stage": "protected", "error": reason, "drawer_id": drawer_id, "decision": decision})
             filtered.append({"action": "keep"})
             continue
-        salience = dict(decision.get("salience") or {})
-        salience["kg_degree"] = live_degree
+        before = (decision.get("salience") or {}).get("usage") or {}
+        after = usage.get(drawer_id) or {}
+        if _usage_changed_since_harvest(before, after):
+            errors.append({"stage": "usage", "error": "usage changed since harvest; re-harvest required",
+                           "drawer_id": drawer_id, "decision": decision})
+            filtered.append({"action": "keep"})
+            continue
+        if drawer_id not in eligible:
+            errors.append({"stage": "salience", "error": "drawer no longer eligible for prune",
+                           "drawer_id": drawer_id, "decision": decision})
+            filtered.append({"action": "keep"})
+            continue
+        if "member_ids" in live and set(live["member_ids"]) != set(decision["member_ids"]):
+            errors.append({"stage": "drift", "error": "physical member IDs changed", "decision": decision})
+            filtered.append({"action": "keep"})
+            continue
+        salience = fresh_by_id[drawer_id]["salience"]
         filtered.append({**decision, "pinned": live_pinned, "salience": salience})
     return filtered, errors
 
@@ -554,17 +641,14 @@ def _verify_reharvest(task: str, worklist: dict[str, Any], path: str) -> int:
     """
     scope = worklist.get("scope") or {}
     params = worklist.get("params") or {}
+    if task == "merge":
+        return len(dream_harvest.harvest_merge_worklist(
+            path, wing=scope.get("wing"), room=scope.get("room"),
+            tau=params.get("tau", 0.9))["items"])
     with tempfile.TemporaryDirectory() as td:
         out = os.path.join(td, "verify.json")
         argv = ["--palace", path, "--task", task, "--out", out]
-        if task == "merge":
-            if scope.get("wing"):
-                argv += ["--wing", scope["wing"]]
-            if scope.get("room"):
-                argv += ["--room", scope["room"]]
-            if params.get("tau") is not None:
-                argv += ["--tau", str(params["tau"])]
-        elif task == "pattern":
+        if task == "pattern":
             if scope.get("wing"):
                 argv += ["--wing", scope["wing"]]
             if scope.get("rooms"):
@@ -582,9 +666,11 @@ def _verify_reharvest(task: str, worklist: dict[str, Any], path: str) -> int:
                 argv += ["--age-floor-days", str(params["age_floor_days"])]
         # contradiction takes no scope/param args (KG is palace-global)
         with contextlib.redirect_stderr(io.StringIO()):
-            dream_harvest.main(argv)
+            rc = dream_harvest.main(argv)
+        if rc != 0:
+            raise RuntimeError(f"verification harvest failed with exit code {rc}")
         with open(out, encoding="utf-8") as fh:
-            return len(json.load(fh).get("items") or [])
+            return len(json.load(fh)["items"])
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -628,10 +714,16 @@ def main(argv: list[str] | None = None) -> int:
     with open(args.decisions, encoding="utf-8") as fh:
         worklist = json.load(fh)
     task = args.task or _task_from_worklist(worklist)
+    if task == "contradiction":
+        try:
+            contradiction_decisions = _resolve_contradiction_decisions(worklist)
+        except ValueError as exc:
+            print(f"error: invalid contradiction decision: {exc}", file=sys.stderr)
+            return 2
 
     if args.dry_run:
         if task == "contradiction":
-            decisions = _resolve_contradiction_decisions(worklist)
+            decisions = contradiction_decisions
             kg_writer = _DryRunKgWriter()
             report = apply_contradiction_decisions(decisions, kg_writer)
             for line in kg_writer.planned:
@@ -640,7 +732,8 @@ def main(argv: list[str] | None = None) -> int:
                 f"[dry-run] would invalidate {report['invalidated']}, skip {report['skipped']}",
                 file=sys.stderr,
             )
-            return 0
+            _print_errors(report)
+            return 1 if report["errors"] else 0
 
         if task == "pattern":
             decisions = _resolve_pattern_decisions(worklist)
@@ -684,7 +777,7 @@ def main(argv: list[str] | None = None) -> int:
 
         if task == "prune":
             decisions = _resolve_prune_decisions(worklist)
-            decisions, preflight_errors = _preflight_prune_decisions(path, decisions)
+            decisions, preflight_errors = _preflight_prune_decisions(path, decisions, worklist)
             archiver = _DryRunArchiver()
             report = _add_preflight_errors(
                 apply_prune_decisions(decisions, archiver),
@@ -734,7 +827,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     if task == "contradiction":
-        decisions = _resolve_contradiction_decisions(worklist)
+        decisions = contradiction_decisions
         kg_writer = dream_palace.KgWriter(path)
         try:
             report = apply_contradiction_decisions(decisions, kg_writer)
@@ -771,7 +864,7 @@ def main(argv: list[str] | None = None) -> int:
     elif task == "prune":
         decisions = _resolve_prune_decisions(worklist)
         with dream_palace.palace_mutation_lock(path):
-            decisions, preflight_errors = _preflight_prune_decisions(path, decisions)
+            decisions, preflight_errors = _preflight_prune_decisions(path, decisions, worklist)
             report = _add_preflight_errors(
                 apply_prune_decisions(decisions, dream_palace.Archiver(path, archive_path=args.archive_file)),
                 preflight_errors,
@@ -831,7 +924,12 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     if args.verify and task in ("merge", "contradiction", "pattern", "prune"):
-        residual = _verify_reharvest(task, worklist, path)
+        try:
+            residual = _verify_reharvest(task, worklist, path)
+        except Exception as exc:  # CLI boundary: failed scans are never convergence.
+            report["errors"].append({"stage": "verify", "error": str(exc)})
+            _print_errors(report)
+            return 1
         print(f"verify: {residual} residual {task} candidate(s) after re-harvest", file=sys.stderr)
         if args.strict and residual:
             _print_errors(report)

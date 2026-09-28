@@ -200,14 +200,15 @@ def _format_example(task: str, ex: dict) -> str:
 
 
 # --------------------------------------------------------------------------
-# Orchestration (palace-facing) — validated by live smoke test
+# Orchestration (palace-facing)
 # --------------------------------------------------------------------------
 def _run_main(argv: list) -> None:
     """Call dream_harvest.main in-process, suppressing its stderr chatter."""
-    with contextlib.redirect_stderr(io.StringIO()):
+    stderr = io.StringIO()
+    with contextlib.redirect_stderr(stderr):
         rc = dream_harvest.main(argv)
     if rc != 0:
-        raise RuntimeError(f"dream_harvest.main {argv} returned {rc}")
+        raise RuntimeError(f"dream_harvest.main {argv} returned {rc}: {stderr.getvalue().strip()}")
 
 
 def harvest(task: str, palace: str, wing: str | None = None, *, tau: float = 0.9,

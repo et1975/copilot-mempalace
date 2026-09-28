@@ -154,10 +154,53 @@ FIREWALL_SCHEMA_DDL = (
 
 
 def bind_palace(palace_path: str) -> str:
-    """Point mempalace at ``palace_path`` for this process. Call before imports."""
+    """Bind an explicit palace, including an already imported embedded server."""
     abspath = os.path.abspath(os.path.expanduser(palace_path))
+    server = sys.modules.get("mempalace.mcp_server")
+    if server is not None:
+        _rebind_mcp_server(server, abspath)
     os.environ["MEMPALACE_PALACE_PATH"] = abspath
     return abspath
+
+
+def _rebind_mcp_server(server, palace_path: str) -> None:
+    path = os.path.realpath(os.path.expanduser(palace_path))
+    current = os.path.realpath(os.path.expanduser(server._config.palace_path))
+    if current != path:
+        if server._MCP_WRITER_LOCK_CM is not None:
+            raise RuntimeError("cannot change MCP palace binding while a writer owns it")
+        from mempalace.config import MempalaceConfig
+
+        server._discard_mcp_storage_handles()
+        previous = os.environ.get("MEMPALACE_PALACE_PATH")
+        os.environ["MEMPALACE_PALACE_PATH"] = path
+        try:
+            config = MempalaceConfig()
+            if os.path.realpath(os.path.expanduser(config.palace_path)) != path:
+                raise RuntimeError("MCP configuration refused explicit palace binding")
+            server._config = config
+        finally:
+            if previous is None:
+                os.environ.pop("MEMPALACE_PALACE_PATH", None)
+            else:
+                os.environ["MEMPALACE_PALACE_PATH"] = previous
+    server._palace_flag_given = True
+
+
+def _embedded_mcp_server(palace_path: str | None = None):
+    """Import MCP without stealing embedded callers' Python or native stdout."""
+    if palace_path is not None:
+        bind_palace(palace_path)
+    stdout, fd = sys.stdout, os.dup(1)
+    try:
+        from mempalace import mcp_server
+    finally:
+        os.dup2(fd, 1)
+        os.close(fd)
+        sys.stdout = stdout
+    if palace_path is not None:
+        _rebind_mcp_server(mcp_server, palace_path)
+    return mcp_server
 
 
 _mutation_locks = threading.local()
@@ -245,10 +288,14 @@ def protection_collection(palace: str):
     return get_collection(palace)
 
 
-def load_source_drawer(palace: str, drawer_id: str, *, collection=None) -> dict[str, Any] | None:
+def load_source_drawer(
+    palace: str, drawer_id: str, *, collection=None, include_embeddings: bool = False,
+) -> dict[str, Any] | None:
     """Read a complete original drawer by either logical or physical ID."""
     col = collection if collection is not None else procedural_collection(palace)
     include = ["documents", "metadatas"]
+    if include_embeddings:
+        include.append("embeddings")
     exact = _rows_from_collection_result(col.get(ids=[drawer_id], include=include))
     parent = ((exact[0].get("metadata") or {}).get("parent_drawer_id") if exact else None) or drawer_id
     children = _rows_from_collection_result(col.get(where={"parent_drawer_id": parent}, include=include))
@@ -256,6 +303,11 @@ def load_source_drawer(palace: str, drawer_id: str, *, collection=None) -> dict[
     if not rows:
         return None
     logical = _group_by_parent(list(rows.values()), ("parent_drawer_id",))[0]
+    return _canonical_drawer(logical, rows)
+
+
+def _canonical_drawer(logical: dict, rows: dict[str, dict]) -> dict:
+    parent = logical["id"]
     members = [rows[member_id] for member_id in logical["member_ids"]]
     # MCP add_drawer slices verbatim characters; mined chunks retain the
     # legacy newline convention. Recipe/author alone are shared by both.
@@ -1009,7 +1061,10 @@ def load_logical_drawers(
     from dream_metadata import decode_procedural_chunks
     procedural = [r for r in rows if (r.get("metadata") or {}).get("room") == "procedural"]
     ordinary = [r for r in rows if (r.get("metadata") or {}).get("room") != "procedural"]
-    return _group_by_parent(ordinary, ("parent_drawer_id",)) + decode_procedural_chunks(procedural)
+    by_id = {row["id"]: row for row in ordinary}
+    logicals = [_canonical_drawer(logical, by_id)
+                for logical in _group_by_parent(ordinary, ("parent_drawer_id",))]
+    return logicals + decode_procedural_chunks(procedural)
 
 
 def list_wings(palace_path: str) -> list[str]:
@@ -1027,38 +1082,201 @@ def load_drawer_by_id(palace_path: str, drawer_id: str) -> dict[str, Any] | None
     """Read a current logical drawer by id, reassembling chunks and hashing text."""
     from mempalace.palace import get_collection  # lazy: heavy import
 
-    col = get_collection(palace_path)
-    include = ["documents", "metadatas", "embeddings"]
-    rows: list[dict[str, Any]] = []
-    seen: set[str] = set()
+    return load_source_drawer(
+        palace_path, drawer_id, collection=get_collection(palace_path), include_embeddings=True)
 
-    for kwargs in (
-        {"where": {"parent_drawer_id": drawer_id}, "include": include},
-        {"ids": [drawer_id], "include": include},
-    ):
-        for row in _rows_from_collection_result(col.get(**kwargs)):
-            if row["id"] not in seen:
-                rows.append(row)
-                seen.add(row["id"])
 
-    if not rows:
-        return None
+def _complete_drawer_rows(collection, *, wing=None, room=None) -> list[dict]:
+    """Page metadata without assuming that a backend honors our page size."""
+    total = collection.count()
+    if type(total) is not int or total < 0:
+        raise RuntimeError("invalid collection count")
+    rows, seen = [], set()
+    where = _where(wing, room)
+    for _ in range(total + 1):
+        result = collection.get(
+            where=where, include=["documents", "metadatas"], limit=1000, offset=len(rows))
+        ids, docs, metas = (_field(result, field) for field in ("ids", "documents", "metadatas"))
+        if (not isinstance(ids, list) or not isinstance(docs, list)
+                or not isinstance(metas, list) or len(ids) != len(docs) or len(ids) != len(metas)):
+            raise RuntimeError("incomplete drawer metadata page")
+        if not ids:
+            if not where and len(rows) != total:
+                raise RuntimeError("incomplete drawer metadata scan")
+            return rows
+        for did, doc, meta in zip(ids, docs, metas):
+            if (not isinstance(did, str) or not did or did in seen
+                    or not isinstance(doc, str) or not isinstance(meta, dict)):
+                raise RuntimeError("malformed or repeated drawer metadata row")
+            if (wing is not None and meta.get("wing") != wing
+                    or room is not None and meta.get("room") != room):
+                raise RuntimeError("drawer metadata escaped requested scope")
+            seen.add(did)
+            rows.append({"id": did, "text": doc, "metadata": meta})
+        if len(rows) > total:
+            raise RuntimeError("drawer metadata changed during scan")
+    raise RuntimeError("incomplete drawer metadata pagination")
 
-    logicals = _group_by_parent(rows, ("parent_drawer_id",))
-    logical = next((item for item in logicals if item["id"] == drawer_id), None)
-    if logical is None:
-        if len(logicals) != 1:
-            return None
-        logical = logicals[0]
 
-    text = logical["text"]
-    return {
-        "id": logical["id"],
-        "text": text,
-        "metadata": logical["metadata"],
-        "embedding": logical["embedding"],
-        "content_hash": hashlib.sha256(text.encode("utf-8")).hexdigest(),
-    }
+def find_duplicate_clusters(
+    palace_path: str, *, wing=None, room=None, threshold=.1, exclude_ids=None, max_clusters=None,
+) -> list[dict]:
+    """Validate exhaustive native discovery, then rebuild scoped logical components."""
+    if (isinstance(threshold, bool) or not isinstance(threshold, (int, float))
+            or not math.isfinite(threshold) or not 0 <= threshold <= 2):
+        raise ValueError("threshold must be finite cosine distance between zero and two")
+    if max_clusters is not None and (type(max_clusters) is not int or max_clusters < 1):
+        raise ValueError("max_clusters must be a positive integer")
+    server = _embedded_mcp_server(palace_path)
+    from mempalace.palace import get_collection
+    from dream_metadata import is_procedural_record
+
+    # Native discovery's raw two-key where is not valid for every backend.
+    native_room = None if wing else room
+    collection = get_collection(palace_path)
+    rows = _complete_drawer_rows(collection, wing=wing, room=native_room)
+    handler = server.TOOLS.get("mempalace_find_duplicates", {}).get("handler")
+    if not callable(handler):
+        raise RuntimeError("native duplicate discovery unavailable")
+    result = handler(wing=wing, room=native_room, threshold=threshold, max_clusters=None)
+    if not isinstance(result, dict):
+        raise RuntimeError("malformed native duplicate result")
+    if result.get("error") or result.get("success") is False:
+        raise RuntimeError(f"native duplicate discovery failed: {result}")
+    if result.get("vector_disabled") or result.get("truncated"):
+        raise RuntimeError(f"incomplete native duplicate scan: {result}")
+    params, clusters = result.get("params"), result.get("clusters")
+    if (not isinstance(params, dict) or not isinstance(clusters, list)
+            or params.get("wing") != wing or params.get("room") != native_room
+            or params.get("threshold") != threshold or params.get("max_clusters") is not None):
+        raise RuntimeError("missing or mismatched native duplicate scan scope")
+    bound = params.get("neighbor_bound")
+    if type(bound) is not int or bound < len(rows):
+        raise RuntimeError(
+            "incomplete native duplicate scan: installed backend "
+            f"neighbor_bound={bound!r}, physical_rows={len(rows)}, "
+            f"queried scope wing={wing!r}, room={native_room!r}; "
+            "complete discovery is not established; narrow the native scan scope")
+    physical_ids = {row["id"] for row in rows}
+    logical_ids = {
+        (row["metadata"].get("parent_drawer_id") or row["id"]) for row in rows}
+    excluded = set(exclude_ids or ())
+    members, edges, reported = {}, {}, set()
+    for cluster in clusters:
+        if not isinstance(cluster, dict):
+            raise RuntimeError("malformed native duplicate cluster")
+        ids, pairs = cluster.get("drawer_ids"), cluster.get("pairs")
+        if (not isinstance(ids, list) or len(ids) < 2
+                or any(not isinstance(did, str) or did not in logical_ids for did in ids)
+                or len(set(ids)) != len(ids) or reported.intersection(ids)
+                or not isinstance(pairs, list) or not pairs):
+            raise RuntimeError("malformed or out-of-scope native duplicate cluster")
+        reported.update(ids)
+        for did in ids:
+            drawer = load_source_drawer(palace_path, did, collection=collection)
+            if (drawer is None or drawer["id"] != did
+                    or not set(drawer["member_ids"]).issubset(physical_ids)):
+                raise RuntimeError(f"native duplicate drawer drifted: {did}")
+            scopes = {(r["metadata"].get("wing"), r["metadata"].get("room"))
+                      for r in rows if r["id"] in drawer["member_ids"]}
+            if len(scopes) != 1:
+                raise RuntimeError(f"native duplicate chunks span scopes: {did}")
+            if (not is_procedural_record(drawer)
+                    and not excluded.intersection([did, *drawer["member_ids"]])
+                    and (room is None or drawer["room"] == room)):
+                members[did] = drawer
+        for pair in pairs:
+            if not isinstance(pair, dict):
+                raise RuntimeError("malformed native duplicate pair")
+            a, b, distance = pair.get("a"), pair.get("b"), pair.get("distance")
+            if (not isinstance(a, str) or not isinstance(b, str)
+                    or a not in ids or b not in ids or a == b
+                    or isinstance(distance, bool) or not isinstance(distance, (int, float))
+                    or not math.isfinite(distance) or not 0 <= distance <= 2):
+                raise RuntimeError("malformed native duplicate pair")
+            if distance >= threshold or a not in members or b not in members:
+                continue
+            if (members[a]["wing"], members[a]["room"]) != (members[b]["wing"], members[b]["room"]):
+                continue
+            key = tuple(sorted((a, b)))
+            edges[key] = max(edges.get(key, -1.), 1. - distance)
+    adjacency = defaultdict(set)
+    for a, b in edges:
+        adjacency[a].add(b)
+        adjacency[b].add(a)
+    output, visited = [], set()
+    for start in sorted(adjacency):
+        if start in visited:
+            continue
+        component, pending = set(), [start]
+        while pending:
+            did = pending.pop()
+            if did not in component:
+                component.add(did)
+                pending.extend(adjacency[did] - component)
+        visited.update(component)
+        output.append({
+            "members": [members[did] for did in sorted(component)],
+            "pair_sims": [{"a": a, "b": b, "sim": sim} for (a, b), sim in sorted(edges.items())
+                          if a in component and b in component],
+        })
+    output.sort(key=lambda c: (-len(c["members"]), [m["id"] for m in c["members"]]))
+    if max_clusters is not None and len(output) > max_clusters:
+        raise RuntimeError("bounded duplicate scan would be incomplete at requested cluster limit")
+    return output
+
+
+def load_drawer_usage(palace_path: str, wing=None, room=None) -> dict[str, dict]:
+    """Read all scoped telemetry, lazily decaying copies without retrieving drawers."""
+    from mempalace.palace import get_collection
+    from mempalace.dynamics import drawer_salience as native_salience
+
+    rows = _complete_drawer_rows(
+        get_collection(palace_path, create=False, read_only=True), wing=wing, room=room)
+    now = datetime.now(timezone.utc)
+    usage, activation_times, scopes = {}, {}, {}
+    fields = {"access_count", "strength", "stability", "last_activated"}
+    for row in rows:
+        meta = row["metadata"]
+        did = meta.get("parent_drawer_id") or row["id"]
+        if not isinstance(did, str):
+            raise ValueError("invalid logical drawer ID in telemetry")
+        scope = (meta.get("wing"), meta.get("room"))
+        if did in scopes and scopes[did] != scope:
+            raise ValueError(f"telemetry chunks span scopes: {did}")
+        scopes[did] = scope
+        present = fields.intersection(meta)
+        if not present:
+            continue
+        snapshot = {key: meta[key] for key in present}
+        for key in ("access_count", "strength", "stability"):
+            if key not in snapshot:
+                continue
+            value = snapshot[key]
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value) or value < 0
+                    or key == "access_count" and type(value) is not int
+                    or key == "stability" and value == 0):
+                raise ValueError(f"invalid {key} telemetry for drawer {did}")
+        activated = None
+        if "last_activated" in snapshot:
+            value = snapshot["last_activated"]
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"invalid last_activated telemetry for drawer {did}")
+            try:
+                activated = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError as exc:
+                raise ValueError(f"invalid last_activated telemetry for drawer {did}") from exc
+            if activated.tzinfo is None:
+                activated = activated.replace(tzinfo=timezone.utc)
+        decayed = native_salience(snapshot, now=now)
+        combined = usage.setdefault(did, {})
+        for key in present - {"last_activated"}:
+            combined[key] = max(combined.get(key, decayed[key]), decayed[key])
+        if activated is not None and (did not in activation_times or activated > activation_times[did]):
+            activation_times[did] = activated
+            combined["last_activated"] = snapshot["last_activated"]
+    return usage
 
 
 def load_observation_entries(
@@ -1505,7 +1723,79 @@ def _premise_interval_nonempty(triple_intervals: dict[str, dict[str, Any]], prem
     return premise_interval(premises) is not None
 
 
-def invalidate_triples_cascade(palace_path: str, root_triple_ids: list[str], ended_at: str) -> dict:
+def _cascade_plan(con: sqlite3.Connection, roots: list[str]) -> dict:
+    """Compute proof loss without changing facts or their support provenance."""
+    _, by_conclusion, by_premise = _load_derivation_graph(con)
+    affected, queue = set(), deque(roots)
+    while queue:
+        for derivation in by_premise.get(queue.popleft(), []):
+            tid = derivation["conclusion_triple_id"]
+            if tid not in affected:
+                affected.add(tid)
+                queue.append(tid)
+    intervals = {tid: row for tid, row in _active_triple_intervals(con).items() if tid not in roots}
+    independent = {tid for tid in affected if tid in intervals and _is_independently_asserted(con, tid)}
+    candidates = (affected & intervals.keys()) - independent
+    grounded = intervals.keys() - candidates
+    supports = {
+        row["support_id"]: row for row in con.execute("SELECT * FROM kg_triple_supports")
+    }
+    specific_support_ids = {
+        _derived_support_id(tid, d["rule_id"], d["candidate_id"])
+        for tid, derivations in by_conclusion.items() for d in derivations
+    }
+    supports_by_triple = defaultdict(list)
+    for support in supports.values():
+        if support["status"] == "deduced":
+            supports_by_triple[str(support["triple_id"])].append(support)
+
+    def proof_supports(derivation):
+        triple_id = derivation["conclusion_triple_id"]
+        specific_id = _derived_support_id(
+            triple_id, derivation["rule_id"], derivation["candidate_id"])
+        # Support IDs are opaque outside our per-derivation writer. Existing
+        # triple-level supports cover its recorded alternative derivations.
+        return [support for support in supports_by_triple.get(triple_id, [])
+                if support["support_id"] == specific_id
+                or support["support_id"] not in specific_support_ids]
+
+    def active_proof(derivation):
+        return any(
+            _support_active_now(support) and support["source_trust"] == "trusted_rule"
+            and support["inherited_status"] in TRUSTED_STATUSES
+            and support["conditional_on_triple_ids"] == "[]" and support["scope"] == "durable"
+            for support in proof_supports(derivation))
+
+    def grounded_proof(derivation):
+        premises = derivation["premise_ids"]
+        return (_premise_interval_nonempty(intervals, premises)
+                and all(tid in grounded for tid in premises))
+
+    changed = True
+    while changed:
+        changed = False
+        for tid in sorted(candidates - grounded):
+            if any(active_proof(d) and grounded_proof(d) for d in by_conclusion.get(tid, [])):
+                grounded.add(tid)
+                changed = True
+    proofs_by_support = defaultdict(list)
+    for tid in affected:
+        for derivation in by_conclusion.get(tid, []):
+            for support in proof_supports(derivation):
+                proofs_by_support[support["support_id"]].append(derivation)
+    # Migrated support is shared: losing one proof must not retire the others.
+    lost_supports = sorted(
+        sid for sid, derivations in proofs_by_support.items()
+        if _support_active_now(supports[sid])
+        and not any(grounded_proof(d) for d in derivations))
+    return {"to_end": sorted(candidates - grounded), "lost_supports": lost_supports,
+            "survived": sorted(candidates & grounded)}
+
+
+def invalidate_triples_cascade(
+    palace_path: str, root_triple_ids: list[str], ended_at: str, *,
+    _connection: sqlite3.Connection | None = None,
+) -> dict:
     """Force-end roots and atomically invalidate derived dependents without an active proof."""
     db_path = _resolve_kg_path(palace_path)
     if not db_path or not os.path.exists(db_path):
@@ -1515,37 +1805,25 @@ def invalidate_triples_cascade(palace_path: str, root_triple_ids: list[str], end
             "survived_by_alternate_proof": [],
         }
 
-    ensure_firewall_schema(db_path)
-    roots = [str(root_id) for root_id in root_triple_ids]
-    con = sqlite3.connect(db_path)
+    if _connection is None:
+        ensure_firewall_schema(db_path)
+    roots = list(dict.fromkeys(str(root_id) for root_id in root_triple_ids))
+    con = _connection if _connection is not None else sqlite3.connect(db_path)
     con.row_factory = sqlite3.Row
     try:
-        con.execute("PRAGMA busy_timeout = 5000")
-        con.execute("BEGIN IMMEDIATE")
+        if _connection is None:
+            con.execute("PRAGMA busy_timeout = 5000")
+            con.execute("BEGIN IMMEDIATE")
 
-        root_active_before = {
-            str(row["id"])
-            for row in con.execute(
-                "SELECT id FROM triples WHERE valid_to IS NULL AND id IN (%s)"
-                % ",".join("?" for _ in roots),
-                roots,
-            ).fetchall()
-        } if roots else set()
-        root_support_active_before = {
-            str(row["triple_id"])
-            for row in con.execute(
-                "SELECT DISTINCT triple_id FROM kg_triple_supports s"
-                " WHERE s.triple_id IN (%s) AND %s"
-                % (",".join("?" for _ in roots), SUPPORT_ACTIVE_NOW_SQL),
-                roots,
-            ).fetchall()
-        } if roots else set()
-
+        roots_ended = []
         for root_id in roots:
-            con.execute(
+            cur = con.execute(
                 "UPDATE triples SET valid_to=? WHERE id=? AND valid_to IS NULL",
                 (ended_at, root_id),
             )
+            if not cur.rowcount:
+                continue
+            roots_ended.append(root_id)
             con.execute(
                 f"""
                 UPDATE kg_triple_supports
@@ -1556,49 +1834,16 @@ def invalidate_triples_cascade(palace_path: str, root_triple_ids: list[str], end
                 (ended_at, root_id),
             )
 
-        _, derivations_by_conclusion, derivations_by_premise = _load_derivation_graph(con)
+        plan = _cascade_plan(con, roots_ended)
+        for support_id in plan["lost_supports"]:
+            con.execute(
+                f"UPDATE kg_triple_supports SET ended_at=? WHERE support_id=? "
+                f"AND {_active_support_clause()}",
+                (ended_at, support_id),
+            )
 
-        affected: set[str] = set()
-        queue = deque(roots)
-        while queue:
-            premise_id = queue.popleft()
-            for derivation in derivations_by_premise.get(str(premise_id), []):
-                conclusion_id = str(derivation["conclusion_triple_id"])
-                if conclusion_id not in affected:
-                    affected.add(conclusion_id)
-                    queue.append(conclusion_id)
-
-        triple_intervals = _active_triple_intervals(con)
-        active_triples = set(triple_intervals)
-        independently_asserted = {
-            triple_id
-            for triple_id in affected
-            if triple_id in active_triples and _is_independently_asserted(con, triple_id)
-        }
-        candidates = {
-            triple_id
-            for triple_id in affected
-            if triple_id in active_triples and triple_id not in independently_asserted
-        }
-
-        grounded = set(active_triples - candidates)
-        grounded.update(independently_asserted)
-
-        changed = True
-        while changed:
-            changed = False
-            for triple_id in sorted(candidates - grounded):
-                for derivation in derivations_by_conclusion.get(triple_id, []):
-                    premise_ids = list(derivation["premise_ids"])
-                    if not _premise_interval_nonempty(triple_intervals, premise_ids):
-                        continue
-                    if all(premise_id in active_triples and premise_id in grounded for premise_id in premise_ids):
-                        grounded.add(triple_id)
-                        changed = True
-                        break
-
-        to_end = sorted(candidates - grounded)
-        for triple_id in to_end:
+        cascaded = []
+        for triple_id in plan["to_end"]:
             con.execute(
                 f"""
                 UPDATE kg_triple_supports
@@ -1620,24 +1865,27 @@ def invalidate_triples_cascade(palace_path: str, root_triple_ids: list[str], end
                 (triple_id,),
             ).fetchone()
             if has_active_support is None:
-                con.execute(
+                cur = con.execute(
                     "UPDATE triples SET valid_to=? WHERE id=? AND valid_to IS NULL",
                     (ended_at, triple_id),
                 )
+                if cur.rowcount:
+                    cascaded.append(triple_id)
 
-        survived = sorted(candidates & grounded)
-        roots_ended = sorted(root_active_before | root_support_active_before)
-        con.commit()
+        if _connection is None:
+            con.commit()
         return {
-            "roots_ended": roots_ended,
-            "cascade_invalidated": to_end,
-            "survived_by_alternate_proof": survived,
+            "roots_ended": sorted(roots_ended),
+            "cascade_invalidated": cascaded,
+            "survived_by_alternate_proof": plan["survived"],
         }
     except Exception:
-        con.rollback()
+        if _connection is None:
+            con.rollback()
         raise
     finally:
-        con.close()
+        if _connection is None:
+            con.close()
 
 
 def kg_source_degree(palace_path: str) -> dict[str, int]:
@@ -1716,17 +1964,8 @@ def kg_protection_degree(palace_path: str) -> dict[str, int]:
 class MempalaceWriter:
     """Writes through the sanctioned MCP tool handlers against the bound palace."""
 
-    def __init__(self) -> None:
-        # Importing the MCP server redirects Python and native stdout for its
-        # own protocol loop. Embedded callers do not run that restoration loop.
-        stdout, fd = sys.stdout, os.dup(1)
-        try:
-            from mempalace import mcp_server  # lazy
-        finally:
-            os.dup2(fd, 1)
-            os.close(fd)
-            sys.stdout = stdout
-
+    def __init__(self, palace_path: str | None = None) -> None:
+        mcp_server = _embedded_mcp_server(palace_path)
         self._server = mcp_server
         self._tools = mcp_server.TOOLS
         self.palace_path = os.path.realpath(os.path.expanduser(mcp_server._config.palace_path))
@@ -1795,10 +2034,13 @@ class MempalaceWriter:
 
 class MempalaceTunneler:
     """Creates room-to-room tunnels via the sanctioned MCP handler."""
-    def __init__(self) -> None:
-        from mempalace.mcp_server import TOOLS  # lazy
-        self._tools = TOOLS
+    def __init__(self, palace_path: str | None = None) -> None:
+        self._server = _embedded_mcp_server(palace_path)
+        self._tools = self._server.TOOLS
+        self.palace_path = os.path.realpath(os.path.expanduser(self._server._config.palace_path))
     def create_tunnel(self, source_wing, source_room, target_wing, target_room, label):
+        if os.path.realpath(os.path.expanduser(self._server._config.palace_path)) != self.palace_path:
+            raise RuntimeError("MCP palace binding changed after tunneler construction")
         return self._tools["mempalace_create_tunnel"]["handler"](
             source_wing=source_wing, source_room=source_room,
             target_wing=target_wing, target_room=target_room, label=label)
@@ -1925,18 +2167,93 @@ class KgWriter:
     def invalidate_triples(self, triple_ids: list[str], ended: str | None = None) -> int:
         if not os.path.exists(self._db_path):
             return 0
-        ended_at = ended or datetime.now(timezone.utc).isoformat()
+        result = invalidate_triples_cascade(
+            self._db_path, triple_ids, ended or datetime.now(timezone.utc).isoformat())
+        return len(result["roots_ended"])
+
+    def supersede(
+        self, subject, predicate, old_object, new_object, *,
+        old_triple_ids, keep_triple_ids, at=None,
+    ) -> dict:
+        """Retire exact contradictory facts without asserting a new successor."""
+        for ids in (old_triple_ids, keep_triple_ids):
+            if (not isinstance(ids, list) or not ids
+                    or any(not isinstance(tid, str) or not tid for tid in ids)
+                    or len(set(ids)) != len(ids)):
+                raise ValueError("supersede requires nonempty unique exact triple IDs")
+        if set(old_triple_ids) & set(keep_triple_ids):
+            raise ValueError("supersede old and kept IDs must be disjoint")
+        ended_at = _utc_now_iso(at)
         con = sqlite3.connect(self._db_path)
+        con.row_factory = sqlite3.Row
         try:
-            count = 0
-            for triple_id in triple_ids:
-                cur = con.execute(
-                    "UPDATE triples SET valid_to=? WHERE id=? AND valid_to IS NULL",
-                    (ended_at, triple_id),
-                )
-                count += cur.rowcount
+            con.execute("PRAGMA busy_timeout = 5000")
+            con.execute("BEGIN IMMEDIATE")
+
+            def entity_id(selector):
+                rows = con.execute(
+                    "SELECT id FROM entities WHERE id=? OR name=?",
+                    (selector, selector),
+                ).fetchall()
+                if len(rows) != 1:
+                    raise ValueError(f"unknown or ambiguous entity: {selector!r}")
+                return str(rows[0]["id"])
+
+            subject_id = entity_id(subject)
+            old_id, new_id = entity_id(old_object), entity_id(new_object)
+            if old_id == new_id:
+                raise ValueError("supersede requires distinct canonical objects")
+            pred = normalize_predicate(predicate)
+            for ids, expected_object in ((old_triple_ids, old_id), (keep_triple_ids, new_id)):
+                for tid in ids:
+                    row = con.execute("SELECT * FROM triples WHERE id=?", (tid,)).fetchone()
+                    if (row is None or row["valid_to"] is not None
+                            or str(row["subject"]) != subject_id
+                            or row["predicate"] != pred or str(row["object"]) != expected_object):
+                        raise ValueError(f"supersede target missing, inactive or drifted: {tid}")
+
+            if not _has_table(con, "kg_triple_supports"):
+                raise ValueError("supersede requires successor support provenance")
+            kept_supports = {}
+            for tid in keep_triple_ids:
+                supports = con.execute(
+                    f"SELECT * FROM kg_triple_supports WHERE triple_id=? AND {_active_support_clause()} "
+                    "ORDER BY support_id", (tid,),
+                ).fetchall()
+                if not any(
+                    (s["status"], s["source_trust"]) in ALLOWED_PREMISE_PAIRS
+                    and s["inherited_status"] in TRUSTED_STATUSES
+                    and s["conditional_on_triple_ids"] == "[]" and s["scope"] == "durable"
+                    for s in supports
+                ):
+                    raise ValueError(f"supersede successor has no durable support: {tid}")
+                kept_supports[tid] = [tuple(s) for s in supports]
+
+            plan = _cascade_plan(con, old_triple_ids)
+            if (set(keep_triple_ids).intersection(plan["to_end"])
+                    or any(s[0] in plan["lost_supports"] for rows in kept_supports.values() for s in rows)):
+                raise ValueError("supersede would change kept support provenance")
+            result = invalidate_triples_cascade(
+                self._db_path, old_triple_ids, ended_at, _connection=con)
+            for tid, before in kept_supports.items():
+                row = con.execute("SELECT valid_to FROM triples WHERE id=?", (tid,)).fetchone()
+                after = con.execute(
+                    f"SELECT * FROM kg_triple_supports WHERE triple_id=? AND {_active_support_clause()} "
+                    "ORDER BY support_id", (tid,),
+                ).fetchall()
+                if row["valid_to"] is not None or [tuple(s) for s in after] != before:
+                    raise ValueError(f"supersede would change kept support provenance: {tid}")
             con.commit()
-            return count
+            return {
+                "invalidated": len(result["roots_ended"]),
+                "retired_ids": result["roots_ended"],
+                "kept_ids": list(keep_triple_ids),
+                "cascaded_ids": result["cascade_invalidated"],
+                "survived_ids": result["survived_by_alternate_proof"],
+            }
+        except Exception:
+            con.rollback()
+            raise
         finally:
             con.close()
 

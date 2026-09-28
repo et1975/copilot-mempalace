@@ -5,10 +5,12 @@ import os
 import hashlib
 import json
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import types
 import unittest
+from unittest.mock import patch
 
 import dream_palace
 from test_dream_procedural_palace import DrawerCollection, installed_palace
@@ -673,6 +675,344 @@ class TestKgWriter(unittest.TestCase):
                 sys.modules["mempalace.knowledge_graph"] = original_kg_module
 
 
+class TestKgWriterProvenance(unittest.TestCase):
+    def setUp(self):
+        self.tmp = _test_tmpdir()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = self.tmp.name
+        self.db = os.path.join(self.path, "knowledge_graph.sqlite3")
+        with sqlite3.connect(self.db) as con:
+            con.executescript("""
+                CREATE TABLE entities (id TEXT PRIMARY KEY, name TEXT NOT NULL);
+                CREATE TABLE triples (
+                    id TEXT PRIMARY KEY, subject TEXT, predicate TEXT, object TEXT,
+                    valid_from TEXT, valid_to TEXT);
+                INSERT INTO entities VALUES
+                    ('s', 'Alice'), ('o', 'Portland'), ('n', 'Seattle');
+                INSERT INTO triples VALUES
+                    ('old', 's', 'lives_in', 'o', '2025-01-01', NULL),
+                    ('unselected', 's', 'lives_in', 'o', '2025-02-01', NULL),
+                    ('keep', 's', 'lives_in', 'n', '2026-01-01', NULL),
+                    ('child', 's', 'visits', 'o', '2025-01-01', NULL),
+                    ('survivor', 's', 'visits', 'n', '2025-01-01', NULL),
+                    ('ended', 's', 'lives_in', 'o', '2024-01-01', '2025-01-01');
+            """)
+        dream_palace.ensure_firewall_schema(self.db)
+        with sqlite3.connect(self.db) as con:
+            for tid in ("old", "unselected", "keep"):
+                con.execute("""
+                    INSERT INTO kg_triple_supports(
+                        support_id, triple_id, status, source_trust, inherited_status,
+                        source_ref, valid_from, created_at)
+                    VALUES (?, ?, 'asserted', 'verified_source', 'asserted',
+                            'original-evidence', '2025-01-01', '2025-01-01')
+                """, ("sup:" + tid, tid))
+            for candidate, conclusion, premise in (
+                ("child-proof", "child", "old"),
+                ("lost-proof", "survivor", "old"),
+                ("alternate-proof", "survivor", "keep"),
+            ):
+                con.execute("""
+                    INSERT INTO kg_derivations(candidate_id, conclusion_triple_id,
+                                               rule_id, premise_triple_ids)
+                    VALUES (?, ?, 'rule', ?)
+                """, (candidate, conclusion, json.dumps([premise])))
+                con.execute("""
+                    INSERT INTO kg_triple_supports(
+                        support_id, triple_id, status, source_trust, inherited_status,
+                        created_at)
+                    VALUES (?, ?, 'deduced', 'trusted_rule', 'deduced', '2025-01-01')
+                """, (dream_palace._derived_support_id(conclusion, "rule", candidate), conclusion))
+        self.writer = dream_palace.KgWriter.__new__(dream_palace.KgWriter)
+        self.writer._db_path = self.db
+
+    def snapshot(self):
+        with sqlite3.connect(self.db) as con:
+            return (
+                con.execute("SELECT * FROM triples ORDER BY id").fetchall(),
+                con.execute("SELECT * FROM kg_triple_supports ORDER BY support_id").fetchall(),
+            )
+
+    def supersede(self, **kwargs):
+        return self.writer.supersede(
+            kwargs.pop("subject", "Alice"), "lives_in",
+            kwargs.pop("old_object", "Portland"), kwargs.pop("new_object", "Seattle"),
+            old_triple_ids=kwargs.pop("old_triple_ids", ["old"]),
+            keep_triple_ids=kwargs.pop("keep_triple_ids", ["keep"]),
+            at="2026-09-28T12:00:00+00:00", **kwargs)
+
+    def test_invalidation_counts_only_active_roots_and_retires_dependent_supports(self):
+        count = self.writer.invalidate_triples(
+            ["old", "old", "missing", "ended"], ended="2026-09-28")
+        self.assertEqual(count, 1)
+        with sqlite3.connect(self.db) as con:
+            ended = dict(con.execute("SELECT id, valid_to FROM triples"))
+            supports = dict(con.execute("SELECT support_id, ended_at FROM kg_triple_supports"))
+        self.assertEqual(ended["child"], "2026-09-28")
+        self.assertIsNone(ended["survivor"])
+        self.assertEqual(supports["sup:old"], "2026-09-28")
+        lost = dream_palace._derived_support_id("survivor", "rule", "lost-proof")
+        alternate = dream_palace._derived_support_id("survivor", "rule", "alternate-proof")
+        self.assertEqual(supports[lost], "2026-09-28")
+        self.assertIsNone(supports[alternate])
+
+    def test_supersede_preserves_existing_successor_and_exact_evidence(self):
+        before_triples, before_supports = self.snapshot()
+        result = self.supersede()
+        self.assertEqual(result, {
+            "invalidated": 1, "retired_ids": ["old"], "kept_ids": ["keep"],
+            "cascaded_ids": ["child"], "survived_ids": ["survivor"],
+        })
+        after_triples, after_supports = self.snapshot()
+        self.assertEqual(len(after_triples), len(before_triples))
+        self.assertEqual(
+            [r for r in after_triples if r[0] in {"keep", "unselected"}],
+            [r for r in before_triples if r[0] in {"keep", "unselected"}])
+        self.assertEqual(
+            [r for r in after_supports if r[1] == "keep"],
+            [r for r in before_supports if r[1] == "keep"])
+        with sqlite3.connect(self.db) as con:
+            self.assertEqual(con.execute(
+                "SELECT COUNT(DISTINCT valid_to) FROM triples WHERE id IN ('old','child')"
+            ).fetchone()[0], 1)
+
+    def test_supersede_refuses_drift_missing_ids_and_unsupported_keep_without_writes(self):
+        for arguments in (
+            {"old_triple_ids": ["old", "missing"]},
+            {"old_triple_ids": ["ended"]},
+            {"old_triple_ids": ["old", "old"]},
+            {"keep_triple_ids": []},
+            {"keep_triple_ids": ["unselected"]},
+            {"old_object": "Seattle"},
+            {"new_object": "Portland"},
+        ):
+            with self.subTest(arguments=arguments):
+                before = self.snapshot()
+                with self.assertRaises(ValueError):
+                    self.supersede(**arguments)
+                self.assertEqual(self.snapshot(), before)
+        with sqlite3.connect(self.db) as con:
+            con.execute("DELETE FROM kg_triple_supports WHERE triple_id='keep'")
+        before = self.snapshot()
+        with self.assertRaisesRegex(ValueError, "support"):
+            self.supersede()
+        self.assertEqual(self.snapshot(), before)
+
+    def test_ambiguous_name_refused_but_canonical_ids_resolve(self):
+        with sqlite3.connect(self.db) as con:
+            con.execute("INSERT INTO entities VALUES ('other-s', 'Alice')")
+        before = self.snapshot()
+        with self.assertRaisesRegex(ValueError, "ambiguous"):
+            self.supersede()
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(self.supersede(subject="s", old_object="o", new_object="n")["invalidated"], 1)
+
+    def test_write_failure_rolls_back_roots_and_supports(self):
+        with sqlite3.connect(self.db) as con:
+            con.executescript("""
+                CREATE TRIGGER fail_cascade BEFORE UPDATE ON triples
+                WHEN NEW.id = 'child'
+                BEGIN SELECT RAISE(ABORT, 'injected cascade failure'); END;
+            """)
+        before = self.snapshot()
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "injected cascade failure"):
+            self.supersede()
+        self.assertEqual(self.snapshot(), before)
+
+    def test_ignored_root_update_reports_zero_and_preserves_support(self):
+        with sqlite3.connect(self.db) as con:
+            con.executescript("""
+                CREATE TRIGGER ignore_root BEFORE UPDATE ON triples
+                WHEN NEW.id = 'old'
+                BEGIN SELECT RAISE(IGNORE); END;
+            """)
+        before = self.snapshot()
+        self.assertEqual(self.writer.invalidate_triples(["old"], ended="2026-09-28"), 0)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_ended_alternate_support_cannot_rescue_a_dependent(self):
+        support_id = dream_palace._derived_support_id("survivor", "rule", "alternate-proof")
+        with sqlite3.connect(self.db) as con:
+            con.execute("UPDATE kg_triple_supports SET ended_at='2026-09-01' WHERE support_id=?",
+                        (support_id,))
+        result = self.supersede()
+        self.assertEqual(result["cascaded_ids"], ["child", "survivor"])
+        self.assertEqual(result["survived_ids"], [])
+
+    def test_kept_evidence_depending_on_retired_root_is_refused_before_updates(self):
+        with sqlite3.connect(self.db) as con:
+            con.execute("DELETE FROM kg_triple_supports WHERE triple_id='keep'")
+            con.execute("""
+                INSERT INTO kg_derivations(candidate_id, conclusion_triple_id, rule_id,
+                                           premise_triple_ids)
+                VALUES ('keep-proof', 'keep', 'rule', '["old"]')
+            """)
+            con.execute("""
+                INSERT INTO kg_triple_supports(
+                    support_id, triple_id, status, source_trust, inherited_status, created_at)
+                VALUES (?, 'keep', 'deduced', 'trusted_rule', 'deduced', '2026-01-01')
+            """, (dream_palace._derived_support_id("keep", "rule", "keep-proof"),))
+            con.executescript("""
+                CREATE TRIGGER no_mutation BEFORE UPDATE ON triples
+                BEGIN SELECT RAISE(ABORT, 'premature mutation'); END;
+            """)
+        before = self.snapshot()
+        with self.assertRaisesRegex(ValueError, "support|provenance"):
+            self.supersede()
+        self.assertEqual(self.snapshot(), before)
+
+    def legacy_support(self, triple_id, *, keep_specific=False):
+        support_id = "sup:legacy:" + triple_id
+        with sqlite3.connect(self.db) as con:
+            if not keep_specific:
+                con.execute("DELETE FROM kg_triple_supports WHERE triple_id=? AND status='deduced'",
+                            (triple_id,))
+            con.execute("""
+                INSERT INTO kg_triple_supports(
+                    support_id, triple_id, status, source_trust, inherited_status, created_at)
+                VALUES (?, ?, 'deduced', 'trusted_rule', 'deduced', '2025-01-01')
+            """, (support_id, triple_id))
+        return support_id
+
+    def test_legacy_and_specific_deductions_both_end_when_assertion_keeps_conclusion(self):
+        legacy_id = self.legacy_support("child", keep_specific=True)
+        with sqlite3.connect(self.db) as con:
+            con.execute("""
+                INSERT INTO kg_triple_supports(
+                    support_id, triple_id, status, source_trust, inherited_status, created_at)
+                VALUES ('independent-child', 'child', 'asserted', 'verified_source',
+                        'asserted', '2026-01-01')
+            """)
+        self.assertEqual(self.writer.invalidate_triples(["old"], ended="2026-09-28"), 1)
+        with sqlite3.connect(self.db) as con:
+            supports = dict(con.execute(
+                "SELECT support_id, ended_at FROM kg_triple_supports WHERE triple_id='child'"))
+            self.assertEqual(supports[legacy_id], "2026-09-28")
+            self.assertEqual(supports[
+                dream_palace._derived_support_id("child", "rule", "child-proof")], "2026-09-28")
+            self.assertIsNone(supports["independent-child"])
+
+    def test_legacy_deduction_ends_while_independent_assertion_survives(self):
+        legacy_id = self.legacy_support("child")
+        with sqlite3.connect(self.db) as con:
+            con.execute("""
+                INSERT INTO kg_triple_supports(
+                    support_id, triple_id, status, source_trust, inherited_status, created_at)
+                VALUES ('independent-child', 'child', 'asserted', 'verified_source',
+                        'asserted', '2026-01-01')
+            """)
+        self.assertEqual(self.writer.invalidate_triples(["old"], ended="2026-09-28"), 1)
+        with sqlite3.connect(self.db) as con:
+            self.assertIsNone(con.execute(
+                "SELECT valid_to FROM triples WHERE id='child'").fetchone()[0])
+            supports = dict(con.execute(
+                "SELECT support_id, ended_at FROM kg_triple_supports WHERE triple_id='child'"))
+            self.assertEqual(supports[legacy_id], "2026-09-28")
+            self.assertIsNone(supports["independent-child"])
+            con.execute("UPDATE kg_triple_supports SET ended_at='2026-09-29' "
+                        "WHERE support_id='independent-child'")
+            self.assertEqual(con.execute(
+                "SELECT COUNT(*) FROM kg_triple_supports WHERE triple_id='child' "
+                "AND ended_at IS NULL AND valid_to IS NULL").fetchone()[0], 0)
+
+    def test_shared_legacy_deduction_survives_until_last_grounded_derivation_is_lost(self):
+        legacy_id = self.legacy_support("survivor")
+        with sqlite3.connect(self.db) as con:
+            before = con.execute(
+                "SELECT * FROM kg_triple_supports WHERE support_id=?", (legacy_id,)).fetchone()
+        result = self.supersede()
+        self.assertEqual(result["invalidated"], 1)
+        self.assertEqual(result["cascaded_ids"], ["child"])
+        self.assertEqual(result["survived_ids"], ["survivor"])
+        with sqlite3.connect(self.db) as con:
+            self.assertEqual(con.execute(
+                "SELECT * FROM kg_triple_supports WHERE support_id=?", (legacy_id,)).fetchone(), before)
+        self.assertEqual(self.writer.invalidate_triples(["keep"], ended="2026-09-29"), 1)
+        with sqlite3.connect(self.db) as con:
+            self.assertEqual(con.execute(
+                "SELECT ended_at FROM kg_triple_supports WHERE support_id=?",
+                (legacy_id,)).fetchone()[0], "2026-09-29")
+            self.assertEqual(con.execute(
+                "SELECT valid_to FROM triples WHERE id='survivor'").fetchone()[0], "2026-09-29")
+
+    def test_kept_legacy_deduction_loss_is_refused_before_any_update(self):
+        self.legacy_support("keep")
+        with sqlite3.connect(self.db) as con:
+            con.execute("""
+                INSERT INTO kg_derivations(candidate_id, conclusion_triple_id, rule_id,
+                                           premise_triple_ids)
+                VALUES ('keep-legacy-proof', 'keep', 'rule', '["old"]')
+            """)
+            con.executescript("""
+                CREATE TRIGGER no_mutation BEFORE UPDATE ON triples
+                BEGIN SELECT RAISE(ABORT, 'premature mutation'); END;
+            """)
+        before = self.snapshot()
+        with self.assertRaisesRegex(ValueError, "support|provenance"):
+            self.supersede()
+        self.assertEqual(self.snapshot(), before)
+
+    def test_legacy_assertion_is_not_retired_as_a_derived_support(self):
+        legacy_id = self.legacy_support("child")
+        with sqlite3.connect(self.db) as con:
+            con.execute(
+                "UPDATE kg_triple_supports SET status='asserted', source_trust='trusted_legacy', "
+                "inherited_status='asserted' WHERE support_id=?", (legacy_id,))
+            before = con.execute(
+                "SELECT * FROM kg_triple_supports WHERE support_id=?", (legacy_id,)).fetchone()
+        self.assertEqual(self.writer.invalidate_triples(["old"], ended="2026-09-28"), 1)
+        with sqlite3.connect(self.db) as con:
+            self.assertEqual(con.execute(
+                "SELECT * FROM kg_triple_supports WHERE support_id=?", (legacy_id,)).fetchone(), before)
+            self.assertIsNone(con.execute(
+                "SELECT valid_to FROM triples WHERE id='child'").fetchone()[0])
+
+    def test_external_aggregate_support_preserves_a_grounded_alternate_proof(self):
+        legacy_id = self.legacy_support("survivor")
+        with sqlite3.connect(self.db) as con:
+            con.execute("UPDATE kg_triple_supports SET support_id='external-evidence' WHERE support_id=?",
+                        (legacy_id,))
+            before = con.execute(
+                "SELECT * FROM kg_triple_supports WHERE support_id='external-evidence'").fetchone()
+        result = self.supersede()
+        self.assertEqual(result["cascaded_ids"], ["child"])
+        self.assertEqual(result["survived_ids"], ["survivor"])
+        with sqlite3.connect(self.db) as con:
+            self.assertEqual(con.execute(
+                "SELECT * FROM kg_triple_supports WHERE support_id='external-evidence'").fetchone(),
+                before)
+
+    def test_external_kept_proof_loss_is_refused_before_any_update(self):
+        legacy_id = self.legacy_support("keep")
+        with sqlite3.connect(self.db) as con:
+            con.execute("UPDATE kg_triple_supports SET support_id='external-evidence' WHERE support_id=?",
+                        (legacy_id,))
+            con.execute("""
+                INSERT INTO kg_derivations(candidate_id, conclusion_triple_id, rule_id,
+                                           premise_triple_ids)
+                VALUES ('keep-external-proof', 'keep', 'rule', '["old"]')
+            """)
+            con.executescript("""
+                CREATE TRIGGER no_mutation BEFORE UPDATE ON triples
+                BEGIN SELECT RAISE(ABORT, 'premature mutation'); END;
+            """)
+        before = self.snapshot()
+        with self.assertRaisesRegex(ValueError, "support|provenance"):
+            self.supersede()
+        self.assertEqual(self.snapshot(), before)
+
+    def test_external_unknown_support_does_not_invent_trust(self):
+        legacy_id = self.legacy_support("survivor")
+        with sqlite3.connect(self.db) as con:
+            con.execute("UPDATE kg_triple_supports SET support_id='external-evidence' WHERE support_id=?",
+                        (legacy_id,))
+            con.execute("UPDATE kg_triple_supports SET source_trust='unknown' "
+                        "WHERE support_id='external-evidence'")
+        result = self.supersede()
+        self.assertEqual(result["cascaded_ids"], ["child", "survivor"])
+        self.assertEqual(result["survived_ids"], [])
+
+
 class TestKgDeriveWriterPathResolution(unittest.TestCase):
     def test_uses_home_level_db_path_when_palace_local_db_is_absent(self):
         original_mempalace = sys.modules.get("mempalace")
@@ -861,6 +1201,7 @@ class TestLoadDrawerById(unittest.TestCase):
                 sys.modules["mempalace.palace"] = original_palace_module
 
         self.assertEqual(drawer["id"], "logical-1")
+        self.assertEqual(drawer["member_ids"], ["chunk-1", "chunk-2"])
         self.assertEqual(drawer["text"], "first\nsecond")
         self.assertEqual(drawer["metadata"], {"parent_drawer_id": "logical-1", "chunk_index": 0, "wing": "wing", "room": "room"})
         self.assertEqual(drawer["embedding"], [2.0, 4.0])
@@ -892,6 +1233,303 @@ class TestLoadDrawerById(unittest.TestCase):
                 sys.modules.pop("mempalace.palace", None)
             else:
                 sys.modules["mempalace.palace"] = original_palace_module
+
+
+class TestNativeDuplicateAdapter(unittest.TestCase):
+    def setUp(self):
+        self.collection = DrawerCollection({
+            name: {"id": name, "text": name + " content",
+                   "metadata": {"wing": "w", "room": "r"}}
+            for name in ("a", "bridge", "b", "c")
+        })
+        self.collection.count = lambda: len(self.collection.rows)
+        self.result = {
+            "clusters": [{"drawer_ids": ["a", "bridge", "b", "c"], "size": 4, "pairs": [
+                {"a": "a", "b": "bridge", "distance": .01},
+                {"a": "bridge", "b": "b", "distance": .02},
+                {"a": "b", "b": "c", "distance": .03},
+            ]}],
+            "params": {"wing": "w", "room": None, "threshold": .1,
+                       "max_clusters": None, "neighbor_bound": 4},
+        }
+        self.calls = []
+
+        def find(**kwargs):
+            self.calls.append(kwargs)
+            return self.result
+
+        self.server = types.SimpleNamespace(
+            TOOLS={"mempalace_find_duplicates": {"handler": find}},
+            _config=types.SimpleNamespace(palace_path="/palace"))
+        self.addCleanup(patch.stopall)
+        patch.object(dream_palace, "_embedded_mcp_server",
+                     return_value=self.server, create=True).start()
+        from mempalace import palace
+        patch.object(palace, "get_collection", return_value=self.collection).start()
+
+    def scan(self, **kwargs):
+        return dream_palace.find_duplicate_clusters("/palace", wing="w", **kwargs)
+
+    def test_physical_exclusion_removes_bridge_and_rebuilds_components(self):
+        bridge = self.collection.rows.pop("bridge")
+        bridge["id"] = "bridge_chunk_000000"
+        bridge["metadata"].update(parent_drawer_id="bridge", chunk_index=0)
+        self.collection.rows[bridge["id"]] = bridge
+        result = self.scan(exclude_ids={"bridge_chunk_000000"})
+        self.assertEqual([[m["id"] for m in c["members"]] for c in result], [["b", "c"]])
+        self.assertEqual(result[0]["pair_sims"], [{"a": "b", "b": "c", "sim": .97}])
+
+    def test_cross_room_bridge_does_not_join_otherwise_disconnected_drawers(self):
+        self.collection.rows["bridge"]["metadata"]["room"] = "other"
+        result = self.scan(room="r", max_clusters=1)
+        self.assertEqual([[m["id"] for m in c["members"]] for c in result], [["b", "c"]])
+        self.assertIsNone(self.calls[0]["max_clusters"])
+        self.assertIsNone(self.calls[0]["room"])
+
+    def test_unscoped_rooms_are_partitioned_too(self):
+        self.collection.rows["bridge"]["metadata"]["room"] = "other"
+        self.assertEqual([[m["id"] for m in c["members"]] for c in self.scan()], [["b", "c"]])
+
+    def test_procedural_metadata_or_trailer_cannot_bridge_merge_candidates(self):
+        bridge = self.collection.rows["bridge"]
+        for trailer in (False, True):
+            with self.subTest(trailer=trailer):
+                if trailer:
+                    bridge["metadata"].pop("kind", None)
+                    bridge["text"] = 'bridge content\n\n<!--dreaming-meta: {"kind":"procedural_event"}-->'
+                else:
+                    bridge["metadata"]["kind"] = "procedural_event"
+                result = self.scan()
+                self.assertEqual([[m["id"] for m in c["members"]] for c in result], [["b", "c"]])
+
+    def test_procedural_room_is_never_an_actionable_merge_cluster(self):
+        for row in self.collection.rows.values():
+            row["metadata"]["room"] = "procedural"
+        self.assertEqual(self.scan(), [])
+
+    def test_native_failure_incompleteness_and_malformed_edges_are_explicit(self):
+        good = self.result
+        for bad in (
+            {"error": "broken native storage"},
+            {"clusters": [], "vector_disabled": True},
+            {**good, "truncated": True},
+            {**good, "params": {**good["params"], "neighbor_bound": 3}},
+            {**good, "params": {**good["params"], "wing": "different"}},
+            {"clusters": []},
+            {**good, "clusters": [{"drawer_ids": ["a", "b"], "pairs": [
+                {"a": "a", "b": "missing", "distance": .01}]}]},
+            {**good, "clusters": [{"drawer_ids": ["a", "b"], "pairs": [
+                {"a": "a", "b": "b", "distance": float("nan")}]}]},
+        ):
+            with self.subTest(bad=bad):
+                self.result = bad
+                with self.assertRaises((RuntimeError, ValueError)):
+                    self.scan()
+
+    def test_requested_cap_is_not_exhaustive_success(self):
+        self.result["clusters"] = [
+            {"drawer_ids": ["a", "bridge"], "pairs": [{"a": "a", "b": "bridge", "distance": .01}]},
+            {"drawer_ids": ["b", "c"], "pairs": [{"a": "b", "b": "c", "distance": .02}]},
+        ]
+        with self.assertRaisesRegex(RuntimeError, "bounded|incomplete|limit"):
+            self.scan(max_clusters=1)
+
+    def test_native_neighbor_limit_diagnostic_names_bound_scope_and_physical_count(self):
+        for index in range(509):
+            did = f"extra-{index}"
+            self.collection.rows[did] = {
+                "id": did, "text": "scope record", "metadata": {"wing": "w", "room": "r"}}
+        self.result["params"]["neighbor_bound"] = 512
+        with self.assertRaisesRegex(
+            RuntimeError, r"neighbor_bound=512.*physical_rows=513.*wing='w'.*room=None"
+        ):
+            self.scan()
+
+    def test_unrelated_palace_rows_do_not_exhaust_native_scope_bound(self):
+        for index in range(513):
+            did = f"outside-{index}"
+            self.collection.rows[did] = {
+                "id": did, "text": "outside record", "metadata": {"wing": "outside", "room": "r"}}
+        self.assertEqual(len(self.scan()), 1)
+
+    def test_canonical_handler_chunks_and_physical_ids_match_live_loader(self):
+        self.collection.rows = {
+            "a_chunk_000000": {"id": "a_chunk_000000", "text": "first",
+                "metadata": {"wing": "w", "room": "r", "parent_drawer_id": "a",
+                             "chunk_index": 0, "id_recipe": "v3", "added_by": "dreaming"}},
+            "a_chunk_000001": {"id": "a_chunk_000001", "text": "second",
+                "metadata": {"wing": "w", "room": "r", "parent_drawer_id": "a",
+                             "chunk_index": 1, "id_recipe": "v3", "added_by": "dreaming"}},
+            "b": {"id": "b", "text": "other", "metadata": {"wing": "w", "room": "r"}},
+        }
+        self.result["params"]["neighbor_bound"] = 3
+        self.result["clusters"] = [
+            {"drawer_ids": ["a", "b"], "pairs": [{"a": "a", "b": "b", "distance": .01}]}]
+        cluster = self.scan()[0]
+        self.assertEqual(cluster["members"][0]["text"], "firstsecond")
+        self.assertEqual(cluster["members"][0]["member_ids"],
+                         ["a_chunk_000000", "a_chunk_000001"])
+        live = dream_palace.load_drawer_by_id("/palace", "a_chunk_000001")
+        self.assertEqual(live["id"], "a")
+        self.assertEqual(live["text"], "firstsecond")
+        self.assertEqual(live["member_ids"], ["a_chunk_000000", "a_chunk_000001"])
+        self.assertEqual(live["content_hash"], hashlib.sha256(b"firstsecond").hexdigest())
+        harvested = {d["id"]: d for d in dream_palace.load_logical_drawers("/palace")}
+        self.assertEqual(harvested["a"]["text"], live["text"])
+        with _test_tmpdir() as path:
+            archive = dream_palace.Archiver(
+                path, collection=self.collection,
+                writer=types.SimpleNamespace(delete_drawer=self.collection.delete))
+            archive.archive_then_delete(cluster["members"][0])
+            with open(archive.archive_path, encoding="utf-8") as stream:
+                record = json.loads(stream.readline())
+            self.assertEqual(record["id"], "a")
+            self.assertEqual(record["member_ids"], ["a_chunk_000000", "a_chunk_000001"])
+            self.assertEqual([r["document"] for r in record["rows"]], ["first", "second"])
+            self.assertEqual(set(self.collection.rows), {"b"})
+
+
+class TestEmbeddedMcpBinding(unittest.TestCase):
+    def test_real_import_restores_python_stdout_and_descriptor_one(self):
+        with _test_tmpdir() as home:
+            env = {**os.environ, "HOME": home, "MEMPALACE_PALACE_PATH": home,
+                   "PYTHONPATH": os.path.dirname(dream_palace.__file__),
+                   "MEMPALACE_BACKEND": "sqlite_exact", "MEMPALACE_BACKEND_EXPLICIT": "sqlite_exact",
+                   "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"}
+            proc = subprocess.run(
+                [sys.executable, "-c",
+                 "import os, sys, dream_palace\n"
+                 "original = sys.stdout\n"
+                 "dream_palace.MempalaceTunneler()\n"
+                 "assert sys.stdout is original\n"
+                 "os.write(1, b'native-stdout\\n')\n"
+                 "print('python-stdout', flush=True)\n"],
+                env=env, capture_output=True, text=True, timeout=60)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout, "native-stdout\npython-stdout\n")
+
+    def test_sequential_explicit_binding_uses_second_palace_and_invalidates_old_writer(self):
+        with _test_tmpdir() as first, _test_tmpdir() as second, installed_palace(first) as server:
+            old = dream_palace.MempalaceWriter()
+            old.add_drawer("w", "r", "first palace")
+            new = dream_palace.MempalaceWriter(second)
+            self.assertEqual(os.path.realpath(server._config.palace_path), second)
+            new.add_drawer("w", "r", "second palace")
+            with self.assertRaisesRegex(RuntimeError, "binding"):
+                old.add_drawer("w", "r", "misdirected")
+            self.assertEqual([d["text"] for d in dream_palace.load_logical_drawers(first)],
+                             ["first palace"])
+            self.assertEqual([d["text"] for d in dream_palace.load_logical_drawers(second)],
+                             ["second palace"])
+
+    def test_real_native_discovery_returns_canonical_scoped_drawers(self):
+        with _test_tmpdir() as path, installed_palace(path):
+            from mempalace.palace import get_collection
+            collection = get_collection(path)
+            text = "Shared native duplicate fixture with grounded project evidence."
+            collection.add(
+                ids=["native-a", "native-b", "outside"],
+                documents=[text, text, text],
+                metadatas=[{"wing": "w", "room": "r"}, {"wing": "w", "room": "r"},
+                           {"wing": "elsewhere", "room": "r"}])
+            result = dream_palace.find_duplicate_clusters(path, wing="w", room="r")
+            self.assertEqual([[m["id"] for m in c["members"]] for c in result],
+                             [["native-a", "native-b"]])
+            self.assertEqual(result[0]["members"][0]["text"], text)
+            self.assertEqual(result[0]["members"][0]["member_ids"], ["native-a"])
+
+    def test_real_native_usage_reads_151_drawers_without_metadata_changes(self):
+        with _test_tmpdir() as path, installed_palace(path):
+            from mempalace.palace import get_collection
+            written = dream_palace.MempalaceWriter().add_drawer("w", "r", "native usage fixture")
+            collection = get_collection(path)
+            seed = collection.get(ids=[written["drawer_id"]], include=["embeddings"])
+            ids = [f"used-{i:03}" for i in range(151)]
+            collection.add(
+                ids=ids, documents=["native usage fixture"] * 151,
+                embeddings=[list(seed["embeddings"][0])] * 151,
+                metadatas=[{"wing": "w", "room": "r", "access_count": i + 1,
+                            "strength": 3., "stability": 2., "last_activated": "2099-01-01"}
+                           for i in range(151)])
+            before = collection.get(include=["metadatas"])
+            usage = dream_palace.load_drawer_usage(path, wing="w", room="r")
+            self.assertEqual(len(usage), 151)
+            self.assertEqual(usage["used-150"], {
+                "access_count": 151, "strength": 3., "stability": 2., "last_activated": "2099-01-01"})
+            after = get_collection(path).get(include=["metadatas"])
+            self.assertEqual(dict(zip(after["ids"], after["metadatas"])),
+                             dict(zip(before["ids"], before["metadatas"])))
+
+
+class TestDrawerUsage(unittest.TestCase):
+    def setUp(self):
+        self.collection = DrawerCollection()
+        self.collection.count = lambda: len(self.collection.rows)
+        from mempalace import palace
+        self.storage_patch = patch.object(palace, "get_collection", return_value=self.collection)
+        self.storage_patch.start()
+        self.addCleanup(self.storage_patch.stop)
+
+    def put(self, did, **metadata):
+        self.collection.rows[did] = {
+            "id": did, "text": "evidence",
+            "metadata": {"wing": "w", "room": "r", **metadata}}
+
+    def test_reads_more_than_100_records_and_short_pages_without_mutation(self):
+        for i in range(151):
+            self.put(f"used-{i:03}", access_count=i, strength=3., stability=2.,
+                     last_activated="2099-01-01T00:00:00Z")
+        self.put("out-of-scope", room="other", access_count=3)
+        before = json.dumps(self.collection.rows, sort_keys=True)
+        original_get = self.collection.get
+
+        def capped_get(**kwargs):
+            kwargs["limit"] = 17
+            return original_get(**kwargs)
+
+        self.collection.get = capped_get
+        usage = dream_palace.load_drawer_usage("/palace", wing="w", room="r")
+        self.assertEqual(len(usage), 151)
+        self.assertEqual(usage["used-150"], {
+            "access_count": 150, "strength": 3., "stability": 2.,
+            "last_activated": "2099-01-01T00:00:00Z"})
+        self.assertEqual(json.dumps(self.collection.rows, sort_keys=True), before)
+
+    def test_chunk_telemetry_uses_conservative_maxima_not_first_chunk_or_sum(self):
+        self.put("chunk-0", parent_drawer_id="logical", chunk_index=0,
+                 access_count=2, strength=1., stability=7., last_activated="2099-01-01")
+        self.put("chunk-1", parent_drawer_id="logical", chunk_index=1,
+                 access_count=8, strength=4., stability=2., last_activated="2099-02-01")
+        self.assertEqual(dream_palace.load_drawer_usage("/palace"), {"logical": {
+            "access_count": 8, "strength": 4., "stability": 7., "last_activated": "2099-02-01"}})
+
+    def test_native_lazy_decay_is_applied_without_potentiation(self):
+        self.put("old", access_count=5, strength=4., stability=1.,
+                 last_activated="2000-01-01T00:00:00Z")
+        usage = dream_palace.load_drawer_usage("/palace")["old"]
+        self.assertEqual(usage["strength"], .05)
+        self.assertEqual(usage["access_count"], 5)
+        self.assertEqual(usage["last_activated"], "2000-01-01T00:00:00Z")
+        self.assertEqual(self.collection.rows["old"]["metadata"]["strength"], 4.)
+
+    def test_unavailable_telemetry_does_not_manufacture_a_recent_activation(self):
+        self.put("legacy")
+        self.put("partial", strength=3.)
+        usage = dream_palace.load_drawer_usage("/palace")
+        self.assertEqual(usage, {"partial": {"strength": 3.}})
+
+    def test_invalid_present_telemetry_is_never_defaulted_or_omitted(self):
+        for key, value in (
+            ("access_count", -1), ("access_count", 1.2), ("access_count", True),
+            ("strength", float("nan")), ("strength", -1), ("strength", "strong"),
+            ("stability", 0), ("stability", float("inf")),
+            ("last_activated", "not-a-date"), ("last_activated", None),
+        ):
+            with self.subTest(key=key, value=value):
+                self.collection.rows.clear()
+                self.put("bad", **{key: value})
+                with self.assertRaisesRegex(ValueError, "telemetry"):
+                    dream_palace.load_drawer_usage("/palace")
 
 
 class OntologyLoaderTests(unittest.TestCase):

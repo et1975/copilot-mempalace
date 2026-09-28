@@ -17,20 +17,21 @@ import argparse
 from datetime import datetime
 import hashlib
 import json
+import math
 import os
 import sys
 
 import dream_ontology
 import dream_palace
 from dream_metadata import is_generated_observation
-from dream_procedural_palace import exclude_protected_drawers
+from dream_procedural_palace import exclude_protected_drawers, live_protected_drawer_ids
 from dream_lib import (
+    WORKLIST_VERSION,
     build_contradiction_worklist,
     build_gap_worklist,
     build_pattern_worklist,
     build_prune_worklist,
     build_reflect_worklist,
-    build_worklist,
     compute_redundancy,
     deductive_closure,
     drawer_salience,
@@ -41,6 +42,9 @@ from dream_lib import (
     ontology_version,
     select_prune_candidates,
 )
+
+DEFAULT_V_MIN = 0.35
+DEFAULT_AGE_FLOOR_DAYS = 30
 
 def _content_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
@@ -82,6 +86,55 @@ def _degree_for(drawer: dict, degrees: dict[str, int]) -> int:
     return sum(degrees.get(drawer_id, 0) for drawer_id in ids)
 
 
+def score_prune_drawers(drawers: list[dict], degrees: dict[str, int],
+                        usage: dict[str, dict]) -> list[dict]:
+    """Score the current scoped population, including topic-retention context."""
+    redundancy = compute_redundancy(drawers)
+    now = datetime.now()
+    scored = []
+    for drawer in drawers:
+        metadata = drawer.get("metadata") or {}
+        scoring_input = {**drawer, "filed_at": metadata.get("filed_at", drawer.get("filed_at"))}
+        scored.append({
+            **drawer,
+            "salience": drawer_salience(
+                scoring_input, redundancy[drawer["id"]], _degree_for(drawer, degrees),
+                now=now, usage=usage.get(drawer["id"])),
+            "pinned": metadata.get("pinned", False),
+        })
+    return scored
+
+
+def harvest_merge_worklist(path: str, *, wing: str | None = None,
+                           room: str | None = None, tau: float = 0.9,
+                           instructions: str | None = None) -> dict:
+    """The exhaustive actionable merge pipeline shared by all CLI entry points."""
+    if not math.isfinite(tau) or not 0 <= tau <= 1:
+        raise ValueError("merge tau must be finite and between zero and one")
+    clusters = dream_palace.find_duplicate_clusters(
+        path, wing=wing, room=room, threshold=1 - tau,
+        exclude_ids=live_protected_drawer_ids(path))
+    items = []
+    for cluster in clusters:
+        members = cluster["members"]
+        items.append({
+            "kind": "merge",
+            "cluster_id": len(items),
+            "members": [{key: value for key, value in member.items() if key != "embedding"}
+                        for member in members],
+            "supersedes": [pid for member in members for pid in member["member_ids"]],
+            "evidence": {"pair_sims": cluster["pair_sims"], "size": len(members)},
+            "decision": None,
+        })
+    worklist = {
+        "version": WORKLIST_VERSION, "task": "merge",
+        "scope": {"palace": path, "wing": wing, "room": room},
+        "params": {"tau": tau}, "instructions": instructions, "items": items,
+    }
+    _stamp_merge_hashes(worklist)
+    return worklist
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--palace", help="Path to the mempalace palace directory (default: mempalace config)")
@@ -95,9 +148,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="Cosine-similarity threshold; defaults to 0.9 for merge and 0.75 for pattern")
     ap.add_argument("--min-support", type=int, default=None,
                     help="Minimum support for pattern themes (default 3) or induced ontology rules (default 2)")
-    ap.add_argument("--v-min", type=float, default=0.35,
+    ap.add_argument("--v-min", type=float, default=DEFAULT_V_MIN,
                     help="Maximum salience value for prune candidates (default 0.35)")
-    ap.add_argument("--age-floor-days", type=int, default=30,
+    ap.add_argument("--age-floor-days", type=int, default=DEFAULT_AGE_FLOOR_DAYS,
                     help="Minimum drawer age for prune candidates (default 30)")
     ap.add_argument("--rooms", default="diary",
                     help=(
@@ -160,24 +213,8 @@ def main(argv: list[str] | None = None) -> int:
         drawers = dream_palace.load_logical_drawers(path, wing=args.wing, room=args.room)
         drawers = exclude_protected_drawers(path, drawers)
         degrees = dream_palace.kg_protection_degree(path)
-        redundancy = compute_redundancy(drawers)
-        now = datetime.now()
-        scored = []
-        for drawer in drawers:
-            metadata = drawer.get("metadata") or {}
-            drawer_for_salience = {**drawer, "filed_at": metadata.get("filed_at", drawer.get("filed_at"))}
-            scored.append(
-                {
-                    **drawer,
-                    "salience": drawer_salience(
-                        drawer_for_salience,
-                        redundancy[drawer["id"]],
-                        _degree_for(drawer, degrees),
-                        now=now,
-                    ),
-                    "pinned": metadata.get("pinned", False),
-                }
-            )
+        usage = dream_palace.load_drawer_usage(path, wing=args.wing, room=args.room)
+        scored = score_prune_drawers(drawers, degrees, usage)
         candidates = select_prune_candidates(
             scored,
             v_min=args.v_min,
@@ -332,15 +369,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     tau = args.tau if args.tau is not None else 0.9
-    drawers = dream_palace.load_logical_drawers(path, args.wing, args.room)
-    drawers = exclude_protected_drawers(path, drawers)
-    worklist = build_worklist(
-        drawers,
-        tau=tau,
-        scope={"palace": path, "wing": args.wing, "room": args.room},
-        instructions=args.instructions,
-    )
-    _stamp_merge_hashes(worklist)
+    worklist = harvest_merge_worklist(
+        path, wing=args.wing, room=args.room, tau=tau, instructions=args.instructions)
 
     with open(args.out, "w", encoding="utf-8") as fh:
         json.dump(worklist, fh, indent=2, ensure_ascii=False)
@@ -348,7 +378,7 @@ def main(argv: list[str] | None = None) -> int:
     n_items = len(worklist["items"])
     n_drawers = sum(item["evidence"]["size"] for item in worklist["items"])
     print(
-        f"harvested {len(drawers)} logical drawers -> {n_items} merge cluster(s) "
+        f"harvested {n_items} merge cluster(s) "
         f"covering {n_drawers} drawers -> {args.out}",
         file=sys.stderr,
     )

@@ -258,6 +258,31 @@ def _clamp01(value: float) -> float:
     return max(0.0, min(1.0, value))
 
 
+def _validate_usage_number(value: Any, field: str) -> None:
+    if type(value) not in (int, float) or value < 0 or (
+        isinstance(value, float) and not math.isfinite(value)
+    ):
+        raise ValueError(f"usage {field} must be a finite nonnegative number")
+
+
+def _usage_protection(usage: dict[str, Any]) -> float:
+    count = usage.get("access_count", 0)
+    if type(count) is not int or count < 0:
+        raise ValueError("usage access_count must be a nonnegative integer")
+    for field in ("strength", "stability"):
+        if field in usage:
+            _validate_usage_number(usage[field], field)
+    activated = usage.get("last_activated")
+    if activated is not None and (
+        not isinstance(activated, str) or _parse_iso(activated) is None
+    ):
+        raise ValueError("usage last_activated must be an ISO timestamp or null")
+    if count == 0:
+        return 0.0
+    strength = _clamp01((min(usage.get("strength", 0.05), 5.0) - 0.05) / 4.95)
+    return (count / (count + 1) + strength) / 2
+
+
 def drawer_salience(
     drawer: dict[str, Any],
     redundancy: float,
@@ -265,8 +290,15 @@ def drawer_salience(
     now: datetime,
     half_life_days: float = 180.0,
     weights: dict[str, float] | None = None,
+    usage: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Score one drawer for pruning; lower ``v`` means weaker / more prunable."""
+    """Score one drawer for pruning; lower ``v`` means weaker / more prunable.
+
+    Optional usage is protection only, not evidence of usefulness. Positive
+    access averages bounded count ``n / (n + 1)`` and native strength normalized
+    from 0.05 to 5. Missing or zero-access usage leaves the original score intact.
+    Stability and activation time are validated and retained, not scored.
+    """
     age_days = _age_days(drawer.get("filed_at"), now)
     negatives = _detect_ephemeral(drawer.get("text", ""))
     recency = math.exp(-age_days / half_life_days) if half_life_days > 0.0 else 0.0
@@ -277,15 +309,23 @@ def drawer_salience(
         "kg_degree": 0.4,
         "redundancy": 0.3,
         "negatives": 0.5,
+        "usage": 0.2,
     }
     if weights is not None:
         w.update(weights)
+    if usage is None:
+        usage = {}
+    if not isinstance(usage, dict):
+        raise ValueError("usage must be a telemetry dictionary or null")
+    _validate_usage_number(w["usage"], "weight")
+    usage_boost = w["usage"] * _usage_protection(usage)
 
     v = _clamp01(
         w["recency"] * recency
         + w["kg_degree"] * deg
         - w["redundancy"] * _clamp01(redundancy)
         - (w["negatives"] if negatives else 0.0)
+        + usage_boost
     )
     return {
         "id": drawer["id"],
@@ -294,6 +334,8 @@ def drawer_salience(
         "redundancy": round(redundancy, 4),
         "negatives": negatives,
         "v": round(v, 4),
+        "usage": dict(usage),
+        "usage_boost": round(usage_boost, 4),
     }
 
 
@@ -789,35 +831,121 @@ def apply_pattern_decisions(decisions: list[dict[str, Any]], writer: Any, min_su
     return report
 
 
+def _distinct_triple_ids(value: Any) -> list:
+    if not isinstance(value, list) or any(
+        type(tid) not in (int, str) or (isinstance(tid, str) and not tid.strip())
+        for tid in value
+    ):
+        raise ValueError("triple IDs must be a list of integer or nonempty string IDs")
+    return list(dict.fromkeys(value))
+
+
+def _validate_root_rowcount(affected: Any, requested: list) -> int:
+    if type(affected) is not int or not 0 <= affected <= len(requested):
+        raise ValueError(f"invalid root rowcount: {affected!r}")
+    return affected
+
+
+def _validate_supersede_result(result: Any, requested: list, kept: list) -> None:
+    if not isinstance(result, dict):
+        raise ValueError("supersede must return a result dictionary")
+    affected = _validate_root_rowcount(result.get("invalidated"), requested)
+    ids = {}
+    for key in ("retired_ids", "kept_ids", "cascaded_ids", "survived_ids"):
+        distinct = _distinct_triple_ids(result.get(key))
+        if len(distinct) != len(result[key]):
+            raise ValueError(f"supersede {key} contains duplicate IDs")
+        ids[key] = set(distinct)
+    if affected != len(ids["retired_ids"]) or not ids["retired_ids"].issubset(requested):
+        raise ValueError("supersede root rowcount or retired IDs do not match requested roots")
+    if ids["kept_ids"] != set(kept):
+        raise ValueError("supersede kept IDs do not match selected successor")
+    roots = set(requested) | set(kept)
+    if (ids["cascaded_ids"] & roots or ids["survived_ids"] & ids["retired_ids"]
+            or ids["cascaded_ids"] & ids["survived_ids"]):
+        raise ValueError("supersede root/cascade or retired/surviving IDs overlap")
+
+
 def apply_contradiction_decisions(decisions: list[dict[str, Any]], writer: Any) -> dict[str, Any]:
-    """Execute approved KG triple invalidation decisions against ``writer``."""
+    """Retire selected KG roots, counting only validated writer outcomes.
+
+    Supersession identities must already be resolved by the caller. A partial
+    integer invalidation count cannot identify which roots retired, so it never
+    contributes guessed IDs to ``invalidated_facts``.
+    """
     report: dict[str, Any] = {
         "invalidated": 0,
         "skipped": 0,
         "invalidated_facts": [],
+        "superseded": [],
         "errors": [],
     }
     for d in decisions:
-        if d.get("action") != "invalidate":
+        action = d.get("action")
+        if action not in ("invalidate", "supersede"):
             report["skipped"] += 1
             continue
-        triple_ids = list(d.get("invalidate") or [])
-        if not triple_ids:
-            report["errors"].append({"stage": "groundedness", "error": "no triples selected", "decision": d})
+        try:
+            triple_ids = _distinct_triple_ids(d.get("invalidate", []))
+            if not triple_ids:
+                raise ValueError("no triples selected")
+            if action == "supersede":
+                for field in ("subject", "predicate", "old_object", "new_object"):
+                    if not isinstance(d.get(field), str) or not d[field].strip():
+                        raise ValueError(f"supersede requires canonical {field}")
+                kept_ids = _distinct_triple_ids(d.get("keep_triple_ids", []))
+                if not kept_ids or set(kept_ids) & set(triple_ids):
+                    raise ValueError("supersede requires distinct retired and kept triples")
+        except ValueError as exc:
+            report["errors"].append({"stage": "groundedness", "error": str(exc), "decision": d})
             continue
         try:
-            writer.invalidate_triples(triple_ids)
-            report["invalidated"] += len(triple_ids)
-            report["invalidated_facts"].extend({"triple_id": tid} for tid in triple_ids)
+            if action == "supersede":
+                result = writer.supersede(
+                    d["subject"], d["predicate"], d["old_object"], d["new_object"],
+                    old_triple_ids=triple_ids, keep_triple_ids=kept_ids,
+                    **({"at": d["at"]} if "at" in d else {}),
+                )
+            else:
+                result = writer.invalidate_triples(triple_ids)
         except Exception as exc:  # noqa: BLE001 - record and continue, stay soft
             report["errors"].append(
                 {
-                    "stage": "invalidate",
+                    "stage": action,
                     "error": str(exc),
                     "triple_ids": triple_ids,
                     "decision": d,
                 }
             )
+            continue
+        try:
+            if action == "supersede":
+                _validate_supersede_result(result, triple_ids, kept_ids)
+                affected = result["invalidated"]
+                retired_ids = result["retired_ids"]
+                report["superseded"].append(result)
+            else:
+                affected = _validate_root_rowcount(result, triple_ids)
+                retired_ids = triple_ids if affected == len(triple_ids) else []
+        except ValueError as exc:
+            report["errors"].append({
+                "stage": "failed_adopt",
+                "error": str(exc),
+                "triple_ids": triple_ids,
+                "decision": d,
+            })
+            continue
+        report["invalidated"] += affected
+        report["invalidated_facts"].extend({"triple_id": tid} for tid in retired_ids)
+        if affected != len(triple_ids):
+            report["errors"].append({
+                "stage": "failed_adopt",
+                "error": f"{action} root rowcount shortfall",
+                "expected": len(triple_ids),
+                "actual": affected,
+                "triple_ids": triple_ids,
+                "decision": d,
+            })
     return report
 
 

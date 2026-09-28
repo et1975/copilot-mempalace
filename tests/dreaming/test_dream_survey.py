@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import os
 import tempfile
@@ -5,6 +7,7 @@ import unittest
 from unittest import mock
 
 import dream_survey as ds
+from test_dream_procedural_palace import installed_palace
 
 
 def _merge_worklist(n=1):
@@ -193,6 +196,31 @@ class TestDefaultPalace(unittest.TestCase):
 
             with mock.patch.dict(os.environ, {"MEMPALACE_CONFIG": config_path}):
                 self.assertIsNone(ds._default_palace())
+
+
+class TestSurveyInProcess(unittest.TestCase):
+    def test_actual_native_merge_survey_keeps_json_on_stdout(self):
+        from mempalace.palace import get_collection
+        with tempfile.TemporaryDirectory(dir=os.environ.get("DREAMING_TEST_TMPDIR")) as td, \
+             installed_palace(td):
+            get_collection(td).add(
+                ids=["a", "b"], documents=["Native survey evidence."] * 2,
+                metadatas=[{"wing": "w", "room": "r"}] * 2)
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
+                rc = ds.main(["--palace", td, "--tasks", "merge", "--wings", "w", "--format", "json"])
+            self.assertEqual(rc, 0)
+            report = json.loads(stdout.getvalue())
+            self.assertEqual(report["tasks"]["merge"]["total"], 1)
+            self.assertEqual(report["tasks"]["merge"]["by_wing"], {"w": 1})
+
+    def test_harvest_failure_preserves_its_diagnostic(self):
+        def failed(_):
+            print("native vector scan is incomplete", file=ds.sys.stderr)
+            return 2
+        with mock.patch.object(ds.dream_harvest, "main", side_effect=failed):
+            with self.assertRaisesRegex(RuntimeError, "native vector scan is incomplete"):
+                ds._run_main(["--task", "merge"])
 
 
 if __name__ == "__main__":

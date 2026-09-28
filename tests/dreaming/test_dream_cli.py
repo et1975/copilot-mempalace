@@ -13,7 +13,7 @@ from unittest import mock
 
 import dream_adopt
 import dream_harvest
-from test_dream_procedural_palace import DrawerCollection
+from test_dream_procedural_palace import DrawerCollection, installed_palace
 
 try:
     from mempalace.knowledge_graph import KnowledgeGraph as _RealKG
@@ -277,6 +277,8 @@ class TestHarvestPruneTask(unittest.TestCase):
     def setUp(self):
         self.enterContext(mock.patch.object(dream_harvest.dream_palace, "protection_collection",
                                            return_value=DrawerCollection()))
+        self.enterContext(mock.patch.object(dream_harvest.dream_palace, "load_drawer_usage",
+                                           create=True, return_value={}))
 
     def test_prune_task_writes_prune_worklist(self):
         drawers = [
@@ -520,10 +522,117 @@ class TestAdoptContradictionTask(unittest.TestCase):
         decisions = dream_adopt._resolve_contradiction_decisions(worklist)
 
         self.assertEqual(decisions, [
-            {"action": "invalidate", "subject": "Alice", "predicate": "lives_in",
-             "invalidate": ["t-pdx"]},
+            {"action": "supersede", "subject": "Alice", "predicate": "lives_in",
+             "old_object": "city-pdx", "new_object": "city-sea",
+             "invalidate": ["t-pdx"], "keep_triple_ids": ["t-sea"]},
             {"action": "skip"},
         ])
+
+    def _worklist(self, keep="Seattle", **decision):
+        return {"task": "contradiction", "items": [{
+            "subject": "Alice", "subject_id": "person-alice", "predicate": "lives_in",
+            "candidates": [
+                {"object": "Seattle", "object_id": "city-sea", "triple_ids": ["s1", "s2"]},
+                {"object": "Portland", "object_id": "city-pdx", "triple_ids": ["p1", "p2"]},
+            ],
+            "decision": {"action": "invalidate", "keep": keep, **decision},
+        }]}
+
+    def test_keep_selectors_resolve_canonical_identity_and_exact_retired_ids(self):
+        for keep in ("Seattle", "city-sea", "s1"):
+            with self.subTest(keep=keep):
+                result = dream_adopt._resolve_contradiction_decisions(
+                    self._worklist(keep, invalidate=["p1"]))
+                self.assertEqual(result, [{
+                    "action": "supersede", "subject": "person-alice", "predicate": "lives_in",
+                    "old_object": "city-pdx", "new_object": "city-sea",
+                    "invalidate": ["p1"], "keep_triple_ids": ["s1", "s2"],
+                }])
+
+    def test_bad_keep_selectors_refuse_before_any_write(self):
+        for keep in ("missing", None, "", [], {}, True):
+            with self.subTest(keep=keep), self.assertRaisesRegex(ValueError, "keep"):
+                dream_adopt._resolve_contradiction_decisions(self._worklist(keep))
+
+    def test_ambiguous_keep_selector_refuses(self):
+        worklist = self._worklist()
+        worklist["items"][0]["candidates"][1]["object"] = "Seattle"
+        with self.assertRaisesRegex(ValueError, "ambiguous"):
+            dream_adopt._resolve_contradiction_decisions(worklist)
+
+    def test_keep_requires_canonical_identity_even_for_multi_retire(self):
+        worklist = self._worklist("s1")
+        worklist["items"][0]["candidates"][0].update(object=None, object_id=None)
+        worklist["items"][0]["candidates"].append(
+            {"object": "Boston", "object_id": "city-bos", "triple_ids": ["b1"]})
+        with self.assertRaisesRegex(ValueError, "canonical"):
+            dream_adopt._resolve_contradiction_decisions(worklist)
+
+    def test_cannot_retire_kept_candidate_or_unknown_id(self):
+        for selected in (["s1"], ["unknown"], "p1"):
+            with self.subTest(selected=selected), self.assertRaises(ValueError):
+                dream_adopt._resolve_contradiction_decisions(
+                    self._worklist(invalidate=selected))
+
+    def test_legacy_explicit_ids_are_not_expanded(self):
+        worklist = self._worklist(invalidate=["p1", "p1"])
+        del worklist["items"][0]["decision"]["keep"]
+        result = dream_adopt._resolve_contradiction_decisions(worklist)
+        self.assertEqual(result[0]["action"], "invalidate")
+        self.assertEqual(result[0]["invalidate"], ["p1"])
+
+    def test_multi_old_resolution_stays_explicit_invalidation(self):
+        worklist = self._worklist()
+        worklist["items"][0]["candidates"].append(
+            {"object": "Boston", "object_id": "city-bos", "triple_ids": ["b1"]})
+        result = dream_adopt._resolve_contradiction_decisions(worklist)
+        self.assertEqual(result[0]["action"], "invalidate")
+        self.assertEqual(result[0]["invalidate"], ["p1", "p2", "b1"])
+
+    def test_actual_kg_supersession_keeps_original_successor_evidence(self):
+        for selector_kind in ("object", "object_id", "triple_id"):
+            with self.subTest(selector=selector_kind), _test_tmpdir() as td:
+                db = os.path.join(td, "knowledge_graph.sqlite3")
+                kg = _RealKG(db_path=db)
+                kg.add_triple("Alice", "lives_in", "Portland", valid_from="2020-01-01")
+                kg.add_triple("Alice", "lives_in", "Seattle", valid_from="2021-01-01")
+                kg.close()
+                dream_adopt.dream_palace.ensure_firewall_schema(db)
+                with sqlite3.connect(db) as con:
+                    tids = [row[0] for row in con.execute("SELECT id FROM triples")]
+                    for tid in tids:
+                        con.execute(
+                            "INSERT INTO kg_triple_supports "
+                            "(support_id,triple_id,status,source_trust,inherited_status,source_ref,created_at) "
+                            "VALUES (?,?,'asserted','verified_source','asserted','original evidence','2020-01-01')",
+                            ("support:" + tid, tid))
+                path = os.path.join(td, "wl.json")
+                with contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(dream_harvest.main([
+                        "--palace", td, "--task", "contradiction", "--out", path]), 0)
+                worklist = _load_json(path)
+                item = worklist["items"][0]
+                kept = next(c for c in item["candidates"] if c["object"] == "Seattle")
+                retired = next(c for c in item["candidates"] if c["object"] == "Portland")
+                with sqlite3.connect(db) as con:
+                    before = con.execute("SELECT * FROM triples WHERE id=?", (kept["triple_id"],)).fetchone()
+                    support = con.execute("SELECT * FROM kg_triple_supports WHERE triple_id=?",
+                                          (kept["triple_id"],)).fetchall()
+                item["decision"] = {"action": "invalidate", "keep": kept[selector_kind],
+                                    "invalidate": [retired["triple_id"]]}
+                _dump_json(path, worklist)
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    rc = dream_adopt.main(["--palace", td, "--decisions", path])
+                self.assertEqual(rc, 0, stderr.getvalue())
+                self.assertIn("invalidated 1", stderr.getvalue())
+                with sqlite3.connect(db) as con:
+                    self.assertEqual(con.execute("SELECT * FROM triples WHERE id=?",
+                                                 (kept["triple_id"],)).fetchone(), before)
+                    self.assertEqual(con.execute("SELECT * FROM kg_triple_supports WHERE triple_id=?",
+                                                 (kept["triple_id"],)).fetchall(), support)
+                    self.assertIsNotNone(con.execute("SELECT valid_to FROM triples WHERE id=?",
+                                                     (retired["triple_id"],)).fetchone()[0])
 
     def test_dry_run_prints_contradiction_invalidations(self):
         worklist = {
@@ -562,7 +671,8 @@ class TestAdoptContradictionTask(unittest.TestCase):
                 ])
 
             self.assertEqual(rc, 0)
-            self.assertIn("INVALIDATE_TRIPLES t-pdx", stdout.getvalue())
+            self.assertIn("SUPERSEDE", stdout.getvalue())
+            self.assertIn("t-pdx", stdout.getvalue())
             self.assertIn("[dry-run] would invalidate 1, skip 0", stderr.getvalue())
 
 
@@ -724,12 +834,6 @@ class TestAdoptMergeArchiveAndVerify(unittest.TestCase):
     def test_verify_reharvests_merge_and_reports_residual(self):
         report = {"merged": 1, "skipped": 0, "deleted": ["chunk-1", "chunk-2"], "errors": []}
 
-        def fake_harvest(argv):
-            out = argv[argv.index("--out") + 1]
-            with open(out, "w", encoding="utf-8") as fh:
-                json.dump({"task": "merge", "items": []}, fh)
-            return 0
-
         with _test_tmpdir() as td:
             decisions_path = os.path.join(td, "decisions.json")
             with open(decisions_path, "w", encoding="utf-8") as fh:
@@ -740,7 +844,8 @@ class TestAdoptMergeArchiveAndVerify(unittest.TestCase):
                  mock.patch.object(dream_adopt.dream_palace, "Archiver", return_value=mock.MagicMock()), \
                  mock.patch.object(dream_adopt, "_preflight_merge_decisions", side_effect=lambda p, d: (d, [])), \
                  mock.patch.object(dream_adopt, "apply_merge_decisions", return_value=report), \
-                 mock.patch.object(dream_adopt.dream_harvest, "main", side_effect=fake_harvest) as harvest_main, \
+                 mock.patch.object(dream_adopt.dream_harvest, "harvest_merge_worklist",
+                                   return_value={"task": "merge", "items": []}) as harvest_main, \
                  contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr):
                 rc = dream_adopt.main([
                     "--palace", td, "--decisions", decisions_path, "--verify",
@@ -748,10 +853,54 @@ class TestAdoptMergeArchiveAndVerify(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertIn("verify: 0 residual", stderr.getvalue())
             # re-harvest reconstructed the merge scope from the worklist
-            called_argv = harvest_main.call_args[0][0]
-            self.assertIn("--task", called_argv)
-            self.assertIn("merge", called_argv)
-            self.assertIn("--wing", called_argv)
+            harvest_main.assert_called_once_with(td, wing="wing", room="room", tau=.9)
+
+    def test_actual_chunked_merge_archive_roundtrip(self):
+        from mempalace.palace import get_collection
+        with _test_tmpdir() as td, installed_palace(td) as server:
+            writer = dream_adopt.dream_palace.MempalaceWriter()
+            common = "The cluster uses stable canonical identities and archives evidence. "
+            prefix = common * (server._config.chunk_size // len(common) + 2)
+            originals = [prefix + "First observation.", prefix + "Second observation."]
+            written = [writer.add_drawer("w", "r", text) for text in originals]
+            self.assertTrue(all(result["chunks"] > 1 for result in written))
+            decisions_path = os.path.join(td, "worklist.json")
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(dream_harvest.main([
+                    "--palace", td, "--wing", "w", "--room", "r", "--tau", ".8",
+                    "--out", decisions_path]), 0)
+            worklist = _load_json(decisions_path)
+            self.assertEqual(len(worklist["items"]), 1)
+            item = worklist["items"][0]
+            expected_ids = {pid for result in written for pid in result["chunk_ids"]}
+            self.assertEqual(set(item["supersedes"]), expected_ids)
+            self.assertEqual({m["text"] for m in item["members"]}, set(originals))
+            self.assertEqual(
+                {m["content_hash"] for m in item["members"]},
+                {hashlib.sha256(text.encode()).hexdigest() for text in originals})
+            item["decision"] = {"action": "merge", "text": "Canonical identity evidence was consolidated."}
+            _dump_json(decisions_path, worklist)
+            archive_path = os.path.join(td, "archive.jsonl")
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                rc = dream_adopt.main(["--palace", td, "--decisions", decisions_path,
+                                       "--archive-file", archive_path, "--verify", "--strict"])
+            self.assertEqual(rc, 0, stderr.getvalue())
+            self.assertIn("0 residual", stderr.getvalue())
+            with open(archive_path, encoding="utf-8") as fh:
+                archives = [json.loads(line) for line in fh]
+            rows = [row for archive in archives for row in archive["rows"]]
+            self.assertEqual({row["id"] for row in rows}, expected_ids)
+            self.assertTrue(all(archive["reason"] == "merge" for archive in archives))
+            self.assertEqual(get_collection(td).get(ids=sorted(expected_ids))["ids"], [])
+            # Restore the archived physical rows, then compare canonical logical content.
+            get_collection(td).add(
+                ids=[row["id"] for row in rows], documents=[row["document"] for row in rows],
+                metadatas=[row["metadata"] for row in rows], embeddings=[row["embedding"] for row in rows])
+            for result, text in zip(written, originals):
+                restored = dream_adopt.dream_palace.load_drawer_by_id(td, result["drawer_id"])
+                self.assertEqual(restored["text"], text)
+                self.assertEqual(set(restored["member_ids"]), set(result["chunk_ids"]))
 
 
 class TestAdoptMergeTask(unittest.TestCase):
@@ -844,6 +993,15 @@ class TestAdoptPruneTask(unittest.TestCase):
     def setUp(self):
         self.enterContext(mock.patch.object(dream_adopt.dream_palace, "protection_collection",
                                            return_value=DrawerCollection()))
+        self.enterContext(mock.patch.object(dream_adopt.dream_palace, "load_drawer_usage",
+                                           create=True, return_value={}))
+        self.enterContext(mock.patch.object(dream_adopt.dream_palace, "load_logical_drawers",
+                                           return_value=[
+            {"id": drawer_id, "member_ids": [drawer_id], "text": "forgettable",
+             "wing": "wing", "room": "room", "embedding": [1., 0.],
+             "metadata": {"filed_at": "2000-01-01"}}
+            for drawer_id in ("drawer-1", "peer")
+        ]))
 
     def test_resolve_prune_decisions_defaults_to_item_fields_and_keeps_by_default(self):
         salience = {"v": 0.12, "age_days": 400, "kg_degree": 0}
@@ -1058,6 +1216,162 @@ class TestAdoptPruneTask(unittest.TestCase):
             self.assertEqual(rc, 1)
             self.assertEqual(stdout.getvalue(), "")
             self.assertIn("protected", stderr.getvalue())
+
+
+class TestPruneUsageSafety(unittest.TestCase):
+    def setUp(self):
+        self.drawers = [
+            {"id": "old", "member_ids": ["old-chunk"], "text": "archival note",
+             "wing": "w", "room": "r", "embedding": [1., 0.],
+             "metadata": {"filed_at": "2000-01-01"}},
+            {"id": "peer", "member_ids": ["peer"], "text": "other note",
+             "wing": "w", "room": "r", "embedding": [0., 1.],
+             "metadata": {"filed_at": "2000-01-01"}},
+        ]
+        self.old_usage = {"access_count": 1, "strength": 1., "stability": 2.,
+                          "last_activated": "2020-01-01T00:00:00Z"}
+        self.enterContext(mock.patch.object(dream_harvest.dream_palace, "protection_collection",
+                                           return_value=DrawerCollection()))
+        self.enterContext(mock.patch.object(dream_harvest.dream_palace, "load_logical_drawers",
+                                           return_value=self.drawers))
+        self.enterContext(mock.patch.object(dream_harvest.dream_palace, "kg_protection_degree",
+                                           return_value={}))
+        self.enterContext(mock.patch.object(dream_harvest.dream_palace, "load_drawer_by_id",
+                                           return_value=self.drawers[0]))
+        self.load_usage = self.enterContext(mock.patch.object(
+            dream_harvest.dream_palace, "load_drawer_usage", create=True,
+            return_value={"old": self.old_usage}))
+
+    def _decision(self, usage=None):
+        salience = {"v": 0., "age_days": 9000, "kg_degree": 0}
+        if usage is not None:
+            salience["usage"] = usage
+        return {"action": "prune", "id": "old", "member_ids": ["old-chunk"],
+                "text": "archival note", "wing": "w", "room": "r", "salience": salience}
+
+    def test_harvest_records_complete_usage_and_uses_core_protection_score(self):
+        self.load_usage.return_value = {"old": {**self.old_usage, "access_count": 101, "strength": 5.}}
+        with _test_tmpdir() as td, contextlib.redirect_stderr(io.StringIO()):
+            out = os.path.join(td, "wl.json")
+            dream_harvest.main(["--palace", td, "--task", "prune",
+                                "--wing", "w", "--room", "r", "--v-min", ".1", "--out", out])
+            worklist = _load_json(out)
+        self.assertEqual([d["id"] for d in worklist["items"]], ["peer"])
+        self.assertEqual(worklist["items"][0]["salience"]["usage"], {})
+
+    def test_harvest_snapshot_is_not_overridden_by_decision(self):
+        decision = self._decision(self.old_usage)
+        worklist = {"items": [{**decision, "decision": {
+            "action": "prune", "salience": {"usage": {"access_count": 999}}}}]}
+        resolved = dream_adopt._resolve_prune_decisions(worklist)[0]
+        self.assertEqual(resolved["salience"]["usage"], self.old_usage)
+
+    def test_usage_advancing_after_harvest_refuses_prune(self):
+        for change in ({"access_count": 2}, {"last_activated": "2025-01-01T00:00:00Z"},
+                       {"strength": 2.}, {"stability": 3.}):
+            with self.subTest(change=change):
+                self.load_usage.return_value = {"old": {**self.old_usage, **change}}
+                filtered, errors = dream_adopt._preflight_prune_decisions(
+                    "/palace", [self._decision(self.old_usage)])
+                self.assertEqual(filtered, [{"action": "keep"}])
+                self.assertIn("usage", errors[0]["error"])
+
+    def test_unchanged_usage_still_must_meet_recorded_threshold(self):
+        worklist = {"scope": {"wing": "w", "room": "r"},
+                    "params": {"v_min": .01, "age_floor_days": 30}}
+        filtered, errors = dream_adopt._preflight_prune_decisions(
+            "/palace", [self._decision(self.old_usage)], worklist)
+        self.assertEqual(filtered, [{"action": "keep"}])
+        self.assertIn("eligible", errors[0]["error"])
+
+    def test_legacy_worklist_with_usage_requires_reharvest(self):
+        filtered, errors = dream_adopt._preflight_prune_decisions("/palace", [self._decision()])
+        self.assertEqual(filtered, [{"action": "keep"}])
+        self.assertIn("usage", errors[0]["error"])
+
+    def test_legacy_unknown_usage_is_rescored_without_invented_activity(self):
+        self.load_usage.return_value = {}
+        filtered, errors = dream_adopt._preflight_prune_decisions("/palace", [self._decision()])
+        self.assertEqual(errors, [])
+        self.assertEqual(filtered[0]["action"], "prune")
+        self.assertEqual(filtered[0]["salience"]["usage"], {})
+
+    def test_usage_load_failure_refuses_instead_of_defaulting_empty(self):
+        self.load_usage.side_effect = RuntimeError("usage incomplete")
+        filtered, errors = dream_adopt._preflight_prune_decisions("/palace", [self._decision()])
+        self.assertEqual(filtered, [{"action": "keep"}])
+        self.assertIn("usage incomplete", errors[0]["error"])
+
+    def test_live_chunk_kg_protection_and_topic_singleton_remain_safe(self):
+        self.load_usage.return_value = {}
+        with mock.patch.object(dream_harvest.dream_palace, "kg_protection_degree",
+                               return_value={"old-chunk": 1}):
+            filtered, errors = dream_adopt._preflight_prune_decisions("/palace", [self._decision()])
+        self.assertEqual(filtered, [{"action": "keep"}])
+        self.assertIn("kg-connected", errors[0]["error"])
+        self.drawers.pop()
+        filtered, errors = dream_adopt._preflight_prune_decisions("/palace", [self._decision()])
+        self.assertEqual(filtered, [{"action": "keep"}])
+        self.assertIn("eligible", errors[0]["error"])
+
+    def test_fresh_usage_check_runs_under_live_apply_lock(self):
+        held = []
+        @contextlib.contextmanager
+        def lock(_):
+            held.append(True)
+            try:
+                yield
+            finally:
+                held.pop()
+        def usage(*args, **kwargs):
+            self.assertTrue(held, "usage check must run under apply lock")
+            return {"old": {**self.old_usage, "access_count": 2}}
+        self.load_usage.side_effect = usage
+        item = self._decision(self.old_usage)
+        item["decision"] = {"action": "prune"}
+        with _test_tmpdir() as td:
+            path = os.path.join(td, "decisions.json")
+            _dump_json(path, {"task": "prune", "items": [item]})
+            with mock.patch.object(dream_adopt.dream_palace, "palace_mutation_lock", lock), \
+                 mock.patch.object(dream_adopt.dream_palace, "Archiver") as archiver, \
+                 contextlib.redirect_stderr(io.StringIO()):
+                rc = dream_adopt.main(["--palace", td, "--decisions", path])
+        self.assertEqual(rc, 1)
+        archiver.return_value.archive_then_delete.assert_not_called()
+
+
+class TestNativePruneUsage(unittest.TestCase):
+    def test_actual_retrieval_after_harvest_refuses_prune(self):
+        from mempalace.palace import get_collection
+        with _test_tmpdir() as td, installed_palace(td) as server:
+            meta = {"wing": "w", "room": "r", "filed_at": "2000-01-01",
+                    "access_count": 0, "strength": .05, "stability": 1.,
+                    "last_activated": "2000-01-01T00:00:00Z"}
+            get_collection(td).add(
+                ids=["old-a", "old-b"], documents=["Old source context."] * 2,
+                metadatas=[meta, meta])
+            path = os.path.join(td, "wl.json")
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(dream_harvest.main([
+                    "--palace", td, "--task", "prune", "--wing", "w", "--room", "r",
+                    "--out", path]), 0)
+            worklist = _load_json(path)
+            target = next(item for item in worklist["items"] if item["id"] == "old-a")
+            self.assertEqual(target["salience"]["usage"]["access_count"], 0)
+            target["decision"] = {"action": "prune"}
+            _dump_json(path, worklist)
+            with mock.patch.dict(os.environ, {server._SALIENCE_POTENTIATE_ENV: "1"}):
+                retrieved = server.tool_search("Old source context.", wing="w")
+            self.assertIn("old-a", [hit["drawer_id"] for hit in retrieved["results"]])
+            self.assertGreater(
+                dream_adopt.dream_palace.load_drawer_usage(td)["old-a"]["access_count"], 0)
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                rc = dream_adopt.main(["--palace", td, "--decisions", path])
+            self.assertEqual(rc, 1, stderr.getvalue())
+            self.assertIn("usage changed since harvest", stderr.getvalue())
+            self.assertEqual(get_collection(td).get(ids=["old-a"])["ids"], ["old-a"])
+            self.assertFalse(os.path.exists(os.path.join(td, "dream-archive.jsonl")))
 
 
 class TestAdoptDeriveTask(unittest.TestCase):

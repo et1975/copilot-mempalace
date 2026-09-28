@@ -53,8 +53,13 @@ audit hook that nags when an external tool is about to run without a prior `memp
   Both merge and prune archive full originals before sanctioned deletion; semantic preservation still
   requires review. Re-harvest measures residual work, not a guaranteed global fixpoint. Existing KG
   premise loading can reconcile legacy provenance and ontology candidate commands explicitly write,
-  so the whole pipeline is not strictly read-only. Native drawer usage-frequency
-  is proposed upstream as MemPalace/mempalace#1921.
+  so the whole pipeline is not strictly read-only. Merge discovery uses the native
+  duplicate finder while preserving canonical chunk identities and procedural
+  evidence exclusions. Native drawer usage adds protection-only prune salience;
+  usage is refreshed before adoption, never interpreted as helpful procedural
+  feedback. Standalone `dream_verify.py` reports the same actionable merge
+  candidates as harvest and `dream_adopt --verify`, with explicit failures for
+  unavailable or incomplete scans.
   See [`skills/dreaming/references/pipeline.md`](skills/dreaming/references/pipeline.md) for the contract.
 - **[Drawer-backed procedural learning](skills/dreaming/references/procedural.md)** — an optional
   `dream_procedure.py` CLI (`propose`, `validate`, `review`, `outcome`, `guidance`, `explain`).
@@ -120,6 +125,12 @@ audit hook that nags when an external tool is about to run without a prior `memp
 - [MemPalace](https://github.com/mempalace/mempalace) installed (`uv tool install mempalace` or `pip install mempalace`).
   Verify with `mempalace status`.
 - MemPalace exposed as an MCP server in your harness — see [Step 0](#step-0--register-mempalace-as-an-mcp-server) below.
+- For dreaming merge discovery: an installed MemPalace build exposing the native
+  `mempalace_find_duplicates` handler, logical drawer IDs and pairwise distances,
+  plus collection access for canonical records. Capability failures are errors,
+  not an empty successful scan. Pruning reads complete drawer metadata rather
+  than relying on the top-100 `mempalace_drawer_salience` endpoint; absent usage
+  telemetry is neutral. See the [substrate contract](skills/dreaming/references/pipeline.md#substrate-capabilities-and-limitations).
 - Python 3 on `PATH` (for the hook). The hook fails silently if Python is missing.
 - For the backup/restore skills only: [`restic`](https://restic.net/) on `PATH`
   (`zypper in restic`, `apt install restic`, `brew install restic`, …).

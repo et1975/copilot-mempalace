@@ -108,6 +108,23 @@ MPY=$(head -1 "$(command -v mempalace)" | sed 's/^#!//')
 "$MPY" dream_adopt.py --palace <palace> --decisions decisions.json --verify
 ```
 
+For a report without adoption, use the same merge candidate pipeline:
+
+```bash
+"$MPY" dream_verify.py --palace <palace> --wing <wing> --room <room> \
+  --tau 0.9 --strict
+```
+
+The report is JSON on stdout with `complete`, `converged`, `residual`, `items`
+and `errors`. Exit status is `0` for a successful report, `1` for residual
+candidates under `--strict`, and `2` for a failed scan regardless of `--strict`.
+Failures use `complete: false`, `converged: false` and `residual: null`.
+Protected evidence and cross-room-only matches are not actionable residuals.
+Zero residuals describe this scoped candidate scan, not semantic equivalence or
+a global storage snapshot. Merge discovery requires the native duplicate-finder
+capability described in [the substrate contract](references/pipeline.md#substrate-capabilities-and-limitations);
+it never substitutes empty success for a missing capability.
+
 ### Pattern observation source (`--source`)
 
 By default (`--source diary`) the `pattern` task mines only diary rooms — themes
@@ -231,7 +248,7 @@ eval gate that measures task-success improvement versus drift using
 LongMemEval/LoCoMo-style methodology is deferred.
 
 For each `"kind": "prune"` item, read the drawer text and salience components
-(`age_days`, `kg_degree`, `redundancy`, `negatives`, `v`). Default to **KEEP**:
+(`age_days`, `kg_degree`, `redundancy`, `negatives`, `usage`, `usage_boost`, `v`). Default to **KEEP**:
 omitted decisions are treated as keep, and pruning should be deliberate even
 though it is archived to JSONL and reversible.
 
@@ -248,6 +265,13 @@ Never prune drawers that are pinned, KG-connected, recent, or the last drawer on
 a topic. Consider steering `θ`: "focus on X" can lower priority elsewhere, but
 "preserve X" is a fixed point. The script also re-checks protected classes at
 apply time, but do not rely on the script to make the judgement for you.
+Usage is protection-only: missing telemetry or zero accesses adds no penalty
+and no boost, even when an unused drawer has high initial strength. Positive
+usage can raise retention priority; it does not prove usefulness. Apply refreshes
+usage under the existing mutation lock and refuses stale prune approval when
+retrieval has advanced, previously known telemetry is lost, or the refreshed
+score is no longer eligible. An old worklist without a usage snapshot cannot
+authorize deletion of a drawer with positive current usage.
 
 ## Session-stamp convention
 
@@ -275,6 +299,10 @@ entries without it contribute no pattern support.
   nothing. Semantic fact preservation is a review obligation, not proved by
   an archive or an embedding.
 - **Provenance** — every merge carries `supersedes` (the ids it replaces).
+  Contradiction adoption resolves kept objects from candidate identities,
+  preserves the existing kept fact and its provenance, and cascades retired
+  supports without discarding conclusions that still have another valid proof.
+  A rowcount shortfall is an adoption error, not reported success.
 - **Groundedness** — recurrence admission re-reads original sources, hashes,
   session attribution and the declared minimum; diary/raw mirrors count once.
   Generated reflections/lessons/procedural records cannot increase independent
@@ -417,8 +445,9 @@ External deletion is still possible; never claim tamper-proof storage.
 Future `kind`s are reserved — see [`references/pipeline.md`](references/pipeline.md)
 for the full contract, formal task formulations, and the mempalace API facts the
 scripts rely on. A shadow palace for search-based preview (instead of file-based
-review) and upstream native drawer salience (MemPalace/mempalace#1921) are
-documented future enhancements.
+review) remains a future enhancement. The historical native-salience proposal
+(MemPalace/mempalace#1921) records the motivation; current usage reads retain
+the complete-metadata and protection-only limits described above.
 
 ## Tests
 

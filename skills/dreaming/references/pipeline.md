@@ -29,9 +29,16 @@ equivalent to "no filesystem writes."
 
 ### Task: dedup / merge (v1)
 
-- Similarity `sim(a,b) = cos(mean_embed(a), mean_embed(b))`.
+- Merge candidate edges come from native `mempalace_find_duplicates` distances,
+  converted to similarity with `sim = 1 - distance`. The native representative
+  and neighbor-search semantics are not assumed identical to the historical
+  local mean-embedding all-pairs implementation.
 - Near-duplicate `a ~_τ b ⟺ sim ≥ τ`. Symmetric but **not transitive** →
-  clusters are connected components of the `~_τ` graph (union-find).
+  clusters are connected components of the returned `~_τ` graph (union-find).
+  Room partitioning and logical/physical protected-ID exclusions precede
+  component rebuilding, so an excluded drawer cannot bridge two survivors.
+  Canonical text and physical chunk membership still come from the existing
+  drawer loader; native display text is not used as an archival identity.
 - Fold `μ(C)` = one synthesised drawer per cluster (the agent's job, Phase 2).
 - Soundness constraint: `μ(C)` must preserve every atomic fact in `C`.
   This is an agent review obligation, not proved by cosine similarity.
@@ -39,6 +46,12 @@ equivalent to "no filesystem writes."
   sanctioned deletion. A successful add or an archive alone does not establish
   semantic preservation. Re-harvest is a residual-work measurement; skipped
   groups and concurrent changes mean zero clusters is not guaranteed.
+  Native errors, unavailable vectors and truncated responses are failures, not
+  zero candidates. Limits cannot be applied before client-side scope/protection
+  filtering and then interpreted as an exhaustive result.
+  Standalone `dream_verify.py` and adoption's `--verify` share the harvest
+  candidate definition; raw cross-room or protected-only matches do not make
+  an otherwise empty actionable worklist fail convergence.
 
 ### Task: contradiction / staleness
 
@@ -51,8 +64,17 @@ equivalent to "no filesystem writes."
   `(valid_from || "", extracted_at || "")` descending, but it never auto-resolves.
 - Adjudication is cognitive: the agent decides whether the predicate should be
   functional, which object is authoritative, and which objects to retire.
-- Adoption is non-destructive belief revision: `KnowledgeGraph.invalidate(...)`
-  sets `valid_to` on retired facts. It does **not** delete rows.
+- Adoption is non-destructive belief revision: it sets `valid_to` on retired
+  facts and ends their supporting provenance, cascading invalidation to
+  dependent conclusions without an alternative valid proof. It does **not**
+  delete rows. Reports count affected root facts, not requested IDs or cascades;
+  a shortfall is an explicit adoption failure.
+- A functional single-old-object resolution uses one transactional supersession
+  boundary. `keep` may identify an object or candidate triple, but is resolved
+  to the canonical kept candidate before writing. The kept fact already exists:
+  preserve its identity, interval and support rather than creating a new
+  unsupported assertion. Multi-retire decisions use exact triple-ID
+  invalidation through the same support-aware machinery.
 - Fixpoint: re-harvest after adoption should remove the resolved functional
   contradiction. Legitimately multi-valued skipped groups may still surface.
 
@@ -63,8 +85,9 @@ equivalent to "no filesystem writes."
 > no such flag, so the handler can target the user's default
 > `~/.mempalace/knowledge_graph.sqlite3` regardless of
 > `MEMPALACE_PALACE_PATH`. `dream_palace.KgWriter` therefore constructs
-> `KnowledgeGraph(db_path=os.path.join(palace_path, "knowledge_graph.sqlite3"))`
-> directly and calls `.invalidate(...)`.
+> `KnowledgeGraph` against the explicitly resolved palace KG and performs
+> support-aware mutations there. A bare native supersede/invalidate call alone
+> does not maintain this package's provenance tables.
 
 ### Task: reflect / pattern
 
@@ -124,13 +147,24 @@ MPY=$(head -1 "$(command -v mempalace)" | sed 's/^#!//')
   is therefore inverted: **remove carefully, reversibly**. `merge` preserves
   source facts by add-then-delete, `contradiction` soft-invalidates KG facts,
   and `pattern` is add-only; `prune` may delete drawers after approval.
-- Ideal salience is `v(d) = usage-freq × recency × KG-degree`. Because
-  mempalace v1 has no per-drawer usage counter and only `filed_at` (filing
-  time, not last-use time), the shipped score is a composite of observable
-  signals: age from `filed_at`, KG source-degree (`source_drawer_id` triple
-  count), redundancy (maximum cosine similarity to neighbours), and ephemeral
-  marker negatives (`for now`, `one-off`, `scratch`, etc.). True usage-frequency
-  is deferred to a session-store oracle or native upstream salience.
+- The base score combines age from `filed_at`, KG protection degree, redundancy
+  (maximum cosine similarity to neighbours), and ephemeral marker negatives
+  (`for now`, `one-off`, `scratch`, etc.). Native usage is an additive,
+  protection-only signal with default weight `0.2`, not a replacement for these
+  gates. Missing telemetry and zero `access_count` leave the base score
+  unchanged, including a never-accessed drawer with high initial strength.
+  Strength uses the native `0.05..5` scale, normalized above its floor; usage
+  snapshots and the added boost are included in salience for review. For
+  positive access count `n`, the usage signal averages `n/(n+1)` with
+  `clamp((strength-0.05)/4.95, 0, 1)`. Its weighted contribution is added before
+  the existing final score clamp; positive usage never lowers the score.
+- Usage is read across the complete scoped metadata set and combined
+  conservatively across physical chunks. The native `drawer_salience` tool
+  returns at most 100 records with no pagination, so absence from that response
+  cannot be treated as absence of usage. Reads do not potentiate drawers.
+  Partial snapshots omit unavailable fields; reading must not invent a fresh
+  activation timestamp or count.
+  Retrieval is not a helpful outcome and never promotes procedural advice.
 - Candidate selection is the guardrail heart: **multi-gate AND**, never OR. A
   drawer is proposed only when `v < v_min` AND `age_days >= age_floor_days` AND
   `kg_degree == 0` AND it is not pinned. The `kg_degree == 0` gate also means the
@@ -141,7 +175,10 @@ MPY=$(head -1 "$(command -v mempalace)" | sed 's/^#!//')
   `mempalace_delete_drawer` handler, which purges the closet/AAAK index. A
   failed archive deletes nothing; the archive is lossless and reversible.
 - Apply has a protected re-check: drawers with `kg_degree > 0` or `pinned` are
-  refused even if adjudication said `prune`.
+  refused even if adjudication said `prune`. Usage is also refreshed under the
+  existing mutation lock. Retrieval advanced since harvest or a refreshed score
+  outside the approved worklist's eligibility policy invalidates prune approval.
+  The same core scorer is used at harvest and apply.
 - All retained procedural events and their original source/lineage drawers
   are excluded at harvest and checked live under the shared mutation lock at
   apply, including logical/physical chunk IDs. Terminal/out-of-scope history
@@ -464,15 +501,18 @@ exact chunk reads and strict nonmutation boundary.
   and `TOOLS["mempalace_delete_drawer"]["handler"](drawer_id=...)`. The durable
   alternative `mempalace.service.run_mcp_tool` accepts write-classified tools
   only.
-- **Palace targeting**: handlers resolve the palace via
-  `MEMPALACE_PALACE_PATH`; set it before importing mempalace
-  (`dream_palace.bind_palace(path)`).
+- **Palace targeting**: bind and verify the requested palace before native
+  reads. Changing `MEMPALACE_PALACE_PATH` alone is not a cache-refresh guarantee
+  after the embedded server has already been imported. Embedded imports must
+  restore Python stdout and descriptor 1; the server's startup redirection is
+  not appropriate for JSON-producing command-line clients.
 - **KG read/write**: the palace-local KG is
   `<palace_path>/knowledge_graph.sqlite3`; active triples are rows where
   `valid_to IS NULL`. For contradiction adoption, use
-  `KnowledgeGraph(db_path=<palace-local KG>)` directly instead of the MCP
+  the explicit-path, support-aware `KgWriter` instead of the MCP
   `mempalace_kg_invalidate` handler because of the `_palace_flag_given` gate
-  described above.
+  described above. The package's provenance records are part of the mutation
+  contract, not supplied by the native supersede signature.
 
 ## Invariants
 
@@ -481,29 +521,41 @@ exact chunk reads and strict nonmutation boundary.
 | Approved mutations / reversibility | no implicit adoption; legacy initialization/reconciliation and explicit ontology candidates are read-only exceptions; failed add skips delete; merge/prune archive full records before delete; failed archive deletes nothing |
 | Provenance | `supersedes` on every merge |
 | Groundedness | converge revalidates declared `min_support`, original session IDs and hashes; mirrors/generated records cannot inflate support; quotes do not prove semantic entailment |
-| Salience-gated protected classes | prune requires `v < v_min` AND age floor AND `kg_degree == 0` AND not pinned; apply refuses KG-connected or pinned drawers |
+| Salience-gated protected classes | prune requires `v < v_min` AND age floor AND `kg_degree == 0` AND not pinned; apply refreshes protected state and usage before honoring approval |
 | Auditability | merge/prune archives retain drawer text, physical members and `archived_at`; procedural events retain all original evidence even after retirement |
 | Operational verification | Phase 5 measures remaining candidates, not a universal zero-cluster guarantee; reflection/pattern/prune are maintenance loops |
 | Bounded cost | scope by wing/room; `tau` gates the pairwise graph |
 | Procedural authority | optional reviewed advice only; explicit attributed outcomes, no feedback from retrieval and no automatic KG/ontology authority |
 
-## Upstream evolution (why harvest imports mempalace)
+## Substrate capabilities and limitations
 
-Harvest reads the ChromaDB collection directly (via `mempalace.palace.get_collection`)
-because **no MCP tool exposes raw embeddings or a bulk near-duplicate scan** —
-`mempalace_search` is query-based top-N only, and `mempalace dedup` is
-destructive keep-longest, not a cluster finder. That direct read is the sole
-reason the scripts need a Python that can `import mempalace`.
+The scripts still require a Python interpreter that can import the installed
+MemPalace package. Merge uses its native `mempalace_find_duplicates` handler,
+not a separate MCP transport. Canonical source reconstruction, complete usage
+metadata, prune redundancy and reflective operations still need collection
+access. This is not a claim that the whole pipeline is remote-MCP-native or
+universally read-only.
 
-The clean long-term fix is a **read-only server-side cluster finder** upstream in
-MemPalace, which would make this pipeline fully MCP-native (no library/venv
-coupling), exact-cosine, and scalable. See
+The duplicate handler must provide logical member IDs, valid pairwise distances
+and a successful, non-truncated scan. Missing capabilities, malformed responses,
+unavailable vectors and explicit incompleteness are errors. A package version
+number alone is not proof of this contract. No runtime package or model download
+is attempted, and the adapter does not silently switch to a different clustering
+algorithm when a capability fails.
+
+The installed native finder also bounds neighbor discovery (currently 512
+physical records). The adapter refuses scans when that bound cannot establish
+coverage of the actual native scope. On builds with the two-key filter defect,
+requesting both wing and room scans the wing natively and filters the room
+locally; a small room therefore cannot hide an incomplete wing scan. Narrow
+to a supported native scope or use a substrate with sufficient coverage.
+This limitation is explicit rather than a claim of unlimited consolidation.
+
+Usage metadata is additive: older drawers without it retain the previous score.
+The capped native salience listing is unsuitable as an exhaustive usage oracle.
+Contradiction supersession additionally requires this package's support-aware
+transactional writer, rather than bare native KG calls.
+
+The historical proposals explain the motivation:
 [`upstream-find-duplicates-proposal.md`](upstream-find-duplicates-proposal.md)
-for the paste-ready proposal. Until that lands, the script-based harvest here is
-the working approach.
-
-For prune, the clean long-term fix is native per-drawer salience dynamics:
-MemPalace/mempalace#1921 would add drawer usage-frequency / last-activated
-signals so `usage-freq` becomes native instead of proxied by host session data or
-observable heuristics. See
-[`upstream-drawer-salience-proposal.md`](upstream-drawer-salience-proposal.md).
+and [`upstream-drawer-salience-proposal.md`](upstream-drawer-salience-proposal.md).
