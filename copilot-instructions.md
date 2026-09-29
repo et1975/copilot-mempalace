@@ -127,9 +127,11 @@ to launch/restart the owner. Ordinary memory filing is unchanged.
 ## Optional repository procedural advice (disabled by convention)
 
 Only after explicit user opt-in for one repository, supplement ordinary
-recall at task start with `skills/dreaming/scripts/dream_procedure.py guidance
+recall at task start with `"$MPY" "$DREAM_SCRIPTS/dream_procedure.py" guidance
 --palace <p> --wing <w> --repository owner/repository --task "<task>"`, using
-the interpreter that already owns MemPalace. Never replace recall-first with
+`MPY` as the absolute path of the interpreter that already owns MemPalace and
+`DREAM_SCRIPTS` as the absolute path of the checkout's or installed dreaming
+skill's `scripts/` directory. Never replace recall-first with
 procedural guidance. See [the full contract](skills/dreaming/references/procedural.md)
 for the existing SQLite-exact/local-MiniLM and clean-read storage requirements.
 

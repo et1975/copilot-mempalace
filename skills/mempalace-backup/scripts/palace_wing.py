@@ -21,17 +21,16 @@ Design notes
 * **KG writes go direct.** Triples are written via ``KnowledgeGraph.add_triple``
   (not the MCP handler, which has a CLI-only palace gate), matching dreaming.
 
-Interpreter: this script imports ``mempalace`` at run time, which system
-``python3`` cannot do. Run it under the interpreter where mempalace is
-installed (e.g. the uv-tool venv) or via ``python -m``; if the import fails it
-exits with a clear message rather than a traceback. The shebang stays
-``python3`` so the pure library and tests remain runnable anywhere.
+Interpreter: this script imports ``mempalace`` at run time. Select MPY as the
+absolute path to the provisioned interpreter that owns that package; system
+Python may not have it. Select BACKUP_SCRIPTS as the absolute backup scripts
+directory. A missing import produces a clear message rather than a traceback.
 
 Usage::
 
-    ./palace_wing.py export <wing> [--out FILE] [--palace PATH]
-    ./palace_wing.py import <bundle> [--into-wing NAME] [--palace PATH]
-                             [--dry-run] [--force-add] [--dup-threshold 0.9]
+    "$MPY" "$BACKUP_SCRIPTS/palace_wing.py" export <wing> [--out FILE] [--palace PATH]
+    "$MPY" "$BACKUP_SCRIPTS/palace_wing.py" import <bundle> [--into-wing NAME] [--palace PATH]
+        [--dry-run] [--force-add] [--dup-threshold 0.9]
 """
 from __future__ import annotations
 

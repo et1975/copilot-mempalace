@@ -107,14 +107,16 @@ package. Provision that package explicitly before registering it.
 ## Setup entry point
 
 Start with the [end-to-end setup guide](setup.md), not a configuration fragment.
-The repository's `scripts/setup-tasks.fsx` provides `configure`, `enable` and
-read-only `check` phases around the installed commands below. It never installs
-dependencies or silently replaces an authority. Existing deployments can begin
-with `check`; incompatible configurations stop with a specific blocker.
+The Python package's `mempalace-tasks setup` command provides `configure`,
+`enable` and read-only `check` phases around the installed commands below.
+It never installs dependencies or silently replaces an authority. Existing
+deployments can begin with `check`; incompatible configurations stop with a
+specific blocker.
 
-The setup helper currently targets Linux and requires a preinstalled .NET SDK
-with F# Interactive in addition to the sidecar and Copilot CLI. The service
-itself retains its existing Python requirements; it does not need .NET.
+Setup shares the sidecar's Python/native-platform requirements and uses its
+POSIX permission and Windows ACL helpers. It needs no .NET SDK or F# runtime.
+`python -m mempalace_tasks setup` is also supported from the installed
+environment. Native macOS/Windows validation limits above still apply.
 
 ## Configure and initialize
 

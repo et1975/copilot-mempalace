@@ -1,4 +1,4 @@
-"""Isolated executable contracts for the optional F# setup entry point.
+"""Isolated executable contracts for the native Python setup entry point.
 
 The same test file doubles as the fixture CLI, copied under pytest's external
 temporary root. It never invokes an installed task service or user Copilot.
@@ -32,7 +32,7 @@ def fixture_cli():
         print(code + ": hidden Bearer SECRET-DO-NOT-PRINT", file=sys.stderr)
         raise SystemExit(1)
 
-    if Path(sys.argv[0]).name == "copilot":
+    if Path(sys.argv[0]).stem == "copilot":
         registrations = json.loads((root / "registrations.json").read_text())
         if arguments[:2] == ["mcp", "get"]:
             if fault == "registration_failure":
@@ -110,8 +110,10 @@ def fixture_cli():
         assert config_path == Path(original), "Probe must use the original config path"
         assert "--no-autostart" in arguments
         assert config.lifecycle == "launcher"
-        assert config_path.stat().st_mode & 0o777 == 0o600
-        assert config_path.parent.stat().st_mode & 0o777 == 0o700
+        from mempalace_tasks.setup_runtime import private_directory
+        from mempalace_tasks.platform_support import read_regular
+        read_regular(config_path, private=True)
+        private_directory(config_path.parent)
         (root / "probe-config").write_text(str(config_path))
         if not (root / "owner").exists():
             error("registry_missing")
@@ -183,28 +185,25 @@ if __name__ == "__main__" and os.environ.get("SETUP_FIXTURE_ROOT"):
     raise SystemExit(0)
 
 import pytest
+from mempalace_tasks import platform_support
 
 REPOSITORY = Path(__file__).resolve().parents[1]
-SCRIPT = REPOSITORY / "scripts" / "setup-tasks.fsx"
-pytestmark = pytest.mark.skipif(
-    shutil.which("dotnet") is None or sys.platform != "linux",
-    reason="optional Linux F# setup runtime unavailable; no installation attempted",
-)
+SETUP = [sys.executable, "-m", "mempalace_tasks", "setup"]
 
 
 @pytest.fixture
 def deployment(tmp_path, monkeypatch):
-    tmp_path.chmod(0o700)
+    tmp_path = platform_support.ensure_private_directory(tmp_path / "deployment")
     binary = tmp_path / "bin"
-    binary.mkdir(mode=0o700)
+    platform_support.ensure_private_directory(binary)
     for name in ("mempalace-tasks", "copilot"):
-        executable = binary / name
-        executable.write_text("#!" + sys.executable + "\n" + Path(__file__).read_text())
-        executable.chmod(0o700)
+        executable = binary / (name + ".py")
+        platform_support.create_private(executable, Path(__file__).read_bytes())
     (tmp_path / "registrations.json").write_text(json.dumps({"unrelated": {"env": {"KEEP": "yes"}}}))
     monkeypatch.setenv("PATH", str(binary) + os.pathsep + os.environ["PATH"])
     monkeypatch.setenv("SETUP_FIXTURE_ROOT", str(tmp_path))
     monkeypatch.setenv("SETUP_SIDECAR_SOURCE", str(REPOSITORY / "sidecar" / "src"))
+    monkeypatch.setenv("PYTHONPATH", str(REPOSITORY / "sidecar" / "src"))
     config = tmp_path / "private" / "config.json"
     (tmp_path / "config-path").write_text(json.dumps(str(config)))
     return tmp_path, config
@@ -212,8 +211,12 @@ def deployment(tmp_path, monkeypatch):
 
 def invoke(deployment, mode, *arguments, ok=True):
     root, config = deployment
+    overrides = []
+    for name, binary in (("task", "mempalace-tasks"), ("copilot", "copilot")):
+        if f"--{name}-executable" not in arguments:
+            overrides.extend((f"--{name}-executable", str(root / "bin" / (binary + ".py"))))
     result = subprocess.run(
-        ["dotnet", "fsi", "--exec", str(SCRIPT), mode, "--config", str(config), *arguments],
+        [*SETUP, mode, "--config", str(config), *overrides, *arguments],
         capture_output=True, text=True, timeout=65,
     )
     assert "SECRET" not in result.stdout + result.stderr
@@ -225,7 +228,8 @@ def invoke(deployment, mode, *arguments, ok=True):
 
 def calls(deployment):
     path = deployment[0] / "calls.jsonl"
-    return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+    values = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+    return [[Path(value[0]).stem, *value[1:]] for value in values]
 
 
 def configure(deployment):
@@ -261,9 +265,14 @@ def test_fresh_configure_is_private_valid_and_idempotent(deployment):
     assert document["schema_version"] == 2
     assert document["lifecycle"] == "launcher"
     assert document["host"] == "127.0.0.1" and document["port"] == 0
-    assert config.stat().st_mode & 0o777 == 0o600
-    assert config.parent.stat().st_mode & 0o777 == 0o700
-    assert Path(document["runtime_dir"]).stat().st_mode & 0o777 == 0o700
+    from mempalace_tasks.setup_runtime import private_directory
+    platform_support.read_regular(config, private=True)
+    private_directory(config.parent)
+    private_directory(document["runtime_dir"])
+    if os.name == "posix":
+        assert config.stat().st_mode & 0o777 == 0o600
+        assert config.parent.stat().st_mode & 0o777 == 0o700
+        assert Path(document["runtime_dir"]).stat().st_mode & 0o777 == 0o700
     assert not Path(document["service_token_file"]).exists()
     before = snapshot(root)
     configure(deployment)
@@ -291,9 +300,8 @@ def test_invalid_configure_has_no_mutations(deployment, arguments):
 ])
 def test_existing_bad_schema_is_not_replaced(deployment, document, code):
     _, config = deployment
-    config.parent.mkdir(mode=0o700)
-    config.write_text(document)
-    config.chmod(0o600)
+    platform_support.ensure_private_directory(config.parent)
+    platform_support.create_private(config, document.encode())
     before = snapshot(deployment[0])
     assert invoke(deployment, "configure", ok=False)["code"] == code
     assert snapshot(deployment[0]) == before
@@ -356,6 +364,7 @@ def test_check_is_readonly_and_absent_owner_never_spawns(deployment):
     {"command": "/bin/false"}, {"args": ["mcp", "--config", "/elsewhere"]},
     {"tools": []}, {"tools": ["mptask_health"]}, {"enabled": False},
     {"env": {"CUSTOM": "SECRET-DO-NOT-PRINT"}}, {"headers": {"X": "SECRET-DO-NOT-PRINT"}},
+    {"custom": "SECRET-DO-NOT-PRINT"},
 ])
 def test_registration_conflicts_refuse_before_mutation(deployment, change):
     ready(deployment)
@@ -386,7 +395,7 @@ def test_protocol_failures_are_bounded_private_and_cleaned(deployment, monkeypat
     assert snapshot(deployment[0]) == before
     assert Path((deployment[0] / "probe-config").read_text()) == deployment[1]
     pid_file = deployment[0] / "child-pid"
-    if pid_file.exists():
+    if pid_file.exists() and sys.platform == "linux":
         assert not Path("/proc", pid_file.read_text()).exists()
         status = Path("/proc", (deployment[0] / "descendant-pid").read_text(), "status")
         assert not status.exists() or "State:\tZ" in status.read_text()
@@ -427,6 +436,7 @@ def test_missing_prerequisites_and_registration(deployment, monkeypatch):
     assert invoke(deployment, "check", ok=False)["code"] == "missing_registration"
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX mode/symlink fixtures; Windows ACL contracts are separate")
 @pytest.mark.parametrize("kind", ["parent_link", "config_link", "public_parent", "public_config"])
 def test_unsafe_paths_refuse_without_repair(deployment, kind):
     root, config = deployment
@@ -451,12 +461,23 @@ def test_unsafe_paths_refuse_without_repair(deployment, kind):
     assert snapshot(root) == before
 
 
-def test_fsharp_contracts(deployment):
-    result = subprocess.run(
-        ["dotnet", "fsi", "--exec", str(REPOSITORY / "tests/task_setup/contracts.fsx")],
-        text=True, capture_output=True, timeout=30,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
+@pytest.mark.parametrize("arguments,code", [
+    ([], "invalid_invocation"),
+    (["enable", "--generate-token"], "initialize_required"),
+    (["configure", "--new-authority"], "new_authority_pair_required"),
+    (["check", "--config", "one", "--config", "two"], "duplicate_option"),
+    (["check", "--config", "relative"], "absolute_path_required"),
+])
+def test_python_invocation_contracts(deployment, arguments, code):
+    from mempalace_tasks.setup import parse_arguments
+    from mempalace_tasks.setup_runtime import SetupError
+
+    if "--config" not in arguments:
+        arguments = [*arguments, "--config", str(deployment[1])]
+    with pytest.raises(SetupError) as caught:
+        parse_arguments(arguments)
+    assert caught.value.code == code
+    assert calls(deployment) == []
 
 
 def test_missing_runtime_is_not_inferred_as_missing_history(deployment):
@@ -502,6 +523,8 @@ def test_owner_shutdown_race_cannot_start_owner(deployment, monkeypatch):
     "runtime_link", "runtime_public", "token_link", "token_public", "missing_hub_token",
 ])
 def test_native_validation_and_private_runtime_refuse_before_enable(deployment, kind):
+    if os.name != "posix" and kind != "missing_hub_token":
+        pytest.skip("POSIX symlink/mode fixture; Windows ACL contracts are separate")
     configure(deployment)
     root, config = deployment
     document = json.loads(config.read_text())
@@ -537,6 +560,26 @@ def test_missing_hub_token_prevents_config_publication(deployment):
     assert not deployment[1].parent.exists()
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX ancestor write permissions")
+def test_runtime_in_writable_parent_refuses_before_enable(deployment):
+    configure(deployment)
+    root, config = deployment
+    parent = root / "public"
+    parent.mkdir()
+    parent.chmod(0o777)
+    runtime = parent / "private"
+    runtime.mkdir(mode=0o700)
+    document = json.loads(config.read_text())
+    document["runtime_dir"] = str(runtime)
+    config.write_text(json.dumps(document))
+    before = snapshot(root)
+    offset = len(calls(deployment))
+    summary = invoke(deployment, "enable", "--initialize", "--generate-token", ok=False)
+    assert summary["code"] == "unsafe_parent"
+    assert snapshot(root) == before
+    assert not any(call[1] in ("init", "start") for call in calls(deployment)[offset:])
+
+
 def test_registration_query_failure_never_means_missing(deployment, monkeypatch):
     ready(deployment)
     monkeypatch.setenv("SETUP_FIXTURE_FAULT", "registration_failure")
@@ -551,6 +594,43 @@ def test_configure_staging_cannot_be_placed_in_repository(deployment, monkeypatc
     assert invoke(deployment, "configure", "--new-authority", "--hub-url",
                   "http://127.0.0.1:8765/mcp", ok=False)["code"] == "temporary_root_inside_repository"
     assert not deployment[1].parent.exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX OS-temporary-directory symlink fixture")
+@pytest.mark.parametrize("scenario", ["os_temp_alias", "user_config_alias", "repository_temp_alias"])
+def test_configure_resolves_only_the_internally_selected_temp_root(deployment, monkeypatch, scenario):
+    from mempalace_tasks import setup
+    from mempalace_tasks.setup_runtime import SetupError, executable
+
+    root, config = deployment
+    physical = (REPOSITORY if scenario == "repository_temp_alias" else
+                platform_support.ensure_private_directory(root / "os-temp"))
+    alias = root / "os-temp-alias"
+    alias.symlink_to(physical, target_is_directory=True)
+    monkeypatch.setattr(setup.tempfile, "gettempdir", lambda: str(alias))
+    if scenario == "user_config_alias":
+        target = platform_support.ensure_private_directory(root / "config-target")
+        config.parent.symlink_to(target, target_is_directory=True)
+    args = setup.parse_arguments([
+        "configure", "--config", str(config), "--new-authority",
+        "--hub-url", "http://127.0.0.1:8765/mcp",
+    ])
+    command = executable("mempalace-tasks", root / "bin" / "mempalace-tasks.py")
+    before = snapshot(root)
+    if scenario == "os_temp_alias":
+        result = setup.configure(command, args)
+        assert result.authority_id == json.loads(config.read_text())["authority_id"]
+        assert list(physical.iterdir()) == []
+        assert alias.is_symlink()
+        assert not result.service_token_file.exists()
+    else:
+        expected = ("unsafe_path" if scenario == "user_config_alias" else
+                    "temporary_root_inside_repository")
+        with pytest.raises((SetupError, platform_support.PlatformError)) as caught:
+            setup.configure(command, args)
+        assert caught.value.code == expected
+        assert snapshot(root) == before
+        assert not config.exists()
 
 
 def test_check_does_not_need_temporary_config(deployment, monkeypatch):
@@ -572,7 +652,8 @@ def test_default_timeout_registration_is_preserved(deployment, arguments):
     path = root / "registrations.json"
     registrations = json.loads(path.read_text())
     registrations["mempalace-tasks"]["args"] = [
-        str(config) if argument == "CONFIG" else argument for argument in arguments
+        str(root / "bin" / "mempalace-tasks.py"),
+        *[str(config) if argument == "CONFIG" else argument for argument in arguments],
     ]
     path.write_text(json.dumps(registrations))
     before = snapshot(root)
@@ -628,6 +709,7 @@ def test_missing_copilot_and_config_directory_do_not_mutate(deployment):
     assert snapshot(deployment[0]) == before
 
 
+@pytest.mark.skipif(os.name != "posix", reason="Native FIFO is POSIX-only")
 def test_config_fifo_refuses_without_blocking(deployment):
     _, config = deployment
     config.parent.mkdir(mode=0o700)
@@ -644,9 +726,9 @@ def test_directory_shaped_config_path_refuses_before_mutation(deployment):
     assert not config.parent.exists()
 
 
-def test_executable_shebang_and_invalid_invocation(deployment):
+def test_module_entry_and_invalid_invocation(deployment):
     result = subprocess.run(
-        [str(SCRIPT), "check", "--initialize"],
+        [*SETUP, "check", "--initialize"],
         capture_output=True, text=True, timeout=30,
     )
     assert result.returncode == 2
@@ -659,13 +741,13 @@ def test_executable_shebang_and_invalid_invocation(deployment):
 def test_common_executable_overrides_select_all_phases(deployment, monkeypatch):
     root, _ = deployment
     selected = root / "selected"
-    selected.mkdir(mode=0o700)
+    platform_support.ensure_private_directory(selected)
     for name in ("mempalace-tasks", "copilot"):
-        shutil.copy2(root / "bin" / name, selected / name)
+        shutil.copyfile(root / "bin" / (name + ".py"), selected / (name + ".py"))
     monkeypatch.setenv("SETUP_FIXTURE_EXECUTABLE_DIRECTORY", str(selected))
     arguments = (
-        "--task-executable", str(selected / "mempalace-tasks"),
-        "--copilot-executable", str(selected / "copilot"),
+        "--task-executable", str(selected / "mempalace-tasks.py"),
+        "--copilot-executable", str(selected / "copilot.py"),
     )
     invoke(deployment, "configure", "--new-authority", "--hub-url",
            "http://127.0.0.1:8765/mcp", *arguments)
@@ -673,7 +755,8 @@ def test_common_executable_overrides_select_all_phases(deployment, monkeypatch):
     invoke(deployment, "enable", "--initialize", "--generate-token",
            "--register-copilot", *arguments)
     registration = json.loads((root / "registrations.json").read_text())["mempalace-tasks"]
-    assert registration["command"] == str(selected / "mempalace-tasks")
+    assert registration["command"] == sys.executable
+    assert registration["args"][0] == str(selected / "mempalace-tasks.py")
     before = snapshot(root)
     invoke(deployment, "check", *arguments)
     invoke(deployment, "enable", "--initialize", "--generate-token",

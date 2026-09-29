@@ -24,6 +24,11 @@ The task service is an additional registration, not a replacement for
 `mempalace-mcp`. Provision its installed package/environment separately, with
 schema-2 configuration, accepted genesis and private credentials. Copying the
 customization pack does not install, initialize or register the task service.
+For the Python-native `mempalace-tasks setup configure` / `enable` / `check`
+workflow, see the repository's [task setup guide](../../../sidecar/setup.md).
+It requires the already prepared package, not a .NET runtime. Finish with
+`check`, then load the registration in the affected harness session; a copied
+skill, installed executable or saved registration alone does not prove readiness.
 
 For harness-managed startup, register a stdio server named `mempalace-tasks`
 using the preinstalled executable (an absolute executable path is recommended):

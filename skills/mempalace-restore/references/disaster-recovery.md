@@ -21,6 +21,10 @@ For task snapshots, use an already installed epoch-aware sidecar package,
 MemPalace CLI and restic. Memory-only restore needs no sidecar package; the
 stdlib-only backup helper and its `palace_restore_io.py` companion provide the
 same generic offline publication guards.
+Set `MPY` to the absolute path of the preinstalled Python satisfying that
+snapshot's requirements, and `BACKUP_SCRIPTS` to the absolute path of the
+companion `mempalace-backup/scripts/` directory. The commands below then work
+from the external session workspace, not an assumed skill-relative directory.
 Task truth is DATA/logstream.sqlite3 (events, artifacts and links), together
 with DATA/replica.json. There is no matching external pending/head/clock state.
 The helper's `--palace` names backup HOME; the MemPalace CLI's `--palace` names
@@ -67,7 +71,7 @@ thing that had to survive.
 5. Materialize and validate a private, disjoint stage:
 
    ```bash
-   python3 ../mempalace-backup/scripts/palace_backup.py --palace ~/.mempalace \
+   "$MPY" "$BACKUP_SCRIPTS/palace_backup.py" --palace ~/.mempalace \
      restore latest --target ~/.mempalace-restore-stage --require-logstream
    ```
 
@@ -80,7 +84,7 @@ thing that had to survive.
 6. After establishing the offline boundary, activate and publish:
 
    ```bash
-   python3 ../mempalace-backup/scripts/palace_backup.py --palace ~/.mempalace \
+   "$MPY" "$BACKUP_SCRIPTS/palace_backup.py" --palace ~/.mempalace \
      restore latest --target ~/.mempalace-restore-stage --from-stage \
      --in-place --offline --require-logstream
    ```

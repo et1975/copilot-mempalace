@@ -5,6 +5,12 @@ Contract for the shipped `contemplate` v1 task: bounded deductive KG closure
 `skills/dreaming/scripts/dream_harvest.py --task derive` and
 `skills/dreaming/scripts/dream_adopt.py --task derive`.
 
+For examples, set `MPY` to the absolute path of the provisioned Python that
+imports MemPalace, and `DREAM_SCRIPTS` to the absolute path of the dreaming
+skill's `scripts/` directory. Select that interpreter explicitly rather than
+parsing a launcher shebang. Run from the external session workspace to keep
+relative worklists and decisions outside the checkout and installed skill.
+
 ## Layered responsibilities
 
 - **Substrate — mempalace**: palace-local temporal KG at
@@ -26,11 +32,10 @@ Contract for the shipped `contemplate` v1 task: bounded deductive KG closure
 Run:
 
 ```bash
-MPY=$(head -1 "$(command -v mempalace)" | sed 's/^#!//')
-"$MPY" skills/dreaming/scripts/dream_harvest.py --task derive \
+"$MPY" "$DREAM_SCRIPTS/dream_harvest.py" --task derive \
   --palace <p> --rules <p>/ontology.json --out worklist.json
 # fill actions in worklist.json and save as decisions.json
-"$MPY" skills/dreaming/scripts/dream_adopt.py --task derive \
+"$MPY" "$DREAM_SCRIPTS/dream_adopt.py" --task derive \
   --palace <p> --decisions decisions.json --verify
 ```
 
@@ -98,11 +103,10 @@ instead of guessing. Two generator tasks can populate disabled candidate rules
 for review:
 
 ```bash
-MPY=$(head -1 "$(command -v mempalace)" | sed 's/^#!//')
 # name-heuristic bootstrap
-"$MPY" skills/dreaming/scripts/dream_harvest.py --task suggest-rules --palace <p> --ontology-out <p>/ontology.json
+"$MPY" "$DREAM_SCRIPTS/dream_harvest.py" --task suggest-rules --palace <p> --ontology-out <p>/ontology.json
 # evidence induction
-"$MPY" skills/dreaming/scripts/dream_harvest.py --task induce-rules --palace <p> --min-support 2 --ontology-out <p>/ontology.json
+"$MPY" "$DREAM_SCRIPTS/dream_harvest.py" --task induce-rules --palace <p> --min-support 2 --ontology-out <p>/ontology.json
 # then a HUMAN reviews ontology.json and flips enabled:true only on approved rules
 ```
 

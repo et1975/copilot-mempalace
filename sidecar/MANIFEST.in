@@ -1,3 +1,4 @@
 include README.md
+include setup.md
 include requirements.lock
 prune tests

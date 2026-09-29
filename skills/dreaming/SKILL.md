@@ -55,9 +55,15 @@ mempalace deliberately has no model. Never push judgement into it.
 
 ## The 5-phase pipeline
 
-Scripts live in `skills/dreaming/scripts/`. Run them with a Python that can
-import `mempalace` (e.g. the interpreter from `uv tool install mempalace`).
-Artifacts go in the session workspace — never commit them.
+Scripts live in `skills/dreaming/scripts/`. Set `MPY` to the absolute path of
+the already provisioned Python that can import `mempalace`, and `DREAM_SCRIPTS`
+to the absolute path of that scripts directory in the checkout or installed
+dreaming skill. Do not derive `MPY` by stripping a console script's shebang:
+launchers may be binaries or use `/usr/bin/env` with arguments. Invoke scripts
+through `"$MPY"`; not every script has an executable bit.
+Run examples from the external session workspace so relative artifact paths
+stay there, never in the checkout or installed skill. Bare script names in
+tables below are shorthand for `"$MPY" "$DREAM_SCRIPTS/<name>"`.
 
 > **Fast reconnaissance first.** Before hand-running per-task/per-wing
 > harvests, get a whole-palace picture in one call with the read-only survey
@@ -65,10 +71,9 @@ Artifacts go in the session workspace — never commit them.
 > and prints one aggregated report (no adopt, ever):
 >
 > ```bash
-> MPY=$(head -1 "$(command -v mempalace)" | sed 's/^#!//')
-> "$MPY" dream_survey.py --palace <p>                 # summary of all tasks/wings
-> "$MPY" dream_survey.py --palace <p> --format json --out survey.json
-> "$MPY" dream_survey.py --palace <p> --tasks merge,prune --wings avs,icm_automation \
+> "$MPY" "$DREAM_SCRIPTS/dream_survey.py" --palace <p> # summary of all tasks/wings
+> "$MPY" "$DREAM_SCRIPTS/dream_survey.py" --palace <p> --format json --out survey.json
+> "$MPY" "$DREAM_SCRIPTS/dream_survey.py" --palace <p> --tasks merge,prune --wings avs,icm_automation \
 >     --worklists-dir ./wl   # also dump non-empty worklists for adjudication
 > ```
 >
@@ -102,10 +107,9 @@ adopt with `--verify` in one call — the adjudication already is the decision.
 For a mempalace tool install, prefer the interpreter that owns the package:
 
 ```bash
-MPY=$(head -1 "$(command -v mempalace)" | sed 's/^#!//')
-"$MPY" dream_harvest.py --palace <palace> --task pattern --wing <wing> \
+"$MPY" "$DREAM_SCRIPTS/dream_harvest.py" --palace <palace> --task pattern --wing <wing> \
   --rooms diary --min-support 3 --out worklist.json
-"$MPY" dream_adopt.py --palace <palace> --decisions decisions.json --verify
+"$MPY" "$DREAM_SCRIPTS/dream_adopt.py" --palace <palace> --decisions decisions.json --verify
 ```
 
 ### Pattern observation source (`--source`)
@@ -119,11 +123,11 @@ preferences — even when nothing was journaled:
 
 ```bash
 # raw host sessions only
-"$MPY" dream_harvest.py --palace <palace> --task pattern --source sessions \
+"$MPY" "$DREAM_SCRIPTS/dream_harvest.py" --palace <palace> --task pattern --source sessions \
   --repository <repo-substr> --since 2026-01-01 --limit-sessions 200 \
   --min-support 2 --out worklist.json
 # union of diary + raw sessions (support-counted across both by distinct session_id)
-"$MPY" dream_harvest.py --palace <palace> --task pattern --source both \
+"$MPY" "$DREAM_SCRIPTS/dream_harvest.py" --palace <palace> --task pattern --source both \
   --rooms diary --repository <repo-substr> --min-support 2 --out worklist.json
 ```
 
@@ -140,10 +144,9 @@ before the sanctioned delete; `--archive-file` sets the path for either (default
 `<palace>/dream-archive.jsonl`):
 
 ```bash
-MPY=$(head -1 "$(command -v mempalace)" | sed 's/^#!//')
-"$MPY" dream_harvest.py --palace <palace> --task prune --wing <wing> \
+"$MPY" "$DREAM_SCRIPTS/dream_harvest.py" --palace <palace> --task prune --wing <wing> \
   --room <room> --v-min 0.35 --age-floor-days 30 --out worklist.json
-"$MPY" dream_adopt.py --palace <palace> --decisions decisions.json \
+"$MPY" "$DREAM_SCRIPTS/dream_adopt.py" --palace <palace> --decisions decisions.json \
   --archive-file archive.jsonl --verify
 ```
 
@@ -329,11 +332,10 @@ content under structural admission and novelty gates.
 **Flow:**
 
 ```bash
-MPY=$(head -1 "$(command -v mempalace)" | sed 's/^#!//')
-"$MPY" dream_harvest.py --palace <p> --task reflect --source diary \
+"$MPY" "$DREAM_SCRIPTS/dream_harvest.py" --palace <p> --task reflect --source diary \
   --wing <w> --rooms diary --min-support 2 --out worklist.json
 # adjudicate worklist (fill `decision` per item)
-"$MPY" dream_adopt.py --palace <p> --decisions decisions.json --task reflect --verify
+"$MPY" "$DREAM_SCRIPTS/dream_adopt.py" --palace <p> --decisions decisions.json --task reflect --verify
 ```
 
 `--task pattern` still works as an alias for the `converge` kind specifically

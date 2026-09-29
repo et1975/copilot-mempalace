@@ -110,6 +110,7 @@ def _parser():
                      description="Explicit task service ownership and remote read-only inspection")
     parser.add_argument("--config", help="Absolute schema-2 JSON configuration (or MPTASK_CONFIG)")
     commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("setup", help="Configure, enable or check task-MCP readiness explicitly")
     for name, description in (
         ("validate-config", "Validate configuration read-only, without creating or starting anything"),
         ("init", "Explicit new-authority init, not data-loss recovery; idempotent with intact state"),
@@ -181,6 +182,13 @@ def _emit(value):
 
 
 def main(argv=None) -> int:
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments[:1] == ["setup"]:
+        from .setup import main as setup_main
+        return setup_main(arguments[1:])
+    if len(arguments) >= 3 and arguments[0] == "--config" and arguments[2] == "setup":
+        from .setup import main as setup_main
+        return setup_main([*arguments[3:], "--config", arguments[1]])
     try:
         try:
             args = _parser().parse_args(argv)

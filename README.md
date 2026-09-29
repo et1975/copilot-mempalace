@@ -42,8 +42,9 @@ audit hook that nags when an external tool is about to run without a prior `memp
   contract](sidecar/README.md#recovery-and-coherent-palace-backuprestore) before
   changing an existing deployment.
   For installation, use the [task setup quick-start](sidecar/setup.md): one
-  `configure` / `enable` / `check` workflow covers configuration, explicit
-  initialization, Copilot registration and actual MCP readiness.
+  Python-native `mempalace-tasks setup configure` / `enable` / `check` workflow
+  covers configuration, explicit initialization, Copilot registration and
+  actual MCP readiness. No additional .NET runtime is needed.
 - **[skills/dreaming/SKILL.md](skills/dreaming/SKILL.md)** — offline consolidation ("dreaming"): a 5-phase
   pipeline (harvest → adjudicate → review → adopt → verify) that merges near-duplicate drawers and resolves
   adjudicated KG contradiction/staleness candidates between sessions, plus constructive `reflect`
@@ -259,7 +260,7 @@ cat copilot-instructions.md >> ~/.copilot/copilot-instructions.md
 mkdir -p ~/.copilot/skills
 ln -s "$(pwd)/skills/mempalace" ~/.copilot/skills/mempalace
 
-# 1.3 Hook (both files together so the JSON's relative reference resolves)
+# 1.3 Hook (the JSON command expects this ~/.copilot/hooks/ script path)
 mkdir -p ~/.copilot/hooks
 ln -s "$(pwd)/hooks/palace-reflex.json" ~/.copilot/hooks/palace-reflex.json
 ln -s "$(pwd)/hooks/palace-reflex.py"   ~/.copilot/hooks/palace-reflex.py
