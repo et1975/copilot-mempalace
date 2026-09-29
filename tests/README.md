@@ -149,6 +149,42 @@ Root configuration disables pytest's repository-local cache and uses `prepend`
 imports to preserve existing bare-module identities. Do not add parallel
 execution: tests share process-global module and environment state.
 
+## GitHub Actions CI
+
+The [`CI` workflow](../.github/workflows/ci.yml) runs on pushes to `main`, pull
+requests and manual `workflow_dispatch` runs. It uses Ubuntu 24.04 with Python
+3.12 and read-only repository permissions. Official actions are pinned to commit
+SHAs; CI dependency pins live in [`requirements-ci.txt`](../requirements-ci.txt),
+with the pytest pin retained in
+[`requirements-test.txt`](../requirements-test.txt). CI installs the full
+transitive [`requirements-ci.lock`](../requirements-ci.lock) with hash
+verification. After changing any input requirements, regenerate that lock with
+the `uv` version pinned in `requirements-ci.txt`:
+
+```bash
+uv pip compile requirements-ci.txt --python-version 3.12 --universal \
+  --only-binary=:all: --generate-hashes --output-file requirements-ci.lock
+```
+
+Provisioning is separate from test execution: CI prepares the Python/runtime and
+build prerequisites, including `uv`, and preprovisions the MiniLM model cache
+before running tests. These preparation steps may access external package/model
+sources; the tests do not install missing prerequisites. In particular, the
+wheel/sdist build and wheel-from-sdist roundtrip remain offline.
+
+CI runs the full root pytest suite serially, including the distribution
+regression, with an isolated temporary HOME and external disposable test
+storage. The prepared model cache is available in that isolated environment;
+no real palace, user credentials or publishing step is required or used.
+Existing integration gates and platform skips remain intact:
+`MPTASK_LIVE_HUB=1` is an explicit opt-in, not part of default CI. Linux CI does
+not certify native Windows or macOS behavior.
+
+The [local full-suite command](#commands) remains canonical. Local runs still
+require the [already provisioned environment](#prepared-environment); CI setup
+does not change the tests into an installer or replace the separate
+[deployment acceptance checks](#distribution-and-deployment-acceptance).
+
 ## Distribution and deployment acceptance
 
 A passing source-tree test run does not prove the deployed artifacts are clean.

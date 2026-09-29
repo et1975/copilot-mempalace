@@ -1,5 +1,7 @@
 # AI-assisted memory (MemPalace)
 
+[![CI](https://github.com/et1975/copilot-mempalace/actions/workflows/ci.yml/badge.svg)](https://github.com/et1975/copilot-mempalace/actions/workflows/ci.yml)
+
 Copilot customization pack that turns [MemPalace](https://github.com/mempalace/mempalace) into the agent's default memory.
 Three hard rules — recall before external fact-finding, save every new fact, end-of-turn diary — plus a `PreToolUse`
 audit hook that nags when an external tool is about to run without a prior `mempalace_search`.
@@ -155,6 +157,11 @@ separate from deployed hooks, skills and sidecar packages. Pytest is the canonic
 runner; root configuration supplies import paths without `PYTHONPATH` or changing
 into production directories. See the [test guide](tests/README.md) for setup,
 suite selectors, existing integration gates and package-content checks.
+
+[GitHub Actions CI](.github/workflows/ci.yml) runs the full suite serially on
+Ubuntu 24.04 / Python 3.12, including the offline wheel/sdist roundtrip.
+See [CI coverage and provisioning](tests/README.md#github-actions-ci) for triggers,
+isolated storage and the separate prerequisite-preparation step.
 
 Commands below run from the repository root. `TEST_PY` must select a preprovisioned
 Python 3.11+ interpreter with pytest 8.4.2 (`requirements-test.txt`); the full suite
