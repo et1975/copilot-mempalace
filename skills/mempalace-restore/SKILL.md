@@ -69,8 +69,13 @@ the epoch-aware `mempalace_tasks` package (`PYTHONPATH=<repo>/sidecar/src` in a
 checkout). Task activation also requires the installed MemPalace CLI; restic is
 needed for materialization, not `--from-stage`. Never install tools implicitly.
 
+Set `MPY` to that Python's absolute path and `BACKUP_SCRIPTS` to the absolute
+path of the companion `mempalace-backup/scripts/` directory (checkout or installed
+skill). This restore skill has no local `scripts/` directory. Use the selected
+interpreter explicitly, rather than the helper's `python3` shebang.
+
 ```bash
-python3 ../mempalace-backup/scripts/palace_backup.py --palace ~/.mempalace \
+"$MPY" "$BACKUP_SCRIPTS/palace_backup.py" --palace ~/.mempalace \
   restore <snapshot-id> --target ~/.mempalace-restore-stage --require-logstream
 ```
 
@@ -96,7 +101,7 @@ land directly under the restore target.
 ### 4. Activate in private staging, then publish offline
 
 ```bash
-python3 ../mempalace-backup/scripts/palace_backup.py --palace ~/.mempalace \
+"$MPY" "$BACKUP_SCRIPTS/palace_backup.py" --palace ~/.mempalace \
   restore <snapshot-id> --target ~/.mempalace-restore-stage \
   --from-stage --in-place --offline --require-logstream
 ```
@@ -211,16 +216,16 @@ input formats are auto-detected:
 # Import needs mempalace importable — run under the interpreter where mempalace
 # is installed (e.g. the uv-tool venv), not necessarily system python3.
 # --palace is the mempalace HOME dir (~/.mempalace), NOT the nested palace/ dir.
-./scripts/palace_wing.py import wing-<wing>.jsonl --palace ~/.mempalace
+"$MPY" "$BACKUP_SCRIPTS/palace_wing.py" import wing-<wing>.jsonl --palace ~/.mempalace
 
 # Markdown directory (or its manifest.json), incl. legacy OneDrive exports:
-./scripts/palace_wing.py import backups/mempalace-wings/<wing> --palace ~/.mempalace
+"$MPY" "$BACKUP_SCRIPTS/palace_wing.py" import backups/mempalace-wings/<wing> --palace ~/.mempalace
 
 # Preview without writing anything:
-./scripts/palace_wing.py import wing-<wing>.jsonl --dry-run
+"$MPY" "$BACKUP_SCRIPTS/palace_wing.py" import wing-<wing>.jsonl --dry-run
 
 # Clone into a different wing name (implies no dedup):
-./scripts/palace_wing.py import wing-<wing>.jsonl --into-wing <new-wing>
+"$MPY" "$BACKUP_SCRIPTS/palace_wing.py" import wing-<wing>.jsonl --into-wing <new-wing>
 ```
 
 > **`--palace` = HOME, and the stray-palace guard.** `--palace` must be the

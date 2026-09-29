@@ -6,9 +6,12 @@ wing/room and reconstructed content. The original physical ids and chunking are
 not resurrected: mempalace mints new drawer ids and recomputes embeddings.
 
 Usage:
-    python3 dream_restore.py --palace ~/.mempalace/palace
-    python3 dream_restore.py --palace ~/.mempalace/palace --dry-run
-    python3 dream_restore.py --palace ~/.mempalace/palace --id logical-id
+    "$MPY" "$DREAM_SCRIPTS/dream_restore.py" --palace ~/.mempalace/palace
+    "$MPY" "$DREAM_SCRIPTS/dream_restore.py" --palace ~/.mempalace/palace --dry-run
+    "$MPY" "$DREAM_SCRIPTS/dream_restore.py" --palace ~/.mempalace/palace --id logical-id
+
+Select absolute MPY (the provisioned MemPalace interpreter) and DREAM_SCRIPTS
+paths; do not assume the current directory or system Python owns MemPalace.
 """
 from __future__ import annotations
 

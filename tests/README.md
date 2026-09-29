@@ -55,6 +55,13 @@ unavailable prerequisites, not hidden with new skips or collection exclusions.
 Report the exact selection, failures and skip reasons; successful collection or a
 partial run is not full-suite validation.
 
+Task-setup regressions in `tests/test_task_setup.py` and
+`tests/test_task_setup_runtime.py` run directly in Python,
+using the same prepared sidecar environment. They exercise isolated fixtures,
+not the user's real task authority, and require no F#/.NET runtime. Native
+platform-specific cases report their own prerequisites; the setup suite is
+not skipped wholesale for lack of .NET or for running outside Linux.
+
 ## External storage and bytecode
 
 Set `SESSION_FILES` to an **existing absolute directory outside the checkout**
@@ -114,6 +121,10 @@ Select the smallest relevant suite while developing:
 "$TEST_PY" -m pytest --basetemp "$SESSION_FILES/pytest-harness" \
   tests/test_layout.py tests/test_harness.py -q
 
+# Task setup and its native subprocess/runtime boundary.
+"$TEST_PY" -W error -m pytest --basetemp "$SESSION_FILES/pytest-task-setup" \
+  tests/test_task_setup.py tests/test_task_setup_runtime.py -q
+
 # Procedural command/replay integration.
 "$TEST_PY" -m pytest --basetemp "$SESSION_FILES/pytest-procedural" \
   tests/dreaming/test_dream_procedure.py \
@@ -154,15 +165,18 @@ acceptance checks. Before accepting packaging changes:
    pytest configuration or `requirements-test.txt`. Match test assets by their
    paths/identities, not by rejecting every filename containing `test`.
 3. Require application modules and console entry-point metadata in the wheel;
-   require README, requirements lock, build metadata and application source in
+   require README, the setup guide, requirements lock, build metadata and application source in
    the source distribution. [`sidecar/MANIFEST.in`](../sidecar/MANIFEST.in)
-   includes README and the production lock and explicitly prunes local tests;
+   includes README, `setup.md` and the production lock and explicitly prunes local tests;
    sibling root tests and development dependencies are not package inputs.
 4. Rebuild a wheel from the produced source distribution offline. Install that
    wheel into a disposable already-provisioned environment without fetching
    dependencies. From outside the checkout with `PYTHONPATH` cleared and
    `PYTHONDONTWRITEBYTECODE=1` still exported, verify both
-   `mempalace-tasks --help` and `mempalace-tasks mcp --help`.
+   `mempalace-tasks --help` and `mempalace-tasks mcp --help`, plus
+   `mempalace-tasks setup --help` and `python -m mempalace_tasks setup --help`
+   using that environment's Python. Help is an installed-entry-point check,
+   not proof of a configured or reachable task authority.
 5. Inspect clean copies of deployable `hooks/` and `skills/`: runtime scripts and
    their referenced files remain present, no tests/helpers remain, and runtime
    modules do not import repository tests.

@@ -49,26 +49,27 @@ open it read-only, without creating a missing file.
 
 ## CLI and artifacts
 
-Use the Python interpreter that already owns MemPalace, from
-`skills/dreaming/scripts`. Examples use `$MPY`, `$PALACE`, `$ARTIFACTS` and
-`$STORE` (session-store.db). `$ARTIFACTS` must be outside the palace.
+Set `MPY` to the absolute path of the Python interpreter that already owns
+MemPalace, and `DREAM_SCRIPTS` to the absolute path of the dreaming skill's
+`scripts/` directory. Examples also use `$PALACE`, `$ARTIFACTS` and `$STORE`
+(session-store.db). `$ARTIFACTS` must be outside the palace and checkout.
 All six commands require `--palace PATH --wing PROJECT`.
 
 ```bash
-"$MPY" dream_procedure.py propose --palace "$PALACE" --wing project \
+"$MPY" "$DREAM_SCRIPTS/dream_procedure.py" propose --palace "$PALACE" --wing project \
   --session-store "$STORE" --input "$ARTIFACTS/proposal-draft.json" \
   --prepare --out "$ARTIFACTS/proposal.json"
-"$MPY" dream_procedure.py propose --palace "$PALACE" --wing project \
+"$MPY" "$DREAM_SCRIPTS/dream_procedure.py" propose --palace "$PALACE" --wing project \
   --session-store "$STORE" --input "$ARTIFACTS/proposal.json" --dry-run
-"$MPY" dream_procedure.py propose --palace "$PALACE" --wing project \
+"$MPY" "$DREAM_SCRIPTS/dream_procedure.py" propose --palace "$PALACE" --wing project \
   --session-store "$STORE" --input "$ARTIFACTS/proposal.json"
-"$MPY" dream_procedure.py validate --palace "$PALACE" --wing project \
+"$MPY" "$DREAM_SCRIPTS/dream_procedure.py" validate --palace "$PALACE" --wing project \
   --session-store "$STORE" --rule-id 'proc:SHA256' \
   --contrast-query 'When did a focused regression test mislead this fix?' \
   --out "$ARTIFACTS/packet.json"
-"$MPY" dream_procedure.py review --palace "$PALACE" --wing project \
+"$MPY" "$DREAM_SCRIPTS/dream_procedure.py" review --palace "$PALACE" --wing project \
   --session-store "$STORE" --input "$ARTIFACTS/review.json"
-"$MPY" dream_procedure.py outcome --palace "$PALACE" --wing project \
+"$MPY" "$DREAM_SCRIPTS/dream_procedure.py" outcome --palace "$PALACE" --wing project \
   --session-store "$STORE" --input "$ARTIFACTS/outcome.json"
 ```
 
@@ -257,13 +258,13 @@ remains the reviewer's responsibility: code does not prove causality.
 After ordinary evidence recall, explicitly opt into repository-scoped advice:
 
 ```bash
-"$MPY" dream_procedure.py guidance --palace "$PALACE" --wing project \
+"$MPY" "$DREAM_SCRIPTS/dream_procedure.py" guidance --palace "$PALACE" --wing project \
   --session-store "$STORE" --task 'Fix the reproducible parser regression' \
   --repository owner/repository
-"$MPY" dream_procedure.py guidance --palace "$PALACE" --wing project \
+"$MPY" "$DREAM_SCRIPTS/dream_procedure.py" guidance --palace "$PALACE" --wing project \
   --session-store "$STORE" --task 'A bounded regression-test trial' \
   --repository owner/repository --include-candidates
-"$MPY" dream_procedure.py explain --palace "$PALACE" --wing project \
+"$MPY" "$DREAM_SCRIPTS/dream_procedure.py" explain --palace "$PALACE" --wing project \
   --session-store "$STORE" --rule-id 'proc:SHA256'
 ```
 

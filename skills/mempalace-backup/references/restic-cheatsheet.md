@@ -31,10 +31,12 @@ running. This is unrelated to `~/.mempalace/locks`, which backups exclude.
 
 ## Backup
 
-For logstream/task storage use the guarded helper from the skill directory:
+For logstream/task storage use the guarded helper. Set `MPY` to the absolute
+path of the preinstalled Python that imports `mempalace_tasks`, and
+`BACKUP_SCRIPTS` to the absolute path of the backup skill's `scripts/` directory:
 
 ```bash
-python3 scripts/palace_backup.py backup --offline --require-logstream
+"$MPY" "$BACKUP_SCRIPTS/palace_backup.py" backup --offline --require-logstream
 ```
 
 Its preinstalled interpreter must import `mempalace_tasks`. Establish the offline

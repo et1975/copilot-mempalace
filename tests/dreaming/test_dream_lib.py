@@ -1,6 +1,8 @@
-"""Unit tests for the dreaming pure core. Stdlib unittest runner.
+"""Unit tests for the dreaming pure core.
 
-Run: cd skills/dreaming/scripts && python3 -m unittest -v
+From the repository root with the prepared test interpreter and external
+temporary-storage environment described in tests/README.md:
+    "$TEST_PY" -m pytest tests/dreaming/test_dream_lib.py -q
 """
 from datetime import datetime
 import json

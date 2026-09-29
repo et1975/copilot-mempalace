@@ -91,6 +91,8 @@ def assert_runtime_wheel(path):
             "mempalace_tasks/__init__.py",
             "mempalace_tasks/__main__.py",
             "mempalace_tasks/cli.py",
+            "mempalace_tasks/setup.py",
+            "mempalace_tasks/setup_runtime.py",
         } <= set(names)
         entry_points = [name for name in names if name.endswith(".dist-info/entry_points.txt")]
         assert len(entry_points) == 1, entry_points
@@ -120,8 +122,11 @@ def test_source_distribution_is_test_free_and_buildable(distributions):
     relative = {str(PurePosixPath(*PurePosixPath(name).parts[1:])) for name in names}
     assert {
         "README.md",
+        "setup.md",
         "requirements.lock",
         "pyproject.toml",
         "src/mempalace_tasks/__init__.py",
         "src/mempalace_tasks/cli.py",
+        "src/mempalace_tasks/setup.py",
+        "src/mempalace_tasks/setup_runtime.py",
     } <= relative
