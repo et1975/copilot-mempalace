@@ -867,7 +867,7 @@ class TestAdoptMergeArchiveAndVerify(unittest.TestCase):
             decisions_path = os.path.join(td, "worklist.json")
             with contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(dream_harvest.main([
-                    "--palace", td, "--wing", "w", "--room", "r", "--tau", ".8",
+                    "--palace", td, "--task", "merge", "--wing", "w", "--room", "r", "--tau", ".8",
                     "--out", decisions_path]), 0)
             worklist = _load_json(decisions_path)
             self.assertEqual(len(worklist["items"]), 1)

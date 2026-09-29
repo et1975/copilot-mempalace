@@ -144,7 +144,7 @@ To harvest the default incremental worklist directly:
 For a report without adoption, use the same merge candidate pipeline:
 
 ```bash
-"$MPY" dream_verify.py --palace <palace> --wing <wing> --room <room> \
+"$MPY" "$DREAM_SCRIPTS/dream_verify.py" --palace <palace> --wing <wing> --room <room> \
   --tau 0.9 --strict
 ```
 

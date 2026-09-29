@@ -12,10 +12,11 @@ temporary ontology and reported, never to the live ``<palace>/ontology.json``.
 Usage::
 
     "$MPY" "$DREAM_SCRIPTS/dream_survey.py" --repository owner/project --wings project
-    "$MPY" "$DREAM_SCRIPTS/dream_survey.py" --palace ~/.mempalace/palace --repository owner/project --wings project
-    "$MPY" "$DREAM_SCRIPTS/dream_survey.py" --palace <p> --tasks merge,prune --wings avs,icm_automation
-    "$MPY" "$DREAM_SCRIPTS/dream_survey.py" --palace <p> --repository owner/project --wings project --format json --out survey.json \\
-        --worklists-dir ./wl
+    "$MPY" "$DREAM_SCRIPTS/dream_survey.py" --palace ~/.mempalace/palace \\
+        --repository owner/project --wings project
+    "$MPY" "$DREAM_SCRIPTS/dream_survey.py" --palace <p> --tasks merge,prune
+    "$MPY" "$DREAM_SCRIPTS/dream_survey.py" --palace <p> --repository owner/project \\
+        --wings project --format json --out survey.json --worklists-dir ./wl
 
 Set MPY to the absolute path of a provisioned Python that imports mempalace,
 and DREAM_SCRIPTS to the absolute dreaming scripts directory. Run from an
@@ -213,10 +214,11 @@ def _format_example(task: str, ex: dict) -> str:
 # --------------------------------------------------------------------------
 def _run_main(argv: list) -> None:
     """Call dream_harvest.main in-process, suppressing its stderr chatter."""
-    with contextlib.redirect_stderr(io.StringIO()) as diagnostics:
+    stderr = io.StringIO()
+    with contextlib.redirect_stderr(stderr):
         rc = dream_harvest.main(argv)
     if rc != 0:
-        raise RuntimeError(f"harvest failed ({rc}): {diagnostics.getvalue().strip()}")
+        raise RuntimeError(f"dream_harvest.main {argv} returned {rc}: {stderr.getvalue().strip()}")
 
 
 def harvest(task: str, palace: str, wing: str | None = None, *, tau: float = 0.9,

@@ -203,8 +203,8 @@ def test_explicit_legacy_reflect_still_uses_drawer_clusters(tmp_path, monkeypatc
 
 def test_explicit_merge_still_works_without_repository(tmp_path, monkeypatch):
     monkeypatch.setattr(dream_palace, "bind_palace", str)
-    monkeypatch.setattr(dream_palace, "load_logical_drawers", lambda *args: [])
-    monkeypatch.setattr(dh, "exclude_protected_drawers", lambda palace, drawers: drawers)
+    monkeypatch.setattr(dream_palace, "find_duplicate_clusters", lambda *args, **kwargs: [])
+    monkeypatch.setattr(dh, "live_protected_drawer_ids", lambda palace: set())
     rc, worklist = run_harvest(tmp_path, "--task", "merge")
     assert rc == 0
     assert worklist["task"] == "merge"

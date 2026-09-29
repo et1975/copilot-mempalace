@@ -27,7 +27,7 @@ class TestNativeMergeHarvest(unittest.TestCase):
                  mock.patch.object(dh.dream_palace, "load_logical_drawers",
                                    side_effect=AssertionError("local reclustering must not run")), \
                  contextlib.redirect_stderr(io.StringIO()):
-                rc = dh.main(["--palace", td, "--wing", "w", "--room", "r",
+                rc = dh.main(["--palace", td, "--task", "merge", "--wing", "w", "--room", "r",
                               "--tau", ".94", "--out", out])
             self.assertEqual(rc, 0)
             with open(out, encoding="utf-8") as fh:
