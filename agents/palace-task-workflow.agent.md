@@ -158,6 +158,12 @@ A ready row is not ownership.
    dispatch prompt. Pass an initial bounded packet with authority/epoch, mode,
    goal/task, acceptance, file/effect scope, session, attempt/generation,
    input artifacts/base and checkpoint, and this wait-before-work boundary.
+   Before including any task reference in that packet, resolve it to a verified
+   real `task_id` from fresh task MCP state (`mptask_get` for a specific task,
+   `mptask_ready` when selecting from readiness). Never pass through a bare
+   plan/artifact label as if it were a `task_id`. The parent catches this before
+   dispatch; the worker should not have to discover mid-task that `mptask_get`
+   on a label returns `not_found`.
 3. From the dispatch result, bind the **actual returned agent ID** using native
    `start`. Do not precompute IDs or substitute a nickname. Parent-owned work
    binds the actual parent session UUID instead.
@@ -174,6 +180,13 @@ control. WAIT is an instruction/acknowledgment, not enforced runtime suspension.
 No invented `cwd` API, model override, permission bypass or isolation fence.
 Materialize prerequisite inputs through the existing execution environment;
 dependency closure does not apply patches into another worktree.
+Observed failure to avoid: in session `896af240-75f1-4a20-a29d-7805cc12cf30`
+(goal `tsk_85c344bb-7baf-54e8-a2a0-969e3e159bde`, repo
+`Azure/Microsoft.AVS.Management`), a parent dispatched label `C1` instead of
+real task `tsk_79f2fd22-764d-55d3-b614-fed94e70990f`. The worker correctly
+stayed read-only after `mptask_get("C1")` returned `not_found`; the mistake was
+the parent's unresolved dispatch packet, not the worker's refusal to fabricate a
+claim.
 
 ### 5. Checkpoint and publish discoveries
 
