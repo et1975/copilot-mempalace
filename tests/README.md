@@ -58,9 +58,8 @@ partial run is not full-suite validation.
 Task-setup regressions in `tests/test_task_setup.py` and
 `tests/test_task_setup_runtime.py` run directly in Python,
 using the same prepared sidecar environment. They exercise isolated fixtures,
-not the user's real task authority, and require no F#/.NET runtime. Native
-platform-specific cases report their own prerequisites; the setup suite is
-not skipped wholesale for lack of .NET or for running outside Linux.
+not the user's real task authority. Native platform-specific cases report their
+own prerequisites; the common setup suite runs across supported platforms.
 
 ## External storage and bytecode
 

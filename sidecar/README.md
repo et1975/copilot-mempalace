@@ -126,7 +126,7 @@ deployments can begin with `check`; incompatible configurations stop with a
 specific blocker.
 
 Setup shares the sidecar's Python/native-platform requirements and uses its
-POSIX permission and Windows ACL helpers. It needs no .NET SDK or F# runtime.
+POSIX permission and Windows ACL helpers.
 `python -m mempalace_tasks setup` is also supported from the installed
 environment. Native macOS/Windows validation limits above still apply.
 

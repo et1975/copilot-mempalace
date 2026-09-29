@@ -61,7 +61,7 @@ audit hook that nags when an external tool is about to run without a prior `memp
   For installation, use the [task setup quick-start](sidecar/setup.md): one
   Python-native `mempalace-tasks setup configure` / `enable` / `check` workflow
   covers configuration, explicit initialization, Copilot registration and
-  actual MCP readiness. No additional .NET runtime is needed.
+  actual MCP readiness using the installed Python task package.
 - **[skills/dreaming/SKILL.md](skills/dreaming/SKILL.md)** — offline consolidation ("dreaming"): a 5-phase
   pipeline (harvest → adjudicate → review → adopt → verify) that merges near-duplicate drawers and resolves
   adjudicated KG contradiction/staleness candidates between sessions, plus constructive `reflect`
