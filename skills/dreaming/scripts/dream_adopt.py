@@ -25,6 +25,7 @@ import contextlib
 import io
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 from typing import Any
@@ -246,12 +247,18 @@ def _recurrence_error(dec, live_by_id):
         source_id = member["id"]
         if source_id.startswith("session:"):
             session_id = source_id[len("session:"):]
-            turns = dream_sessions.load_session_turns(session_id)
-            text = dream_palace._strip_context_boilerplate(dream_sessions._bounded_text([
-                turn["user_message"] for turn in turns
-                if isinstance(turn.get("user_message"), str) and turn["user_message"]]))
-            if not turns or not text:
-                return "missing_recurrence_source"
+            if "_incremental_sessions" in dec:
+                source = dec["_incremental_sessions"].get(source_id)
+                if not source or source.get("session_id") != session_id or not source.get("text"):
+                    return "missing_recurrence_source"
+                text = source["text"]
+            else:
+                turns = dream_sessions.load_session_turns(session_id)
+                text = dream_palace._strip_context_boilerplate(dream_sessions._bounded_text([
+                    turn["user_message"] for turn in turns
+                    if isinstance(turn.get("user_message"), str) and turn["user_message"]]))
+                if not turns or not text:
+                    return "missing_recurrence_source"
         else:
             live = live_by_id.get(source_id)
             if live is None or is_generated_observation(live):
@@ -291,6 +298,9 @@ def _preflight_reflect_decisions(path, decisions):
             allowed = {str(mid) for mid in (dec.get("member_ids") or [])}
             members_by_id = {mid: full_by_id[mid] for mid in allowed if mid in full_by_id
                              and not is_procedural_record(live_by_id[mid])}
+            if "_incremental_memories" in dec:
+                members_by_id = {mid: source["text"] for mid, source in dec["_incremental_memories"].items()
+                                 if mid in allowed}
             candidate = {"conclusion": dec.get("conclusion"), "premises": dec.get("premises")}
             v = validate_reflect(candidate, members_by_id)
             if not v["ok"]:
@@ -627,6 +637,17 @@ def main(argv: list[str] | None = None) -> int:
         args.archive_file = os.path.join(path, "dream-archive.jsonl")
     with open(args.decisions, encoding="utf-8") as fh:
         worklist = json.load(fh)
+    if "incremental" in worklist:
+        import dream_incremental
+        try:
+            if args.task not in (None, "reflect"):
+                raise ValueError("incremental review cannot override its reflection task")
+            report = dream_incremental.complete(path, worklist, dry_run=args.dry_run)
+        except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
+            print(f"error: incremental adoption failed: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(report, sort_keys=True), file=sys.stderr)
+        return 0
     task = args.task or _task_from_worklist(worklist)
 
     if args.dry_run:

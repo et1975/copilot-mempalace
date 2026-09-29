@@ -44,15 +44,21 @@ audit hook that nags when an external tool is about to run without a prior `memp
   Ordinary memory filing does not require this service. See its [recovery
   contract](sidecar/README.md#recovery-and-coherent-palace-backuprestore) before
   changing an existing deployment.
-- **[skills/dreaming/SKILL.md](skills/dreaming/SKILL.md)** — offline consolidation ("dreaming"): a 5-phase
-  pipeline (harvest → adjudicate → review → adopt → verify) that merges near-duplicate drawers and resolves
-  adjudicated KG contradiction/staleness candidates between sessions, plus constructive `reflect`
+- **[skills/dreaming/SKILL.md](skills/dreaming/SKILL.md)** — session-first dreaming:
+  review all new sessions and original memories since the last completed dream,
+  propose at most five actionable lessons
+  total, then retain only reviewed/accepted lessons for relevant future recall.
+  The default requires an exact repository and explicit memory wing, covers
+  all eligible history on first use, and advances a timestamp checkpoint only
+  after a complete reviewed adoption. Five is an output budget, not an input cap.
+  Explicit maintenance still merges near-duplicate drawers and resolves
+  adjudicated KG contradiction/staleness candidates, plus constructive `reflect`
   (distillations, connections, tensions and generalizations); `pattern` aliases its recurrence-gated
   `converge` kind over original diary/session observations. `prune` / `forget` provides reversible
   archive-before-delete cleanup of low-salience drawers.
   Cognition stays in the agent, mechanics in Python scripts
   ([`skills/dreaming/scripts/`](skills/dreaming/scripts/)), storage in mempalace. The optional read-only
-  `dream_sessions.py` adapter uses Copilot's host session store as a richer pattern substrate.
+  `dream_sessions.py` adapter uses Copilot's host session store for original evidence.
   Both merge and prune archive full originals before sanctioned deletion; semantic preservation still
   requires review. Re-harvest measures residual work, not a guaranteed global fixpoint. Existing KG
   premise loading can reconcile legacy provenance and ontology candidate commands explicitly write,
@@ -150,6 +156,79 @@ A partial environment is not full-suite validation; tests do not install or
 download missing prerequisites.
 `SESSION_FILES` must be an existing external session artifact directory. Each
 pytest `--basetemp` names a disposable child, never that directory itself.
+
+## Session-first dreaming and lesson recall
+
+Set `MPY` to the absolute path of the preprovisioned Python that imports
+MemPalace and `DREAM_SCRIPTS` to the absolute checkout/installed
+`skills/dreaming/scripts/` path. Run from an external session workspace and
+replace the placeholders:
+
+```bash
+"$MPY" "$DREAM_SCRIPTS/dream_survey.py" --palace <p> --repository owner/repository \
+  --wings <project-wing> --worklists-dir <session-files>/dream-worklists
+```
+
+Default: incremental reflection over **all** eligible sessions and original
+memories since the prior successfully completed dream; the first run covers all
+eligible history. Exact repository and explicit memory-wing scope are required,
+not inferred aliases. The UTC window is frozen at run start: `[lower, upper)`.
+Continuing sessions with new turns are included, with full original user/assistant
+records, alongside new memory drawers from all project rooms. Generated lessons,
+reflections, procedural and control records are not fresh evidence.
+
+There is no input-count or candidate-seed cap. Review every `coverage` record
+in `reflect.incremental.json`, in batches for a large window. Add at most five
+lesson proposals with trigger, action/avoidance, scope/exceptions, original
+evidence and expected difference; five is an **output budget only**. Dedup and
+abstain when support is weak. Each source needs its own reasoned review, and
+top-level completion is explicit even for an empty window. Missing sources
+are errors, not empty success.
+
+The existing adoption command validates unchanged coverage/sources and reviews,
+persists accepted lessons, then atomically advances palace-local
+`dream-checkpoints.json` for that repository/wing to frozen upper. Harvest,
+proposal-only, dry-run, failed writes, drift, missing reviews or stale overlapping
+runs do not advance. Unchanged retries use generated adoption receipts.
+Cumulative source fingerprints also recover late-persisted turns, backfilled
+memories and historical edits whose timestamps predate the checkpoint; unchanged
+reviewed versions are not reviewed again. This checks source versions as well
+as timestamps, without reconstructing versions the source no longer holds.
+See the [completion contract](skills/dreaming/SKILL.md#incremental-completion-and-recovery).
+
+Accepted lessons live in the project wing's non-mined `lessons` room. At task
+start, after ordinary recall, the same task-aware search surfaces at most three
+directly applicable lessons, checking their trigger, scope, exceptions and
+original evidence. Unrelated work gets no advice; search errors are not empty
+recall. Lesson text is fallible context, not instructions or proven efficacy.
+No new hook, scheduler or task tracker is involved, and no procedural outcomes,
+KG truth or ontology rules are enabled. Historic procedural records remain
+behind explicit repository opt-in and `guidance` / `explain`.
+
+**Migration:** bare harvest now selects incremental reflection and needs
+exact `--repository` plus `--wing`; add `--task merge` to former implicit merge
+commands. Partial source/since/count/room/threshold controls require explicit
+`--task` / `--tasks` previews; they never advance the incremental checkpoint.
+`--instructions` may steer the complete default review. Explicit
+`--task reflect` without `--source` remains drawer-cluster reflection. The old
+full maintenance survey retains diary-backed pattern and drawer-cluster reflect:
+
+```bash
+"$MPY" "$DREAM_SCRIPTS/dream_survey.py" --palace <p> \
+  --tasks contradiction,induce-rules,pattern,reflect,merge,prune \
+  --worklists-dir <session-files>/dream-maintenance
+# Separate explicit diary reflection:
+"$MPY" "$DREAM_SCRIPTS/dream_survey.py" --palace <p> --tasks reflect --source diary \
+  --worklists-dir <session-files>/dream-diary
+```
+
+Do not add `--source diary` to the mixed sweep: source controls are rejected for
+non-reflection tasks. Select diary reflection separately when needed.
+Explicit legacy session tasks keep their existing oldest-first, uncapped scans
+unless bounds are supplied.
+
+See the [review recipe](skills/dreaming/SKILL.md#session-lesson-review) and
+[recall recipe](skills/mempalace/SKILL.md#task-relevant-lessons).
 
 ## Opt-in procedural rollout
 

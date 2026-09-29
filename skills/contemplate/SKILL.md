@@ -5,8 +5,9 @@ description: Use when the user wants deliberate, on-demand deductive reasoning o
 
 # Contemplate
 
-On-demand reasoning for a mempalace palace. Where `dreaming` is
-unattended off-hours consolidation, `contemplate` is deliberate inline
+On-demand reasoning for a mempalace palace. Where `dreaming` defaults to
+off-hours review of all new sessions and original memories since its last
+completed checkpoint, `contemplate` is deliberate inline
 cognition: derive what follows from the active KG under explicitly-approved
 rules, query for relevant past sessions, propose ontology rules, and report
 knowledge gaps — without automatically adopting new KG conclusions/drawers.
@@ -331,6 +332,14 @@ surfaces:
 shared_constraint, converge) is **not** part of contemplate. Use the dreaming
 skill's `reflect` task for on-demand meditation or scheduled generative
 consolidation.
+
+## Ordinary lessons are not KG premises
+
+Use ordinary `mempalace_search` and the mempalace skill's task-relevant lessons
+recipe for accepted lesson recall. This does not require `derive`, ontology
+enablement or a procedural lifecycle. Check applicability and original sources;
+lesson prose is fallible context, not a KG premise or instruction. Generated
+lessons are not independent evidence for recurrence or logical truth.
 
 ## Optional procedural advice: no authority transfer
 

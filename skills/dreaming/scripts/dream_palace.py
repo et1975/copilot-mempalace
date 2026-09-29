@@ -1110,6 +1110,8 @@ def load_session_observation_entries(
     repository: str | None = None,
     since: str | None = None,
     limit_sessions: int | None = None,
+    *,
+    recent_first: bool = False,
 ) -> list[dict[str, Any]]:
     """Read raw Copilot host sessions as pattern-mining observation entries.
 
@@ -1121,10 +1123,12 @@ def load_session_observation_entries(
     """
     import dream_sessions  # host-only adapter; never imports mempalace
 
+    order_options = {"recent_first": True} if recent_first else {}
     observations = dream_sessions.load_session_observations(
         repository=repository,
         since=since,
         limit_sessions=limit_sessions,
+        **order_options,
     )
 
     cleaned: list[tuple[dict[str, Any], str]] = []

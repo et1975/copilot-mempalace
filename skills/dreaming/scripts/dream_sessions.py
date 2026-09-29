@@ -8,6 +8,7 @@ only issue SELECT queries against the host-owned SQLite store.
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import os
 import sqlite3
 
@@ -37,8 +38,12 @@ def load_sessions(
     repository: str | None = None,
     since: str | None = None,
     limit: int | None = None,
+    *,
+    recent_first: bool = False,
 ) -> list[dict]:
     """Load session metadata ordered by creation time."""
+    if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0):
+        raise ValueError("session limit must be a positive integer")
     store_path = db_path or default_store_path()
     if not os.path.exists(store_path):
         return []
@@ -48,14 +53,18 @@ def load_sessions(
     if repository:
         clauses.append("repository LIKE ?")
         params.append(f"%{repository}%")
-    if since:
-        clauses.append("created_at >= ?")
-        params.append(since)
+    if since is not None:
+        bound = datetime.fromisoformat(since)
+        if bound.tzinfo is not None:
+            bound = bound.astimezone(timezone.utc)
+        clauses.append("julianday(created_at) >= julianday(?)")
+        params.append(bound.isoformat())
 
     where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     limit_sql = "LIMIT ?" if limit is not None else ""
     if limit is not None:
         params.append(limit)
+    ordering = "julianday(created_at) DESC, id DESC" if recent_first else "created_at ASC"
 
     con = _connect_ro(store_path)
     try:
@@ -71,7 +80,7 @@ def load_sessions(
                 cwd
             FROM sessions
             {where_sql}
-            ORDER BY created_at ASC
+            ORDER BY {ordering}
             {limit_sql}
             """,
             params,
@@ -119,10 +128,22 @@ def load_session_observations(
     repository: str | None = None,
     since: str | None = None,
     limit_sessions: int | None = None,
+    *,
+    recent_first: bool = False,
 ) -> list[dict]:
     """Load session-attributed user-message observations for pattern mining."""
     store_path = db_path or default_store_path()
-    sessions = load_sessions(store_path, repository=repository, since=since, limit=limit_sessions)
+    if not os.path.isfile(store_path):
+        raise FileNotFoundError(f"session store is missing: {store_path}")
+    con = _connect_ro(store_path)
+    try:
+        con.execute(
+            "SELECT session_id, turn_index, user_message, assistant_response, timestamp FROM turns LIMIT 0"
+        )
+    finally:
+        con.close()
+    sessions = load_sessions(
+        store_path, repository=repository, since=since, limit=limit_sessions, recent_first=recent_first)
 
     observations: list[dict] = []
     for session in sessions:
