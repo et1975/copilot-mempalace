@@ -96,15 +96,30 @@ For deeper workflow docs (init, mine, full search/status walkthrough), invoke th
 
 For an explicitly tracked sidecar task or a requested durable task workflow,
 invoke the [mempalace-tasks safety skill](skills/mempalace-tasks/SKILL.md) and use
-the separately configured `mptask_*` tools. For explicitly tracked native
-`/fleet` goals, select the existing
-[palace-task-workflow agent](agents/palace-task-workflow.agent.md) and follow the
-[per-goal workflow](sidecar/README.md#per-goal-native-fleet-workflow).
+the separately configured `mptask_*` tools. Treat native `/fleet` phrases such as
+`execute and track this as a goal`, `track this as a goal`, or an explicit named
+tracked-goal resume as the per-goal opt-in. Route the active native parent through
+the existing [palace-task-workflow agent](agents/palace-task-workflow.agent.md)
+guidance and follow the
+[per-goal workflow](sidecar/README.md#per-goal-native-fleet-workflow); the user
+does not need a separate `/agent` handoff.
 Each goal requires explicit tracking opt-in. Selecting the agent, installing
 this pack, available tools or an ordinary `/fleet` request do not enroll work.
 An explicitly named resume preserves only that goal's scope, not other goals.
 Ordinary native fleet and session planning remain available without
 task-service setup or durable writes.
+
+For a new opted-in goal, use the current approved native plan when present.
+Preserve that plan verbatim as the canonical MemPalace artifact and file a
+concise searchable drawer index with the objective, stage outline, artifact ID
+and SHA-256. The drawer is recall context, not task status or authority. Bootstrap
+a concise root goal and planning/import task, then publish independently
+actionable tasks, acceptance, stable intent keys, source references and real
+dependency edges in atomic bounded batches. No task may become runnable before
+its initial blockers are attached. Paragraph order alone is not a dependency.
+Keep rationale in plan memory or descriptions, express validation as
+acceptance/evidence unless independently actionable, and leave ambiguous or
+out-of-budget items non-runnable pending admission.
 
 Native fleet remains the orchestrator. All task and MemPalace storage interaction
 in this workflow uses the configured, server-qualified MCP tools. Build bounded
@@ -113,23 +128,51 @@ determines tracked task state. Native memory/delegation acknowledgments,
 drawers, diaries and KG projections are not task ownership or current
 operational state.
 
-Use current owner/attempt/generation and authorization, atomic expand/yield for
-new prerequisites, and confirmed goal closure rather than an empty ready list.
-Worker dispatch and physical supervision remain host responsibilities; do not
-claim native execution support from a healthy MCP frontend or registration.
-No native fleet supervisor is shipped: an authorized coordinator can plan
-durably without one, but tracked execution stays blocked. For an explicit
-tracked request, report missing service/schema/actor or supervision as a
-blocker; do not silently fall back to untracked execution or create a replacement
-writer. Human status/history/watch remain read-only observations, never a reason
-to launch/restart the owner. Ordinary memory filing is unchanged.
+For a new tracked native goal, discover `mptask_native` and retain one issuing
+parent session UUID (existing harness UUID, or issue once if unavailable).
+Bootstrap atomically enrolls that session and creates the
+cooperative goal/import task; no separate actor provisioning, coordinator daemon
+or native supervisor is required. The UUID is an identifier, not a secret/auth
+token. Existing authenticated MCP remains the trust boundary. The native parent
+is the sole dispatcher: claim before dispatch, bind the actual returned agent ID
+with start (parent session UUID for parent work), checkpoint, assess acceptance
+and evidence, then complete. Workers wait for confirmed binding before work.
+
+Use current epoch/session/task/attempt/generation, atomic expand/yield for new
+prerequisites, and confirmed aggregate goal closure rather than an empty ready
+list. Same-session compaction retains its UUID but refreshes state. A new/forked
+parent uses its own UUID and explicit resume/CAS/reconciliation of the named goal.
+Resume updates only the root; inherited active status may remain stored, but
+authorization is false. Release each inherited active attempt, then reconcile;
+do not adopt it or infer an incremented `claim_generation`. Internal session
+generations prevent UUID reuse from reviving old attempts; never send those fields.
+Interrupted or unknown work requires release/reconciliation; silence is not a
+death signal or automatic retry trigger. Do not mirror tracked tasks in native
+todos or SQL.
+Reject unwanted open native proposals with `cancel` and current version/reason/
+observations, without fake admission or dispatch. Active/recovering work instead
+requires release/reconcile; rejecting proposals does not prove goal acceptance.
+For wanted open work, native `update` clears resolved holds/defer with null fields
+and current version; do not cancel/recreate it. Content-only updates cannot change
+admission/mode/execution or bypass active/recovering work.
+
+Native mode provides cooperative ownership/publication, not timer-supervised
+runtime proof, physical stop or effect settlement. Managed goals retain their
+registered host/actor/lease/fencing contract; named resume follows stored mode,
+never silent migration. Missing service/native API/version is a blocker; missing
+a separate actor/supervisor is not a native prerequisite. Do not silently fall back
+to untracked execution or create a replacement writer. Human status/history/watch
+remain read-only observations, never a reason to launch/restart the owner.
+Ordinary memory filing is unchanged.
 
 ## Optional repository procedural advice (disabled by convention)
 
 Only after explicit user opt-in for one repository, supplement ordinary
-recall at task start with `skills/dreaming/scripts/dream_procedure.py guidance
+recall at task start with `"$MPY" "$DREAM_SCRIPTS/dream_procedure.py" guidance
 --palace <p> --wing <w> --repository owner/repository --task "<task>"`, using
-the interpreter that already owns MemPalace. Never replace recall-first with
+`MPY` as the absolute path of the interpreter that already owns MemPalace and
+`DREAM_SCRIPTS` as the absolute path of the checkout's or installed dreaming
+skill's `scripts/` directory. Never replace recall-first with
 procedural guidance. See [the full contract](skills/dreaming/references/procedural.md)
 for the existing SQLite-exact/local-MiniLM and clean-read storage requirements.
 

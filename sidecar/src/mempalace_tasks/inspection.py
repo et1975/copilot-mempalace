@@ -263,11 +263,14 @@ def _duration(seconds):
 
 
 def _task_lines(task, display, eligibility=None):
+    native = task.get("coordination_mode") == "cooperative_native"
     ready = eligibility.get("ready") if eligibility is not None else task.get("ready")
     reasons = eligibility.get("reasons") if eligibility is not None else task.get("reasons")
     remaining = display["lease_remaining_seconds"]
     lease = "unknown" if remaining is None else (
         f"EXPIRED ({_duration(-remaining)} ago)" if remaining <= 0 else _duration(remaining))
+    if native:
+        lease = "not_applicable"
     lines = [
         f"id={escape_text(task.get('id'))} title={escape_text(task.get('title'))} "
         f"priority={escape_text(task.get('priority'))} status={escape_text(task.get('status'))} "
@@ -282,10 +285,18 @@ def _task_lines(task, display, eligibility=None):
         f"reasons={escape_text(reasons)}",
         f"  resources={escape_text(task.get('resource_keys'))} recovery={escape_text(task.get('recovery'))}",
     ]
-    if display["pending_expiry"]:
+    if native:
+        session = task.get("native") or {}
+        lines.append(
+            "  mode=cooperative_native physical_supervision=false "
+            f"recorded_session_id={escape_text(session.get('session_id'))} "
+            f"issuing_session_id={escape_text(session.get('issuing_session_id'))} "
+            "current_parent=goal_session interruption=explicit_reconciliation_required")
+    elif display["pending_expiry"]:
         lines.append("  EXPIRED deadline at as_of; stored in_progress, authorization expired / pending expiry.")
-    lines.append(f"  progress_remaining={_duration(display['progress_remaining_seconds'])} "
-                 f"hard_remaining={_duration(display['hard_remaining_seconds'])} (at server as_of)")
+    if not native:
+        lines.append(f"  progress_remaining={_duration(display['progress_remaining_seconds'])} "
+                     f"hard_remaining={_duration(display['hard_remaining_seconds'])} (at server as_of)")
     return lines
 
 
@@ -330,6 +341,9 @@ def render_text(frame):
             "retry_budget_granted", "retry_not_before", "escalation", "completion",
             "cancellation_reason", "attempt", "goal_policy", "graph_revision",
         ):
+            if task.get("coordination_mode") == "cooperative_native" and key in {
+                    "policy", "automatic_retries_used", "retry_budget_granted", "retry_not_before"}:
+                continue
             lines.append(f"  {key}={escape_text(task.get(key))}")
         lines.append("  relations=" + escape_text(data.get("relations")))
     elif frame["command"] == "history":

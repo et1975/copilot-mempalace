@@ -7,9 +7,12 @@ palace. The agent (the dreaming skill) then fills each item's ``decision`` in
 an ``adjudicate`` phase to produce ``decisions.json`` for ``dream_adopt.py``.
 
 Usage:
-    python3 dream_harvest.py --palace ~/.mempalace/palace --wing myproj \\
+    "$MPY" "$DREAM_SCRIPTS/dream_harvest.py" --palace ~/.mempalace/palace --wing myproj \\
         --tau 0.9 --out worklist.json
-    python3 dream_harvest.py --wing myproj --tau 0.9 --out worklist.json
+    "$MPY" "$DREAM_SCRIPTS/dream_harvest.py" --wing myproj --tau 0.9 --out worklist.json
+
+Select absolute MPY (the provisioned MemPalace interpreter) and DREAM_SCRIPTS
+paths. Run from an external session workspace for relative artifact paths.
 """
 from __future__ import annotations
 

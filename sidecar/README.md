@@ -5,8 +5,9 @@ provides authenticated Streamable HTTP MCP, a harness-launched stdio MCP fronten
 read-only human inspection, and foreground or opt-in launcher hosting. Schema 2
 uses MemPalace as the sole durable task/recovery store. No systemd, launchd or
 Windows service is required; Linux worker supervision is a separate, optional integration.
-It does not replace MemPalace, install another task database, or ship a native
-Copilot `/fleet` execution adapter.
+It does not replace MemPalace or install another task database. Cooperative native
+Copilot `/fleet` coordination uses the issuing session and existing native parent;
+it does not ship a native process supervisor or replace native dispatch.
 
 ```text
 Harness stdio frontends --------\
@@ -14,6 +15,7 @@ Direct HTTP MCP clients --------> one shared task owner --> MemPalace logstream
 Human status/history/watch -----/
 
 External host/coordinator --> claims, optional supervision and result delivery
+Native parent session -----> cooperative reservations, agent binding and acceptance
 ```
 
 ## What is authoritative
@@ -40,12 +42,21 @@ recovery in bounded batches. Execution is not automatically resumed. Effective
 time is rebuilt from accepted journal timestamps and a process-local,
 suspend-inclusive clock, never a restored local clock file.
 
-Claims have renewable leases and monotonically increasing generations. A claim
+Managed-host claims have renewable leases and monotonically increasing generations. A claim
 is initially **preparing**, not permission to execute. A registered supervisor
 provides preparation evidence; mutations from stale generations are rejected.
 Default policy is a 300-second lease, renewal every 100 seconds, 15-second
 maintenance sweep, 30-minute no-progress cap, two-hour attempt cap and three
 automatic retries after the initial attempt.
+
+Native cooperative goals instead use `mptask_native` with the actual issuing
+session UUID, no separately registered actor/supervisor and no short-TTL model
+heartbeat. Bootstrap enrolls the session atomically. Claims reserve attempts before
+native dispatch; starts bind actual returned agent IDs. Explicit release,
+reconciliation and session transfer handle unknown/interrupted work; silence is
+not automatic retry permission. Epoch/version/attempt/generation checks fence
+stale publication, not external processes or effects. Existing managed goals are
+not migrated or weakened.
 
 New prerequisites use atomic graph publication with source disposition `yield`.
 Goal bootstrap creates the root and planning task together; goal closure checks
@@ -57,7 +68,8 @@ Never move/delete that directory or its stable lock files while an owner can
 still run; using another directory bypasses local exclusion. The lock is not a
 distributed fence or hub-enforced compare-and-swap. The private bearer token
 identifies trusted local clients as a group; its holder can assert registered
-actor names. This is not multi-tenant per-actor authentication.
+actor names or native session identities. A session UUID is not a secret or
+additional credential. This is not multi-tenant per-actor/session authentication.
 
 ## Requirements and offline setup
 
@@ -103,6 +115,20 @@ The executable registered with the harness must already support
 `mempalace-tasks mcp --help`. Use its absolute path if it is not on the harness's
 `PATH`; updating a checkout does not update a separately installed, non-editable
 package. Provision that package explicitly before registering it.
+
+## Setup entry point
+
+Start with the [end-to-end setup guide](setup.md), not a configuration fragment.
+The Python package's `mempalace-tasks setup` command provides `configure`,
+`enable` and read-only `check` phases around the installed commands below.
+It never installs dependencies or silently replaces an authority. Existing
+deployments can begin with `check`; incompatible configurations stop with a
+specific blocker.
+
+Setup shares the sidecar's Python/native-platform requirements and uses its
+POSIX permission and Windows ACL helpers. It needs no .NET SDK or F# runtime.
+`python -m mempalace_tasks setup` is also supported from the installed
+environment. Native macOS/Windows validation limits above still apply.
 
 ## Configure and initialize
 
@@ -169,6 +195,25 @@ and is **not** read-only inspection or the restore procedure. Actors, supervisor
 and declared capabilities are fixed by that genesis; changing JSON later does
 not change accepted authorization.
 
+Those registered roles/profiles govern managed-host work. Native cooperative
+bootstrap enrolls its issuing session through authenticated `mptask_native`; it
+does not require adding a native coordinator, worker or supervisor to genesis.
+Service initialization/credentials are still required. Do not reinitialize an
+existing authority to obtain a native session identity.
+
+For configuration-only validation, without connecting to the hub or creating
+files, use:
+
+```bash
+mempalace-tasks validate-config --config /absolute/path/tasks.json
+```
+
+`--allow-missing-service-token` permits a missing service credential during
+deliberate preparation. It does not create it or relax validation of existing
+files, permissions, genesis or other configuration fields. The result reports
+allowlisted deployment fields, never credential contents. This is not an
+authority-health or accepted-genesis check.
+
 ### Foreground and launcher lifecycle
 
 The following is command syntax, not an automatic deployment sequence.
@@ -231,6 +276,11 @@ Startup policy comes from that configuration:
 - **`lifecycle: "external"`** (the default) only discovers/connects. If no ready
   owner is available, startup fails; explicitly run `serve` or arrange external
   hosting first. There is no silent launcher fallback or systemd requirement.
+
+For a no-start probe of either configuration, invoke `mcp --no-autostart`.
+This invocation-only restriction uses read-only discovery even for launcher
+configs. It does not change the configuration or its authenticated binding, and
+refuses if the owner disappears rather than starting a replacement.
 
 `--timeout` defaults to ten seconds and accepts positive `s`/`m`/`h` durations up
 to 300 seconds. It bounds startup and each upstream exchange, **not the lifetime
@@ -337,14 +387,19 @@ Discover actual `tools/list` schemas instead of copying argument guesses.
 
 | Group | Tools |
 |---|---|
+| Cooperative native | `mptask_native` with a strict action-specific payload |
 | Lifecycle | `mptask_create`, `update`, `claim`, `renew`, `checkpoint`, `attempt_report`, `release`, `recover`, `transition`, `note` |
 | Graph and goals | `mptask_add_dependency`, `remove_dependency`, `bootstrap`, `expand`, `goal_close` |
 | Read/observe | `mptask_get`, `snapshot`, `list`, `ready`, `history`, `health`, `wait_ready` |
 | Historical resolution | `mptask_outcome` |
 
-Every short name in the table has the `mptask_` prefix. Public mutations require
-`actor`, `command_id`, and **`expected_epoch`**
-from the current read/health response's `epoch_id`. Clients do not pass
+Every short name in the table has the `mptask_` prefix. Managed mutations require
+`actor`, `command_id`, and **`expected_epoch`**.
+Native mutations use
+`mptask_native(action, session_id, command_id, expected_epoch, payload)` without
+an actor argument. The action selects a strict payload; discover its current
+schema rather than reuse managed arguments. Both modes obtain `expected_epoch`
+from the current read/health response's `epoch_id`. Clients do not pass internal
 `operation`. Missing or stale epochs are rejected before mutation, even for a
 known command ID. Internal genesis and
 expiry commands are not exposed as public MCP tools.
@@ -362,7 +417,8 @@ absence is not confirmed abandonment or evidence of absent external effects.
 Only a confirmed terminal-abandoned outcome permits a new ID for a still-needed
 request after fresh state/authorization checks. An old receipt is historical,
 not current execution permission. Use current `mptask_get.authorization` and
-match the host-supplied actor/owner, attempt and generation as well as the epoch.
+match the mode-specific session/agent or host-supplied actor/owner, attempt and
+generation as well as the epoch.
 
 ## Human supervision
 
@@ -403,27 +459,56 @@ do not themselves make an otherwise current snapshot fail.
 
 ## Per-goal native fleet workflow
 
-The existing [task-safety skill](../skills/mempalace-tasks/SKILL.md) and
-[workflow agent](../agents/palace-task-workflow.agent.md) provide optional prompt
-guidance around native Copilot `/fleet`, not a replacement dispatcher or runtime
-enforcement layer. Native fleet remains the orchestrator. Task state is read and
-written only through the `mempalace-tasks` MCP registration; MemPalace context and
-evidence use the `mempalace` MCP registration. Build handoff references from fresh
-MCP observations; the durable authority alone determines tracked task state.
+The [task-safety skill](../skills/mempalace-tasks/SKILL.md) and
+[workflow agent](../agents/palace-task-workflow.agent.md) use `mptask_native` for
+**cooperative native session coordination**. The existing native parent remains
+the sole dispatcher; this is not another agent scheduler, daemon or supervisor.
+Task state uses only the `mempalace-tasks` MCP registration; exact artifacts,
+context and memory use only `mempalace` MCP. There is no CLI/SQL storage fallback or
+native todo mirror. Fresh MCP observations, not native success messages or memory
+drawers, determine tracked task state.
 
-After copying/linking those customizations, select the agent and explicitly
-request tracking for the goal:
+After copying/linking those customizations, explicitly request tracking for the
+goal. The tracking phrase routes the active native parent through the workflow;
+a separate agent-selection handoff is not required:
 
 ```text
-/agent palace-task-workflow
-/fleet Track this goal in MemPalace Tasks: update the cache index and its tests.
-Start with durable planning and report any execution blocker.
+/fleet execute and track this as a goal
 ```
 
-A real request must supply the configured project, an actually registered actor,
-acceptance criteria and explicit work/time/cost/concurrency budgets. Never infer
-IDs or actor identity from the logged-in username. To resume the same tracked
-goal, name its actual durable ID; this example ID is synthetic:
+When an approved native plan is present in the active conversation, the workflow
+preserves it verbatim as the canonical MemPalace artifact and files a concise
+searchable drawer index with its objective, stage outline, artifact ID and
+SHA-256. The drawer contains no task status. The workflow then creates a concise
+root plus planning/import task and publishes the executable units and their real
+dependencies as the durable task graph. Paragraph order is not a dependency;
+rationale remains plan memory, and validation is task acceptance/evidence unless
+it is independently actionable.
+
+Retain one issuing parent session UUID: use the harness UUID when available,
+otherwise issue one UUID and retain the enrolled binding across compaction.
+Use project/scope/bounded task/concurrency/credit limits from the request or trusted
+configuration. Explicit user limits override defaults. Do not infer identity
+from a username or issue a fresh UUID for each command.
+Native bootstrap atomically enrolls this session with the new scoped goal and
+import task. No separately provisioned coordinator actor or native supervisor is
+required. The UUID is an identifier, not a secret or credential; the existing
+authenticated MCP connection remains the trust boundary.
+
+The same session retains its UUID through compaction/resume, but must refresh
+durable state. A fork or new parent has a distinct UUID and explicitly transfers
+the named goal through native `resume` with current compare-and-swap state and
+reconciliation. It must not claim continuity by copying the old UUID.
+Current parent identity comes from the root goal's `native.session_id` or fresh
+`authorization.session_id`. Bounded transfer updates only the root, leaving member
+snapshots untouched. Inherited attempts may remain stored `in_progress`, but fresh
+authorization is false with `native_reconciliation_required`; they cannot publish.
+Members' recorded sessions are not current ownership.
+The root's internal `session_generation` advances on transfer and is matched
+against each attempt's recorded generation, preventing A→B→A UUID reuse from
+reviving old work. This is server-maintained fencing, not a caller payload field.
+To resume the same tracked goal, name its actual durable ID; this example ID is
+synthetic:
 
 ```text
 /fleet Resume the tracked MemPalace goal tsk_goal_fixture.
@@ -434,17 +519,87 @@ Selecting the agent, installing the pack, available tools or ordinary `/fleet`
 does **not** opt in. Each new goal needs an explicit request; named resume keeps
 only the existing goal's scope. Unrelated goals and session planning stay untouched.
 
-| Deployment state | Allowed workflow and required report |
+| Observed state | Allowed workflow and required report |
 |---|---|
 | No explicit goal opt-in | Ordinary native fleet/session planning; no task-service setup demand or durable writes. |
-| Opted in, service/schema/registered actor unavailable | Report the request and setup blocker in the conversation; no alternate storage, durable success claim or silent untracked execution. |
-| Service and authorized coordinator available, no actual compatible native supervisor | Inspect/resume and publish the authorized durable plan; report tracked execution blocked. |
-| Separately supplied compatible native host plus current task authorization | Conditional native dispatch under the safety contract; report actual host/owner, attempt/generation, evidence and confirmed outcomes. |
+| Opted in, service or `mptask_native`/required action schema unavailable | Report the concrete version/setup blocker. No alternate store, invented identity or silent untracked fallback; a healthy old service is insufficient. |
+| Native API available, no separately configured actor/supervisor | Proceed with cooperative session bootstrap/resume and native-parent dispatch. Their absence is not a native prerequisite. |
+| Named native goal, same session after compaction | Read current mode/binding/epoch/versions and reconcile unresolved commands; no new goal or enrollment. |
+| Named native goal, new parent/fork | Explicit `resume` with the new actual session UUID, CAS and reconciliation before replacement work. |
+| Named managed goal | Preserve managed mode and registered actor/host/lease/fencing requirements; no silent conversion via native API. |
+| Unknown stored mode | Fail closed as unsupported mode/schema; no inferred cooperative enrollment. |
 
-**No native fleet supervisor is shipped.** A healthy MCP frontend, execution
-profile or supervisor registration does not establish execution support. The
-optional Linux `HostSupervisor` remains a separate
-[host integration](#worker-assignment-and-execution), not native fleet wiring.
+### Native lifecycle
+
+This is the workflow order. The [native MCP reference](../skills/mempalace-tasks/references/native.md)
+provides exact action payloads, receipt/read fields and substitutable JSON examples
+checked against the implementation; discover the deployed schema before calls.
+
+1. Preserve exact approved plan and searchable drawer index, then native
+   `bootstrap` the concise goal and import/planning task.
+2. `claim` the import task; `start` parent work using the actual parent session
+   UUID. Native `expand` publishes definitions, membership, provenance and initial
+   blockers together. Native definitions omit managed execution-class/profile/
+   resource fields; the stored mode is `cooperative_native`.
+   Use dependency-closed batches; final import completion
+   includes the last required publication and acceptance evidence.
+3. Read the goal's ready frontier. `claim` reserves the current task version's
+   attempt/generation **before** native dispatch. Send a bounded worker packet
+   requiring it to wait for confirmed binding before work.
+   If legitimate work is held/deferred, native `update` can clear resolved gates
+   with a current-version content patch; do not cancel/recreate it. Null clears
+   `hold_reason`/`deferred_until`. Update only accepts open non-root content, not
+   admission/execution changes or active/recovering-state bypasses.
+4. Dispatch using native `task`, then `start` binds its **actual returned agent
+   ID**. Confirm start and notify that ID with `write_agent`; worker checks the
+   fresh task/agent/attempt/generation binding before effects. Parent-owned work
+   binds the parent session UUID. Neither a claim nor a guessed agent ID is a
+   started worker. Unknown dispatch/start requires reconciliation, not duplicates.
+   WAIT is an instruction/acknowledgment, not enforced runtime suspension;
+   parent-only lifecycle publication is workflow discipline, not per-worker
+   authentication under the shared bearer.
+5. Preserve meaningful progress with `checkpoint`. Publish independent discoveries
+   with expand/continue; dependent work includes its real blockers from first
+   visibility. If A needs new B, atomically expand/yield A with checkpoint, reason,
+   observations, B, provenance and `blocks(B,A)`. A becomes recovering; explicitly
+   reconcile before a new claim. Do not hold A's slot waiting for B.
+6. Assess returned results against acceptance and current binding; native
+   `complete` requires durable evidence and explicit `parent_acceptance`.
+   Expand/complete and goal_close require the same acceptance fields.
+   Final discoveries can use atomic
+   expand/complete. Stale results remain evidence, not fresh publication authority.
+7. For interrupted/unknown work use `release`/`reconcile` with explicit known facts.
+   A new parent uses root-only `resume`; inherited active attempts remain stored
+   active but unauthorized. Individually release each with current version and
+   retained attempt/generation/agent, then reconcile the now-recovering task.
+   Already recovering tasks reconcile directly; never adopt old workers.
+   Silence, compaction or long reasoning is not proof of death and
+   does not trigger automatic retries.
+8. Inspect unresolved/blocked/proposed work even if ready is empty. Native
+   `cancel` rejects unwanted open non-root proposals/tasks in place with
+   version CAS, reason and observations; no fake admission, claim or attempt tokens.
+   Active/recovering work must use release/reconcile; nested epic cancellation
+   requires finished, recovery-free children and never cascades. The root cannot
+   be cancelled through this action.
+   Native
+   `goal_close` uses current goal/graph revisions and aggregate acceptance evidence;
+   report success only after confirmed durable closure and intake sealing.
+
+**Assurance boundary:** native mode records cooperative ownership, checkpoints and
+accepted evidence. It does not require short-TTL model heartbeats or an external
+timer, and does not prove containment, physical stop or effect settlement.
+Native authorization deliberately reports `lease_live=false` and
+`physical_supervision=false`; these are not expired managed lease conditions.
+Require fresh matching `authorized=true` for executing/publishing running-source
+work, not before bootstrap, update, claim, start, cancel, recovery or aggregate closure. Those
+actions use their own state/session/version/acceptance checks; reserved/preparing
+and recovering attempts intentionally report `authorized=false`.
+Epoch/version/attempt/generation checks reject stale task publications; they do not
+undo Git/cloud effects or stop old processes. Unknown effects stay explicit until
+reconciled, never retried on silence. Work requiring managed-host assurances must
+retain that contract rather than be relabeled cooperative.
+The optional Linux `HostSupervisor` remains a separate
+[managed host integration](#worker-assignment-and-execution).
 
 Use the existing [preinstalled-package preparation](#requirements-and-offline-setup),
 [schema-2 initialization/private credentials](#configure-and-initialize) and
@@ -460,21 +615,25 @@ retain the original authority, epoch, command ID and exact payload of unresolved
 mutations. Reconnection is not new execution authorization. EOF, frontend stop
 or native cancellation is neither owner stop nor proof of physical settlement.
 Roll back this workflow for new goals by no longer opting them in; this does not
-erase tracked state, release active claims or settle effects. Follow the
-[host recovery contract](#worker-assignment-and-execution) and
+erase tracked state, release active claims or settle effects. Reconcile native
+work explicitly; managed work follows the
+[host recovery contract](#worker-assignment-and-execution). Use the
 [recovery procedure](#recovery-and-coherent-palace-backuprestore) for existing work.
 
-The [workflow scenarios](../skills/mempalace-tasks/references/scenarios.md) are
-bounded prompt simulations, not native runtime enforcement or a live harness
-integration test. MCP/service tests or registration checks alone do not verify
-supervised native fleet execution. Existing memory recall/reflection/procedural
+The [workflow scenarios](../skills/mempalace-tasks/references/scenarios.md) separate
+the observed failed-session baseline, expected pressure behavior, simulations,
+service tests and live harness evidence. Documentation/schema checks alone are
+not live enforcement proof. No managed native-supervision claim follows from
+successful cooperative coordination. Existing memory recall/reflection/procedural
 guidance and hooks remain independent and unchanged.
 
 ## Worker assignment and execution
 
-The sidecar determines readiness and enforces claims. **Choosing, launching and
-supervising workers belongs to an external host/coordinator.** Native Copilot
-`/fleet` is not automatically subscribed to this queue.
+The sidecar determines readiness and enforces claims. In cooperative native mode,
+the native parent chooses/dispatches workers through the lifecycle above; `/fleet`
+is not automatically subscribed to the queue. The remainder of this section
+describes **managed-host execution**, whose choosing, launching and supervising
+workers belongs to a configured external host/coordinator.
 
 The optional **Linux** integration includes `HostSupervisor`, `LocalProfile` and
 an explicit bounded programmatic helper, `mempalace_tasks.cli.supervise`. The

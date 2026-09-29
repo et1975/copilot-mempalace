@@ -76,7 +76,7 @@ mempalace_find_duplicates(
 ## Implementation notes
 
 - The pairwise-distance / grouping compute already exists in
-  [`mempalace/dedup.py`](../../../) (`dedup_source_group`, backend similarity
+  upstream `mempalace/dedup.py` (`dedup_source_group`, backend similarity
   search). This tool can reuse it in a non-destructive "collect clusters" mode
   instead of the keep/delete branch.
 - Clusters = connected components of the `distance < threshold` graph

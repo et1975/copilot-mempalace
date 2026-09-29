@@ -1,0 +1,10 @@
+# CI-only dependencies. Regenerate requirements-ci.lock with the pinned uv:
+# uv pip compile requirements-ci.txt --python-version 3.12 --universal \
+#   --only-binary=:all: --generate-hashes --output-file requirements-ci.lock
+-r requirements-test.txt
+-r sidecar/requirements.lock
+
+mempalace==3.8.0
+setuptools==80.9.0
+wheel==0.45.1
+uv==0.12.1

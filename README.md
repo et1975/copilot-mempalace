@@ -1,5 +1,7 @@
 # AI-assisted memory (MemPalace)
 
+[![CI](https://github.com/et1975/copilot-mempalace/actions/workflows/ci.yml/badge.svg)](https://github.com/et1975/copilot-mempalace/actions/workflows/ci.yml)
+
 Copilot customization pack that turns [MemPalace](https://github.com/mempalace/mempalace) into the agent's default memory.
 Three hard rules — recall before external fact-finding, save every new fact, end-of-turn diary — plus a `PreToolUse`
 audit hook that nags when an external tool is about to run without a prior `mempalace_search`.
@@ -13,8 +15,8 @@ audit hook that nags when an external tool is about to run without a prior `memp
   proactive vs reactive use, mining hygiene, HNSW drift recovery, auto-save hook notes.
 - **[MemPalace Tasks sidecar](sidecar/README.md)** — optional, separately installed
   Python Streamable HTTP MCP service with a harness-launched stdio frontend for
-  durable tasks, dependencies, atomic claims/discoveries and renewable fenced
-  leases. Schema 2 replays the MemPalace logstream as its sole durable task/recovery
+  durable tasks, dependencies, atomic claims/discoveries, cooperative native
+  session ownership and managed-host renewable fenced leases. Schema 2 replays the MemPalace logstream as its sole durable task/recovery
   store, with a fresh fenced epoch
   per owner startup and disposable local runtime/discovery files. Foreground
   hosting requires no service manager. `mempalace-tasks mcp --config CONFIG`
@@ -27,20 +29,39 @@ audit hook that nags when an external tool is about to run without a prior `memp
   [workflow agent](agents/palace-task-workflow.agent.md). The
   [per-goal native fleet workflow](sidecar/README.md#per-goal-native-fleet-workflow)
   keeps native `/fleet` as orchestrator and requires explicit tracking for each
-  goal; selecting the agent or installing this pack does not enroll ordinary work.
+  goal; `/fleet execute and track this as a goal` is sufficient opt-in, while
+  ordinary fleet prompts remain untracked. An approved native plan is retained as
+  an exact artifact plus a searchable memory index, then materialized through
+  atomic task/dependency publications rather than one giant prose goal.
   Task and MemPalace storage interaction uses the separate, server-qualified MCP
   tools.
-  Without a separately supplied compatible native supervisor, it supports
-  durable planning and execution-blocker reporting, not tracked execution.
-  Worker dispatch remains a host responsibility; connecting MCP does not
-  automatically wire native `/fleet`.
-  No native `/fleet` execution adapter is shipped. Linux process supervision is
+  Cooperative native mode uses `mptask_native`: the issuing session UUID is
+  enrolled atomically with a goal, the native parent reserves attempts before
+  dispatch and binds actual returned agent IDs. No separate coordinator, actor
+  provisioning or supervisor is required. The UUID is an identifier, not a secret;
+  existing authenticated MCP remains the trust boundary. Explicit reconciliation
+  and session transfer handle interruption without heartbeat timers or retry on
+  silence. Acceptance evidence and sealed durable closure finish the goal.
+  Rejected open proposals can be cancelled in place without admitting or
+  dispatching them; active/uncertain attempts still require reconciliation.
+  Content-only native updates clear resolved holds/defer on wanted open work.
+  Session takeover is a bounded root-only ownership change; inherited active
+  attempts need individual release/reconciliation, never silent adoption.
+  Missing native API/version is a blocker, not a reason to use another store.
+  This is cooperative workflow support, not physical containment/effect-settlement
+  proof or automatic queue subscription. Existing managed goals keep their own
+  actor/host/lease/fencing requirements and are never silently converted.
+  Ordinary untracked `/fleet` remains unchanged. Linux process supervision is
   optional and separate; macOS/Windows hosting code exists but native
   certification remains unrun. Only the current journal-backed authority is
   supported; there is no original-runtime or old-format compatibility mode.
   Ordinary memory filing does not require this service. See its [recovery
   contract](sidecar/README.md#recovery-and-coherent-palace-backuprestore) before
   changing an existing deployment.
+  For installation, use the [task setup quick-start](sidecar/setup.md): one
+  Python-native `mempalace-tasks setup configure` / `enable` / `check` workflow
+  covers configuration, explicit initialization, Copilot registration and
+  actual MCP readiness. No additional .NET runtime is needed.
 - **[skills/dreaming/SKILL.md](skills/dreaming/SKILL.md)** — offline consolidation ("dreaming"): a 5-phase
   pipeline (harvest → adjudicate → review → adopt → verify) that merges near-duplicate drawers and resolves
   adjudicated KG contradiction/staleness candidates between sessions, plus constructive `reflect`
@@ -148,6 +169,11 @@ runner; root configuration supplies import paths without `PYTHONPATH` or changin
 into production directories. See the [test guide](tests/README.md) for setup,
 suite selectors, existing integration gates and package-content checks.
 
+[GitHub Actions CI](.github/workflows/ci.yml) runs the full suite serially on
+Ubuntu 24.04 / Python 3.12, including the offline wheel/sdist roundtrip.
+See [CI coverage and provisioning](tests/README.md#github-actions-ci) for triggers,
+isolated storage and the separate prerequisite-preparation step.
+
 Commands below run from the repository root. `TEST_PY` must select a preprovisioned
 Python 3.11+ interpreter with pytest 8.4.2 (`requirements-test.txt`); the full suite
 also requires sidecar production dependencies and the existing MemPalace/local
@@ -190,6 +216,16 @@ source drawers, including retired rules and counterexamples. External deletion
 is not prevented and no cross-drawer transaction/global snapshot is claimed.
 
 ## Install
+
+### Choose the installation scope
+
+**Memory-only:** follow the MCP and customization-pack steps below.
+**Task tracking:** also follow the [task setup quick-start](sidecar/setup.md).
+Installing an executable or copying a skill does not configure a task authority,
+register its tools, or prove that a native worker supervisor exists. A task
+installation is ready only after the setup check confirms the configured
+authority and its advertised MCP tools; an already-open session must load the
+new registration separately.
 
 ### Step 0 — Register MemPalace as an MCP server
 
@@ -257,7 +293,7 @@ cat copilot-instructions.md >> ~/.copilot/copilot-instructions.md
 mkdir -p ~/.copilot/skills
 ln -s "$(pwd)/skills/mempalace" ~/.copilot/skills/mempalace
 
-# 1.3 Hook (both files together so the JSON's relative reference resolves)
+# 1.3 Hook (the JSON command expects this ~/.copilot/hooks/ script path)
 mkdir -p ~/.copilot/hooks
 ln -s "$(pwd)/hooks/palace-reflex.json" ~/.copilot/hooks/palace-reflex.json
 ln -s "$(pwd)/hooks/palace-reflex.py"   ~/.copilot/hooks/palace-reflex.py

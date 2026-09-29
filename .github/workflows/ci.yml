@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Python 3.12 / full serial suite
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONPATH: ""
+      UV_PYTHON_DOWNLOADS: never
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      ANONYMIZED_TELEMETRY: "False"
+    steps:
+      - name: Create isolated storage
+        run: |
+          root="$RUNNER_TEMP/mempalace-ci"
+          mkdir -p "$root/home" "$root/tmp"
+          {
+            printf 'CI_ROOT=%s\n' "$root"
+            printf 'HOME=%s/home\n' "$root"
+            printf 'USERPROFILE=%s/home\n' "$root"
+            printf 'TMPDIR=%s/tmp\n' "$root"
+            printf 'TEMP=%s/tmp\n' "$root"
+            printf 'TMP=%s/tmp\n' "$root"
+            printf 'DREAMING_TEST_TMPDIR=%s/tmp\n' "$root"
+            printf 'MPTASK_TEST_TMPDIR=%s/tmp\n' "$root"
+            printf 'MEMPALACE_PALACE_PATH=%s/palace\n' "$root"
+            printf 'MEMPAL_PALACE_PATH=%s/palace\n' "$root"
+            printf 'MEMPALACE_DAEMON_STATE_ROOT=%s/daemon\n' "$root"
+            printf 'UV_CACHE_DIR=%s/uv-cache\n' "$root"
+          } >> "$GITHUB_ENV"
+
+      - name: Check out source
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: "3.12.13"
+
+      - name: Install hash-locked test and build dependencies
+        # External dependency provisioning is approved; tests never install anything.
+        run: |
+          python -m pip install --require-hashes --only-binary=:all: \
+            -r requirements-ci.lock
+          python -m pip check
+
+      - name: Stage checksum-pinned local MiniLM model
+        # WARNING: Runtime model download approved by user; verify SHA-256 before extraction.
+        # Chroma 1.5.9's ONNXMiniLM_L6_V2 archive and expected SHA-256.
+        run: |
+          curl --fail --silent --show-error --location --retry 3 --max-time 180 \
+            --proto '=https' --tlsv1.2 \
+            https://chroma-onnx-models.s3.amazonaws.com/all-MiniLM-L6-v2/onnx.tar.gz \
+            --output "$CI_ROOT/onnx.tar.gz"
+          printf '%s  %s\n' \
+            913d7300ceae3b2dbc2c50d1de4baacab4be7b9380491c27fab7418616a16ec3 \
+            "$CI_ROOT/onnx.tar.gz" | sha256sum --check --strict
+          model="$HOME/.cache/chroma/onnx_models/all-MiniLM-L6-v2"
+          mkdir -p "$model"
+          tar -xzf "$CI_ROOT/onnx.tar.gz" --no-same-owner -C "$model"
+          rm "$CI_ROOT/onnx.tar.gz"
+
+      - name: Run all tests and offline distribution regressions
+        env:
+          UV_OFFLINE: "1"
+          PIP_NO_INDEX: "1"
+        # Serial by contract; includes real wheel/sdist builds and sdist rebuild.
+        run: python -m pytest --basetemp "$CI_ROOT/pytest-all" -q -ra
+
+      - name: Smoke test installed rebuilt wheel outside the checkout
+        env:
+          UV_OFFLINE: "1"
+          PIP_NO_INDEX: "1"
+        run: |
+          shopt -s nullglob
+          wheels=("$CI_ROOT"/pytest-all/sidecar-distributions[0-9]*/rebuilt/*.whl)
+          test "${#wheels[@]}" -eq 1
+          python -m pip install --no-index --no-deps "${wheels[0]}"
+          cd "$CI_ROOT"
+          mempalace-tasks --help
+          mempalace-tasks mcp --help
+          mempalace-tasks setup --help
+          python -m mempalace_tasks setup --help

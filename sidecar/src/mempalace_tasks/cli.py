@@ -110,7 +110,9 @@ def _parser():
                      description="Explicit task service ownership and remote read-only inspection")
     parser.add_argument("--config", help="Absolute schema-2 JSON configuration (or MPTASK_CONFIG)")
     commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("setup", help="Configure, enable or check task-MCP readiness explicitly")
     for name, description in (
+        ("validate-config", "Validate configuration read-only, without creating or starting anything"),
         ("init", "Explicit new-authority init, not data-loss recovery; idempotent with intact state"),
         ("serve", "Run foreground authenticated MCP; requires prior init"),
         ("mcp", "Run stdio MCP frontend; reuse/start launcher owner or connect to external owner"),
@@ -127,6 +129,12 @@ def _parser():
     ):
         command = commands.add_parser(name, help=description, description=description)
         command.add_argument("--config", default=argparse.SUPPRESS)
+        if name == "validate-config":
+            command.add_argument("--allow-missing-service-token", action="store_true",
+                                 help="Allow an absent service token without creating it")
+        if name == "mcp":
+            command.add_argument("--no-autostart", action="store_true",
+                                 help="Only connect to an existing owner, even with launcher lifecycle")
         if name in {"start", "connect", "stop", "mcp"}:
             command.add_argument("--timeout", type=parse_duration, default=10.0)
         if name == "connect":
@@ -174,6 +182,13 @@ def _emit(value):
 
 
 def main(argv=None) -> int:
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments[:1] == ["setup"]:
+        from .setup import main as setup_main
+        return setup_main(arguments[1:])
+    if len(arguments) >= 3 and arguments[0] == "--config" and arguments[2] == "setup":
+        from .setup import main as setup_main
+        return setup_main([*arguments[3:], "--config", arguments[1]])
     try:
         try:
             args = _parser().parse_args(argv)
@@ -181,9 +196,21 @@ def main(argv=None) -> int:
             return int(exit.code)
         if args.command == "mcp":
             from .stdio_frontend import main as stdio_main
-            return stdio_main(args.config, timeout=args.timeout)
+            options = {"no_autostart": True} if args.no_autostart else {}
+            return stdio_main(args.config, timeout=args.timeout, **options)
         config = load_config(args.config, allow_missing_service_token=(
-            args.command == "init" and args.generate_token))
+            (args.command == "init" and args.generate_token)
+            or (args.command == "validate-config" and args.allow_missing_service_token)))
+        if args.command == "validate-config":
+            _emit({
+                "ok": True, "schema_version": config.schema_version,
+                "authority_id": config.authority_id, "lifecycle": config.lifecycle,
+                "host": config.host, "port": config.port, "hub_url": config.hub_url,
+                "runtime_dir": str(config.runtime_dir),
+                "service_token_file": str(config.service_token_file),
+                "service_token_present": config.service_token is not None,
+            })
+            return 0
         if args.command in {"start", "connect", "stop"}:
             if args.command == "stop":
                 _emit(stop(config, expected_instance_id=args.instance_id, timeout=args.timeout))

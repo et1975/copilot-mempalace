@@ -14,9 +14,12 @@ If a merge decision omits ``wing``/``room``/``supersedes``, they default to the
 first member's wing/room and the item's ``supersedes`` list.
 
 Usage:
-    python3 dream_adopt.py --palace ~/.mempalace/palace --decisions decisions.json
-    python3 dream_adopt.py --palace ~/.mempalace/palace --decisions decisions.json --dry-run
-    python3 dream_adopt.py --decisions decisions.json  # palace_path from config
+    "$MPY" "$DREAM_SCRIPTS/dream_adopt.py" --palace ~/.mempalace/palace --decisions decisions.json
+    "$MPY" "$DREAM_SCRIPTS/dream_adopt.py" --decisions decisions.json --dry-run
+    "$MPY" "$DREAM_SCRIPTS/dream_adopt.py" --decisions decisions.json  # palace_path from config
+
+Select absolute MPY (the provisioned MemPalace interpreter) and DREAM_SCRIPTS
+paths. Run from an external session workspace for relative artifact paths.
 """
 from __future__ import annotations
 

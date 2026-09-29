@@ -11,12 +11,14 @@ temporary ontology and reported, never to the live ``<palace>/ontology.json``.
 
 Usage::
 
-    MPY=$(head -1 "$(command -v mempalace)" | sed 's/^#!//')
-    "$MPY" dream_survey.py
-    "$MPY" dream_survey.py --palace ~/.mempalace/palace
-    "$MPY" dream_survey.py --palace <p> --tasks merge,prune --wings avs,icm_automation
-    "$MPY" dream_survey.py --palace <p> --format json --out survey.json \
-        --worklists-dir ./wl
+    "$MPY" "$DREAM_SCRIPTS/dream_survey.py"
+    "$MPY" "$DREAM_SCRIPTS/dream_survey.py" --palace ~/.mempalace/palace
+    "$MPY" "$DREAM_SCRIPTS/dream_survey.py" --palace <p> --tasks merge,prune
+    "$MPY" "$DREAM_SCRIPTS/dream_survey.py" --palace <p> --format json --out survey.json
+
+Set MPY to the absolute path of a provisioned Python that imports mempalace,
+and DREAM_SCRIPTS to the absolute dreaming scripts directory. Run from an
+external session workspace so relative output paths stay outside the checkout.
 """
 import argparse
 import contextlib

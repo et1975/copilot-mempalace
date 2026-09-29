@@ -58,6 +58,12 @@ helper together with its stdlib-only `scripts/palace_restore_io.py` companion,
 which provides generic private-stage, writer-exclusion and publication guards.
 Task history validation and epoch activation remain task-package operations.
 
+For the command examples, set `MPY` to the absolute path of the selected
+preinstalled Python and `BACKUP_SCRIPTS` to the absolute path of this skill's
+`scripts/` directory. Invoke helpers through that interpreter instead of relying
+on the `#!/usr/bin/env python3` shebang to choose the right environment. Relative
+export destinations belong in the external session workspace, not the skill.
+
 The helper refuses active or malformed/unreadable hub/daemon records, acquires
 the real current-user HOME-relative MemPalace writer lease, checkpoints existing
 KG/Chroma/logstream databases, then holds bounded-acquisition SQLite
@@ -79,7 +85,7 @@ the password and do not use `--insecure-no-password`.
 export RESTIC_REPOSITORY=/mnt/backup/mempalace-restic
 export RESTIC_PASSWORD_FILE=~/.config/mempalace-restic.pass
 
-python3 scripts/palace_backup.py --palace ~/.mempalace \
+"$MPY" "$BACKUP_SCRIPTS/palace_backup.py" --palace ~/.mempalace \
   backup --offline --require-logstream
 ```
 
@@ -143,11 +149,11 @@ whole-palace logstream/artifact recovery unit above.
 ```bash
 # Export needs NO restic and NO mempalace import — it reads the palace SQLite directly.
 # --palace is the mempalace HOME dir (~/.mempalace), NOT the nested palace/ dir.
-./scripts/palace_wing.py export <wing> --out wing-<wing>.jsonl
-./scripts/palace_wing.py export copilot-mempalace --palace ~/.mempalace
+"$MPY" "$BACKUP_SCRIPTS/palace_wing.py" export <wing> --out wing-<wing>.jsonl
+"$MPY" "$BACKUP_SCRIPTS/palace_wing.py" export copilot-mempalace --palace ~/.mempalace
 
 # Human-readable, git/OneDrive-friendly markdown directory (lossless round-trip):
-./scripts/palace_wing.py export <wing> --format md --out backups/mempalace-wings
+"$MPY" "$BACKUP_SCRIPTS/palace_wing.py" export <wing> --format md --out backups/mempalace-wings
 ```
 
 A bundle contains: **drawers** (multi-chunk drawers reassembled), **best-effort
@@ -179,14 +185,14 @@ Publication preserves HOME's `locks/` and `server/` control directories.
 export RESTIC_REPOSITORY=/mnt/backup/mempalace-restic
 export RESTIC_PASSWORD_FILE=~/.config/mempalace-restic.pass
 
-./scripts/palace_backup.py backup --offline --require-logstream
-./scripts/palace_backup.py checkpoint --require-logstream  # not quiescence proof
-./scripts/palace_backup.py verify                 # restic check + repair-status
-./scripts/palace_backup.py --dry-run backup --offline
+"$MPY" "$BACKUP_SCRIPTS/palace_backup.py" backup --offline --require-logstream
+"$MPY" "$BACKUP_SCRIPTS/palace_backup.py" checkpoint --require-logstream # not quiescence proof
+"$MPY" "$BACKUP_SCRIPTS/palace_backup.py" verify # restic check + repair-status
+"$MPY" "$BACKUP_SCRIPTS/palace_backup.py" --dry-run backup --offline
 ```
 
 Restore lives in the same script (see the `mempalace-restore` skill):
-`./scripts/palace_backup.py restore <snapshot> --in-place --offline`.
+`"$MPY" "$BACKUP_SCRIPTS/palace_backup.py" restore <snapshot> --in-place --offline`.
 Developer tests are repository-only under `tests/mempalace-backup`, not shipped
 with the installed skill. From the repository root, use a preprovisioned
 Python 3.11+ `TEST_PY` with pytest 8.4.2 and sidecar production dependencies:

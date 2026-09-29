@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 import unittest
+from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
 from mcp import ClientSession, McpError, StdioServerParameters, types
@@ -21,7 +22,7 @@ from starlette.applications import Starlette
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
-from mempalace_tasks import discovery, launcher, platform_support
+from mempalace_tasks import discovery, launcher, platform_support, stdio_frontend
 from mempalace_tasks.server_identity import InstanceIdentity, instance_bearer, make_proof
 from portable_lifecycle_fixture import ConfigurationFixture, IdentityServer, ROOT_TOKEN
 from service_fixture import ServiceFixture, SocketRunner
@@ -36,8 +37,8 @@ def wire(value):
 class GatewayService:
     """Official SDK server with paginated descriptors and controlled transport faults."""
 
-    def __init__(self):
-        self.configuration = ConfigurationFixture(lifecycle="external")
+    def __init__(self, *, lifecycle="external"):
+        self.configuration = ConfigurationFixture(lifecycle=lifecycle)
         self.config = self.configuration.config
         self.runner = SocketRunner()
         self.identity = InstanceIdentity(
@@ -186,16 +187,17 @@ class GatewayService:
 
 
 class StdioFrontendTests(unittest.TestCase):
-    def parameters(self, path, timeout="2s", *, env=None):
+    def parameters(self, path, timeout="2s", *, env=None, no_autostart=False):
         return StdioServerParameters(
             command=sys.executable,
             args=["-m", "mempalace_tasks", "mcp",
-                  *(["--config", str(path)] if path is not None else []), "--timeout", timeout],
+                  *(["--config", str(path)] if path is not None else []), "--timeout", timeout,
+                  *(["--no-autostart"] if no_autostart else [])],
             env={**os.environ, **(env or {})},
         )
 
     @asynccontextmanager
-    async def frontend(self, path, timeout="2s", *, env=None):
+    async def frontend(self, path, timeout="2s", *, env=None, no_autostart=False):
         error_path = Path(os.environ["MPTASK_TEST_TMPDIR"]) / f"stdio-{uuid4()}.stderr"
         incoming = []
 
@@ -205,7 +207,8 @@ class StdioFrontendTests(unittest.TestCase):
 
         try:
             with error_path.open("w+") as errors:
-                async with stdio_client(self.parameters(path, timeout, env=env), errlog=errors) as (r, w):
+                async with stdio_client(self.parameters(
+                        path, timeout, env=env, no_autostart=no_autostart), errlog=errors) as (r, w):
                     async with ClientSession(
                             r, w, read_timeout_seconds=timedelta(seconds=8),
                             message_handler=observe) as session:
@@ -374,16 +377,38 @@ class StdioFrontendTests(unittest.TestCase):
 
     def test_bounded_admission_rejects_excess_without_dispatch(self):
         with GatewayService() as server:
-            server.delay = 0.35
+            admitted = threading.Event()
+            release = threading.Event()
+            call_tool = server.sdk.request_handlers[types.CallToolRequest]
+
+            async def hold_call(request):
+                result = await call_tool(request)
+                if len(server.calls) == 32:
+                    admitted.set()
+                if not await asyncio.to_thread(release.wait, 10):
+                    raise AssertionError("Test did not release admitted calls")
+                return result
+
+            server.sdk.request_handlers[types.CallToolRequest] = hold_call
 
             async def scenario():
-                async with self.frontend(server.configuration.path, "3s") as session:
-                    results = await asyncio.gather(*[
-                        self.raw_call(session, "mptask_future_write", {"command_id": str(index)})
-                        for index in range(40)])
-                    rejected = [result for result in results if result.isError]
+                async with self.frontend(server.configuration.path, "10s") as session:
+                    accepted = [asyncio.create_task(self.raw_call(
+                        session, "mptask_future_write", {"command_id": str(index)}))
+                        for index in range(32)]
+                    try:
+                        self.assertTrue(await asyncio.to_thread(admitted.wait, 5),
+                                        "All admission slots must be occupied before excess calls")
+                        rejected = await asyncio.gather(*[
+                            self.raw_call(session, "mptask_future_write", {"command_id": str(index)})
+                            for index in range(32, 40)])
+                    finally:
+                        release.set()
+                        results = await asyncio.gather(*accepted)
+                    self.assertTrue(all(not result.isError for result in results))
                     self.assertEqual(len(rejected), 8)
-                    self.assertTrue(all(result.structuredContent["error"]["code"] == "busy"
+                    self.assertTrue(all(result.isError
+                                        and result.structuredContent["error"]["code"] == "busy"
                                         for result in rejected))
                     self.assertTrue(all(not result.structuredContent["error"]["ambiguous"]
                                         for result in rejected))
@@ -491,6 +516,90 @@ class StdioFrontendTests(unittest.TestCase):
                 self.assertEqual(list(server.config.runtime_dir.glob("launch-*.log")), [])
                 info = await asyncio.to_thread(discovery.connect, server.config)
                 self.assertEqual(info.instance_id, server.identity.instance_id)
+            asyncio.run(scenario())
+
+    def test_no_autostart_uses_connect_with_original_launcher_binding(self):
+        fixture = ConfigurationFixture(lifecycle="launcher")
+        self.addCleanup(fixture.close)
+        server = IdentityServer(fixture.config)
+        self.addCleanup(server.close)
+        server.publish()
+        config_bytes = fixture.path.read_bytes()
+        registry = fixture.config.runtime_dir / "serverinfo.json"
+        registry_bytes = registry.read_bytes()
+        with patch.object(launcher, "start", side_effect=AssertionError("Must not start")) as start, \
+                patch.object(discovery, "connect", wraps=discovery.connect) as connect, \
+                patch.object(stdio_frontend, "_run", new_callable=AsyncMock, return_value=0) as run:
+            self.assertEqual(stdio_frontend.main(fixture.path, timeout=1, no_autostart=True), 0)
+        start.assert_not_called()
+        connect.assert_called_once_with(fixture.config, timeout=1)
+        run.assert_awaited_once()
+        connection, timeout, _ = run.call_args.args
+        self.assertEqual(connection.instance_id, server.identity.instance_id)
+        self.assertEqual(connection.authority_id, fixture.config.authority_id)
+        self.assertTrue(connection.ready)
+        self.assertEqual(timeout, 1)
+        self.assertEqual(fixture.path.read_bytes(), config_bytes)
+        self.assertEqual(registry.read_bytes(), registry_bytes)
+        self.assertEqual(fixture.config.lifecycle, "launcher")
+        self.assertFalse(any(row[0] == "POST" for row in server.requests))
+
+    def test_no_autostart_missing_or_vanished_owner_refuses_without_startup(self):
+        fixture = ConfigurationFixture(lifecycle="launcher")
+        self.addCleanup(fixture.close)
+        for state, expected in (("missing", "registry_missing"),
+                                ("vanished", "endpoint_unavailable")):
+            if state == "vanished":
+                server = IdentityServer(fixture.config)
+                self.addCleanup(server.close)
+                server.publish()
+                self.assertTrue(discovery.connect(fixture.config).ready)
+                server.close()
+            before = {
+                str(path.relative_to(fixture.root)): (path.stat().st_mode,
+                                                     path.stat().st_mtime_ns,
+                                                     path.read_bytes() if path.is_file() else None)
+                for path in (fixture.root, *fixture.root.rglob("*"))
+            }
+            with self.subTest(state=state), patch.object(
+                    launcher, "start", side_effect=AssertionError("Must not start")) as start, \
+                    patch.object(stdio_frontend, "_run", new_callable=AsyncMock) as run:
+                with self.assertRaises(discovery.DiscoveryError) as caught:
+                    stdio_frontend.main(fixture.path, timeout=1, no_autostart=True)
+                self.assertEqual(caught.exception.code, expected)
+                start.assert_not_called()
+                run.assert_not_awaited()
+            result = self.call_cli("mcp", "--config", str(fixture.path),
+                                   "--no-autostart", "--timeout", "1s")
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertEqual(result.stdout, "")
+            self.assertIn(expected, result.stderr)
+            self.assertNotIn(ROOT_TOKEN, result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+            self.assertEqual({
+                str(path.relative_to(fixture.root)): (path.stat().st_mode,
+                                                     path.stat().st_mtime_ns,
+                                                     path.read_bytes() if path.is_file() else None)
+                for path in (fixture.root, *fixture.root.rglob("*"))
+            }, before)
+            if state == "missing":
+                self.assertFalse(fixture.config.runtime_dir.exists())
+
+    def test_no_autostart_probes_real_stdio_under_unchanged_launcher_config(self):
+        with GatewayService(lifecycle="launcher") as server:
+            original_config = server.configuration.path.read_bytes()
+            registry = server.config.runtime_dir / "serverinfo.json"
+            original_registry = registry.read_bytes()
+
+            async def scenario():
+                async with self.frontend(server.configuration.path, no_autostart=True) as session:
+                    self.assertEqual((await session.list_tools()).nextCursor, "second")
+                info = await asyncio.to_thread(discovery.connect, server.config)
+                self.assertEqual(info.instance_id, server.identity.instance_id)
+                self.assertEqual(server.configuration.path.read_bytes(), original_config)
+                self.assertEqual(registry.read_bytes(), original_registry)
+                self.assertEqual(list(server.config.runtime_dir.glob("launch-*.log")), [])
+                self.assertEqual(server.calls, [])
             asyncio.run(scenario())
 
     def test_real_stdio_http_pagination_descriptors_and_exact_results(self):

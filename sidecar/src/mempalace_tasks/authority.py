@@ -420,6 +420,16 @@ class TaskAuthority:
                          if task["status"] == "in_progress"), None)
             if task is None:
                 break
+            if task.get("coordination_mode") == "cooperative_native":
+                self.execute_current({
+                    "operation": "native_interrupt", "command_id": str(uuid4()),
+                    "task_id": task["id"], "expected_version": task["version"],
+                    "attempt_id": task["attempt"]["id"],
+                    "claim_generation": task["claim_generation"],
+                    "reason": "authority_startup",
+                    "observations": [f"mptask://{self.authority_id}/epochs/{self._owner_epoch}"],
+                })
+                continue
             self.execute_current({
                 "operation": "attempt_report", "command_id": str(uuid4()),
                 "actor": self._system_actor, "task_id": task["id"],
@@ -452,7 +462,8 @@ class TaskAuthority:
         role = config["actors"].get(command.get("actor")) if config is not None else None
         operation = command["operation"]
         maintenance = (
-            operation == "expire" and role == "system"
+            operation == "native_interrupt"
+            or operation == "expire" and role == "system"
             or operation == "recover" and role in {"operator", "supervisor"}
             or operation == "attempt_report" and command.get("report_kind") == "recovery_started"
             and role == "system"
@@ -471,6 +482,9 @@ class TaskAuthority:
     def execute(self, command, *, expected_epoch=None):
         with self._boundary():
             self._check_epoch(expected_epoch)
+            if isinstance(command, dict) and command.get("operation") in {
+                    "native_interrupt", "mptask_native_interrupt"}:
+                raise AuthorityError("not_owner", "Native startup interruption is owner-internal")
             if self._startup_pending:
                 raise AuthorityError("startup_pending", "Inherited attempts must be revoked first")
             return self._execute_current(command, expected_epoch)
@@ -579,6 +593,30 @@ class TaskAuthority:
         matching = (attempt is not None and old_attempt is not None
                     and attempt["id"] == old_attempt["id"]
                     and task["claim_generation"] == original["claim_generation"])
+        if original.get("coordination_mode") == "cooperative_native":
+            fresh, reason = self._freshness() if freshness is None else freshness
+            goal = self._log.state.tasks.get(task["goal_id"]) if task else None
+            session = goal["native"]["session_id"] if goal else None
+            live = (bool(matching) and task["status"] == "in_progress"
+                    and attempt["owner"] == session
+                    and attempt["session_generation"] == goal["native"]["session_generation"]
+                    and attempt["status"] == "running"
+                    and attempt["native_agent_id"] == old_attempt["native_agent_id"])
+            inherited = (bool(matching) and task["status"] == "in_progress"
+                         and (attempt["owner"] != session
+                              or attempt["session_generation"] != goal["native"]["session_generation"]))
+            return {
+                "task_id": original["id"], "attempt_id": old_attempt["id"] if old_attempt else None,
+                "claim_generation": original["claim_generation"], "matches_current": bool(matching),
+                "lease_live": False, "authorized": bool(live and fresh),
+                "current_lease_revision": task["lease_revision"] if task else None,
+                "lease_expires_at": None, "coordination_mode": "cooperative_native",
+                "physical_supervision": False,
+                "session_id": session,
+                "native_agent_id": attempt["native_agent_id"] if attempt else None,
+                "reason": reason if not fresh else None if live else (
+                    "native_reconciliation_required" if inherited else "native_not_running"),
+            }
         live = (bool(matching) and task["status"] == "in_progress"
                 and attempt["status"] in {"preparing", "running", "settled"}
                 and instant(now) < min(instant(task["lease_expires_at"]),
@@ -682,7 +720,8 @@ class TaskAuthority:
     def _row(self, task, now):
         eligibility = task_eligibility(self._log.state, task, now)
         attempt = task["attempt"]
-        due = (task["status"] == "in_progress" and instant(now) >= min(
+        due = (task.get("coordination_mode") != "cooperative_native"
+               and task["status"] == "in_progress" and instant(now) >= min(
             instant(task["lease_expires_at"]), instant(attempt["progress_deadline"]),
             instant(attempt["hard_deadline"])))
         return {**{key: deepcopy(task[key]) for key in (
@@ -693,9 +732,14 @@ class TaskAuthority:
                 "progress_deadline": attempt["progress_deadline"] if attempt else None,
                 "hard_deadline": attempt["hard_deadline"] if attempt else None,
                 "checkpoint": deepcopy(attempt["checkpoint"]) if attempt else None,
+                **({"coordination_mode": "cooperative_native", "native": deepcopy(task["native"]),
+                    "native_agent_id": attempt["native_agent_id"] if attempt else None}
+                   if task.get("coordination_mode") == "cooperative_native" else {}),
                 "ready": eligibility["ready"], "reasons": eligibility["reasons"],
                 "needs_attention": bool(due or task["status"] in {"recovering", "quarantined"}
-                                        or task["escalation"] is not None),
+                                        or task["escalation"] is not None
+                                        or any(reason["code"] == "native_reconciliation_required"
+                                               for reason in eligibility["reasons"])),
                 "blockers": [edge["source"] for edge in self._log.state.edges
                              if edge["target"] == task["id"] and edge["edge_type"] == "blocks"
                              and self._log.state.tasks[edge["source"]]["status"] != "closed"]}

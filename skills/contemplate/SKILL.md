@@ -48,14 +48,21 @@ Substrate  = mempalace             → active KG triples + derived lineage table
 `skills/dreaming/scripts/` and runs the `derive` task through the same
 `dream_harvest.py` / `dream_adopt.py` rails.
 
+Set `MPY` to the absolute path of the already provisioned Python that imports
+MemPalace, and `DREAM_SCRIPTS` to the absolute path of the checkout's or installed
+dreaming skill's `scripts/` directory. Do not infer the interpreter by stripping
+a launcher shebang; binary launchers and `/usr/bin/env` wrappers differ.
+Run examples from the external session workspace so relative worklists and
+decisions are not written into the checkout or installed skill.
+Bare script names below use the same interpreter and script-path convention.
+
 ## One-shot driver (fewer prompts)
 
 Prefer the one-shot driver for inline reconnaissance:
 
 ```bash
-MPY=$(head -1 "$(command -v mempalace)" | sed 's/^#!//')
-"$MPY" skills/dreaming/scripts/dream_contemplate.py --palace <p>
-"$MPY" skills/dreaming/scripts/dream_contemplate.py --palace <p> --bootstrap
+"$MPY" "$DREAM_SCRIPTS/dream_contemplate.py" --palace <p>
+"$MPY" "$DREAM_SCRIPTS/dream_contemplate.py" --palace <p> --bootstrap
 ```
 
 `dream_contemplate.py` runs the derive scan (without adopting conclusions) in one in-process call
@@ -70,8 +77,7 @@ Use `--recall` when the current reasoning task needs grounding from past Copilot
 host sessions:
 
 ```bash
-MPY=$(head -1 "$(command -v mempalace)" | sed 's/^#!//')
-"$MPY" skills/dreaming/scripts/dream_contemplate.py --palace <p> \
+"$MPY" "$DREAM_SCRIPTS/dream_contemplate.py" --palace <p> \
   --recall "<reasoning query>" [--k 5] [--repository <substr>] \
   [--since <iso>] [--limit-sessions N] [--min-similarity 0.0] \
   [--format summary|json]
@@ -112,8 +118,7 @@ hypothesised edges whose addition would unblock currently-underivable `_closure`
 conclusions, ranked by **DUC** (how many conclusions each gap would unblock).
 
 ```bash
-MPY=$(head -1 "$(command -v mempalace)" | sed 's/^#!//')
-"$MPY" skills/dreaming/scripts/dream_harvest.py --palace <p> --task gaps \
+"$MPY" "$DREAM_SCRIPTS/dream_harvest.py" --palace <p> --task gaps \
   [--target-subject "<entity id or name>"] [--rules <p>/ontology.json] \
   [--max-candidates 500] --out worklist.json
 ```
@@ -182,8 +187,7 @@ Artifacts go in the session workspace — never commit them. Use the interpreter
 that owns the `mempalace` package:
 
 ```bash
-MPY=$(head -1 "$(command -v mempalace)" | sed 's/^#!//')
-"$MPY" skills/dreaming/scripts/dream_harvest.py --task derive \
+"$MPY" "$DREAM_SCRIPTS/dream_harvest.py" --task derive \
   --palace <p> --rules <p>/ontology.json --out worklist.json
 ```
 
@@ -198,7 +202,7 @@ MPY=$(head -1 "$(command -v mempalace)" | sed 's/^#!//')
 Adopt and verify:
 
 ```bash
-"$MPY" skills/dreaming/scripts/dream_adopt.py --task derive \
+"$MPY" "$DREAM_SCRIPTS/dream_adopt.py" --task derive \
   --palace <p> --decisions decisions.json --verify
 ```
 
@@ -280,10 +284,9 @@ human review.
 For inline review of ontology candidates, prefer the proposal commands:
 
 ```bash
-MPY=$(head -1 "$(command -v mempalace)" | sed 's/^#!//')
-"$MPY" skills/dreaming/scripts/dream_contemplate.py --palace <p> --propose
-"$MPY" skills/dreaming/scripts/dream_contemplate.py --palace <p> --enable-rule <rule-id>
-"$MPY" skills/dreaming/scripts/dream_contemplate.py --palace <p> --disable-rule <rule-id>
+"$MPY" "$DREAM_SCRIPTS/dream_contemplate.py" --palace <p> --propose
+"$MPY" "$DREAM_SCRIPTS/dream_contemplate.py" --palace <p> --enable-rule <rule-id>
+"$MPY" "$DREAM_SCRIPTS/dream_contemplate.py" --palace <p> --disable-rule <rule-id>
 ```
 
 `--propose` shows plain-language disabled ontology candidates for review.

@@ -3,6 +3,12 @@
 Design basis for the dreaming scripts. Filed in the palace under wing
 `copilot-mempalace`, room `dreaming` / `api`; summarised here for offline use.
 
+For command examples, set `MPY` to the absolute path of the existing MemPalace
+Python interpreter and `DREAM_SCRIPTS` to the absolute path of the dreaming
+skill's `scripts/` directory. Use the provisioned interpreter, not a parsed
+launcher shebang. Run from the external session workspace so relative artifacts
+remain outside the checkout and installed skill.
+
 ## Layered responsibilities
 
 - **Substrate — mempalace** (passive): stores drawers + embeddings + KG; serves
@@ -136,8 +142,7 @@ equivalent to "no filesystem writes."
 Harvest:
 
 ```bash
-MPY=$(head -1 "$(command -v mempalace)" | sed 's/^#!//')
-"$MPY" dream_harvest.py --palace <palace> --task pattern --wing <wing> \
+"$MPY" "$DREAM_SCRIPTS/dream_harvest.py" --palace <palace> --task pattern --wing <wing> \
   --rooms diary --min-support 3 --out worklist.json
 ```
 
@@ -192,17 +197,16 @@ MPY=$(head -1 "$(command -v mempalace)" | sed 's/^#!//')
 Harvest:
 
 ```bash
-MPY=$(head -1 "$(command -v mempalace)" | sed 's/^#!//')
-"$MPY" dream_harvest.py --palace <palace> --task prune --wing <wing> \
+"$MPY" "$DREAM_SCRIPTS/dream_harvest.py" --palace <palace> --task prune --wing <wing> \
   --room <room> --v-min 0.35 --age-floor-days 30 --out worklist.json
 ```
 
 Adopt:
 
 ```bash
-"$MPY" dream_adopt.py --palace <palace> --decisions decisions.json \
+"$MPY" "$DREAM_SCRIPTS/dream_adopt.py" --palace <palace> --decisions decisions.json \
   --archive-file archive.jsonl --dry-run
-"$MPY" dream_adopt.py --palace <palace> --decisions decisions.json \
+"$MPY" "$DREAM_SCRIPTS/dream_adopt.py" --palace <palace> --decisions decisions.json \
   --archive-file archive.jsonl
 ```
 
@@ -238,8 +242,8 @@ Phase-2 adjudication should use the human-readable renderer instead of opening
 large raw JSON:
 
 ```bash
-"$MPY" dream_show.py --worklist <worklist.json>
-"$MPY" dream_show.py --worklist <worklist.json> --task derive --full
+"$MPY" "$DREAM_SCRIPTS/dream_show.py" --worklist <worklist.json>
+"$MPY" "$DREAM_SCRIPTS/dream_show.py" --worklist <worklist.json> --task derive --full
 ```
 
 The renderer prints one compact block/line per candidate and avoids the 20KB file

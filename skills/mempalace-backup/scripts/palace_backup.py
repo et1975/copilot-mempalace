@@ -39,11 +39,15 @@ Usage::
     export RESTIC_REPOSITORY=/mnt/backup/mempalace-restic
     export RESTIC_PASSWORD_FILE=~/.config/mempalace-restic.pass
 
-    ./palace_backup.py checkpoint            # inventory + WAL-checkpoint SQLite DBs
-    ./palace_backup.py backup --offline --require-logstream
-    ./palace_backup.py restore <snapshot>    # validate private staging only
-    ./palace_backup.py restore <snapshot> --in-place --offline
-    ./palace_backup.py verify                # restic check (+ palace repair-status)
+    "$MPY" "$BACKUP_SCRIPTS/palace_backup.py" checkpoint
+    "$MPY" "$BACKUP_SCRIPTS/palace_backup.py" backup --offline --require-logstream
+    "$MPY" "$BACKUP_SCRIPTS/palace_backup.py" restore <snapshot>
+    "$MPY" "$BACKUP_SCRIPTS/palace_backup.py" restore <snapshot> --in-place --offline
+    "$MPY" "$BACKUP_SCRIPTS/palace_backup.py" verify
+
+Select absolute MPY (the provisioned MemPalace interpreter) and BACKUP_SCRIPTS
+paths. Checkpoint inventories and WAL-checkpoints SQLite; restore without
+--in-place validates private staging only; verify checks restic and repair status.
 """
 from __future__ import annotations
 
