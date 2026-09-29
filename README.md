@@ -13,8 +13,8 @@ audit hook that nags when an external tool is about to run without a prior `memp
   proactive vs reactive use, mining hygiene, HNSW drift recovery, auto-save hook notes.
 - **[MemPalace Tasks sidecar](sidecar/README.md)** — optional, separately installed
   Python Streamable HTTP MCP service with a harness-launched stdio frontend for
-  durable tasks, dependencies, atomic claims/discoveries and renewable fenced
-  leases. Schema 2 replays the MemPalace logstream as its sole durable task/recovery
+  durable tasks, dependencies, atomic claims/discoveries, cooperative native
+  session ownership and managed-host renewable fenced leases. Schema 2 replays the MemPalace logstream as its sole durable task/recovery
   store, with a fresh fenced epoch
   per owner startup and disposable local runtime/discovery files. Foreground
   hosting requires no service manager. `mempalace-tasks mcp --config CONFIG`
@@ -33,11 +33,23 @@ audit hook that nags when an external tool is about to run without a prior `memp
   atomic task/dependency publications rather than one giant prose goal.
   Task and MemPalace storage interaction uses the separate, server-qualified MCP
   tools.
-  Without a separately supplied compatible native supervisor, it supports
-  durable planning and execution-blocker reporting, not tracked execution.
-  Worker dispatch remains a host responsibility; connecting MCP does not
-  automatically wire native `/fleet`.
-  No native `/fleet` execution adapter is shipped. Linux process supervision is
+  Cooperative native mode uses `mptask_native`: the issuing session UUID is
+  enrolled atomically with a goal, the native parent reserves attempts before
+  dispatch and binds actual returned agent IDs. No separate coordinator, actor
+  provisioning or supervisor is required. The UUID is an identifier, not a secret;
+  existing authenticated MCP remains the trust boundary. Explicit reconciliation
+  and session transfer handle interruption without heartbeat timers or retry on
+  silence. Acceptance evidence and sealed durable closure finish the goal.
+  Rejected open proposals can be cancelled in place without admitting or
+  dispatching them; active/uncertain attempts still require reconciliation.
+  Content-only native updates clear resolved holds/defer on wanted open work.
+  Session takeover is a bounded root-only ownership change; inherited active
+  attempts need individual release/reconciliation, never silent adoption.
+  Missing native API/version is a blocker, not a reason to use another store.
+  This is cooperative workflow support, not physical containment/effect-settlement
+  proof or automatic queue subscription. Existing managed goals keep their own
+  actor/host/lease/fencing requirements and are never silently converted.
+  Ordinary untracked `/fleet` remains unchanged. Linux process supervision is
   optional and separate; macOS/Windows hosting code exists but native
   certification remains unrun. Only the current journal-backed authority is
   supported; there is no original-runtime or old-format compatibility mode.

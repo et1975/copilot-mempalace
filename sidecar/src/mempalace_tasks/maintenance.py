@@ -108,6 +108,8 @@ class LeaseMaintenance:
         if startup_pending:
             return
         for task in sorted(state.tasks.values(), key=lambda t: t["id"]):
+            if task.get("coordination_mode") == "cooperative_native":
+                continue
             if task["status"] == "in_progress":
                 if instant(now) >= min(instant(task["lease_expires_at"]),
                                          instant(task["attempt"]["progress_deadline"]),

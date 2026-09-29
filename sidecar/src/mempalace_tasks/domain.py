@@ -199,7 +199,10 @@ def _check_task_input(state, data):
     resources = _strings(data["resource_keys"], "resource_keys", 32, width=256)
     require(resources == sorted(resources), "resource_keys must be sorted")
     data["policy"] = _policy(data["policy"], state.configuration["policy"])
-    if data["kind"] == "epic":
+    if data.get("coordination_mode") == "cooperative_native":
+        require(data["execution_class"] is None and data["execution_profile"] is None and not resources,
+                "Cooperative tasks cannot claim managed execution guarantees")
+    elif data["kind"] == "epic":
         require(data["execution_class"] is None and data["execution_profile"] is None and not resources,
                 "Epics must not declare execution resources or profiles")
     else:
@@ -213,13 +216,15 @@ def _check_task_input(state, data):
                 "Shared tasks require resources; isolated tasks must not reserve shared resources")
 
 
-def _new_task(state, task_id, inputs, at):
+def _new_task(state, task_id, inputs, at, *, native=None):
     object_fields(inputs, TASK_INPUT, {"project", "kind", "title", "description", "acceptance"},
                   "task")
     task = {"id": task_id, "priority": 2, "hold_reason": None, "deferred_until": None,
             "execution_class": None, "execution_profile": None, "resource_keys": [],
             "policy": {}, "goal_id": None, "intent_key": None, "admitted": True,
             **deepcopy(inputs)}
+    if native is not None:
+        task.update(coordination_mode="cooperative_native", native=deepcopy(native))
     _check_task_input(state, task)
     task.update(status="open", version=1, claim_generation=0, lease_revision=0,
                 lease_expires_at=None, attempt=None, automatic_retries_used=0,
@@ -353,9 +358,10 @@ def _checkpoint(task, sequence, reference, at):
     require(previous is None or (sequence > previous["sequence"] and reference != previous["reference"]),
             "Checkpoint must have a fresh sequence and changed durable reference")
     task["attempt"]["checkpoint"] = {"sequence": sequence, "reference": reference, "at": at}
-    task["attempt"]["progress_deadline"] = utc(min(
-        _deadline(at, task["policy"]["progress_timeout_seconds"]),
-        instant(task["attempt"]["hard_deadline"])))
+    if task.get("coordination_mode") != "cooperative_native":
+        task["attempt"]["progress_deadline"] = utc(min(
+            _deadline(at, task["policy"]["progress_timeout_seconds"]),
+            instant(task["attempt"]["hard_deadline"])))
 
 
 def _wait_reasons(state, task, at):
@@ -398,12 +404,16 @@ def task_eligibility(state, task, as_of):
         goal = _goal(state, task["goal_id"], open_only=False)
         if goal["sealed"] or goal["status"] != "open":
             reasons.append({"code": "goal_sealed"})
+        if (task.get("coordination_mode") == "cooperative_native" and task["status"] == "in_progress"
+                and (task["attempt"]["owner"] != goal["native"]["session_id"]
+                     or task["attempt"]["session_generation"] != goal["native"]["session_generation"])):
+            reasons.append({"code": "native_reconciliation_required"})
     for key in task["resource_keys"]:
         record = state.resources.get(key)
         if record and record["reservation"] is not None:
             reasons.append({"code": "resource_busy", "resource_key": key,
                             "task_id": record["reservation"]["task_id"]})
-    if task["kind"] == "task":
+    if task["kind"] == "task" and task.get("coordination_mode") != "cooperative_native":
         profile = state.configuration["execution_profiles"].get(task["execution_profile"])
         if (profile is None or profile["execution_class"] != task["execution_class"]
                 or not profile["available"] or not any(
@@ -494,9 +504,12 @@ def _touch_goals(state, task_ids, touched):
         touched.add(goal_id)
 
 
-def _complete(state, task, command, at):
+def _complete(state, task, command, at, *, native=False):
     summary = text(command.get("summary"), "summary", 8192, byte_limit=True)
     evidence = _strings(command.get("evidence"), "evidence", nonempty=True)
+    if native:
+        from .native import complete_task
+        return complete_task(state, task, command, at, summary, evidence)
     if task["kind"] == "task":
         _live(state, task, command, at)
     require(not _wait_reasons(state, task, at), "Task has unresolved gates", "not_ready")
@@ -532,14 +545,15 @@ def _goal_policy(value):
             "max_batch": integer(value.get("max_batch", 25), "max_batch", 1, 50)}
 
 
-def _expand(state, command, at, touched):
+def _expand(state, command, at, touched, *, native=False):
     goal = _goal(state, command["goal_id"])
     _expected(goal, command["expected_graph_revision"], "graph_revision")
     source_id = command.get("source_task_id")
     disposition = _enum(command["source_disposition"], {"continue", "yield", "complete"},
                         "source_disposition")
     if source_id is None:
-        _admin(state, command["actor"])
+        if not native:
+            _admin(state, command["actor"])
         require(disposition == "continue" and not (TOKENS | {"expected_version"}) & command.keys(),
                 "Coordinator admission has no source execution disposition")
         source = None
@@ -547,7 +561,11 @@ def _expand(state, command, at, touched):
         source = _task(state, source_id)
         require(source["goal_id"] == goal["id"] and source["admitted"],
                 "Source must be admitted in the goal")
-        _live(state, source, command, at)
+        if native:
+            from .native import live_attempt
+            live_attempt(source, command)
+        else:
+            _live(state, source, command, at)
         _expected(source, command.get("expected_version"))
         require(source["attempt"]["status"] == "running"
                 or (disposition == "complete" and source["attempt"]["status"] == "settled"),
@@ -561,7 +579,11 @@ def _expand(state, command, at, touched):
         checkpoint = command.get("checkpoint")
         object_fields(checkpoint, {"sequence", "reference"}, {"sequence", "reference"}, "checkpoint")
         _checkpoint(source, checkpoint["sequence"], checkpoint["reference"], at)
-        _revoke(state, source, at, command.get("reason"), "release")
+        if native:
+            from .native import interrupt
+            interrupt(source, at, command.get("reason"), command.get("observations"))
+        else:
+            _revoke(state, source, at, command.get("reason"), "release")
         touched.add(source_id)
     else:
         require("checkpoint" not in command and "reason" not in command,
@@ -609,12 +631,14 @@ def _expand(state, command, at, touched):
             require("expected_version" not in spec, "New tasks have no expected version")
             task_uuid = str(uuid5(UUID(command["command_id"]), key))
             inputs = {"kind": "task", **spec, "project": goal["project"], "goal_id": goal["id"]}
-            target = _new_task(state, task_id_for(state.authority_id, task_uuid), inputs, at)
+            target = _new_task(state, task_id_for(state.authority_id, task_uuid), inputs, at,
+                               native=goal.get("native") if native else None)
             created.append(target["id"])
         if target["id"] not in created:
             reused_versions[target["id"]] = spec.get("expected_version")
         if spec.get("admitted", target["admitted"]) != target["admitted"]:
-            _admin(state, command["actor"])
+            if not native:
+                _admin(state, command["actor"])
             _expected(target, spec.get("expected_version"))
             require(spec["admitted"] is True and target["status"] == "open",
                     "Only open proposals can be admitted", "invalid_transition")
@@ -647,12 +671,48 @@ def _expand(state, command, at, touched):
     require(sum(not t["admitted"] and t["status"] not in TERMINAL for t in members) <= 100,
             "Pending proposal limit exceeded")
     if disposition == "complete":
-        _complete(state, source, command, at)
+        _complete(state, source, command, at, native=native)
         touched.add(source_id)
     if touched:
         goal["graph_revision"] += 1
         touched.add(goal["id"])
     return {"goal_id": goal["id"], "admitted_task_ids": admitted, "proposed_task_ids": proposed}
+
+
+def _bootstrap(state, command, at, touched, *, native=None):
+    goal_id = task_id_for(state.authority_id, command["command_id"])
+    goal = _new_task(state, goal_id, {k: command[k] for k in
+                     ("project", "title", "description", "acceptance", "priority") if k in command}
+                     | {"kind": "epic", "goal_id": goal_id}, at, native=native)
+    goal["goal_policy"] = _goal_policy(command["goal_policy"])
+    goal["graph_revision"] = 1
+    planner_spec = command["planning_task"]
+    object_fields(planner_spec, CONTENT | EXECUTION, {"title", "description", "acceptance"},
+                  "planning_task")
+    planner_id = task_id_for(state.authority_id, str(uuid5(UUID(command["command_id"]), "planning")))
+    _new_task(state, planner_id, {**planner_spec, "project": goal["project"], "kind": "task",
+                                 "goal_id": goal_id, "intent_key": "planning"}, at, native=native)
+    _add_edge(state, goal_id, planner_id, "parent_child", touched)
+    return {"goal_id": goal_id, "planning_task_id": planner_id}
+
+
+def _close_goal(state, command, at, touched, *, native=False):
+    goal = _goal(state, command["goal_id"])
+    _expected(goal, command["expected_version"])
+    _expected(goal, command["expected_graph_revision"], "graph_revision")
+    members = [t for t in state.tasks.values() if t["goal_id"] == goal["id"] and t["id"] != goal["id"]]
+    require(bool(members) and any(t["status"] == "closed" for t in members),
+            "Goal requires completed work, not only an empty/cancelled frontier", "not_ready")
+    require(all(t["status"] in TERMINAL and t["recovery"] is None for t in members),
+            "Goal has unfinished work, proposals or recovery", "not_ready")
+    require(not any(r["reservation"] is not None
+                    and r["reservation"]["task_id"] in {t["id"] for t in members}
+                    for r in state.resources.values()), "Goal retains resources", "not_ready")
+    _complete(state, goal, command, at, native=native)
+    goal["sealed"] = True
+    goal["graph_revision"] += 1
+    touched.add(goal["id"])
+    return {"goal_id": goal["id"]}
 
 
 def _execute(state, command, at):
@@ -665,6 +725,12 @@ def _execute(state, command, at):
         state.configuration = _configuration(command)
         return "AuthorityCreated", touched, {"authority_id": state.authority_id}
     require(state.configuration is not None, "Authority must be created first", "invalid_transition")
+    # Transport sessions are never registered as privileged managed actors.
+    for key in ("task_id", "goal_id", "source_task_id", "source", "target"):
+        value = command.get(key)
+        task = state.tasks.get(value) if type(value) is str else None
+        require(task is None or task.get("coordination_mode") != "cooperative_native",
+                "Use mptask_native for cooperative work", "coordination_mode_mismatch")
     role = _role(state, actor)
     if op == "create":
         _admin(state, actor)
@@ -678,41 +744,13 @@ def _execute(state, command, at):
         kind, response = "TaskCreated", {"task_id": task["id"]}
     elif op == "bootstrap":
         _admin(state, actor)
-        goal_id = task_id_for(state.authority_id, command["command_id"])
-        goal = _new_task(state, goal_id, {k: command[k] for k in
-                         ("project", "title", "description", "acceptance", "priority") if k in command}
-                         | {"kind": "epic", "goal_id": goal_id}, at)
-        goal["goal_policy"] = _goal_policy(command["goal_policy"])
-        goal["graph_revision"] = 1
-        planner_spec = command["planning_task"]
-        object_fields(planner_spec, CONTENT | EXECUTION, {"title", "description", "acceptance"},
-                      "planning_task")
-        planner_id = task_id_for(state.authority_id, str(uuid5(UUID(command["command_id"]), "planning")))
-        _new_task(state, planner_id, {**planner_spec, "project": goal["project"], "kind": "task",
-                                     "goal_id": goal_id, "intent_key": "planning"}, at)
-        _add_edge(state, goal_id, planner_id, "parent_child", touched)
-        kind, response = "GoalBootstrapped", {"goal_id": goal_id, "planning_task_id": planner_id}
+        kind, response = "GoalBootstrapped", _bootstrap(state, command, at, touched)
     elif op == "expand":
         response = _expand(state, command, at, touched)
         kind = "TasksExpanded"
     elif op == "goal_close":
         _admin(state, actor)
-        goal = _goal(state, command["goal_id"])
-        _expected(goal, command["expected_version"])
-        _expected(goal, command["expected_graph_revision"], "graph_revision")
-        members = [t for t in state.tasks.values() if t["goal_id"] == goal["id"] and t["id"] != goal["id"]]
-        require(bool(members) and any(t["status"] == "closed" for t in members),
-                "Goal requires completed work, not only an empty/cancelled frontier", "not_ready")
-        require(all(t["status"] in TERMINAL and t["recovery"] is None for t in members),
-                "Goal has unfinished work, proposals or recovery", "not_ready")
-        require(not any(r["reservation"] is not None
-                        and r["reservation"]["task_id"] in {t["id"] for t in members}
-                        for r in state.resources.values()), "Goal retains resources", "not_ready")
-        _complete(state, goal, command, at)
-        goal["sealed"] = True
-        goal["graph_revision"] += 1
-        touched.add(goal["id"])
-        kind, response = "GoalClosed", {"goal_id": goal["id"]}
+        kind, response = "GoalClosed", _close_goal(state, command, at, touched)
     elif op in {"add_dependency", "remove_dependency"}:
         _admin(state, actor)
         a, b = _task(state, command["source"]), _task(state, command["target"])
@@ -955,17 +993,26 @@ def decide(state, command: dict, now: str) -> dict:
     operation = command.get("operation")
     require(type(operation) is str, "operation must be text")
     operation = operation.removeprefix("mptask_")
-    require(operation in SCHEMAS, "Unknown operation", operation=operation)
-    allowed, required = SCHEMAS[operation]
-    object_fields(command, BASE | allowed, BASE | required, "command")
+    native = operation in {"native", "native_interrupt"}
+    require(operation in SCHEMAS or native, "Unknown operation", operation=operation)
+    if native:
+        from .native import validate_command
+        validate_command({**command, "operation": operation})
+    else:
+        allowed, required = SCHEMAS[operation]
+        object_fields(command, BASE | allowed, BASE | required, "command")
+        text(command["actor"], "actor")
     identifier(command["command_id"], "command_id")
-    text(command["actor"], "actor")
     normalized = {**deepcopy(command), "operation": operation}
     at = utc(instant(now))
     require(state.last_event_at is None or instant(at) >= instant(state.last_event_at),
             "Decision time must not move backwards")
     working = deepcopy(state)
-    kind, touched, response = _execute(working, normalized, at)
+    if native:
+        from .native import execute
+        kind, touched, response = execute(working, normalized, at)
+    else:
+        kind, touched, response = _execute(working, normalized, at)
     for task_id in touched:
         task = working.tasks[task_id]
         if task_id in state.tasks:
@@ -1132,7 +1179,8 @@ def validate_state(state):
         "sealed", "graph_revision", "goal_policy",
     }
     for task in state.tasks.values():
-        object_fields(task, snapshot_fields | {"assignee"}, snapshot_fields, "task snapshot")
+        object_fields(task, snapshot_fields | {"assignee", "coordination_mode", "native"},
+                      snapshot_fields, "task snapshot")
     for task_id, task in state.tasks.items():
         require(task_id == task["id"] and task_id.startswith("tsk_"), "Task ID mismatch")
         identifier(task_id[4:], "task UUID")
@@ -1154,10 +1202,17 @@ def validate_state(state):
                 instant(task[field], field)
         require(("assignee" in task) == (task["status"] == "in_progress"),
                 "Assignee and active status disagree")
-        require((task["lease_expires_at"] is not None) == (task["status"] == "in_progress"),
-                "Lease and active status disagree")
-        _validate_attempt(state, task)
-        _validate_recovery(task)
+        native = task.get("coordination_mode") == "cooperative_native"
+        if native:
+            from .native import validate_task
+            validate_task(state, task)
+        else:
+            require("native" not in task and "coordination_mode" not in task,
+                    "Unknown coordination mode")
+            require((task["lease_expires_at"] is not None) == (task["status"] == "in_progress"),
+                    "Lease and active status disagree")
+            _validate_attempt(state, task)
+            _validate_recovery(task)
         require((task["completion"] is not None) == (task["status"] == "closed"),
                 "Closed status requires completion")
         if task["completion"] is not None:
@@ -1168,7 +1223,10 @@ def validate_state(state):
             _strings(completion["evidence"], "evidence", nonempty=True)
             instant(completion["at"])
             text(completion["actor"], "completion actor")
-            require(completion["actor"] in state.configuration["actors"], "Unknown completion actor")
+            if native:
+                identifier(completion["actor"], "completion session")
+            else:
+                require(completion["actor"] in state.configuration["actors"], "Unknown completion actor")
         require((task["cancellation_reason"] is not None) == (task["status"] == "cancelled"),
                 "Cancelled status requires a reason")
         if task["cancellation_reason"] is not None:

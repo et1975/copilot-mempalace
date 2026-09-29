@@ -2,16 +2,37 @@
 
 ## Evidence status
 
-A fresh-context evaluation covered task lookup and resumption, service
+**Observed red baseline:** session `1cbd653b-18ac-4d51-9445-a0155f06595c`
+received successful task health/list/snapshot reads but stopped because no
+registered coordinator identity was established and existing guidance required a
+native supervisor. No bootstrap/mutation was attempted. Supervisor availability
+was not actually probed: the evidence is **unverified**, not proof it was absent.
+The new native API removes these extra actor/supervisor prerequisites for
+cooperative goals; it does not assert that a managed supervisor now exists.
+
+An earlier fresh-context evaluation covered task lookup and resumption, service
 unavailability, task-note/evidence/learning filing, ordinary untracked fleet, and
 an unresolved old-epoch mutation. State and evidence operations stayed on their
 respective MCP servers, and ordinary dispatch remained available. Missing schemas
-and identities stayed explicit prerequisites.
+and identities stayed explicit prerequisites under the earlier managed contract.
 
 This was **one grouped simulation**, not live calls or repeated independent
 sampling. The remaining scenarios specify expected behavior unless separately
 tested. Simulation results do not certify live custom-agent tool availability,
 service deployment, native platform support or supervised fleet execution.
+The new native cases below are pressure-test specifications, **not recorded green
+runs**. Schema/document checks and deterministic service tests must be reported
+separately from fresh-context agent tests and actual live native fleet execution.
+
+A parent-reported follow-up pressure evaluation found two gaps: rejected native
+proposals lacked a cancellation path, and an unqualified `authorized=true` gate
+could block start/recovery. Guidance now covers native cancel and action-specific
+non-running checks; E22–E25 target these gaps. This records the reported findings
+and revised expectations, not a claimed green rerun or live enforcement test.
+Additional review identified missing unhold/update support and an oversized
+takeover event when multiple large active task snapshots were rewritten.
+E26–E28 cover content updates and bounded root-only transfer/per-task recovery;
+these remain guidance expectations, distinct from reported service regression runs.
 
 ## MCP storage boundary
 
@@ -32,7 +53,7 @@ Request intended tool calls, arguments and required observations, not actual liv
 mutations. Use discovered schemas or supplied exact schema fixtures. Record the
 chosen calls/fields and verdict; distinguish claimed intent from observed behavior.
 
-### Regression: a prerequisite discovered during execution
+### Managed regression: a prerequisite discovered during execution
 
 **Pressure:** A has a live running attempt and occupies the last worker slot.
 Its next step needs newly discovered B. Publish B immediately and free capacity.
@@ -54,7 +75,7 @@ Its next step needs newly discovered B. Publish B immediately and free capacity.
 keep A claimed waiting for B; dispatch B before publication/claim; start another
 fleet to manufacture capacity.
 
-### Publication and goal cases
+### Managed publication and goal cases
 
 | Pressure | Expected observable green behavior |
 |---|---|
@@ -69,7 +90,7 @@ fleet to manufacture capacity.
 | Goal close races publication | Use `mptask_goal_close` with current task/graph revisions and acceptance evidence. Refresh on conflict; accepted publication prevents premature close or a sealed goal rejects new intake. |
 | Ready frontier empty; blocked/proposed/recovering/quarantined work remains | Report actual reasons and wait/escalate as appropriate. Neither emptiness nor all-cancelled children proves acceptance. |
 
-### Ownership, outcomes, and runtime cases
+### Managed ownership, outcomes, and runtime cases
 
 | Pressure | Expected observable green behavior |
 |---|---|
@@ -92,35 +113,56 @@ fleet to manufacture capacity.
 | Diagnostic config/token read from a repository or shared directory | Validate regular files and required permissions without repair. File and parent-directory modes remain unchanged; missing/invalid inputs fail without creation or chmod. Only explicit init creates its own credential/state artifacts. |
 | Supporting context, durable artifacts or a session memory must be filed | Use discovered native search/read, artifact and duplicate-check/filing/diary tools. Memory can supply evidence references, never claim/lease/status mutations or an alternate task authority. |
 
-### Per-goal native fleet and stdio frontend cases
+### Cooperative native fleet cases
 
 The following are assessor expectations, not prompts to include in the simulated
-worker's input. Run with the relevant guidance and synthetic observations only;
-record actual intended actions separately. A hypothetical compatible host in a
-fixture does not establish that this repository ships one.
+worker's input. Run with the relevant guidance and exact advertised schema
+fixtures, without live mutations; record actual intended actions separately.
+Native fixtures advertise `mptask_native`, not a hypothetical managed supervisor.
+Keep observations of agent intent, service rejection and physical runtime behavior
+distinct.
 
 | Case and pressure | Expected observable behavior |
 |---|---|
-| B0: an approved multi-stage native plan is in current context, then `/fleet execute and track this as a goal` | Treat the phrase as the explicit per-goal opt-in without requiring prior agent selection or a repeated handoff. Preserve the approved plan verbatim as the canonical durable artifact and file a concise searchable memory drawer containing its objective, stage outline, content hash and artifact reference without task status. Bootstrap a concise root plus import/planning task, then publish independently actionable tasks, initial goal membership, provenance and real `blocks` edges so each task's definition and initial blockers are atomic at first runnable visibility. Paragraph order alone is not a dependency; rationale stays in plan memory/descriptions, validation becomes acceptance/evidence unless independently actionable, and ambiguous or over-budget items remain `admitted=false`. A live authorized import source may complete with the final required publication; coordinator-only publication must leave execution/closure blocked rather than fabricate source authority. |
+| B0: an approved multi-stage native plan is in current context, then `/fleet execute and track this as a goal` | Recognize explicit per-goal opt-in without agent-selection handoff/repeating the plan. Preserve exact artifact plus searchable objective/stages/hash/reference drawer without task state. Native bootstrap enrolls actual issuing session and creates root/import task; claim/start import as parent work. Atomically expand independently actionable tasks, membership, provenance and real blockers. Paragraph/stage order alone is not a dependency; rationale stays in plan memory, validation becomes acceptance/evidence unless independently actionable, and ambiguous/over-budget work remains `admitted=false`. Complete import with final required publication/evidence. |
 | B0a: the approved plan exceeds `max_batch` or 200 initial edges | Topologically order bounded, dependency-closed expansions. Every admitted task's known prerequisites already exist or are declared in the same expansion; later tasks may depend on earlier batches when they are first published. Use non-runnable proposals when safe runnable publication is incomplete. Do not publish a runnable task and attach an initial blocker later. |
 | B1: `/fleet Update docs and tests`; workflow agent selected and task tools available | Ordinary native work remains available; no automatic durable enrollment, claim, or supervisor demand. |
-| B2: explicit durable planning; fresh service, configured coordinator/defaults and registered supervisor/profile names, but no compatible native host | Derive project and bounded defaults from trusted harness/config context, use the current plan/objective as planning input, inspect for reuse, and permit authorized coordinator bootstrap/admission without making the user restate the plan. Report tracked execution blocked; no claim or fabricated host. |
-| B3: resume named goal after compaction; session summary says done, fresh task MCP state is open | Refresh authority/goal/task through MCP, report the discrepancy and current state, and retain a bounded handoff reference. No duplicate bootstrap or execution from remembered tokens. |
+| B2: healthy task MCP and `mptask_native` available, actual session UUID known, but no separately configured coordinator actor or native supervisor | Proceed with cooperative native bootstrap, graph, claim/dispatch/start and acceptance workflow. Send no `actor` argument, demand no provisioning/daemon/timer and invent no managed host evidence. Parent remains sole dispatcher. This directly targets the observed red baseline. |
+| B3: same-session compaction; summary says done but fresh task MCP state is open | Retain actual session UUID, refresh stored mode/ownership/epoch/versions and report discrepancy. No duplicate bootstrap or native todo mirror. Resume only current binding; reconcile uncertain work rather than retry on silence. |
 | B4: launcher-mode frontend reports `connection_closed`; old expansion may have dispatched; replacement owner exists | Report transport blocker and require explicit reconnection. Status inspection must not start/restart a launcher. Resolve the original authority/epoch/command/payload through historical outcome lookup; replacement readiness does not upgrade that request or renew execution. |
-| E1: explicitly tracked request but missing task tools/schema/actor | Report the request/setup blocker in the conversation. No alternate storage, invented durable IDs, native delegation acknowledgment substitute, alternate writer, or untracked execution fallback. |
-| E2: separately supplied native host with matching fresh authorization and materialized inputs | Native parent dispatches a bounded packet through `task`, records the returned native agent ID, and follows notifications. Packet includes real authority/epoch/task/attempt/generation, acceptance/scope, inputs/base/checkpoint and required evidence. No fictitious working-directory API, model override or second coordinator. |
-| E3: native worker reports success but current authority has another epoch/attempt/generation | Preserve evidence through memory/artifact MCP when needed and report the stale result. Native success cannot close durable work or authorize the old worker. |
-| E4: A occupies the last slot and needs B | Use the exact atomic expand/yield prerequisite recipe above with the supplied durable checkpoint and `blocks(B,A)`; physical recovery remains the supervisor's responsibility. |
+| E1: health succeeds but deployed old schema lacks `mptask_native`, or task service is disconnected | Report missing native API/version or unavailable authority, not missing actor/supervisor. No direct SQL/CLI, alternate storage/writer, borrowed managed actor, made-up IDs or silent untracked fallback. Do not claim checkout changes update an installed package. |
+| E2: native task ready, inputs available, idle capacity | Native parent claims before `task`; packet requires waiting for binding. Bind the actual returned agent ID through native start; notify that ID and require fresh binding verification before work. No nickname substitution, fictitious cwd/fence, second coordinator or direct worker task-state writes. Parent work binds actual parent UUID instead. |
+| E3: result is for wrong task/agent or old epoch/attempt/generation/session binding | Reject publication under mismatched identity; preserve relevant evidence but do not close the current task or copy it under fresh tokens. Check each identity independently, not just task title or worker success. |
+| E4: A occupies the last slot and needs new B | Native expand/yield atomically supplies checkpoint/reason/observations, B, provenance and `blocks(B,A)`. Confirm publication/revocation before B's claim; old A cannot publish. A becomes recovering, requiring explicit reconcile/retry and resolved prerequisites before fresh claim/start. No claimed parent waiting for children or claim that yield physically stopped effects. |
 | E5: all native workers ended and ready is empty, but proposal/recovery remains | Report those blockers; no goal completion without accepted sealed closure. |
 | E6: old request is terminal abandoned after an epoch change | Reassess with fresh state; use a new ID only if the operation is still authorized and needed, preserving the stable discovery intent. Do not revive old execution. |
-| E7: shell killed but shared-unfenced cloud job still runs | Keep resources reserved pending real stop and effect reconciliation. Native cancellation/stdio EOF is not physical settlement. |
-| E8: expired successful claim receipt and preparing-time input | Obtain fresh authorization and the actual host packet; no close or execution from historical success. |
+| E7: native worker interrupted, notifications silent, or external job may still run | Keep outcome/effects unknown; inspect known agent and durable checkpoint, resolve command outcomes, and explicitly release/reconcile before replacement. No short-TTL heartbeat requirement, automatic retry, fake stop/settlement or equating complete with physical safety. If managed effects are required, keep that work managed/non-runnable. |
+| E8: stale successful claim receipt or reserved attempt with no accepted start | Obtain fresh state and actual binding; no work/completion from old receipt or claim alone. Unknown dispatch/start must reconcile before another launch. |
 | E9: source finishes while discovering independent final work | Publish definitions/edges and complete atomically with evidence, or confirm publication before a separate close. No success-shaped loss of discoveries. |
 | E10: creation timeout under the same owner epoch | Preserve the exact scoped request; unknown/not-recorded is not terminal abandonment and does not justify a new ID. |
+| E11: session is forked with copied transcript/summary | Use the fork's actual distinct UUID. Do not impersonate the old session, bootstrap duplicate goal, or treat summary tokens as authority. Explicit named resume uses current CAS and reconciliation. |
+| E12: user explicitly resumes native goal in a new parent while old attempt is unresolved | Native resume CAS changes only root ownership/version. Members stay stored unchanged; inherited `in_progress` work is unauthorized with `native_reconciliation_required`. New parent reads current member versions/retained tokens, releases each inherited active attempt, then refreshes/reconciles; already recovering work reconciles directly. No adoption, duplicate bootstrap or invented generation. Conflict refreshes state; no physical stop claim. |
+| E13: named goal is managed and no supervisor is available | Respect stored managed mode and existing actor/host/lease/barrier prerequisites; report managed blocker. Do not call native resume to convert it or weaken shared/fenced assurance. |
+| E14: all admitted work accepted, no unresolved proposals, aggregate goal evidence present | Parent uses native goal_close with current goal/graph versions and acceptance evidence. Report completed only after durable sealed closure receipt/fresh observation; conflict requires reassessment. Complete end-to-end evidence covers plan/import, graph, actual bindings, checkpoints/discoveries, tasks and goal. |
+| E15: user opts into a second goal; first goal is already tracked in this session | Enroll second goal only from its own explicit request; separate graph/scope/version checks. Same session UUID does not make cross-goal publication or implicit enrollment valid. |
+| E16: harness UUID unavailable for a new opted-in goal | Issue one canonical session UUID and retain its enrolled binding across compaction/commands. Do not derive identity from username/nickname, copy another session, or issue a fresh UUID per call. If a resumed binding is lost, inspect and explicitly transfer rather than assert continuity. The UUID is not a secret/auth token. |
+| E17: native authorization is fresh/matching/authorized but `lease_live=false` and `physical_supervision=false` | Recognize intentional cooperative fields; do not block on a managed lease or falsely claim supervision. Match actual session/task/agent/attempt/generation. |
+| E18: worker evidence exists but parent has not assessed acceptance | No native complete, expand/complete or goal_close until nonempty evidence and explicit `parent_acceptance` describe the parent's review. Text fields record cooperative assessment, not externally verified physical proof. |
+| E19: transferred goal has members recording the prior session | Determine current parent from root `native.session_id` or fresh `authorization.session_id`, not member history. Resume changes only the root; all member snapshots/versions remain unchanged. Later member mutations update recorded sessions as needed; stored active status does not authorize inherited work. |
+| E20: worker ignores WAIT or another authenticated client knows the session UUID | Do not claim runtime suspension or per-worker access control. WAIT and parent-only publishing are cooperative workflow rules; UUID is not authentication. Report the violation/unknown effects and reconcile rather than claim physical enforcement. |
+| E21: inspected goal has an unknown explicit coordination mode | Fail closed as unsupported mode/schema. Only absent native metadata denotes legacy managed; do not reinterpret an unknown mode as native or silently migrate it. |
+| E22: claim succeeded but preparing attempt reports `authorized=false`; later a released attempt also reports false | Start checks current reservation/session/version/attempt/generation and actual returned agent ID, not running authorization. Reconcile checks recovering state/current tokens/session and observations. Do not deadlock either action behind `authorized=true`; require that gate only for executing/publishing running-source work. Non-running epic/goal closure and source-free admission retain their action-specific checks. |
+| E23: accepted work is complete but an unwanted `admitted=false` proposal prevents goal closure | Read proposal version; native `cancel` with project/goal/task/version and reason/observations rejects it in place, without attempt tokens, admission or dispatch. Confirm cancelled state/history and refresh goal/graph before evidence-backed goal_close. Cancelled-only work remains insufficient acceptance. |
+| E24: cancellation requested for preparing/running/recovering work, or old-session/stale-version tokens | Do not use open-work cancel to bypass uncertainty or CAS. Preparing/running work uses release, recovering work uses reconcile with explicit decision and current retained attempt/generation/agent. Wrong session/project/goal or stale version is rejected; no replacement identity or direct managed transition. |
+| E25: nested epic has unfinished or recovering children and parent asks to cancel the whole branch | No cascade: resolve children explicitly before cancelling the open epic. Root uses aggregate goal_close, never native cancel. An open task after explicit reconcile/retry may cancel; a terminal task may not be newly cancelled. |
+| E26: legitimate native task remains open but held/deferred after the gate is resolved | Native update uses project/goal/task/current version and nonempty content-only patch, with null hold/defer fields to clear them. Preserve task identity; no cancel/recreate, invented claim or admitted/mode/execution patch. Recheck readiness. Root/active/recovering/terminal updates fail; open nested epic content can update. |
+| E27: new parent takes over eight active tasks with 16,384-byte descriptions | Resume publishes only the root owner/transfer snapshot, not eight member snapshots; same-request replay is idempotent. Members remain unchanged, but get authorization/eligibility expose `native_reconciliation_required` and snapshot `needs_attention=true`. No old or new parent can complete adopted work; per-member release/reconcile and fresh claim/start are required. Do not claim a guidance simulation proves the journal byte-limit regression. |
+| E28: service restarts with the same large inherited graph | Distinguish startup from session transfer: startup journals bounded per-attempt interruption into recovery, rather than one unbounded graph rewrite. New parent inspects fresh epoch/state and explicitly reconciles recovering work; old-epoch results remain fenced. No physical stop or automatic retry claim. |
+| E29: explicit transfers return from session UUID A to B and then A | Original A attempt remains unauthorized because its internal session generation predates the root's current generation. Read fresh root/member authorization; release/reconcile inherited work and claim/start a new attempt rather than revive it. Do not add internal `session_generation` to public payloads or invent an incremented `claim_generation`. |
 
-Frontend transport tests and these guidance simulations answer different
-questions. SDK stdio forwarding can preserve schemas, freshness and errors
-without implementing native heartbeat, containment, checkpoint or settlement.
+Frontend transport tests and guidance simulations answer different questions.
+SDK stdio forwarding preserves schemas, freshness and errors; cooperative native
+support does not claim a heartbeat supervisor, containment or physical settlement.
 EOF leaves the shared owner running. `mempalace-tasks mcp` is the registered
 long-lived frontend; human `start`/`connect` output is not a stdio MCP stream.
 
@@ -135,7 +177,8 @@ long-lived frontend; human `start`/`connect` output is not a stdio MCP stream.
   reads and verify invalid inputs are not repaired. This guidance records the
   expected behavior, not an executed service regression.
 - Report unrun cases and wording checks explicitly. Distinguish simulated
-  coverage from live tool availability, deployment and supervised execution.
+  coverage from live tool availability, deployment, cooperative execution and
+  managed supervision.
 - Record grouped versus independent samples for native fleet cases. Verify
   ordinary untracked fleet remains usable with the workflow agent selected,
   and a read-only request cannot trigger launcher startup or claim recovery.
@@ -147,3 +190,7 @@ long-lived frontend; human `start`/`connect` output is not a stdio MCP stream.
   task/edge limits and never require retroactive blockers on runnable tasks.
 - Verify that all task/MemPalace storage reads and writes use the configured,
   server-qualified MCP operations.
+- Record the advertised native action payloads and exact mode/session/binding
+  observations used. Distinguish missing native schema from absent managed actors.
+- Check session compaction, fork/new-parent transfer, wrong task/agent/generation,
+  interrupted work and managed mode without treating silence as physical evidence.

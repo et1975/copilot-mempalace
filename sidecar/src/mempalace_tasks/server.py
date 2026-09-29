@@ -32,7 +32,7 @@ from .server_identity import InstanceIdentity, make_proof
 
 MAX_REQUEST_BYTES = 256 * 1024
 MAX_IN_FLIGHT = 32
-PUBLIC_OPERATIONS = tuple(name for name in SCHEMAS if name not in {"authority_create", "expire"})
+PUBLIC_OPERATIONS = tuple(name for name in SCHEMAS if name not in {"authority_create", "expire"}) + ("native",)
 READ_OPERATIONS = ("get", "snapshot", "list", "ready", "history", "health", "wait_ready", "outcome")
 _in_request = ContextVar("mptask_http_request", default=False)
 
@@ -131,6 +131,10 @@ def _schemas():
     }, ("source", "target", "edge_type"))}
     result = {}
     for name in PUBLIC_OPERATIONS:
+        if name == "native":
+            from .native import schema
+            result[name] = schema()
+            continue
         allowed, required = SCHEMAS[name]
         properties = {key: deepcopy(fields[key]) for key in allowed | {"actor", "command_id"}}
         if name == "transition":
@@ -204,10 +208,13 @@ def _attempt_authorization(value):
         return False
     if set(value) == {"as_of", "fresh", "tasks"}:
         return isinstance(value["tasks"], list)
-    return set(value) == {
+    fields = {
         "as_of", "fresh", "task_id", "attempt_id", "claim_generation", "matches_current",
         "lease_live", "authorized", "current_lease_revision", "lease_expires_at", "reason",
     }
+    return set(value) == fields or (
+        value.get("coordination_mode") == "cooperative_native" and set(value) == fields | {
+            "coordination_mode", "physical_supervision", "session_id", "native_agent_id"})
 
 
 def _safe(value, token, *, identifier_keys=False):
@@ -380,7 +387,9 @@ class _Runtime:
         if self.lifecycle is None or self.lifecycle.phase == "ready":
             return
         completion = (name in {"renew", "checkpoint", "release", "recover", "transition"}
-                      or name == "attempt_report" and arguments.get("report_kind") != "started")
+                      or name == "attempt_report" and arguments.get("report_kind") != "started"
+                      or name == "native" and arguments.get("action") in {
+                          "checkpoint", "complete", "release", "reconcile", "cancel", "goal_close"})
         if self.lifecycle.phase != "draining" or not completion:
             raise AuthorityError("service_draining", "New task intake is disabled")
 
@@ -480,6 +489,11 @@ def create_app(authority, maintenance, *, token, host="127.0.0.1", port=8766,
             name=f"mptask_{name}", description=(
                 "Read diagnostic task state; never authorizes execution."
                 if name in READ_OPERATIONS else
+                "Cooperative native coordination. Stable session UUID is a nonsecret identity; "
+                "no registered actor, supervisor, heartbeat or physical execution guarantee. "
+                "Only the native parent dispatches; explicitly reconcile interruption. "
+                "Retain command_id and frozen expected_epoch for ambiguous requests."
+                if name == "native" else
                 f"Apply {name}; retain command_id and frozen expected_epoch; "
                 "never upgrade an ambiguous request. Actor must be registered."),
             inputSchema=deepcopy(schema),
