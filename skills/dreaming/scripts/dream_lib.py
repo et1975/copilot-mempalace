@@ -1516,6 +1516,7 @@ def apply_reflect_decisions(decisions, writer, tunneler=None) -> dict:
             "premises": premises,
             "decision_or_prediction": conclusion.get("decision_or_prediction"),
         }
+        metadata.update(dec.get("incremental_receipt") or {})
         try:
             add_result = writer.add_drawer(dec.get("wing") or "copilot-mempalace",
                                            dec.get("room") or "reflections", content,

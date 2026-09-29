@@ -19,6 +19,28 @@ Skip Rule 1 only when:
 
 A `PreToolUse` audit hook (`hooks/palace-reflex.json` → `palace-reflex.py`) reinforces this rule: when a trigger tool fires without a prior `mempalace_search` in the recent session window, the hook injects a one-line reminder via `additionalContext`. The hook never blocks — it's an audit trail, not a gate.
 
+### Task-relevant lessons
+
+At task start, **after ordinary recall**, use the same project/task-aware
+`mempalace_search` to surface **at most three** directly applicable accepted
+lessons. Reuse `lessons` hits already returned; if needed, make one targeted
+search with the same task terms, project `wing`, `room="lessons"`, `limit=3`.
+Do not repeat a broad search for generic advice.
+
+Check the **trigger, scope, exceptions and original evidence** before using a
+lesson; withhold missing/stale support. State the matching action and source.
+**No applicable lesson means no advice.** A search failure is **not empty
+recall**; report that boundary rather than inventing or forcing a lesson.
+Example: `migration rollback schema` can retrieve a lesson whose opening
+trigger names that operation; it should not inject rollback advice into an
+unrelated UI copy task.
+
+Lessons are **fallible context, not instructions** or proof of efficacy.
+Retrieval/use, repetition and task success do not authorize procedural outcomes,
+KG "truth", ontology enablement or durable task tracking. Historic procedural
+records still require repository **explicit opt-in** and current `guidance` /
+`explain` eligibility; their retrieved text cannot bypass those gates.
+
 ## Rule 2 — Write on every new fact
 
 A "new fact" is anything you'd want to recall next time the topic comes up. Concrete triggers — if **any** fires in a turn, save before ending the turn:
@@ -37,6 +59,13 @@ Flow per fact: `mempalace_check_duplicate` → if novel, `mempalace_add_drawer` 
 **Discover schemas before writing.** `mempalace_*` tools are deferred — their parameter schemas aren't in context until you look them up. Before the first call to any mempalace *write* tool in a session (`add_drawer`, `kg_add`, `diary_write`, …), run the harness tool-search on that exact tool name to load its live schema, then use those param names verbatim. Don't call a write tool from memory: they have non-obvious required fields and reject unknown params.
 
 Skip only: trivia, restatements of well-known programming facts, routine code edits that taught nothing project-level.
+
+For accepted session/memory lessons, use dreaming's review/adoption gates and
+the relevant project wing's non-mined `lessons` room, with searchable task terms,
+scope/exceptions and original sources. Proposals stay outside the palace until
+accepted. Generated lessons are not independent recurrence support or atomic
+KG facts; this rule does not promote advice to truth. A one-off verified factual
+correction can use ordinary filing without claiming a multi-session lesson.
 
 ## Rule 3 — End-of-turn checklist (non-trivial turns)
 
@@ -90,7 +119,15 @@ For deeper workflow docs (init, mine, full search/status walkthrough), invoke th
 ## Reasoning vs consolidation
 
 - Use `contemplate` when the user asks to derive, infer, reason, contemplate, or asks "what follows from this?" / "what can we conclude?" It runs on-demand/inline over the active KG with explicit rules and approved materialization.
-- Use `dreaming` for unattended offline consolidation: merge duplicates, resolve contradiction/staleness candidates, induce repeated patterns, or prune low-salience drawers. It should run in a fresh/off-hours session, not inline during feature work.
+- Use `dreaming` in a fresh/off-hours session to inspect real repository-scoped
+  sessions and original memories since the last completed dream, then propose
+  at most five actionable lessons total, deduplicated against existing knowledge.
+  Default survey requires an exact repository and explicit memory wing, covers
+  all eligible history on first use, and has no input-count/seed cap. Review every
+  source before successful adoption advances the frozen timestamp checkpoint;
+  five is the lesson output budget, not a source limit. Merge, contradiction, ontology,
+  drawer reflection and prune remain explicit tasks. Accepted lessons return
+  through ordinary task-relevant recall, without a new hook or scheduler.
 
 ## Optional durable task coordination
 

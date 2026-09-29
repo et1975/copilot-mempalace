@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """dream_harvest — phase 1 of the dreaming pipeline (READ-ONLY).
 
-Reads a mempalace palace, clusters near-duplicate drawers, and writes a
-deterministic ``worklist.json`` of merge candidates. Writes nothing to the
-palace. The agent (the dreaming skill) then fills each item's ``decision`` in
+By default, exports all unreviewed sessions and original wing memories in a
+frozen incremental window to ``worklist.json``. Explicit tasks retain their legacy
+meaning, including drawer-cluster reflection without --source. Writes nothing
+to the palace for reflection. The agent then fills each item's ``decision`` in
 an ``adjudicate`` phase to produce ``decisions.json`` for ``dream_adopt.py``.
 
 Usage:
-    "$MPY" "$DREAM_SCRIPTS/dream_harvest.py" --palace ~/.mempalace/palace --wing myproj \\
-        --tau 0.9 --out worklist.json
-    "$MPY" "$DREAM_SCRIPTS/dream_harvest.py" --wing myproj --tau 0.9 --out worklist.json
+    "$MPY" "$DREAM_SCRIPTS/dream_harvest.py" --palace ~/.mempalace/palace \\
+        --repository owner/myproj --wing myproj --out worklist.json
+    "$MPY" "$DREAM_SCRIPTS/dream_harvest.py" --task merge --wing myproj --tau 0.9 --out worklist.json
 
 Select absolute MPY (the provisioned MemPalace interpreter) and DREAM_SCRIPTS
 paths. Run from an external session workspace for relative artifact paths.
@@ -22,6 +23,7 @@ import hashlib
 import json
 import math
 import os
+import sqlite3
 import sys
 
 import dream_ontology
@@ -138,39 +140,46 @@ def harvest_merge_worklist(path: str, *, wing: str | None = None,
     return worklist
 
 
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--palace", help="Path to the mempalace palace directory (default: mempalace config)")
     ap.add_argument("--task", choices=[
         "merge", "contradiction", "pattern", "prune", "derive", "gaps", "suggest-rules", "induce-rules", "reflect"
-    ], default="merge",
-                    help="Dreaming task to harvest (default merge)")
-    ap.add_argument("--wing", help="Scope merge harvest to this wing (ignored for contradiction)")
-    ap.add_argument("--room", help="Scope merge harvest to this room (ignored for contradiction)")
+    ], default=None,
+                    help="Explicit preview/maintenance task (default: incremental sessions and original memories)")
+    ap.add_argument("--wing", help="Required memory wing for incremental review; drawer scope for explicit tasks")
+    ap.add_argument("--room", help="Drawer room scope for explicit tasks, not incremental review")
     ap.add_argument("--tau", type=float,
                     help="Cosine-similarity threshold; defaults to 0.9 for merge and 0.75 for pattern")
-    ap.add_argument("--min-support", type=int, default=None,
+    ap.add_argument("--min-support", type=positive_int, default=None,
                     help="Minimum support for pattern themes (default 3) or induced ontology rules (default 2)")
     ap.add_argument("--v-min", type=float, default=DEFAULT_V_MIN,
                     help="Maximum salience value for prune candidates (default 0.35)")
     ap.add_argument("--age-floor-days", type=int, default=DEFAULT_AGE_FLOOR_DAYS,
                     help="Minimum drawer age for prune candidates (default 30)")
-    ap.add_argument("--rooms", default="diary",
+    ap.add_argument("--rooms", default=None,
                     help=(
                         "Comma-separated rooms for pattern observation harvest (default diary). "
                         "Put surfaced lessons in a non-mined room so future pattern harvests ignore them."
                     ))
     ap.add_argument("--source", choices=["diary", "sessions", "both"], default=None,
                     help=(
-                        "Observation source for the pattern task: diary rooms (default), raw Copilot "
-                        "host sessions, or both unioned. 'sessions'/'both' mine raw session turns."
+                        "Explicit reflection preview source: diary, sessions, or both. "
+                        "Requires --task; implicit review always includes sessions and original memories."
                     ))
     ap.add_argument("--repository",
-                    help="Filter host sessions by repository substring (pattern --source sessions/both)")
+                    help="Exact repository for incremental review; substring filter for explicit session previews")
     ap.add_argument("--since",
-                    help="Only host sessions created at/after this ISO timestamp (pattern --source sessions/both)")
-    ap.add_argument("--limit-sessions", type=int, default=None,
-                    help="Cap the number of host sessions read (pattern --source sessions/both)")
+                    help="Explicit preview lower bound; implicit review uses the completed-dream checkpoint")
+    ap.add_argument("--limit-sessions", type=positive_int, default=None,
+                    help="Explicit preview session cap; no default cap and not allowed for incremental review")
     ap.add_argument("--instructions", help="Optional steering note recorded in the worklist")
     ap.add_argument("--rules", default=None,
                     help="Path to ontology config (default: <palace>/ontology.json)")
@@ -182,8 +191,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="Maximum derivation depth for derive (default 3)")
     ap.add_argument("--max-iterations", type=int, default=10,
                     help="Maximum closure iterations for derive (default 10)")
-    ap.add_argument("--max-candidates", type=int, default=500,
-                    help="Maximum candidates for derive (default 500)")
+    ap.add_argument("--max-candidates", type=positive_int, default=None,
+                    help="Explicit task candidate cap (default 500); not an incremental input limit")
     ap.add_argument("--target-subject", default=None,
                     help="Restrict gaps (--task gaps) to conclusions about this subject (entity id or display name)")
     ap.add_argument("--out", default="worklist.json", help="Output worklist path (default worklist.json)")
@@ -194,6 +203,39 @@ def main(argv: list[str] | None = None) -> int:
         config_path = os.environ.get("MEMPALACE_CONFIG") or "~/.mempalace/config.json"
         print(f"error: no --palace given and {config_path} has no palace_path", file=sys.stderr)
         return 2
+
+    implicit = args.task is None
+    if implicit:
+        if not (args.repository or "").strip() or not (args.wing or "").strip():
+            ap.error("incremental dreaming requires explicit nonblank --repository and --wing")
+        if any(value is not None for value in (
+                args.source, args.since, args.limit_sessions, args.max_candidates, args.room,
+                args.rooms, args.tau, args.min_support)):
+            ap.error("partial source/since/limit/room options require an explicit --task reflect preview")
+        import dream_incremental
+        try:
+            path = dream_palace.bind_palace(effective_palace)
+            worklist = dream_incremental.harvest(path, args.repository, args.wing, args.instructions)
+        except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
+            print(f"error: incremental harvest failed: {exc}", file=sys.stderr)
+            return 2
+        with open(args.out, "w", encoding="utf-8") as fh:
+            json.dump(worklist, fh, indent=2, ensure_ascii=False)
+        return 0
+    raw_sessions = args.source in ("sessions", "both")
+    if args.source and args.task not in ("reflect", "pattern"):
+        ap.error("--source is only supported for reflect or pattern")
+    if any(value is not None for value in (args.repository, args.since, args.limit_sessions)) and not raw_sessions:
+        ap.error("--repository, --since and --limit-sessions require --source sessions or both")
+    if raw_sessions and args.room:
+        ap.error("--room does not scope raw sessions; use --repository")
+    if args.since is not None:
+        try:
+            datetime.fromisoformat(args.since)
+        except ValueError:
+            ap.error("--since must be an ISO date or timestamp")
+    if args.max_candidates is None:
+        args.max_candidates = 500
 
     path = dream_palace.bind_palace(effective_palace)
     if args.task == "contradiction":
@@ -334,7 +376,8 @@ def main(argv: list[str] | None = None) -> int:
         import dream_reflect
         if args.source:  # recurrence / converge path (also the pattern alias)
             tau = args.tau if args.tau is not None else 0.75
-            rooms = tuple(room.strip() for room in args.rooms.split(",") if room.strip())
+            room_names = args.rooms if args.rooms is not None else "diary"
+            rooms = tuple(room.strip() for room in room_names.split(",") if room.strip())
             entries = []
             if args.source in ("diary", "both"):
                 entries.extend(
@@ -342,21 +385,25 @@ def main(argv: list[str] | None = None) -> int:
                     if not _is_surfaced_lesson(e)
                 )
             if args.source in ("sessions", "both"):
-                entries.extend(
-                    dream_palace.load_session_observation_entries(
-                        path, repository=args.repository, since=args.since,
-                        limit_sessions=args.limit_sessions)
-                )
+                try:
+                    entries.extend(
+                        dream_palace.load_session_observation_entries(
+                            path, repository=args.repository, since=args.since,
+                            limit_sessions=args.limit_sessions)
+                    )
+                except (OSError, sqlite3.Error) as exc:
+                    print(f"error: cannot read session source: {exc}", file=sys.stderr)
+                    return 2
             min_support = args.min_support if args.min_support is not None else 3
             seeds = dream_reflect.converge_seeds_from_recurrence(entries, tau=tau, min_support=min_support)
-            params = {"tau": tau, "min_support": min_support, "top_k": args.max_candidates or 10, "min_coverage": 2}
+            params = {"tau": tau, "min_support": min_support, "top_k": args.max_candidates, "min_coverage": 2}
         else:            # cluster path
             seeds = dream_reflect.gather_reflect_seeds(
                 path, wing=args.wing, room=args.room, k=args.min_support or 5,
-                top_n=args.max_candidates or 10)
-            params = {"top_k": args.max_candidates or 10, "min_coverage": 2}
+                top_n=args.max_candidates)
+            params = {"top_k": args.max_candidates, "min_coverage": 2}
         admitted = dream_reflect.admit_structural(
-            seeds, min_coverage=2, top_k=args.max_candidates or 10)
+            seeds, min_coverage=2, top_k=args.max_candidates)
         items = [{
             "kind": "reflect", "seed_id": s["anchor_id"], "member_ids": s["member_ids"],
             "members": s.get("members"), "snippets": s.get("snippets"),
@@ -364,9 +411,12 @@ def main(argv: list[str] | None = None) -> int:
             "evidence": s.get("evidence"), "reflect_kind": s.get("reflect_kind"),
             "decision": None,
         } for s in admitted]
-        worklist = build_reflect_worklist(
-            items, scope={"wing": args.wing, "room": args.room, "source": args.source},
-            params=params)
+        scope = {"wing": args.wing, "room": args.room, "source": args.source}
+        if raw_sessions:
+            scope.update(repository=args.repository, since=args.since, limit_sessions=args.limit_sessions)
+        worklist = build_reflect_worklist(items, scope=scope, params=params)
+        if args.instructions:
+            worklist["instructions"] += f"\nSteering note (not source evidence): {args.instructions}"
         with open(args.out, "w", encoding="utf-8") as fh:
             json.dump(worklist, fh, indent=2, ensure_ascii=False)
         return 0

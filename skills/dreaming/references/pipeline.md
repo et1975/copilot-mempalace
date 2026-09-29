@@ -24,6 +24,123 @@ readiness from those memories. Preserve source task/event IDs when retaining
 evidence and use the sidecar for current state. The task projection pipeline and
 its rebuild command were removed; dreaming does not recreate task projections.
 
+## Default: session review, then relevant recall
+
+Use the already provisioned MemPalace interpreter (`MPY`, absolute path) and
+the checkout/installed `skills/dreaming/scripts/` directory (`DREAM_SCRIPTS`,
+absolute path). Run examples from the external session workspace.
+
+```bash
+"$MPY" "$DREAM_SCRIPTS/dream_survey.py" --palace <p> --repository owner/repository \
+  --wings <project-wing> --worklists-dir <session-files>/dream-worklists
+```
+
+Implicit dreaming requires an **exact repository and explicit memory wing**;
+there is no alias/wing inference. The first run covers **all eligible history**.
+Later runs cover the frozen UTC **`[lower, upper)`** interval, from the prior
+successfully completed cutoff to the current **run start**. There is **no
+input-count or candidate-seed cap**. Sources include new sessions, continuing
+sessions with new timestamped turns, and original memories from all project
+rooms in that wing, using memory filing/creation timestamps. Session coverage
+contains full original user/assistant turns before upper, not a cropped body.
+Generated lessons, reflections, procedural and control records are excluded as
+fresh evidence. Original memory IDs do not establish independent sessions.
+
+Survey emits `reflect.incremental.json`, including an **empty window**. It
+contains full source `coverage` with `review: null`, empty proposal `items` and
+`completion: null`. Empty items alone do not establish review or abstention.
+Missing/incomplete sources and invalid timestamps are errors, not successful
+empty input. No default maintenance, KG scan, ontology work or adoption runs.
+`--instructions` steers review only. Partial source/since/count/room filters
+and candidate thresholds require explicit preview tasks and cannot complete
+an incremental window.
+
+The agent reviews **every coverage record**, in batches if necessary, dedups
+against existing knowledge and proposes at most **five actionable lessons
+total**. This is an output budget, never a source limit. Each lesson describes
+a trigger, action/avoidance, scope/exceptions, original evidence and expected
+difference in the existing reflect conclusion text. Missing/weak support or
+no useful novelty means abstention. A one-off factual correction uses ordinary
+filing, not a weakened generalization gate.
+
+Proposals remain session artifacts until reviewed and accepted. Add-only
+adoption files accepted lessons in the relevant project wing's non-mined
+`lessons` room. Lead with task/trigger vocabulary for retrieval. After ordinary
+task-start recall, reuse the same scoped search to consider at most three directly
+applicable lessons, checking trigger, scope, exceptions and original evidence.
+No match means no advice; search failure is not empty recall. Advice is fallible
+context, not instructions or proof of efficacy. This does not enroll procedural
+learning/outcomes, enable ontology rules, write KG truth, or track durable tasks;
+historic procedural records still require explicit opt-in and `guidance` /
+`explain`. The [skill](../SKILL.md#session-lesson-review) owns the review recipe.
+
+### Migration: explicit maintenance
+
+The previous full survey is still available by explicit request:
+
+```bash
+"$MPY" "$DREAM_SCRIPTS/dream_survey.py" --palace <p> \
+  --tasks contradiction,induce-rules,pattern,reflect,merge,prune \
+  --worklists-dir <session-files>/dream-maintenance
+# Separate explicit diary reflection:
+"$MPY" "$DREAM_SCRIPTS/dream_survey.py" --palace <p> --tasks reflect --source diary \
+  --worklists-dir <session-files>/dream-diary
+```
+
+The full sweep keeps pattern diary-backed and reflect drawer-cluster-backed;
+it rejects `--source diary` on the mixed maintenance list. Explicit diary
+reflection is a separate command above, not the default session review. Bare
+`dream_harvest.py` now means incremental reflection and requires exact
+`--repository` plus `--wing`;
+old implicit merge callers must add `--task merge`. Explicit task selections
+keep their meaning: `--task pattern` defaults to diary, and `--task reflect`
+without `--source` retains drawer-cluster reflection. Use `--source sessions`
+explicitly for raw-session reflection. Explicit legacy session tasks retain
+oldest-first, uncapped behavior unless bounds are supplied. Explicit tasks
+are previews/legacy operations and never advance incremental completion.
+The specialized contracts below are unchanged; a survey never adopts, and
+legacy collection/KG initialization remains subject to the read boundary below.
+
+## Incremental checkpoint contract
+
+`dream-checkpoints.json` version 2 is palace-local run control keyed by exact
+repository + memory wing. Each completed scope retains `cutoff`,
+`session_store`, `run_id`, `review_hash` and cumulative `reviewed_versions`
+source fingerprints; it is not lesson evidence.
+The immutable worklist `incremental` block contains `version`, `scope`
+(`repository`, `wing`, `session_store`), `lower`, `upper`, prior `base`,
+`source_hash` and `run_id`.
+
+- Keep source contents and metadata intact. Each `coverage` record needs
+  `review: {"action":"reviewed","reason":"<specific rationale/abstention>"}`.
+- Author `items` as `{proposal_id, source_ids, decision}` referencing coverage.
+  `decision.conclusion` uses existing `text`, `kind`, `decision_or_prediction`.
+  `converge` requires at least two independent raw session sources and empty
+  premises; memory-grounded kinds require at least two original memories and
+  exact `{drawer_id, quote}` premises. Never invent session support for memories.
+- Set top-level `completion: {"action":"complete","reason":"<review summary>"}`
+  only after all sources and proposals were reviewed, including no-lesson and
+  empty windows. The [skill's examples](../SKILL.md#session-lesson-review) are
+  edits to a harvested manifest, not replacements for its evidence.
+- Existing `dream_adopt.py --palace <p> --decisions decisions.json` revalidates
+  full coverage, source rereads/hashes and the prior checkpoint. After accepted
+  additions and write readback succeed, it atomically advances to frozen upper.
+  Harvest, proposal-only, dry-run, missing reviews, partial input, failed writes,
+  source drift and stale overlapping runs do not advance.
+- Retry the unchanged review after a partial write; generated receipts identify
+  already-adopted proposals. For drift/stale scope, re-harvest and review from
+  the current completed checkpoint rather than editing cutoff/hash metadata.
+  New events at or after upper wait for the next run. Unseen or changed source
+  versions with older timestamps are also included, recovering late-persisted
+  turns, backfilled memories and historical edits. Unchanged reviewed versions
+  stay excluded across empty windows. Source versions are checked, not merely
+  filtered by event time; deleted intermediate versions cannot be reconstructed.
+- Native naive memory `filed_at` values are local time; naive session timestamps
+  are UTC. Explicit offsets are honored and boundaries normalized to UTC.
+- Version 1 checkpoint scopes receive a full source reconciliation on their
+  next harvest; only successful completion publishes version 2. Pending version
+  1 worklists must be re-harvested.
+
 ## The dream as a function
 
 `Δ : (M_in, S, θ) ↦ M_out`, with `M_in` immutable. The store `M` includes
@@ -238,15 +355,18 @@ cache; legacy destructive safety lookups keep their existing backend semantics.
 
 ## Artifacts (session workspace — never commit)
 
-Phase-2 adjudication should use the human-readable renderer instead of opening
-large raw JSON:
+For explicit legacy worklists, Phase-2 adjudication can use the human-readable
+renderer instead of opening large raw JSON:
 
 ```bash
 "$MPY" "$DREAM_SCRIPTS/dream_show.py" --worklist <worklist.json>
 "$MPY" "$DREAM_SCRIPTS/dream_show.py" --worklist <worklist.json> --task derive --full
 ```
 
-The renderer prints one compact block/line per candidate and avoids the 20KB file
+Incremental worklists initially have no candidate items. Review their full
+`coverage` in batches; an empty candidate rendering is not completed review.
+
+The renderer prints one compact block/line per legacy candidate and avoids the 20KB file
 view limit. Use it for merge, contradiction, pattern, prune, and derive worklists
 before filling `item["decision"]`.
 
