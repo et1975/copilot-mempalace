@@ -377,16 +377,38 @@ class StdioFrontendTests(unittest.TestCase):
 
     def test_bounded_admission_rejects_excess_without_dispatch(self):
         with GatewayService() as server:
-            server.delay = 0.35
+            admitted = threading.Event()
+            release = threading.Event()
+            call_tool = server.sdk.request_handlers[types.CallToolRequest]
+
+            async def hold_call(request):
+                result = await call_tool(request)
+                if len(server.calls) == 32:
+                    admitted.set()
+                if not await asyncio.to_thread(release.wait, 10):
+                    raise AssertionError("Test did not release admitted calls")
+                return result
+
+            server.sdk.request_handlers[types.CallToolRequest] = hold_call
 
             async def scenario():
-                async with self.frontend(server.configuration.path, "3s") as session:
-                    results = await asyncio.gather(*[
-                        self.raw_call(session, "mptask_future_write", {"command_id": str(index)})
-                        for index in range(40)])
-                    rejected = [result for result in results if result.isError]
+                async with self.frontend(server.configuration.path, "10s") as session:
+                    accepted = [asyncio.create_task(self.raw_call(
+                        session, "mptask_future_write", {"command_id": str(index)}))
+                        for index in range(32)]
+                    try:
+                        self.assertTrue(await asyncio.to_thread(admitted.wait, 5),
+                                        "All admission slots must be occupied before excess calls")
+                        rejected = await asyncio.gather(*[
+                            self.raw_call(session, "mptask_future_write", {"command_id": str(index)})
+                            for index in range(32, 40)])
+                    finally:
+                        release.set()
+                        results = await asyncio.gather(*accepted)
+                    self.assertTrue(all(not result.isError for result in results))
                     self.assertEqual(len(rejected), 8)
-                    self.assertTrue(all(result.structuredContent["error"]["code"] == "busy"
+                    self.assertTrue(all(result.isError
+                                        and result.structuredContent["error"]["code"] == "busy"
                                         for result in rejected))
                     self.assertTrue(all(not result.structuredContent["error"]["ambiguous"]
                                         for result in rejected))
