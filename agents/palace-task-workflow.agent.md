@@ -48,6 +48,12 @@ not enroll a goal. Without opt-in, use ordinary native `task` dispatch without
 task-service setup demands or durable task writes. The harness manages its own
 session planning; this workflow does not access its storage.
 
+Treat `/fleet execute and track this as a goal`, `track this as a goal`, and an
+explicit named tracked-goal resume as sufficient opt-in. The user need not first
+select this agent or restate an approved plan already present in the active
+conversation. The active native parent follows this workflow directly; do not
+spawn this agent as a second coordinator.
+
 For an explicitly tracked or named resume request, invoke `mempalace-tasks` before
 task operations. If intent/identity is ambiguous, use `ask_user`; when interaction
 is unavailable, report the blocker in the conversation rather than inventing a
@@ -125,14 +131,34 @@ Historical pages/assignments aid discovery, not
 authorization. If a lease is stale or recovery pending, hand it to the registered
 supervisor rather than resume or manufacture a replacement.
 
-Retain the verbatim goal, acceptance, scope and explicit task/concurrency/credit
-limits. Reuse the explicitly identified goal; missing or ambiguous references
-require clarification, not semantic guessing or duplicate bootstrap. Remembered
+Retain the goal, acceptance, scope and explicit task/concurrency/credit limits.
+Reuse the explicitly identified goal; missing or ambiguous references require
+clarification, not semantic guessing or duplicate bootstrap. Remembered
 authority/attempt tokens cannot authorize resumption.
-For a new goal, `mptask_bootstrap` atomically creates a root and an actionable
-planning task. Supply `project`, `title`, `description`, `acceptance`,
-`planning_task`, and `goal_policy` with declared `scope` and bounded
-`max_tasks`/`max_batch`. An empty starting queue calls for planning, not success.
+
+For a new opted-in goal, locate the current approved native plan in active
+conversation context. If present, preserve its exact content first with the
+advertised MemPalace artifact operation and retain the returned immutable
+artifact ID, SHA-256 and size. Use duplicate check, then file a concise searchable
+memory drawer in the project wing's `plans` room with the objective, stage outline,
+artifact ID and SHA-256. Do not put goal/task status, claims, leases or completion
+in that drawer. The artifact remains canonical exact provenance; the drawer is
+only its semantic recall index. Report drawer-index failure explicitly without
+substituting the drawer for the artifact or task authority.
+
+If no approved plan is present, use the current `/fleet` objective as planning
+input; do not ask the user to repeat context that is already available. Derive
+project, actor and bounded defaults only from trusted harness/host configuration.
+Missing trusted identity or required defaults is a setup blocker, not a reason to
+infer from the logged-in username.
+
+`mptask_bootstrap` atomically creates a concise root and actionable
+planning/import task. Supply `project`, `title`, a bounded objective description,
+aggregate `acceptance`, `planning_task`, and `goal_policy` with declared `scope`
+and bounded `max_tasks`/`max_batch`. Reference the preserved plan artifact from
+the root/planning input and optionally include the drawer reference for discovery,
+rather than copying the full prose into task truth. An empty starting queue calls
+for planning, not success.
 
 Build the skill's bounded handoff/report reference from fresh MCP observations.
 If a session summary or native completion conflicts with current MCP state,
@@ -141,7 +167,41 @@ durable task note or evidence artifact is needed, use the task-note or MemPalace
 artifact MCP operation with its advertised schema and actual authorization;
 neither is a substitute for task-state mutation.
 
-### 2. Decompose into complete, bounded publications
+### 2. Ingest the plan as an executable graph
+
+Treat the preserved plan as provenance and the task graph as the executable
+representation. Parse stages and paragraphs by meaning, not formatting:
+
+- Turn independently actionable deliverables into tasks with acceptance,
+  stable intent keys, execution class/profile, resource keys, concrete inputs,
+  and a source pointer such as `<plan-artifact>#<section>`.
+- Keep rationale and explanatory paragraphs in the artifact or task description.
+- Put validation in task acceptance/evidence unless it requires substantial
+  independent work.
+- Default tasks to parallel eligibility. Heading order, paragraph order and stage
+  numbering do not establish dependency.
+- Add `blocks` only when a task consumes another task's output or the plan states a
+  real prerequisite. Across stages, connect required stage exits to the next
+  stage's entry tasks; do not create an all-to-all stage barrier.
+- Preserve ambiguous, unsupported or over-budget units as `admitted=false`
+  proposals instead of guessing them into runnable work.
+
+Publish each task's definition/reuse, membership, provenance and known initial
+blockers in the same accepted `mptask_expand`, so no task is briefly runnable
+without its initial blockers. If the graph fits the advertised task/edge limits,
+publish it in one expansion. Otherwise topologically order it into bounded,
+dependency-closed batches: every admitted task's prerequisites must already exist
+or be declared in the same batch. Later batches may depend on earlier tasks when
+their own definitions and edges are published. Use non-runnable proposals when a
+complete runnable batch is not yet safe; never add an initial blocker after a task
+has become runnable.
+
+With a live authorized planning/import source, complete that source atomically
+with the final required publication. If only coordinator planning is available,
+source-free batches may create the durable graph, but must not fabricate execution
+or close the planning task; report the blocker.
+
+### 3. Decompose later discoveries into complete, bounded publications
 
 Define independently actionable tasks with acceptance, stable intent keys,
 execution class/profile, resource keys, and concrete prerequisite inputs.
@@ -157,7 +217,7 @@ equivalent work by stable intent or explicit reuse with current versions.
 For large decompositions, use bounded non-runnable proposals and admit complete
 batches; no temporarily runnable tasks missing their initial dependencies.
 
-### 3. Select ready work and arrange execution
+### 4. Select ready work and arrange execution
 
 Query `mptask_ready` with
 `{"filters":{"goal_id":...,"execution_profile":...}}`.
@@ -204,7 +264,7 @@ idle slots use bounded `mptask_wait_ready` with nested `filters`,
 then recheck current eligibility.
 Do not spawn fleets/factories recursively or treat a notification as a claim.
 
-### 4. Advance, checkpoint, and handle discoveries
+### 5. Advance, checkpoint, and handle discoveries
 
 Have workers provide durable artifacts and progress references to the registered
 supervisor, which owns renewal/checkpoint reporting. On renewal uncertainty, the
@@ -225,7 +285,7 @@ physical recovery/resource retention after yield; intentional yield is not a
 failure retry. Ask the supervisor to recover interrupted work and pass checkpoints
 to a fresh generation rather than assume the same worker will resume.
 
-### 5. Assess results, retries, and goal acceptance
+### 6. Assess results, retries, and goal acceptance
 
 Compare durable results against task acceptance. Have the live owner request
 `mptask_transition` with `target="closed"`, current live source tokens, expected

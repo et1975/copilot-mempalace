@@ -27,7 +27,10 @@ audit hook that nags when an external tool is about to run without a prior `memp
   [workflow agent](agents/palace-task-workflow.agent.md). The
   [per-goal native fleet workflow](sidecar/README.md#per-goal-native-fleet-workflow)
   keeps native `/fleet` as orchestrator and requires explicit tracking for each
-  goal; selecting the agent or installing this pack does not enroll ordinary work.
+  goal; `/fleet execute and track this as a goal` is sufficient opt-in, while
+  ordinary fleet prompts remain untracked. An approved native plan is retained as
+  an exact artifact plus a searchable memory index, then materialized through
+  atomic task/dependency publications rather than one giant prose goal.
   Task and MemPalace storage interaction uses the separate, server-qualified MCP
   tools.
   Without a separately supplied compatible native supervisor, it supports

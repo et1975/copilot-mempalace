@@ -411,19 +411,28 @@ written only through the `mempalace-tasks` MCP registration; MemPalace context a
 evidence use the `mempalace` MCP registration. Build handoff references from fresh
 MCP observations; the durable authority alone determines tracked task state.
 
-After copying/linking those customizations, select the agent and explicitly
-request tracking for the goal:
+After copying/linking those customizations, explicitly request tracking for the
+goal. The tracking phrase routes the active native parent through the workflow;
+a separate agent-selection handoff is not required:
 
 ```text
-/agent palace-task-workflow
-/fleet Track this goal in MemPalace Tasks: update the cache index and its tests.
-Start with durable planning and report any execution blocker.
+/fleet execute and track this as a goal
 ```
 
-A real request must supply the configured project, an actually registered actor,
-acceptance criteria and explicit work/time/cost/concurrency budgets. Never infer
-IDs or actor identity from the logged-in username. To resume the same tracked
-goal, name its actual durable ID; this example ID is synthetic:
+When an approved native plan is present in the active conversation, the workflow
+preserves it verbatim as the canonical MemPalace artifact and files a concise
+searchable drawer index with its objective, stage outline, artifact ID and
+SHA-256. The drawer contains no task status. The workflow then creates a concise
+root plus planning/import task and publishes the executable units and their real
+dependencies as the durable task graph. Paragraph order is not a dependency;
+rationale remains plan memory, and validation is task acceptance/evidence unless
+it is independently actionable.
+
+The deployment must provide the configured project, an actually registered actor
+and bounded defaults for work/time/cost/concurrency; explicit user limits override
+those defaults. Never infer IDs or actor identity from the logged-in username.
+To resume the same tracked goal, name its actual durable ID; this example ID is
+synthetic:
 
 ```text
 /fleet Resume the tracked MemPalace goal tsk_goal_fixture.

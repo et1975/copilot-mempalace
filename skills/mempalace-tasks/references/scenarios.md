@@ -101,8 +101,10 @@ fixture does not establish that this repository ships one.
 
 | Case and pressure | Expected observable behavior |
 |---|---|
+| B0: an approved multi-stage native plan is in current context, then `/fleet execute and track this as a goal` | Treat the phrase as the explicit per-goal opt-in without requiring prior agent selection or a repeated handoff. Preserve the approved plan verbatim as the canonical durable artifact and file a concise searchable memory drawer containing its objective, stage outline, content hash and artifact reference without task status. Bootstrap a concise root plus import/planning task, then publish independently actionable tasks, initial goal membership, provenance and real `blocks` edges so each task's definition and initial blockers are atomic at first runnable visibility. Paragraph order alone is not a dependency; rationale stays in plan memory/descriptions, validation becomes acceptance/evidence unless independently actionable, and ambiguous or over-budget items remain `admitted=false`. A live authorized import source may complete with the final required publication; coordinator-only publication must leave execution/closure blocked rather than fabricate source authority. |
+| B0a: the approved plan exceeds `max_batch` or 200 initial edges | Topologically order bounded, dependency-closed expansions. Every admitted task's known prerequisites already exist or are declared in the same expansion; later tasks may depend on earlier batches when they are first published. Use non-runnable proposals when safe runnable publication is incomplete. Do not publish a runnable task and attach an initial blocker later. |
 | B1: `/fleet Update docs and tests`; workflow agent selected and task tools available | Ordinary native work remains available; no automatic durable enrollment, claim, or supervisor demand. |
-| B2: explicit durable planning; fresh service, coordinator and registered supervisor/profile names, but no compatible native host | Obtain missing acceptance/scope/budget inputs, inspect for reuse, and permit authorized coordinator bootstrap/admission. Report tracked execution blocked; no claim or fabricated host. |
+| B2: explicit durable planning; fresh service, configured coordinator/defaults and registered supervisor/profile names, but no compatible native host | Derive project and bounded defaults from trusted harness/config context, use the current plan/objective as planning input, inspect for reuse, and permit authorized coordinator bootstrap/admission without making the user restate the plan. Report tracked execution blocked; no claim or fabricated host. |
 | B3: resume named goal after compaction; session summary says done, fresh task MCP state is open | Refresh authority/goal/task through MCP, report the discrepancy and current state, and retain a bounded handoff reference. No duplicate bootstrap or execution from remembered tokens. |
 | B4: launcher-mode frontend reports `connection_closed`; old expansion may have dispatched; replacement owner exists | Report transport blocker and require explicit reconnection. Status inspection must not start/restart a launcher. Resolve the original authority/epoch/command/payload through historical outcome lookup; replacement readiness does not upgrade that request or renew execution. |
 | E1: explicitly tracked request but missing task tools/schema/actor | Report the request/setup blocker in the conversation. No alternate storage, invented durable IDs, native delegation acknowledgment substitute, alternate writer, or untracked execution fallback. |
@@ -137,5 +139,11 @@ long-lived frontend; human `start`/`connect` output is not a stdio MCP stream.
 - Record grouped versus independent samples for native fleet cases. Verify
   ordinary untracked fleet remains usable with the workflow agent selected,
   and a read-only request cannot trigger launcher startup or claim recovery.
+- Verify the one-line tracked-fleet phrase consumes the current approved plan,
+  preserves exact provenance in an artifact plus a searchable drawer index, and
+  publishes each task atomically with its initial blockers without treating
+  formatting or paragraph order as dependencies.
+- Verify oversized plans use dependency-closed bounded batches within advertised
+  task/edge limits and never require retroactive blockers on runnable tasks.
 - Verify that all task/MemPalace storage reads and writes use the configured,
   server-qualified MCP operations.
