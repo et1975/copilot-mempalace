@@ -41,6 +41,9 @@ audit hook that nags when an external tool is about to run without a prior `memp
   Ordinary memory filing does not require this service. See its [recovery
   contract](sidecar/README.md#recovery-and-coherent-palace-backuprestore) before
   changing an existing deployment.
+  For installation, use the [task setup quick-start](sidecar/setup.md): one
+  `configure` / `enable` / `check` workflow covers configuration, explicit
+  initialization, Copilot registration and actual MCP readiness.
 - **[skills/dreaming/SKILL.md](skills/dreaming/SKILL.md)** — offline consolidation ("dreaming"): a 5-phase
   pipeline (harvest → adjudicate → review → adopt → verify) that merges near-duplicate drawers and resolves
   adjudicated KG contradiction/staleness candidates between sessions, plus constructive `reflect`
@@ -179,6 +182,16 @@ source drawers, including retired rules and counterexamples. External deletion
 is not prevented and no cross-drawer transaction/global snapshot is claimed.
 
 ## Install
+
+### Choose the installation scope
+
+**Memory-only:** follow the MCP and customization-pack steps below.
+**Task tracking:** also follow the [task setup quick-start](sidecar/setup.md).
+Installing an executable or copying a skill does not configure a task authority,
+register its tools, or prove that a native worker supervisor exists. A task
+installation is ready only after the setup check confirms the configured
+authority and its advertised MCP tools; an already-open session must load the
+new registration separately.
 
 ### Step 0 — Register MemPalace as an MCP server
 

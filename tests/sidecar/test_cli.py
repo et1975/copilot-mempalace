@@ -1,6 +1,6 @@
 """Current CLI consumers: palace-only ownership and authenticated discovery."""
 
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from copy import deepcopy
 import io
 import json
@@ -53,6 +53,218 @@ class CliTests(unittest.TestCase):
         self.root = self.path.parent
         self.token = service.config.service_token_file
         self.document = json.loads(self.path.read_text())
+
+    def filesystem_fingerprint(self):
+        result = {}
+        for path in (self.root, *self.root.rglob("*")):
+            info = path.lstat()
+            contents = (os.readlink(path) if path.is_symlink()
+                        else path.read_bytes() if path.is_file() else None)
+            result[str(path.relative_to(self.root))] = (
+                info.st_mode, info.st_uid, info.st_gid, info.st_ino,
+                info.st_size, info.st_mtime_ns, info.st_ctime_ns, contents,
+            )
+        return result
+
+    def validate_config(self, *options):
+        before = self.filesystem_fingerprint()
+        with ExitStack() as stack:
+            forbidden = [
+                stack.enter_context(patch.object(
+                    cli, name, side_effect=AssertionError("Validation must be read-only")))
+                for name in ("TaskAuthority", "PalaceClient", "TaskServiceClient",
+                             "owned_authority", "initialize", "connect", "start", "stop",
+                             "startup_election", "serve", "create_service_token")
+            ]
+            forbidden.append(stack.enter_context(patch(
+                "os.chmod", side_effect=AssertionError("Validation must not repair permissions"))))
+            result = self.call("validate-config", *options)
+            for operation in forbidden:
+                operation.assert_not_called()
+        self.assertEqual(self.filesystem_fingerprint(), before)
+        self.assertNotIn("Invalid command-line arguments", result[2])
+        return result
+
+    def test_validate_config_returns_only_allowlisted_fields_without_lifecycle_work(self):
+        hub_token = self.root / "hub.token"
+        hub_token.write_text("owned-validation-hub-token\n")
+        hub_token.chmod(0o600)
+        self.document["hub_token_file"] = str(hub_token)
+        for overrides, lifecycle, port in (
+            ({}, "external", 8766),
+            ({"lifecycle": "launcher", "port": 0}, "launcher", 0),
+        ):
+            with self.subTest(lifecycle=lifecycle):
+                self.document.update(overrides)
+                self.save()
+                for options in ((), ("--allow-missing-service-token",)):
+                    code, out, err = self.validate_config(*options)
+                    self.assertEqual(code, 0, err)
+                    self.assertEqual(err, "")
+                    self.assertEqual(json.loads(out), {
+                        "ok": True, "schema_version": 2,
+                        "authority_id": "11111111-1111-1111-1111-111111111111",
+                        "lifecycle": lifecycle, "host": "127.0.0.1", "port": port,
+                        "hub_url": "http://127.0.0.1:8765/mcp",
+                        "runtime_dir": str(self.root / "runtime"),
+                        "service_token_file": str(self.token),
+                        "service_token_present": True,
+                    })
+                    self.assertNotIn("owned-validation-hub-token", out + err)
+                    self.assertNotIn(str(hub_token), out + err)
+        self.assertFalse((self.root / "runtime").exists())
+
+    def test_validate_config_preserves_existing_runtime_and_shared_parent_permissions(self):
+        runtime = self.root / "runtime"
+        runtime.mkdir()
+        (runtime / "owned-fixture").write_text("existing coordination bytes")
+        self.root.chmod(0o775)
+        self.path.chmod(0o664)
+        code, out, err = self.validate_config()
+        self.assertEqual(code, 0, err)
+        self.assertTrue(json.loads(out)["service_token_present"])
+
+    def test_validate_config_missing_config_never_creates_file_or_parent(self):
+        for path in (self.root / "missing.json", self.root / "absent" / "config.json"):
+            self.path = path
+            for options in ((), ("--allow-missing-service-token",)):
+                with self.subTest(path=path.name, options=options):
+                    code, out, err = self.validate_config(*options)
+                    self.assertEqual(code, 2, err)
+                    self.assertEqual(out, "")
+                    self.assertTrue(err)
+
+    def test_validate_config_missing_token_requires_explicit_read_only_allowance(self):
+        self.token.unlink()
+        for token_path in (self.token, self.root / "absent" / "service.token"):
+            self.document["service_token_file"] = str(token_path)
+            self.document["runtime_dir"] = str(self.root / "uncreated" / "runtime")
+            self.save()
+            code, out, err = self.validate_config()
+            self.assertEqual(code, 2, err)
+            self.assertEqual(out, "")
+            self.assertTrue(err)
+            code, out, err = self.validate_config("--allow-missing-service-token")
+            self.assertEqual(code, 0, err)
+            self.assertEqual(err, "")
+            result = json.loads(out)
+            self.assertIs(result["service_token_present"], False)
+            self.assertEqual(result["service_token_file"], str(token_path))
+        self.assertFalse((self.root / "absent").exists())
+        self.assertFalse((self.root / "uncreated").exists())
+
+    def test_validate_config_rejects_schema_one_and_invalid_genesis_with_safe_errors(self):
+        original = deepcopy(self.document)
+        variants = (
+            {"schema_version": 1},
+            {"genesis": {**original["genesis"], "policy": {"renewal_seconds": 300}}},
+        )
+        for update in variants:
+            self.document = {**original, **update}
+            self.save()
+            for options in ((), ("--allow-missing-service-token",)):
+                with self.subTest(update=update, options=options):
+                    code, out, err = self.validate_config(*options)
+                    self.assertEqual(code, 2, err)
+                    self.assertEqual(out, "")
+                    self.assertIn("invalid_configuration:", err)
+                    self.assertNotIn(json.dumps(self.document["genesis"]), err)
+
+    def test_validate_config_allow_missing_still_rejects_present_invalid_or_insecure_tokens(self):
+        for contents, mode in (
+            ("", 0o600), ("owned invalid token", 0o600),
+            ("owned\ninjected", 0o600), ("owned-nonascii-\u2603", 0o600),
+            (TOKEN, 0o644),
+        ):
+            self.token.write_text(contents)
+            self.token.chmod(mode)
+            for options in ((), ("--allow-missing-service-token",)):
+                with self.subTest(mode=mode, options=options, length=len(contents)):
+                    code, out, err = self.validate_config(*options)
+                    self.assertEqual(code, 2, err)
+                    self.assertEqual(out, "")
+                    self.assertTrue(err)
+                    if contents:
+                        self.assertNotIn(contents, err)
+
+    def test_validate_config_allow_missing_never_relaxes_hub_token_validation(self):
+        hub_token = self.root / "hub.token"
+        self.document["hub_token_file"] = str(hub_token)
+        self.save()
+        for mode in (None, 0o644):
+            if mode is not None:
+                hub_token.write_text("owned-validation-hub-token\n")
+                hub_token.chmod(mode)
+            code, out, err = self.validate_config("--allow-missing-service-token")
+            self.assertEqual(code, 2, err)
+            self.assertEqual(out, "")
+            self.assertTrue(err)
+            self.assertNotIn("owned-validation-hub-token", err)
+
+    def test_validate_config_rejects_token_and_config_symlinks_even_when_token_absent(self):
+        self.token.unlink()
+        self.token.symlink_to(self.root / "missing-token")
+        code, out, err = self.validate_config("--allow-missing-service-token")
+        self.assertEqual(code, 2, err)
+        self.assertEqual(out, "")
+        self.assertTrue(err)
+        self.token.unlink()
+        link = self.root / "config-link.json"
+        link.symlink_to(self.path)
+        self.path = link
+        code, out, err = self.validate_config("--allow-missing-service-token")
+        self.assertEqual(code, 2, err)
+        self.assertEqual(out, "")
+        self.assertTrue(err)
+
+    def test_validate_config_module_entrypoint_and_existing_argument_conventions(self):
+        completed = subprocess.run(
+            [sys.executable, "-W", "error", "-m", "mempalace_tasks",
+             "--config", str(self.path), "validate-config"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stderr, "")
+        self.assertTrue(json.loads(completed.stdout)["service_token_present"])
+        self.assertNotIn(TOKEN, completed.stdout)
+        code, out, err = self.call("validate-config", "--generate-token")
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertIn("Invalid command-line arguments", err)
+        code, out, err = self.call("init", "--allow-missing-service-token")
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertIn("Invalid command-line arguments", err)
+
+    def test_mcp_no_autostart_is_forwarded_only_when_explicit(self):
+        for options, expected in (
+            ((), {}),
+            (("--no-autostart",), {"no_autostart": True}),
+        ):
+            with self.subTest(options=options), patch(
+                    "mempalace_tasks.stdio_frontend.main", return_value=0) as frontend:
+                code, out, err = self.call("mcp", "--timeout", "2s", *options)
+            self.assertEqual((code, out, err), (0, "", ""))
+            frontend.assert_called_once_with(str(self.path), timeout=2.0, **expected)
+
+    def test_mcp_no_autostart_errors_are_safe_and_flag_is_mcp_only(self):
+        from mempalace_tasks.discovery import DiscoveryError
+
+        with patch("mempalace_tasks.stdio_frontend.main",
+                   side_effect=DiscoveryError("endpoint_unavailable", TOKEN)):
+            code, out, err = self.call("mcp", "--no-autostart")
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        self.assertIn("endpoint_unavailable:", err)
+        for operation in ("validate-config", "init", "serve", "start", "connect",
+                          "stop", "inspect", "reconcile", "status", "list",
+                          "show", "history", "watch"):
+            with self.subTest(operation=operation), patch.object(
+                    cli, "load_config", side_effect=AssertionError("Invalid flags must not load config")):
+                code, out, err = self.call(operation, "--no-autostart")
+            self.assertEqual(code, 2, err)
+            self.assertEqual(out, "")
+            self.assertIn("Invalid command-line arguments", err)
 
     def test_init_is_explicit_normalized_and_conflicts_precede_activation(self):
         self.initialize()

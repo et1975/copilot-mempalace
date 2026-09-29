@@ -104,6 +104,18 @@ The executable registered with the harness must already support
 `PATH`; updating a checkout does not update a separately installed, non-editable
 package. Provision that package explicitly before registering it.
 
+## Setup entry point
+
+Start with the [end-to-end setup guide](setup.md), not a configuration fragment.
+The repository's `scripts/setup-tasks.fsx` provides `configure`, `enable` and
+read-only `check` phases around the installed commands below. It never installs
+dependencies or silently replaces an authority. Existing deployments can begin
+with `check`; incompatible configurations stop with a specific blocker.
+
+The setup helper currently targets Linux and requires a preinstalled .NET SDK
+with F# Interactive in addition to the sidecar and Copilot CLI. The service
+itself retains its existing Python requirements; it does not need .NET.
+
 ## Configure and initialize
 
 Create a private credential/config directory using your normal administration
@@ -169,6 +181,19 @@ and is **not** read-only inspection or the restore procedure. Actors, supervisor
 and declared capabilities are fixed by that genesis; changing JSON later does
 not change accepted authorization.
 
+For configuration-only validation, without connecting to the hub or creating
+files, use:
+
+```bash
+mempalace-tasks validate-config --config /absolute/path/tasks.json
+```
+
+`--allow-missing-service-token` permits a missing service credential during
+deliberate preparation. It does not create it or relax validation of existing
+files, permissions, genesis or other configuration fields. The result reports
+allowlisted deployment fields, never credential contents. This is not an
+authority-health or accepted-genesis check.
+
 ### Foreground and launcher lifecycle
 
 The following is command syntax, not an automatic deployment sequence.
@@ -231,6 +256,11 @@ Startup policy comes from that configuration:
 - **`lifecycle: "external"`** (the default) only discovers/connects. If no ready
   owner is available, startup fails; explicitly run `serve` or arrange external
   hosting first. There is no silent launcher fallback or systemd requirement.
+
+For a no-start probe of either configuration, invoke `mcp --no-autostart`.
+This invocation-only restriction uses read-only discovery even for launcher
+configs. It does not change the configuration or its authenticated binding, and
+refuses if the owner disappears rather than starting a replacement.
 
 `--timeout` defaults to ten seconds and accepts positive `s`/`m`/`h` durations up
 to 300 seconds. It bounds startup and each upstream exchange, **not the lifetime

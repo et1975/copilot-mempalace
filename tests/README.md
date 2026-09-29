@@ -55,6 +55,12 @@ unavailable prerequisites, not hidden with new skips or collection exclusions.
 Report the exact selection, failures and skip reasons; successful collection or a
 partial run is not full-suite validation.
 
+The optional repository task-setup helper additionally needs a preinstalled
+.NET SDK with F# Interactive. Its `tests/test_task_setup.py` bridge runs the
+F# setup regression harness on isolated fixtures; absence of that optional
+runtime is reported as an explicit skip, never repaired through downloads.
+These tests do not initialize or alter the user's real task authority.
+
 ## External storage and bytecode
 
 Set `SESSION_FILES` to an **existing absolute directory outside the checkout**

@@ -149,19 +149,20 @@ class _Gateway:
                 await self.server.run(reader, writer, self.server.create_initialization_options())
 
 
-def main(config_path=None, *, timeout=10.0):
+def main(config_path=None, *, timeout=10.0, no_autostart=False):
     """Run until stdio EOF; startup/exchanges are bounded, session lifetime is not.
 
     Configuration is explicit (or MPTASK_CONFIG). Only launcher lifecycle may
-    start an owner; external lifecycle is connect-only. This function never
-    initializes an authority, prints endpoint JSON, or stops the shared owner.
+    start an owner; external lifecycle and no_autostart are connect-only.
+    no_autostart preserves the original configuration's authenticated binding.
+    This function never initializes an authority, prints endpoint JSON, or stops the shared owner.
     The CLI owns safe stderr diagnostics and exit-code mapping.
     """
     discovery._Deadline(timeout)
     config_path = config_path or os.environ.get("MPTASK_CONFIG")
     config = load_config(config_path)
     connection = (launcher.start(config_path, timeout=timeout)
-                  if config.lifecycle == "launcher"
+                  if config.lifecycle == "launcher" and not no_autostart
                   else discovery.connect(config, timeout=timeout))
     return asyncio.run(_run(connection, timeout, (
         connection.token, config.service_token, config.hub_token)))
