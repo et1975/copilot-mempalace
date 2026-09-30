@@ -215,6 +215,13 @@ def _authority(stream, event_type):
         raise SnapshotError("invalid_protocol", f"Malformed reserved stream: {stream}") from exc
 
 
+def _normalize_event_topic(raw):
+    """Keep legacy hashes stable across the upstream nullable-topic migration."""
+    if raw.get("topic") is not None:
+        return raw
+    return {key: value for key, value in raw.items() if key != "topic"}
+
+
 def _replay(con, columns, links, count):
     logs = {}
     header_columns = (
@@ -225,6 +232,8 @@ def _replay(con, columns, links, count):
     selected = list(_EVENT_COLUMNS) + [
         field if field in columns else f"NULL AS {field}" for field in _PROVENANCE_COLUMNS
     ]
+    if "topic" in columns:
+        selected.append("topic")
     for header in _rows(con, "events", header_columns, count):
         authority_id = _authority(header["stream"], header["type"])
         if authority_id is None:
@@ -242,7 +251,7 @@ def _replay(con, columns, links, count):
             logs[authority_id] = LogState(authority_id)
         log = logs[authority_id]
         try:
-            fold_record(log, raw)
+            fold_record(log, _normalize_event_topic(raw))
         except (ProtocolError, DomainError) as exc:
             raise SnapshotError(
                 "invalid_protocol", f"Invalid task event {raw['id']} in {authority_id}: {exc}") from exc

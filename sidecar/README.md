@@ -699,6 +699,10 @@ and its current platform/refusal limits. At a high level:
 The snapshot retains the task IDs, edges, holds and source-plan/artifact content
 it actually contains; post-snapshot work may be absent. Do not replay pending
 commands or restore sidecar cache files from a discarded future.
+Snapshot replay and restore receipts preserve non-null native event `topic`
+values in history integrity checks. An absent topic and a null topic are
+equivalent, so an upstream nullable-column migration does not change legacy
+history hashes; mismatched non-null topics still prevent publication.
 Reprovision config/tokens as needed and rebuild disposable discovery/runtime
 state only while owners are quiescent. Neither palace restore nor task fencing
 undoes Git/cloud effects or target-side fence counters; reconcile those before

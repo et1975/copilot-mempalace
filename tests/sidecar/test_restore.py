@@ -164,6 +164,42 @@ class RestoreTests(unittest.TestCase):
             self.restore.prepare_task_restore(self.data, private_stage=True, append=corrupt)
         self.assertEqual(caught.exception.code, "changed_history")
 
+    def test_optional_topic_migration_preserves_null_history_but_hashes_values(self):
+        original = self.restore.read_task_logs(self.data)[fixtures.AUTHORITY].raw_hash
+        self.fixture.sql("ALTER TABLE events ADD COLUMN topic TEXT")
+        migrated = self.restore.read_task_logs(self.data)[fixtures.AUTHORITY].raw_hash
+        self.assertEqual(migrated, original)
+        self.fixture.sql("UPDATE events SET topic = 'task-routing' WHERE id = 'evt-000001'")
+        changed = self.restore.read_task_logs(self.data)[fixtures.AUTHORITY].raw_hash
+        self.assertNotEqual(changed, original)
+
+    def test_native_topic_receipt_matches_replayed_history_after_schema_migration(self):
+        def append_with_topic(data, payload):
+            receipt = self.append(data, payload)
+            self.fixture.sql("ALTER TABLE events ADD COLUMN topic TEXT")
+            self.fixture.sql("UPDATE events SET topic = ? WHERE id = ?",
+                             ("task-routing", receipt["id"]))
+            return {**receipt, "topic": "task-routing"}
+
+        result = self.restore.prepare_task_restore(
+            self.data, private_stage=True, append=append_with_topic)
+        self.assertTrue(result["publishable"])
+        self.assertEqual(result["status"], "prepared")
+
+    def test_native_topic_receipt_mismatch_refuses_publication(self):
+        def corrupt_topic(data, payload):
+            receipt = self.append(data, payload)
+            self.fixture.sql("ALTER TABLE events ADD COLUMN topic TEXT")
+            self.fixture.sql("UPDATE events SET topic = ? WHERE id = ?",
+                             ("task-routing", receipt["id"]))
+            return {**receipt, "topic": "different-routing"}
+
+        with self.assertRaises(self.restore.RestoreError) as caught:
+            self.restore.prepare_task_restore(
+                self.data, private_stage=True, append=corrupt_topic)
+        self.assertEqual(caught.exception.code, "changed_history")
+        self.assertFalse(caught.exception.details["publishable"])
+
     def test_private_stage_acknowledgement_and_schema_validation_precede_append(self):
         with self.assertRaises(self.restore.RestoreError) as caught:
             self.restore.prepare_task_restore(self.data, append=self.append)

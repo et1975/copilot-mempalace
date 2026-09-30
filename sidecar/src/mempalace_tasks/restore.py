@@ -372,7 +372,7 @@ def task_restore_preparation(data_path, *, private_stage=False, expected_authori
                 if type(receipt) is not dict or receipt.get("body") != canonical_json(payload):
                     raise RestoreError("append_uncertain", "Stored-event receipt does not match staging epoch")
                 expected = deepcopy(log)
-                fold_record(expected, receipt)
+                fold_record(expected, snapshot._normalize_event_topic(receipt))
                 logs[key] = expected
                 actual = read_task_logs(data)
                 if set(actual) != set(logs) or any(
