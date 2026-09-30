@@ -154,7 +154,10 @@ audit hook that nags when an external tool is about to run without a prior `memp
 - MemPalace exposed as an MCP server in your harness — see [Step 0](#step-0--register-mempalace-as-an-mcp-server) below.
 - For dreaming merge discovery: an installed MemPalace build exposing the native
   `mempalace_find_duplicates` handler, logical drawer IDs and pairwise distances,
-  plus collection access for canonical records. Capability failures are errors,
+  plus collection access for canonical records. Dreaming pruning also requires
+  `mempalace.dynamics.drawer_salience`. The public 3.8.0 package lacks these two
+  APIs; CI uses the custom fork source described under [Tests](#tests), not that
+  public release. Capability failures are errors,
   not an empty successful scan. Pruning reads complete drawer metadata rather
   than relying on the top-100 `mempalace_drawer_salience` endpoint; absent usage
   telemetry is neutral. See the [substrate contract](skills/dreaming/references/pipeline.md#substrate-capabilities-and-limitations).
@@ -177,14 +180,21 @@ suite selectors, existing integration gates and package-content checks.
 
 [GitHub Actions CI](.github/workflows/ci.yml) runs the full suite serially on
 Ubuntu 24.04 / Python 3.12, including the offline wheel/sdist roundtrip.
+MemPalace comes from the published [`et1975/mempalace`](https://github.com/et1975/mempalace)
+fork's `copilot/local-with-prs` line (package version 3.10.0), which provides the
+custom dreaming APIs. [`requirements-ci-source.txt`](requirements-ci-source.txt)
+is authoritative for its immutable full-commit archive URL and SHA-256; CI does
+not install from the moving branch name. Hash-locked dependency/build wheels
+are installed first, then the verified source with dependency resolution and
+build isolation disabled, so the source build cannot fetch build prerequisites.
 See [CI coverage and provisioning](tests/README.md#github-actions-ci) for triggers,
-isolated storage and the separate prerequisite-preparation step.
+isolated storage and the same two-phase local prerequisite-preparation path.
 
 Commands below run from the repository root. `TEST_PY` must select a preprovisioned
 Python 3.11+ interpreter with pytest 8.4.2 (`requirements-test.txt`); the full suite
-also requires sidecar production dependencies and the existing MemPalace/local
-model prerequisites. Its offline package regression requires preinstalled `uv`
-and sidecar build-system prerequisites in `TEST_PY` (`setuptools>=68`, plus
+also requires sidecar production dependencies, the compatible MemPalace source
+above and local model prerequisites. Its offline package regression requires
+preinstalled `uv` and sidecar build-system prerequisites in `TEST_PY` (`setuptools>=68`, plus
 `wheel` if required by the chosen backend), separate from runtime dependencies.
 A partial environment is not full-suite validation; tests do not install or
 download missing prerequisites.

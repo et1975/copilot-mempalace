@@ -33,7 +33,13 @@ interpreter. It must have **pytest 8.4.2**, pinned only in
 dependency, not part of `sidecar/pyproject.toml` or `sidecar/requirements.lock`.
 
 A full-suite environment also needs the sidecar's declared production
-dependencies and the existing MemPalace/model prerequisites in that interpreter.
+dependencies, a compatible MemPalace build and the local model prerequisites in
+that interpreter. The custom fork selected by
+[`requirements-ci-source.txt`](../requirements-ci-source.txt) supplies
+`mempalace_find_duplicates` and `mempalace.dynamics.drawer_salience`, which are
+absent from public MemPalace 3.8.0. To match CI, provision the same source and
+locked dependencies using the [two-phase setup below](#github-actions-ci)
+before running tests.
 It additionally requires preinstalled `uv` on PATH and the sidecar's
 [`[build-system]` prerequisites](../sidecar/pyproject.toml) in `TEST_PY`:
 `setuptools>=68`, plus `wheel` if the chosen backend requires it. These are
@@ -155,15 +161,49 @@ requests and manual `workflow_dispatch` runs. It uses Ubuntu 24.04 with Python
 3.12 and read-only repository permissions. Official actions are pinned to commit
 SHAs; CI dependency pins live in [`requirements-ci.txt`](../requirements-ci.txt),
 with the pytest pin retained in
-[`requirements-test.txt`](../requirements-test.txt). CI installs the full
-transitive [`requirements-ci.lock`](../requirements-ci.lock) with hash
-verification. After changing any input requirements, regenerate that lock with
-the `uv` version pinned in `requirements-ci.txt`:
+[`requirements-test.txt`](../requirements-test.txt).
+
+[`requirements-ci-source.txt`](../requirements-ci-source.txt) is the authoritative
+source provenance: it pins a full-commit GitHub archive URL and SHA-256 from the
+published [`et1975/mempalace`](https://github.com/et1975/mempalace)
+`copilot/local-with-prs` line (package version 3.10.0). The branch name and package
+version are context, not installation selectors. This custom source provides
+the dreaming APIs described above; substituting the public 3.8.0 package does
+not satisfy that contract.
+
+`requirements-ci.txt` includes the source manifest and pins its `hatchling`
+build backend. The generated
+[`requirements-ci.lock`](../requirements-ci.lock) contains the transitive
+dependency and build-tool wheels, but deliberately omits MemPalace itself.
+CI installs those hash-verified wheels first, then builds and installs the
+hash-verified source without dependency resolution or build isolation. To
+prepare a local environment the same way, select an existing Python 3.12
+environment with pip as `TEST_PY`, and run these provisioning commands from the
+repository root **before** test execution:
+
+```bash
+"$TEST_PY" -m pip install --require-hashes --only-binary=:all: \
+  -r requirements-ci.lock
+PIP_NO_INDEX=1 "$TEST_PY" -m pip install --require-hashes --no-deps \
+  --no-build-isolation --no-cache-dir -r requirements-ci-source.txt
+```
+
+The second phase disables package-index lookup and caching while fetching the
+pinned archive directly, then uses the already installed build backend and
+dependencies; there are no build-time dependency downloads. After changing any input
+requirements (including the source manifest or sidecar lock), regenerate the
+wheel lock using preinstalled **uv 0.12.1**, pinned in `requirements-ci.txt`:
 
 ```bash
 uv pip compile requirements-ci.txt --python-version 3.12 --universal \
-  --only-binary=:all: --generate-hashes --output-file requirements-ci.lock
+  --only-binary=:all: --generate-hashes --no-emit-package mempalace \
+  --output-file requirements-ci.lock
 ```
+
+The included source manifest remains a resolver input so its dependencies are
+locked even though `--no-emit-package mempalace` excludes its source entry from
+the wheel-only lock. Keep the source pin, build-backend pin and generated lock
+in sync; a successful lock regeneration alone is not full-suite validation.
 
 Provisioning is separate from test execution: CI prepares the Python/runtime and
 build prerequisites, including `uv`, and preprovisions the MiniLM model cache
@@ -172,9 +212,11 @@ sources; the tests do not install missing prerequisites. In particular, the
 wheel/sdist build and wheel-from-sdist roundtrip remain offline.
 
 CI runs the full root pytest suite serially, including the distribution
-regression, with an isolated temporary HOME and external disposable test
-storage. The prepared model cache is available in that isolated environment;
+regression, followed by the offline installed-wheel smoke check, with an
+isolated temporary HOME and external disposable test storage.
+The prepared model cache is available in that isolated environment;
 no real palace, user credentials or publishing step is required or used.
+No tests are skipped or mocked merely to accommodate the source build.
 Existing integration gates and platform skips remain intact:
 `MPTASK_LIVE_HUB=1` is an explicit opt-in, not part of default CI. Linux CI does
 not certify native Windows or macOS behavior.
