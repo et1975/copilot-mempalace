@@ -138,13 +138,28 @@ is the sole dispatcher: claim before dispatch, bind the actual returned agent ID
 with start (parent session UUID for parent work), checkpoint, assess acceptance
 and evidence, then complete. Workers wait for confirmed binding before work.
 
+One retained native parent coordinates a goal across repositories. Finding
+repository-relevant tasks is discovery, not consent to transfer the whole goal.
+Use goal-scoped, cursor-complete inspection and task scope/intent; `project` is
+not necessarily a repository identifier. Other sessions hand verified task IDs
+to the current parent through an available communication path, or report that
+coordination is blocked. Never borrow its UUID or resume merely to claim a leaf;
+independent native parents cannot own separate leaves under the current protocol.
+Worker binding needs a background dispatch and a supported post-start notification
+path; otherwise select parent-owned work before claim/start or report the blocker.
+
 Use current epoch/session/task/attempt/generation, atomic expand/yield for new
 prerequisites, and confirmed aggregate goal closure rather than an empty ready
 list. Same-session compaction retains its UUID but refreshes state. A new/forked
-parent uses its own UUID and explicit resume/CAS/reconciliation of the named goal.
+parent taking an explicitly authorized whole-goal handoff uses its own UUID and
+resume/CAS/reconciliation; explain the impact on existing attempts before transfer.
 Resume updates only the root; inherited active status may remain stored, but
-authorization is false. Release each inherited active attempt, then reconcile;
-do not adopt it or infer an incremented `claim_generation`. Internal session
+authorization is false. Exhaust `mptask_snapshot` pages filtered by the goal and
+`needs_attention=true`, then refresh each task before mutation. Release inherited
+active attempts then reconcile; already recovering work reconciles directly.
+Hold uncertain outcomes rather than force retries. Unrelated tasks remain subject
+to their own current eligibility/dependencies, not an all-siblings-cleared barrier.
+Do not adopt old attempts or infer an incremented `claim_generation`. Internal session
 generations prevent UUID reuse from reviving old attempts; never send those fields.
 Interrupted or unknown work requires release/reconciliation; silence is not a
 death signal or automatic retry trigger. Do not mirror tracked tasks in native

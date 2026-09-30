@@ -63,6 +63,11 @@ are not sidecar claims, leases, or completion evidence.
 Native fleet's **existing parent remains the sole dispatcher**. It issues durable
 lifecycle commands and binds workers; no extra coordinator agent, daemon,
 supervisor, periodic timer or independent queue consumer is required.
+This also applies to a goal spanning repositories: one retained parent dispatches
+repository-scoped workers and publishes their lifecycle. Discovering relevant
+work in another checkout does not authorize whole-goal `resume`, borrowing the
+owner's UUID, or a second coordinator. An independent session cannot claim a leaf
+without owning its root; transfer requires an explicit named-goal resume.
 The service's existing authenticated MCP connection is the trust boundary.
 Session UUIDs identify owners; they are not secrets, bearer tokens or per-user
 authentication.
@@ -79,12 +84,12 @@ continuity. One session may own multiple **separately opted-in** goals.
 | `bootstrap` | Atomically enroll the issuing session and create scoped cooperative goal plus import/planning task. No pre-registered coordinator. |
 | `expand` | Publish graph membership/definitions/initial edges and source disposition atomically, within the native goal scope. |
 | `update` | Current-version content patch for open non-root work; null clears hold/defer. No admission/execution edits or recovery bypass. |
-| `claim` | Reserve the current version's attempt/generation **before** native dispatch; reservation is not a started worker. |
+| `claim` | First select an executable path through the capability gate below; then reserve the current version's attempt/generation **before** native dispatch. Reservation is not a started worker. |
 | `start` | Bind the actual agent ID returned by dispatch, or the actual parent session UUID for parent work. Match task/attempt/generation/session/epoch. |
 | `checkpoint` | Preserve meaningful progress and durable references for current bound work, not a model-heartbeat lease. |
 | `complete` | Require current binding, acceptance assessment and durable evidence. Success text alone is insufficient. |
 | `release` / `reconcile` | Resolve cooperative ownership with explicit known/unknown facts; do not infer stop or settled effects. |
-| `resume` | Bounded root-only owner CAS; inherited active status stays unchanged but unauthorized. Individually release then reconcile, never adopt. |
+| `resume` | Bounded root-only owner CAS; inherited active status stays unchanged but unauthorized. Discover all attention pages and classify fresh per-task state as below; never adopt inherited attempts. |
 | `cancel` | Reject open non-root work/proposals with current version, reason/observations; no attempt tokens. Active/recovering work requires release/reconcile instead; never cancel the root. |
 | `goal_close` | Confirm aggregate acceptance, current goal/graph revisions, resolved work/proposals and sealed intake. |
 
@@ -101,16 +106,42 @@ an old receipt, summary, native result or remembered token cannot authorize
 publication.
 Current parent is the root goal's `native.session_id`, also resolved in fresh
 `authorization.session_id`. Transfer leaves all member snapshots untouched;
-`native_reconciliation_required` marks unauthorized inherited active work. Release
-each such attempt with current version/retained tokens, then reconcile.
+`native_reconciliation_required` marks unauthorized inherited active work. Enumerate
+`mptask_snapshot(filters={goal_id, needs_attention:true})` through every
+`next_cursor`; these pinned observations include already recovering work, not only
+inherited active attempts. Follow the [paginated recovery procedure](references/native.md#interrupted-sessions-and-limits):
+refresh each task, current root ownership and epoch before mutation; release
+inherited active work with freshly read tokens, then read/reconcile, while already
+recovering work reconciles directly. Keep unknown effects on `hold`, not forced
+retry/cancel. Readiness is per task and its dependencies: unrelated eligible work
+may be claimed while other work remains held; recovery is not a goal-wide barrier.
 Internal session-generation fencing prevents A→B→A attempt revival; callers never
 supply `session_generation`. `claim_generation` changes only on claim.
 
-Because native dispatch returns the agent ID after launch, the initial worker
-packet must require waiting for confirmed `start` binding. Parent sends that
-confirmation via `write_agent`; worker verifies fresh task/agent/attempt/generation
-before doing work. An ambiguous dispatch/start is reconciled before replacement
-dispatch, never "fixed" by starting a second worker.
+### Pre-claim execution capability gate
+
+Before claim/start, the parent inspects its **actually exposed** `task` and
+messaging schemas. A worker/reviewer's different tool surface does not establish
+the parent's capabilities. Choose one executable path:
+
+- **Background worker:** only when the parent's schema supports background
+  dispatch (for example `mode="background"` when advertised) and `write_agent`
+  can deliver the binding confirmation after dispatch returns.
+- **Parent-owned work:** choose before claim/start, only if the parent can access
+  the verified repository, inputs and required tools; bind the actual parent UUID.
+- **Neither available:** report the explicit capability/access blocker; do not
+  claim work that cannot execute through either path.
+
+Never guess a `mode` argument or attempt a synchronous/one-shot WAIT-then-message
+handshake. On the supported background path, claim before dispatch; the initial
+packet requires waiting for confirmed `start`
+binding. Start with the actual returned agent ID, then confirm via `write_agent`;
+the worker verifies fresh task/agent/attempt/generation before work.
+If dispatch, start **or binding notification** fails or is ambiguous, inspect
+current task/binding and any known agent, and resolve any uncertain task command
+using its original envelope. If execution remains uncertain, release/reconcile
+with current observations before replacement, retaining hold for unknown effects.
+Messaging failure proves neither physical stop nor durable closure.
 WAIT is an instruction/acknowledgment, not enforced suspension. Parent-only
 lifecycle publishing is workflow discipline under shared MCP trust, not per-worker
 access control.
@@ -149,8 +180,9 @@ Oversized graphs use bounded, topological, dependency-closed batches: prerequisi
 already exist or appear in the same batch. If that is impossible, keep proposals
 non-runnable; never attach a known initial blocker after runnable publication.
 
-Native `bootstrap` creates the root and planning/import task. Claim/start the import
-task as parent work, publish the graph, and complete that source only when the final
+Native `bootstrap` creates the root and planning/import task. Verify parent-owned
+access through the capability gate, then claim/start the import task as parent
+work, publish the graph, and complete that source only when the final
 required batch includes completion atomically. Managed bootstrap remains
 `mptask_bootstrap`; managed coordinator-only planning without a compatible host may
 publish authorized source-free batches but cannot fabricate import execution.
@@ -241,6 +273,13 @@ Native `complete` does not confer [managed settlement](references/managed.md#rec
 Verify explicit authority/goal/task through fresh MCP. Handoffs/memory supply
 identity hints, never current authorization/completion; resolve ambiguous references
 before operations.
+Labels such as `C1` are not task IDs. Enumerate the named goal with
+`mptask_snapshot(filters={goal_id})`, omitting status and exhausting its cursor.
+Use candidate IDs for `mptask_get` and require a unique scope/intent match before
+dispatch. `project` is a stored task tag, not necessarily a repository; verify
+repository/file scope from the task and plan rather than guessing from cwd.
+`ready` cannot discover blocked or claimed labels, and `get(label)` cannot resolve
+them. Ambiguity remains a blocker, not permission to create duplicate work.
 
 Handoff/status packets contain bounded fresh MCP observations:
 

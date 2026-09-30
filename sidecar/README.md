@@ -496,9 +496,11 @@ required. The UUID is an identifier, not a secret or credential; the existing
 authenticated MCP connection remains the trust boundary.
 
 The same session retains its UUID through compaction/resume, but must refresh
-durable state. A fork or new parent has a distinct UUID and explicitly transfers
-the named goal through native `resume` with current compare-and-swap state and
-reconciliation. It must not claim continuity by copying the old UUID.
+durable state. A fork or repository session has a distinct UUID; its request to
+find a leaf does **not** authorize transfer. Only a deliberately authorized
+full-goal successor transfers the named goal through native `resume` with current
+compare-and-swap state and reconciliation, after explaining the impact on existing
+attempts. It must not claim continuity by copying the old UUID.
 Current parent identity comes from the root goal's `native.session_id` or fresh
 `authorization.session_id`. Bounded transfer updates only the root, leaving member
 snapshots untouched. Inherited attempts may remain stored `in_progress`, but fresh
@@ -507,12 +509,12 @@ Members' recorded sessions are not current ownership.
 The root's internal `session_generation` advances on transfer and is matched
 against each attempt's recorded generation, preventing A→B→A UUID reuse from
 reviving old work. This is server-maintained fencing, not a caller payload field.
-To resume the same tracked goal, name its actual durable ID; this example ID is
-synthetic:
+To deliberately transfer the whole tracked goal, name its actual durable ID and
+scope the takeover explicitly; this example ID is synthetic:
 
 ```text
-/fleet Resume the tracked MemPalace goal tsk_goal_fixture.
-Refresh its durable state before selecting work.
+/fleet Take over the entire tracked MemPalace goal tsk_goal_fixture.
+Inspect the affected attempts and explain their recovery before transfer.
 ```
 
 Selecting the agent, installing the pack, available tools or ordinary `/fleet`
@@ -525,9 +527,55 @@ only the existing goal's scope. Unrelated goals and session planning stay untouc
 | Opted in, service or `mptask_native`/required action schema unavailable | Report the concrete version/setup blocker. No alternate store, invented identity or silent untracked fallback; a healthy old service is insufficient. |
 | Native API available, no separately configured actor/supervisor | Proceed with cooperative session bootstrap/resume and native-parent dispatch. Their absence is not a native prerequisite. |
 | Named native goal, same session after compaction | Read current mode/binding/epoch/versions and reconcile unresolved commands; no new goal or enrollment. |
-| Named native goal, new parent/fork | Explicit `resume` with the new actual session UUID, CAS and reconciliation before replacement work. |
+| Repository session asks for relevant leaves in a named goal | Read-only goal-scoped discovery and handoff to the existing coordinator; no `resume`, epic claim or borrowed UUID. |
+| Deliberately authorized full-goal successor | Explicit `resume` with the new actual session UUID, CAS and inherited-attempt recovery before replacement work. |
 | Named managed goal | Preserve managed mode and registered actor/host/lease/fencing requirements; no silent conversion via native API. |
 | Unknown stored mode | Fail closed as unsupported mode/schema; no inferred cooperative enrollment. |
+
+### Cross-repository discovery and coordination
+
+Retain **one existing native coordinator per goal**, even when its leaves target
+different repositories. The root's current `native.session_id` governs ordinary
+mutations including `claim`; neither a task's original/recorded session nor its
+`project` grants a different repository parent independent ownership. `project`
+is a categorization, not necessarily the repository name. The API does not
+support independent repository-parent ownership of leaves within one native goal.
+Recovery instructions do not add that protocol or an enforced transfer-consent
+guard.
+
+A request such as "find work relevant to this repo from goal G" is valid leaf
+discovery, not consent to claim the epic or take over the whole goal:
+
+1. Use the exact goal ID with `mptask_get` to inspect stored mode, root owner and
+   scope. Keep managed goals managed.
+2. Call `mptask_list(filters={"goal_id": G}, limit=...)` with no status restriction
+   and follow **every `next_cursor`**, keeping the filter unchanged. Do not guess
+   `project=repository` or restrict discovery to `ready`/`needs_attention`:
+   active, blocked, proposed and terminal tasks may identify the intended work.
+   Expired/incomplete pagination is not proof of a unique match; refresh or report
+   the read-budget blocker. Cursor pages are pinned snapshots.
+3. Resolve unknown labels through those candidates' exact-ID `mptask_get` details,
+   repository/file/worktree scope, stable intent and plan references. Titles or
+   labels need not be unique. `mptask_get` is not a label resolver;
+   `mptask_ready` only selects currently ready tasks. Missing/ambiguous scope is a
+   blocker, never a reason to invent an ID. Before any claim/dispatch, the current
+   coordinator refreshes the root and selected task, checks readiness and uses the
+   real task ID, stored project and current version.
+4. Present a bounded packet with authority/epoch, goal/current parent, exact task
+   IDs/versions, repository/worktree scope, intent/acceptance and observed blockers.
+   Hand it to the existing coordinator using only a verified available contact
+   path, such as `write_agent` to a known reachable agent. A session UUID is not a
+   cross-session messaging address. Without supported contact, report an explicit
+   coordination blocker and provide the packet for handoff. Do not invent a
+   transport/API, borrow the parent's identity, create a second coordinator or
+   resume the root merely to claim a leaf.
+
+The retained coordinator claims/starts both independent leaves, binds distinct
+workers to their repository/worktree scopes and publishes their returned evidence.
+Workers verify their actual working location before effects; scope text does not
+create a worktree, grant access or enforce isolation. Parent-owned work is an
+alternative only when the actual coordinator has access and selects it before
+claim/start. A different repository session is not that fallback parent.
 
 ### Native lifecycle
 
@@ -543,18 +591,30 @@ checked against the implementation; discover the deployed schema before calls.
    resource fields; the stored mode is `cooperative_native`.
    Use dependency-closed batches; final import completion
    includes the last required publication and acceptance evidence.
-3. Read the goal's ready frontier. `claim` reserves the current task version's
-   attempt/generation **before** native dispatch. Send a bounded worker packet
+3. Resolve exact task IDs using the discovery procedure above and read the goal's
+   ready frontier. Select the execution path before claiming: worker dispatch
+   requires verified live support for native `task(mode="background", ...)` and
+   subsequent `write_agent` to the returned ID. A synchronous or one-shot worker
+   cannot perform the post-return WAIT/start handshake. If the schema does not
+   expose that mode/contact capability, select parent-owned work or report the
+   blocker, rather than inventing a tool argument.
+   `claim` reserves the current task version's attempt/generation **before**
+   native dispatch. Send a bounded worker packet
    requiring it to wait for confirmed binding before work.
    If legitimate work is held/deferred, native `update` can clear resolved gates
    with a current-version content patch; do not cancel/recreate it. Null clears
    `hold_reason`/`deferred_until`. Update only accepts open non-root content, not
    admission/execution changes or active/recovering-state bypasses.
-4. Dispatch using native `task`, then `start` binds its **actual returned agent
-   ID**. Confirm start and notify that ID with `write_agent`; worker checks the
-   fresh task/agent/attempt/generation binding before effects. Parent-owned work
+4. Dispatch using supported native `task(mode="background", ...)`, then `start`
+   binds its **actual returned agent ID**. Confirm start and notify that ID with
+   `write_agent`; worker checks the fresh task/agent/attempt/generation binding
+   before effects. Parent-owned work
    binds the parent session UUID. Neither a claim nor a guessed agent ID is a
-   started worker. Unknown dispatch/start requires reconciliation, not duplicates.
+   started worker. Failed/ambiguous dispatch, binding or notification requires
+   inspection of the known worker and fresh task, `mptask_outcome` resolution of
+   uncertain durable commands, then release/reconciliation before a replacement.
+   A completed read-only report is not a successful handshake. Never fabricate a
+   returned ID or turn a ghost worker binding into parent work.
    WAIT is an instruction/acknowledgment, not enforced runtime suspension;
    parent-only lifecycle publication is workflow discipline, not per-worker
    authentication under the shared bearer.
@@ -569,8 +629,9 @@ checked against the implementation; discover the deployed schema before calls.
    Final discoveries can use atomic
    expand/complete. Stale results remain evidence, not fresh publication authority.
 7. For interrupted/unknown work use `release`/`reconcile` with explicit known facts.
-   A new parent uses root-only `resume`; inherited active attempts remain stored
-   active but unauthorized. Individually release each with current version and
+   An explicitly authorized full-goal successor uses root-only `resume`;
+   inherited active attempts remain stored active but unauthorized.
+   Individually release each with current version and
    retained attempt/generation/agent, then reconcile the now-recovering task.
    Already recovering tasks reconcile directly; never adopt old workers.
    Silence, compaction or long reasoning is not proof of death and

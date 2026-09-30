@@ -79,6 +79,22 @@ Existing reads remain:
 - `mptask_outcome({"epoch_id":"<original UUID>","command_id":"<original UUID>"})`:
   historical resolution only, never fresh execution authorization.
 
+For a handoff label rather than an exact task ID, enumerate
+`mptask_snapshot({"filters":{"goal_id":"tsk_goal_fixture"}})` across all statuses
+(omit `status`) and exhaust `next_cursor`. Inspect candidate IDs with `mptask_get`;
+require a unique match to the intended scope/intent and verified repository/file
+scope in the task and plan. `get` accepts an exact ID, not a label resolver;
+`ready` omits blocked/claimed work. `project` is a task tag, not a repository
+selector: use the stored project value in mutations, not the checkout's name.
+Ambiguous matches do not authorize a guessed ID or duplicate task.
+
+One retained native parent owns dispatch and lifecycle publication even when
+the goal's tasks span repositories. Repository-scoped workers report to that
+parent. Discovery in another repository does not authorize an independent
+session's leaf claim, borrowing the root owner's UUID, whole-goal `resume`, or
+another coordinator. Explicit named-goal transfer is a different operation,
+not cross-repository participation.
+
 Receipts retain existing `outcome`, replay, task snapshots and authorization
 shapes. Native response fields include `coordination_mode`, `session_id`,
 `goal_id`; bootstrap adds `planning_task_id`, individual-task actions add
@@ -127,14 +143,14 @@ UTF-8 bytes. A supplied evidence/reference string is exact, not a fuzzy plan nam
 |---|---|
 | `bootstrap` | Full example above; creates root and import task atomically. |
 | `update` | Task plus nonempty `patch` of content fields only. Open non-root task/epic, no assignee/recovery. See held/deferred example below; no execution/admission/mode edits. |
-| `claim` | Task. Reserves an attempt; status is `in_progress`, attempt status `preparing`, agent ID null. No execution yet. |
+| `claim` | Task, after choosing a supported path through the execution capability gate below. Reserves an attempt; status is `in_progress`, attempt status `preparing`, agent ID null. No execution yet. |
 | `start` | Bound, with actual returned native agent ID (or parent session UUID). Checks the current reserved/preparing attempt, not running authorization. Binds once and makes attempt `running`. |
 | `checkpoint` | Bound plus positive `checkpoint_sequence` and `reference`; sequence increases and reference changes. |
 | `complete` task | Bound plus Accepted; requires a current running attempt. |
 | `complete` non-root epic | Task plus Accepted, **without** attempt/generation/agent fields; children/gates must be resolved. A root uses `goal_close`. |
 | `release` | Bound plus Observed; `native_agent_id` may be null only for an unbound reservation. Current parent may release its own or an inherited active attempt. Moves that task to `recovering`; no adoption or automatic retry. |
 | `reconcile` | Bound plus Observed plus `decision` = `hold`, `retry` or `cancel`; requires recovering work, whose execution authorization is false. `hold` remains recovering; `retry` explicitly opens for a new claim; `cancel` records cancellation. Never accepts completion. |
-| `resume` | Scope plus current goal `expected_version`, `expected_session_id`, Observed. Envelope carries the **new** parent UUID. Bounded root-only CAS changes owner/version, leaving all member snapshots unchanged but fencing old-parent publication. Inherited active work needs per-task release/reconcile, never adoption. |
+| `resume` | Scope plus current goal `expected_version`, `expected_session_id`, Observed. Envelope carries the **new** parent UUID. Bounded root-only CAS changes owner/version, leaving all member snapshots unchanged but fencing old-parent publication. Follow paginated discovery and per-task recovery below; no adoption or goal-wide recovery gate. |
 | `cancel` | Task plus Observed, **no attempt/generation/agent tokens**. Only open non-root work/proposals without assignee/recovery. Nested epics require terminal, recovery-free direct children; no cascade. Preparing/running/recovering/terminal/root work is rejected. |
 | `goal_close` | Scope plus current goal `expected_version`, `expected_graph_revision`, Accepted. Seals intake only after aggregate closure checks. |
 
@@ -161,12 +177,33 @@ Up to 50 tasks and 200 edges per expansion, further bounded by `goal_policy`.
 References in edges can use declared intent keys/task IDs, `"$goal"` and
 `"$source"`. Stable intent keys deduplicate work; command IDs deduplicate requests.
 
+## Execution capability gate
+
+Before **any claim/start**, inspect the parent's actual exposed `task` and
+messaging schemas, not a worker/reviewer's possibly different surface.
+Background dispatch is usable only when that schema supports it (use
+`mode="background"` only when advertised) **and** `write_agent` supports
+post-return delivery of binding confirmation to the launched worker.
+Do not invent a mode argument or a synchronous/one-shot WAIT-then-message handshake.
+If either capability is absent, select accessible parent-owned execution before
+claim/start, binding the actual parent UUID; if the parent cannot access the
+verified repository, inputs or required tools, report that explicit blocker
+without claiming the task.
+
+Failed or ambiguous dispatch, start **or binding notification** requires fresh
+task/binding inspection and inspection of any known agent. Resolve uncertain task commands with
+their original epoch/command/payload, not a new request inferred from messaging
+failure. When execution remains uncertain, release/reconcile with current
+observations before replacement; hold unknown effects. A failed message is not
+physical stop, settled effects or durable task closure.
+
 ## Start-to-finish application
 
 1. Preserve the approved plan through MemPalace artifact MCP and file its
    searchable index. Bootstrap using the envelope above; retain actual returned
    goal and planning IDs.
-2. Read the import task; claim it with Task fields. Read its reserved attempt;
+2. Select accessible parent-owned import execution through the capability gate.
+   Read the import task; claim it with Task fields. Read its reserved attempt;
    start using Bound fields with `native_agent_id` equal to the parent UUID.
    Refresh the goal graph and import version. Import with `action="expand"` and
    this payload shape (substitute current values):
@@ -197,17 +234,24 @@ References in edges can use declared intent keys/task IDs, `"$goal"` and
 }
 ```
 
-3. Read scoped readiness and claim the actual admitted task. Dispatch only after
-   reservation, with a worker packet requiring **wait for start binding**.
-   `task` returns the native agent ID; start with that actual ID, confirm the
-   receipt and notify that worker. It verifies fresh binding before work.
+3. Read scoped readiness and select an executable path through the capability
+   gate **before claiming** the actual admitted task.
+   On the supported background-worker path, claim, then dispatch in the advertised
+   background mode with a packet requiring **wait for start binding**. After
+   `task` returns the actual agent ID, start with that ID, confirm the receipt and
+   notify that worker through `write_agent`. It verifies fresh binding before work.
+   On the accessible parent-owned path, claim/start with the actual parent UUID
+   and execute locally; no worker/message handshake is needed. Otherwise report
+   the explicit blocker without claiming. Handle failed notification as well as
+   dispatch/start uncertainty through inspection and recovery before replacement.
    WAIT is a cooperative instruction/acknowledgment, not runtime suspension.
    Parent-only lifecycle publishing is workflow discipline under shared bearer
    trust, not service-enforced per-worker authentication. Verify both the current
    root parent and task/attempt/generation/agent tuple.
 4. Checkpoint meaningful progress using Bound plus
-   `checkpoint_sequence`/`reference`. Follow notifications for the known agent;
-   result text is evidence to assess, not a durable state transition.
+   `checkpoint_sequence`/`reference`. On the worker path, follow notifications
+   for the known agent; result text is evidence to assess, not a durable state
+   transition.
 5. If A needs B, expand/yield with current source fields, checkpoint, reason,
    observations, B and these edges:
 
@@ -322,13 +366,66 @@ rows mark `needs_attention=true`. Stored active status is not permission to work
 Neither old-parent publication nor new-parent start/checkpoint/complete/source
 expansion may adopt the attempt.
 
-For **each** inherited active attempt, read current task/version and retained
-attempt/generation/agent; the new parent issues `release` with reason/observations.
-This moves that member to recovering. Refresh its version, then `reconcile` with
-hold/retry/cancel. Already recovering work can reconcile directly. Only release
-permits the inherited attempt-owner mismatch after root/session/scope checks.
-Only a later claim advances `claim_generation`; never invent its increment on
-transfer or supply the internal session generation as a caller field.
+### Paginated discovery and current recovery decisions
+
+After confirmed resume, enumerate attention candidates through task MCP:
+
+```json
+{"filters":{"goal_id":"tsk_goal_fixture","needs_attention":true}}
+```
+
+That is the argument object for `mptask_snapshot`, not a native mutation payload.
+The default page is **100 rows** (maximum `limit=500`); goals may contain 10,000
+tasks. Continue with `{"cursor":"<returned next_cursor>"}` until `next_cursor`
+is null. Omit `filters` on continuation, or repeat the exact initial filters;
+changing them (including sending `{}`) invalidates that cursor. An optional
+`limit` is a page size, not a total-result cap.
+
+Retain the snapshot ID, scope, `as_of` and unique candidate task IDs across pages.
+Continuation pages intentionally have `fresh=false`, `reason="pinned_snapshot"`;
+even a fresh first page is only an observation, never a mutation token.
+Collect pages before lengthy recovery: cursors expire after 60 seconds and may
+be evicted. On `snapshot_expired`, restart discovery and deduplicate task IDs;
+never interpret a partial scan, read failure or missing page as complete/empty.
+If a complete scan cannot be obtained, report discovery as incomplete rather
+than silently dropping work. A later fresh scan can find work changed since the
+pinned snapshot; it need not be empty to permit unrelated ready work.
+
+For **each candidate**, use fresh `mptask_get` on the root and task before
+mutation. Check authority/epoch freshness, stored mode/project/goal scope and
+that this session still owns the root. Copy current version, attempt ID,
+`claim_generation` and agent association from that task, not the page or a prior
+receipt. Reclassify from current status, eligibility reasons and authorization:
+
+| Fresh observation | Next action |
+|---|---|
+| `in_progress` and `native_reconciliation_required` | Current parent releases that inherited active attempt with fresh Bound fields and explicit reason/observations. Read task and root/epoch again; only then reconcile its confirmed recovering state. |
+| `recovering`, including a prior reconciliation `hold` | Reconcile directly with fresh Bound fields and reviewed observations; do not release it again. |
+| Current authorized active work, open/terminal work, or another attention reason | Do not apply inherited-attempt release. Follow the observed state's supported action and blockers, or report the unresolved reason. |
+
+`needs_attention` is not an inherited-attempt-only filter: it also includes
+recovering, quarantined and escalated rows. An open task's `hold_reason` alone
+does not make it an attention row; inspect all statuses without that filter for
+complete scope/label discovery or goal acceptance.
+
+Reconciliation records explicit known/unknown facts and the decision rationale:
+keep `decision="hold"` while outcome/effects remain unknown. Choose `retry` only
+after review supports deliberately repeating the work; choose `cancel` only when
+review supports abandoning it. Explain the relevant observations, remaining
+uncertainty and why the chosen action is warranted, not merely that time passed
+or the queue should clear. Neither decision proves physical stop or settlement;
+unresolved effects are not a reason to force reopening or cancellation.
+An ambiguous mutation retains its original epoch/command/payload for outcome
+resolution; a conflict requires fresh reads and reassessment, not replay with
+new tokens under the old command ID.
+
+Readiness remains **per task and its dependencies**, not a requirement that all
+inherited attempts or held siblings be cleared before any claim. The current
+parent may claim unrelated eligible work while recovery remains held.
+Dependency-blocked work stays blocked, including after its prerequisite is
+reopened by retry; retry is not successful completion of that prerequisite.
+Only a later claim advances `claim_generation`, followed by fresh start binding;
+never invent its increment on transfer or send internal session generation.
 
 Members' recorded sessions remain historical until a later mutation. Human views
 distinguish `recorded_session_id` from `current_parent=goal_session`. Service restart
