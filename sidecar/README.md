@@ -628,6 +628,14 @@ checked against the implementation; discover the deployed schema before calls.
    Expand/complete and goal_close require the same acceptance fields.
    Final discoveries can use atomic
    expand/complete. Stale results remain evidence, not fresh publication authority.
+   If acceptance fails, persist native `request_changes` with criterion-specific
+   findings and explicit `rework` (same binding) or `hold` (recovering, publication
+   revoked). The parent sends feedback separately; the service does not dispatch
+   workers or certify delivery. Pending reviews appear in `needs_attention` and
+   survive retry/transfer. Eventual complete or expand/complete must provide
+   `review_resolution` covering every current finding exactly once with evidence.
+   Repeated rejection cannot drop existing findings or rewrite their criteria.
+   See the [payloads and correction loop](../skills/mempalace-tasks/references/native.md#acceptance-rejection-and-correction-loop).
 7. For interrupted/unknown work use `release`/`reconcile` with explicit known facts.
    An explicitly authorized full-goal successor uses root-only `resume`;
    inherited active attempts remain stored active but unauthorized.
@@ -659,6 +667,11 @@ Epoch/version/attempt/generation checks reject stale task publications; they do 
 undo Git/cloud effects or stop old processes. Unknown effects stay explicit until
 reconciled, never retried on silence. Work requiring managed-host assurances must
 retain that contract rather than be relabeled cooperative.
+Review resolution checks recorded finding coverage, not evidence truth or
+unrecorded criterion coverage; the parent still judges acceptance. Tasks without
+a review retain their original completion contract. Checkout changes do not
+upgrade an installed service: discover deployed action support before using the
+correction loop.
 The optional Linux `HostSupervisor` remains a separate
 [managed host integration](#worker-assignment-and-execution).
 

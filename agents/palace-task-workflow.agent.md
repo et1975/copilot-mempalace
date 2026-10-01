@@ -267,6 +267,38 @@ goal_close require those acceptance fields too. A worker
 success message or exit zero does not close a task. Stale results remain evidence
 only and must not be republished under borrowed fresh tokens.
 
+For an unmet criterion, run the correction loop instead of silently leaving the
+task active:
+
+1. State the unmet original criterion, observed failure, actionable correction
+   and evidence needed. Persist native `request_changes` with stable finding
+   IDs and explicit `next_action`. Choose `rework` only when the current worker
+   binding and supported follow-up path remain usable; choose `hold` for
+   uncertain execution/effects. Hold revokes publication, not the process.
+2. Confirm the durable review, then send the known worker its review ID,
+   findings and required evidence using supported same-task messaging.
+   Parent-owned work corrects locally. A notification failure is not delivery:
+   inspect the known worker/current task and release/reconcile uncertainty
+   before replacement. Do not assume that a one-shot worker can accept feedback.
+3. Assess each correction against the original criterion. Further rejection
+   retains every outstanding finding ID/criterion, may revise feedback/add
+   findings within the API bound, and produces a new review ID. Record meaningful
+   progress; if no safe progress is possible, explicitly hold/escalate rather
+   than silently looping or changing acceptance. An inactive parent does not
+   trigger automatic retry.
+4. When all findings are supported, supply exact `review_resolution` coverage
+   with per-finding summary/evidence and current `parent_acceptance` on complete
+   or expand/complete. The service rejects missing/stale/partial coverage.
+   For a new worker, first release/reconcile/retry and claim/start afresh;
+   unresolved findings persist and must be passed into its handoff.
+
+An unresolved review is visible in `needs_attention`; it is not an instruction
+to release authorized same-attempt rework. Do not cancel/recreate wanted work
+to erase feedback. This is a recorded finding gate, not an independent semantic
+verifier or a worker-dispatch daemon. Use the task skill's
+[native reference](../skills/mempalace-tasks/references/native.md#acceptance-rejection-and-correction-loop)
+and deployed schema; missing support is a version blocker.
+
 For interrupted/uncertain work, record known facts and use native `release`/
 `reconcile` as their schemas permit. Do not assert process stop, settlement or
 failure simply because notifications stopped. A deliberately authorized full-goal

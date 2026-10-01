@@ -292,6 +292,8 @@ def _task_lines(task, display, eligibility=None):
             f"recorded_session_id={escape_text(session.get('session_id'))} "
             f"issuing_session_id={escape_text(session.get('issuing_session_id'))} "
             "current_parent=goal_session interruption=explicit_reconciliation_required")
+        if "review" in session:
+            lines.append(f"  review={escape_text(session['review'])}")
     elif display["pending_expiry"]:
         lines.append("  EXPIRED deadline at as_of; stored in_progress, authorization expired / pending expiry.")
     if not native:

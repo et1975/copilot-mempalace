@@ -87,7 +87,8 @@ continuity. One session may own multiple **separately opted-in** goals.
 | `claim` | First select an executable path through the capability gate below; then reserve the current version's attempt/generation **before** native dispatch. Reservation is not a started worker. |
 | `start` | Bind the actual agent ID returned by dispatch, or the actual parent session UUID for parent work. Match task/attempt/generation/session/epoch. |
 | `checkpoint` | Preserve meaningful progress and durable references for current bound work, not a model-heartbeat lease. |
-| `complete` | Require current binding, acceptance assessment and durable evidence. Success text alone is insufficient. |
+| `request_changes` | Persist criterion-specific findings for a current running leaf, with explicit `rework` or `hold`; never confuse the receipt with feedback delivery or process stop. |
+| `complete` | Require current binding, acceptance assessment, durable evidence and exact resolution of outstanding review findings. Success text alone is insufficient. |
 | `release` / `reconcile` | Resolve cooperative ownership with explicit known/unknown facts; do not infer stop or settled effects. |
 | `resume` | Bounded root-only owner CAS; inherited active status stays unchanged but unauthorized. Discover all attention pages and classify fresh per-task state as below; never adopt inherited attempts. |
 | `cancel` | Reject open non-root work/proposals with current version, reason/observations; no attempt tokens. Active/recovering work requires release/reconcile instead; never cancel the root. |
@@ -108,8 +109,10 @@ Current parent is the root goal's `native.session_id`, also resolved in fresh
 `authorization.session_id`. Transfer leaves all member snapshots untouched;
 `native_reconciliation_required` marks unauthorized inherited active work. Enumerate
 `mptask_snapshot(filters={goal_id, needs_attention:true})` through every
-`next_cursor`; these pinned observations include already recovering work, not only
-inherited active attempts. Follow the [paginated recovery procedure](references/native.md#interrupted-sessions-and-limits):
+`next_cursor`; these pinned observations include recovering work and unresolved
+reviews, not only inherited active attempts. Attention is not a release list:
+authorized same-attempt rework may continue.
+Follow the [paginated recovery procedure](references/native.md#interrupted-sessions-and-limits):
 refresh each task, current root ownership and epoch before mutation; release
 inherited active work with freshly read tokens, then read/reconcile, while already
 recovering work reconciles directly. Keep unknown effects on `hold`, not forced
@@ -155,6 +158,25 @@ Cooperative completion is accepted task evidence, **not managed-host assurance**
 Native mode cannot substitute for managed isolated/shared/fenced execution
 requirements; work needing those guarantees remains managed or a non-runnable
 proposal.
+
+### Acceptance rejection boundary
+
+When a current worker's result fails acceptance, persist `request_changes` with
+bounded findings (`id`, original `criterion`, actionable `feedback`), evidence
+and an explicit next action. `rework` retains the binding; `hold` revokes it into
+recovering without claiming physical stop. The parent delivers correction
+instructions separately and checks notification outcomes. Replacement still
+requires release/reconcile/retry and a fresh claim/start.
+
+An outstanding `native.review` survives recovery and owner transfer. Completion,
+including expand/complete, requires `review_resolution` naming the current
+review and covering every finding exactly once with summary/evidence. Repeated
+reviews retain existing finding IDs/criteria; do not drop findings, weaken
+acceptance or cancel/recreate wanted work to bypass them. A receipt validates
+coverage and ownership, not semantic correctness. Inspect cited evidence before
+providing `parent_acceptance`. Missing deployed action/schema support is a
+version blocker, not permission to substitute chat-only acceptance.
+See the [exact correction contract](references/native.md#acceptance-rejection-and-correction-loop).
 
 ## Native plan ingestion boundary
 

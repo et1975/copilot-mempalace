@@ -40,6 +40,13 @@ cross-repository boundaries. Offline authority characterization lives in
 `tests/sidecar/test_native_recovery_workflow.py`; it is not a fresh-context skill
 evaluation or live fleet run.
 
+The acceptance audit found no durable criterion-specific rejection gate: a parent
+could leave rejection only in chat and later complete with unrelated prose.
+E33-E36 specify the new request-changes/resolution expectations. Domain and MCP
+regressions live in `tests/sidecar/test_native_review.py` and
+`tests/sidecar/test_native_review_boundary.py`; these do not establish live
+deployment, autonomous feedback delivery or semantic correctness.
+
 ## MCP storage boundary
 
 Task and MemPalace storage use the appropriate server-qualified MCP operations.
@@ -168,6 +175,10 @@ distinct.
 | E30: attention snapshot has 103 rows mixing inherited active, recovering and reconciliation-held work; a task changes while pages are read | Exhaust `next_cursor` with the same pinned scope (omit filters or repeat exactly); default 100/maximum 500 is only a page size. Preserve pinned freshness/as_of, deduplicate candidate IDs and restart expired discovery rather than treating it as empty. Before each mutation refresh root ownership/epoch and task status/version/tokens. Release only still-inherited active attempts, then read/reconcile; reconcile already recovering work directly, keep unknown effects held, and reclassify changed rows rather than mutating page snapshots. |
 | E31: inherited work remains held for unknown effects, an unrelated task is ready and another task depends on the held work | Current root parent may claim the unrelated eligible task; the dependent stays blocked. Do not force retry/cancel or clear every inherited sibling as a goal-wide gate. Record known/unknown facts and deliberate rationale for any retry/cancel. An open content hold is distinct from reconciliation hold and may not appear in attention results. Neither partial discovery nor empty readiness proves goal acceptance. |
 | E32: another repository's checkout finds label C1 under an existing native goal, but C1 is blocked/claimed and the project's tag is not the repository name | Enumerate exact goal scope across all statuses and cursor pages, inspect candidate IDs with get, and require a unique scope/intent and repository match. Do not use get(label), ready-only lookup or a guessed project filter. One retained root parent dispatches repository-scoped workers and publishes lifecycle; discovery does not authorize an independent session's claim, whole-goal resume, borrowed UUID or second coordinator. |
+| E33: worker says done, but one original acceptance criterion fails | Persist `request_changes` with current Bound identity, evidence, stable finding ID, criterion and actionable feedback; choose explicit rework/hold. For rework confirm the receipt, then send the known worker its review ID and evidence requirements. Do not close, silently abandon active work or claim that persistence delivered feedback. |
+| E34: corrected worker result arrives, but the completion packet omits one outstanding finding or names an older review | Inspect the current review and retain original criteria. Require exact current `review_resolution` coverage and per-finding evidence before complete or expand/complete. Repeat rejection may revise feedback/add findings but cannot drop existing IDs or rewrite their criteria. Neither an all-tests-pass summary nor a new parent_acceptance string bypasses the gate. |
+| E35: rejection feedback cannot be delivered, effects are uncertain, or another worker is needed | Inspect actual worker/task and resolve uncertain command outcomes. Use hold/recovery for unknown effects; replacement requires release/reconcile/retry and fresh claim/start, preserving review findings in the handoff. No fake delivery, timeout reassignment, changed worker ID on old tokens or physical-stop claim. |
+| E36: attention pages include an authorized same-attempt correction, an inherited attempt and a recovering task | Classify from fresh task/root state. Continue authorized rework; release only inherited active work and reconcile recovering work as appropriate. Do not treat attention as a release list. Retry/transfer/restart retains findings, unrelated eligible work remains runnable, and cancelled review history is not positive acceptance. |
 
 Frontend transport tests and guidance simulations answer different questions.
 SDK stdio forwarding preserves schemas, freshness and errors; cooperative native

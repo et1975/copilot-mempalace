@@ -146,7 +146,8 @@ UTF-8 bytes. A supplied evidence/reference string is exact, not a fuzzy plan nam
 | `claim` | Task, after choosing a supported path through the execution capability gate below. Reserves an attempt; status is `in_progress`, attempt status `preparing`, agent ID null. No execution yet. |
 | `start` | Bound, with actual returned native agent ID (or parent session UUID). Checks the current reserved/preparing attempt, not running authorization. Binds once and makes attempt `running`. |
 | `checkpoint` | Bound plus positive `checkpoint_sequence` and `reference`; sequence increases and reference changes. |
-| `complete` task | Bound plus Accepted; requires a current running attempt. |
+| `request_changes` | Bound plus `summary`, `evidence`, `findings`, and `next_action` (`rework` or `hold`). Current running leaf only; records outstanding acceptance findings. See the correction loop below. |
+| `complete` task | Bound plus Accepted; requires a current running attempt and `review_resolution` when a review is outstanding. |
 | `complete` non-root epic | Task plus Accepted, **without** attempt/generation/agent fields; children/gates must be resolved. A root uses `goal_close`. |
 | `release` | Bound plus Observed; `native_agent_id` may be null only for an unbound reservation. Current parent may release its own or an inherited active attempt. Moves that task to `recovering`; no adoption or automatic retry. |
 | `reconcile` | Bound plus Observed plus `decision` = `hold`, `retry` or `cancel`; requires recovering work, whose execution authorization is false. `hold` remains recovering; `retry` explicitly opens for a new claim; `cancel` records cancellation. Never accepts completion. |
@@ -170,8 +171,9 @@ Source-free expansion is `continue` only, without execution tokens/version.
 - `continue`: no completion or yield fields.
 - `yield`: requires `checkpoint={"sequence":N,"reference":"..."}`, `reason`,
   `observations`; include new prerequisites and blockers in this same call.
-- `complete`: requires all Accepted fields, including `parent_acceptance`.
-  No checkpoint/reason/observations.
+- `complete`: requires all Accepted fields, including `parent_acceptance`, and
+  `review_resolution` if the source has outstanding review findings.
+  No checkpoint/reason/observations. `continue` and `yield` cannot carry resolution.
 
 Up to 50 tasks and 200 edges per expansion, further bounded by `goal_policy`.
 References in edges can use declared intent keys/task IDs, `"$goal"` and
@@ -269,11 +271,104 @@ physical stop, settled effects or durable task closure.
    `summary`, actual `evidence` and the parent's explicit `parent_acceptance`.
    For example, acceptance text can describe which tests and artifact changes
    were examined; it must not claim physical settlement.
+   If acceptance fails, use the correction loop below rather than leave rejection
+   only in chat. Outstanding findings require an exact `review_resolution` on
+   eventual completion, including atomic expand/complete.
 7. Read the complete scoped graph, not just readiness. Reject unwanted open
    proposals with `cancel` as below; reconcile recovering work and assess aggregate
    acceptance. Use `goal_close` with
    current goal version/graph revision and Accepted fields. Confirm `closed`
    and `sealed=true` before reporting goal completion.
+
+## Acceptance rejection and correction loop
+
+The parent records a failed acceptance assessment with `request_changes` before
+sending correction instructions. This records a decision; it does not contact a
+worker or launch another attempt. Use the existing native envelope and this
+payload shape with actual Bound values:
+
+```json
+{
+  "project": "demo",
+  "goal_id": "tsk_goal_fixture",
+  "task_id": "tsk_task_fixture",
+  "expected_version": 3,
+  "attempt_id": "att_task_fixture",
+  "claim_generation": 1,
+  "native_agent_id": "returned-worker-fixture",
+  "summary": "The output does not meet the retry-safety criterion.",
+  "evidence": ["artifact:failed-retry-test-fixture"],
+  "next_action": "rework",
+  "findings": [
+    {
+      "id": "AC-1",
+      "criterion": "Retrying the same request must not duplicate its effects.",
+      "feedback": "The second request created another record; fix and rerun the retry case."
+    }
+  ]
+}
+```
+
+`findings` contains 1-20 entries with distinct, nonblank IDs (at most 128 UTF-8
+bytes). `criterion` and `feedback` are nonblank and at most 2,048 UTF-8 bytes each.
+Summary and evidence use the existing bounds and must be nonblank.
+The command UUID becomes `native.review.id`; the record preserves findings,
+decision/evidence, parent, time and reviewed attempt. A later `request_changes`
+must carry every outstanding finding ID with the original criterion. It may
+revise feedback and add findings within the bound; its new review ID makes an old
+resolution stale. Earlier reviews remain in command history.
+
+- `rework` preserves the running task and worker binding. After confirmed
+  publication, the parent sends the known worker the review ID, findings and
+  expected evidence through supported same-task messaging, then reassesses the
+  returned correction. Parent-owned work follows the same review gate locally.
+- `hold` atomically moves the task to `recovering` and revokes publication. It
+  proves neither physical stop nor settled effects. Inspect/reconcile before
+  another attempt. For replacement after `rework`, explicitly release, reconcile
+  with `retry`, and claim/start a fresh attempt; never silently rebind the worker.
+- A failed/ambiguous notification is not delivered feedback. Inspect the known
+  worker and current task, resolve uncertain command outcomes using the original
+  envelope, and release/reconcile uncertain execution. Do not launch a duplicate.
+
+An unresolved review appears in `needs_attention` and survives retry, transfer
+and restart. Attention is not a release list: an authorized worker correcting
+its result may continue. After an explicit retry, review findings do not prevent
+readiness; they prevent acceptance. Unrelated eligible work remains independent.
+
+Once the parent has examined corrected evidence, add this field to the normal
+`complete` payload (or source `expand` with disposition `complete`):
+
+```json
+{
+  "review_resolution": {
+    "review_id": "22222222-2222-4222-8222-222222222222",
+    "findings": [
+      {
+        "id": "AC-1",
+        "summary": "Repeated request now returns the same record without a second write.",
+        "evidence": ["artifact:passing-retry-test-fixture"]
+      }
+    ]
+  }
+}
+```
+
+Replace `review_id` with the exact current persisted review ID. Cover every
+finding exactly once, with a nonblank summary and nonempty evidence references;
+missing, duplicate, unknown or stale IDs are rejected atomically. Existing
+`summary`, `evidence`, `parent_acceptance` and current Bound fields are still
+required. Successful completion stores the resolution and marks the review
+accepted. Without an outstanding review, omit `review_resolution`; it is also
+invalid on epic/goal closure or non-completing expansions.
+
+Do not cancel/recreate a wanted task to erase review findings. Legitimate
+cancellation preserves rejection history and is not positive acceptance.
+Tasks with no review retain their existing completion contract. This gate
+enforces recorded finding coverage, not the semantic truth of evidence or
+coverage of criteria that the parent never recorded. No automatic timeout,
+worker restart or independent acceptance verifier is added. A disconnected or
+inactive parent still needs explicit resumption; the durable review makes its
+unfinished decision inspectable.
 
 ## Rejecting a proposal without dispatch
 

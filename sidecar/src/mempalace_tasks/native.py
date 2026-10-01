@@ -15,7 +15,7 @@ from .model import identifier, instant, integer, object_fields, require, text
 
 MODE = "cooperative_native"
 ACTIONS = ("bootstrap", "expand", "update", "claim", "start", "checkpoint", "complete",
-           "release", "reconcile", "resume", "cancel", "goal_close")
+           "request_changes", "release", "reconcile", "resume", "cancel", "goal_close")
 
 
 def _object(properties, required=()):
@@ -42,6 +42,17 @@ def schema():
               "native_agent_id": {"type": ["string", "null"], "minLength": 1}}
     running = {**tokens, "native_agent_id": string}
     outcome = {"summary": string, "evidence": refs, "parent_acceptance": string}
+    finding_id = {**string, "maxLength": 128}
+    findings = {"type": "array", "minItems": 1, "maxItems": 20, "items": _object({
+        "id": finding_id, "criterion": {**string, "maxLength": 2048},
+        "feedback": {**string, "maxLength": 2048},
+    }, ("id", "criterion", "feedback"))}
+    resolution = _object({
+        "review_id": uuid,
+        "findings": {"type": "array", "minItems": 1, "maxItems": 20, "items": _object({
+            "id": finding_id, "summary": {**string, "maxLength": 8192}, "evidence": refs,
+        }, ("id", "summary", "evidence"))},
+    }, ("review_id", "findings"))
     observed = {"reason": string, "observations": refs}
     specs = {
         "bootstrap": _object({
@@ -60,8 +71,12 @@ def schema():
         "start": _object(running, running),
         "checkpoint": _object({**running, "checkpoint_sequence": positive, "reference": string},
                               set(running) | {"checkpoint_sequence", "reference"}),
+        "request_changes": _object({
+            **running, "summary": {**string, "maxLength": 8192}, "evidence": refs,
+            "next_action": {"enum": ["rework", "hold"]}, "findings": findings,
+        }, set(running) | {"summary", "evidence", "next_action", "findings"}),
         "complete": {"oneOf": [
-            _object({**running, **outcome}, set(running) | set(outcome)),
+            _object({**running, **outcome, "review_resolution": resolution}, set(running) | set(outcome)),
             _object({**task, **outcome}, set(task) | set(outcome)),
         ]},
         "release": _object({**tokens, **observed}, set(tokens) | set(observed)),
@@ -80,7 +95,7 @@ def schema():
             "native_agent_id": string,
             "source_disposition": {"enum": ["continue", "yield", "complete"]},
             "checkpoint": _object({"sequence": positive, "reference": string}, ("sequence", "reference")),
-            **observed, **outcome,
+            **observed, **outcome, "review_resolution": resolution,
             "tasks": {"type": "array", "maxItems": 50, "items": _object({
                 **content, "kind": {"enum": ["task", "epic"]}, "intent_key": string,
                 "admitted": {"type": "boolean"}, "reuse_task_id": string, "expected_version": positive,
@@ -162,6 +177,62 @@ def interrupt(task, at, reason, observations):
                         "barrier_satisfied": False, "mode": MODE}
 
 
+def pending_review(task):
+    return task.get("native", {}).get("review", {}).get("status") == "changes_requested"
+
+
+def _findings(value, *, resolved=False):
+    from .domain import _strings
+    require(type(value) is list and 1 <= len(value) <= 20, "Review requires 1-20 findings")
+    fields = {"id", "summary", "evidence"} if resolved else {"id", "criterion", "feedback"}
+    indexed = {}
+    for finding in value:
+        object_fields(finding, fields, fields, "review finding")
+        key = text(finding["id"], "finding id", 128, byte_limit=True)
+        require(key not in indexed, "Finding IDs must be unique")
+        if resolved:
+            text(finding["summary"], "finding summary", 8192, byte_limit=True)
+            _strings(finding["evidence"], "finding evidence", nonempty=True)
+        else:
+            text(finding["criterion"], "finding criterion", 2048, byte_limit=True)
+            text(finding["feedback"], "finding feedback", 2048, byte_limit=True)
+        indexed[key] = finding
+    return indexed
+
+
+def _resolution(review, value):
+    fields = {"review_id", "findings"}
+    object_fields(value, fields, fields, "review resolution")
+    identifier(value["review_id"], "review_id")
+    require(value["review_id"] == review["id"], "Resolution must name the current review")
+    findings = _findings(value["findings"], resolved=True)
+    require(set(findings) == {finding["id"] for finding in review["findings"]},
+            "Resolution must cover every current finding exactly once")
+
+
+def _request_changes(task, command, at):
+    from .domain import _enum, _strings
+    attempt = live_attempt(task, command)
+    require(attempt["status"] == "running", "Review requires running work", "invalid_transition")
+    summary = text(command["summary"], "summary", 8192, byte_limit=True)
+    evidence = _strings(command["evidence"], "evidence", nonempty=True)
+    next_action = _enum(command["next_action"], {"rework", "hold"}, "next_action")
+    findings = _findings(command["findings"])
+    if pending_review(task):
+        require(all(previous["id"] in findings
+                    and findings[previous["id"]]["criterion"] == previous["criterion"]
+                    for previous in task["native"]["review"]["findings"]),
+                "Outstanding finding IDs and criteria must be retained")
+    task["native"]["review"] = {
+        "id": command["command_id"], "status": "changes_requested",
+        "summary": summary, "evidence": evidence, "next_action": next_action,
+        "findings": deepcopy(command["findings"]), "actor": command["session_id"], "at": at,
+        "attempt_id": attempt["id"], "claim_generation": task["claim_generation"],
+    }
+    if next_action == "hold":
+        interrupt(task, at, summary, evidence)
+
+
 def complete_task(state, task, command, at, summary, evidence):
     from .domain import TERMINAL, _wait_reasons
     acceptance = text(command.get("parent_acceptance"), "parent_acceptance", 8192, byte_limit=True)
@@ -170,9 +241,20 @@ def complete_task(state, task, command, at, summary, evidence):
     if task["kind"] == "task":
         attempt = live_attempt(task, command)
         require(attempt["status"] == "running", "Native attempt has not started", "invalid_transition")
+        if pending_review(task):
+            review = task["native"]["review"]
+            _resolution(review, command.get("review_resolution"))
+            review["resolution"] = {
+                **deepcopy(command["review_resolution"]), "actor": command["session_id"], "at": at,
+                "attempt_id": attempt["id"], "claim_generation": task["claim_generation"],
+            }
+            review["status"] = "accepted"
+        else:
+            require("review_resolution" not in command, "No pending review to resolve")
         attempt["status"] = "completed"
         task.pop("assignee", None)
     else:
+        require("review_resolution" not in command, "Epics cannot resolve task reviews")
         require(not {"attempt_id", "claim_generation", "native_agent_id"} & command.keys(),
                 "Epics cannot carry execution tokens")
         require(task["status"] == "open", "Epic is not open", "invalid_transition")
@@ -244,6 +326,7 @@ def execute(state, command, at):
             text(payload.get("parent_acceptance"), "parent_acceptance", 8192, byte_limit=True)
         else:
             require("parent_acceptance" not in payload, "Only completion accepts parent acceptance")
+            require("review_resolution" not in payload, "Only completion accepts review resolution")
         response.update(_expand(state, fields, at, touched, native=True))
     elif action == "goal_close":
         response.update(_close_goal(state, fields, at, touched, native=True))
@@ -322,6 +405,8 @@ def execute(state, command, at):
                 _checkpoint(task, payload["checkpoint_sequence"], payload["reference"], at)
             elif action == "complete":
                 _complete(state, task, fields, at, native=True)
+            elif action == "request_changes":
+                _request_changes(task, fields, at)
             elif action == "release":
                 interrupt(task, at, payload["reason"], payload["observations"])
     return "Native" + action.title().replace("_", ""), touched, response
@@ -333,7 +418,7 @@ def validate_task(state, task):
     native = task["native"]
     object_fields(native, {"session_id", "issuing_session_id", "session_generation",
                            "plan_references", "parent_acceptance",
-                           "transfer", "reconciliation"},
+                           "transfer", "reconciliation", "review"},
                   {"session_id", "issuing_session_id", "session_generation", "plan_references"},
                   "native session")
     identifier(native["session_id"], "session_id")
@@ -418,3 +503,64 @@ def validate_task(state, task):
                 "Native reconciliation is not a physical barrier")
     if task["status"] == "closed":
         text(native.get("parent_acceptance"), "parent_acceptance", 8192, byte_limit=True)
+    if "review" in native:
+        _validate_review(state, task)
+
+
+def _review_provenance(state, task, record):
+    identifier(record["actor"], "review actor")
+    integer(record["claim_generation"], "review claim_generation", 1, task["claim_generation"])
+    attempt_id = text(record["attempt_id"], "review attempt_id")
+    require(attempt_id.startswith("att_"), "Invalid review attempt")
+    identifier(attempt_id[4:], "review attempt UUID")
+    at = instant(record["at"])
+    require(instant(task["created_at"]) <= at <= instant(state.last_event_at),
+            "Invalid review timestamp")
+    attempt = task["attempt"]
+    require(attempt is not None, "Review requires an attempt")
+    if record["claim_generation"] == task["claim_generation"]:
+        require(attempt_id == attempt["id"] and record["actor"] == attempt["owner"]
+                and attempt["native_agent_id"] is not None and attempt["status"] != "preparing"
+                and at >= instant(attempt["started_at"]), "Review attempt mismatch")
+    else:
+        require(attempt_id != attempt["id"] and at <= instant(attempt["started_at"]),
+                "Review predates the current attempt")
+
+
+def _validate_review(state, task):
+    from .domain import _enum, _strings
+    require(task["kind"] == "task", "Only leaf tasks have reviews")
+    review = task["native"]["review"]
+    fields = {"id", "status", "summary", "evidence", "next_action", "findings",
+              "actor", "at", "attempt_id", "claim_generation"}
+    object_fields(review, fields | {"resolution"}, fields, "native review")
+    identifier(review["id"], "review id")
+    _enum(review["status"], {"changes_requested", "accepted"}, "review status")
+    text(review["summary"], "review summary", 8192, byte_limit=True)
+    _strings(review["evidence"], "review evidence", nonempty=True)
+    _enum(review["next_action"], {"rework", "hold"}, "review next_action")
+    _findings(review["findings"])
+    _review_provenance(state, task, review)
+    if review["status"] == "changes_requested":
+        require("resolution" not in review and task["status"] != "closed"
+                and task["attempt"]["status"] != "completed"
+                and task["completion"] is None and "parent_acceptance" not in task["native"],
+                "Pending review cannot carry acceptance")
+        require(review["next_action"] != "hold"
+                or review["claim_generation"] < task["claim_generation"]
+                or task["status"] != "in_progress", "Held review cannot retain a live binding")
+    else:
+        require(task["status"] == "closed" and task["attempt"]["status"] == "completed",
+                "Accepted review requires completed work")
+        resolved = review.get("resolution")
+        fields = {"review_id", "findings", "actor", "at", "attempt_id", "claim_generation"}
+        object_fields(resolved, fields, fields, "accepted review resolution")
+        _resolution(review, {key: resolved[key] for key in ("review_id", "findings")})
+        _review_provenance(state, task, resolved)
+        completion = task["completion"]
+        require(resolved["claim_generation"] == task["claim_generation"]
+                and type(completion) is dict
+                and resolved["actor"] == completion.get("actor")
+                and resolved["at"] == completion.get("at")
+                and instant(review["at"]) <= instant(resolved["at"]),
+                "Resolution must match current parent acceptance")

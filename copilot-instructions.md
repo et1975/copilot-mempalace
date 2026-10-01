@@ -138,6 +138,17 @@ is the sole dispatcher: claim before dispatch, bind the actual returned agent ID
 with start (parent session UUID for parent work), checkpoint, assess acceptance
 and evidence, then complete. Workers wait for confirmed binding before work.
 
+If a bound worker's result fails acceptance, native `request_changes` persists
+criterion-specific findings and explicit `rework` or `hold`. Rework keeps the
+binding; the parent separately delivers feedback and checks that communication.
+Hold revokes publication into recovering without proving physical stop.
+Pending reviews remain visible in `needs_attention` through recovery/transfer.
+Completion, including expand/complete, requires exact current `review_resolution`
+coverage with per-finding evidence; never erase findings by cancelling/recreating
+wanted work. This checks recorded coverage, not semantic truth. Use the deployed
+schema and the task skill's correction contract; no automatic timeout or dispatch
+is implied.
+
 One retained native parent coordinates a goal across repositories. Finding
 repository-relevant tasks is discovery, not consent to transfer the whole goal.
 Use goal-scoped, cursor-complete inspection and task scope/intent; `project` is
