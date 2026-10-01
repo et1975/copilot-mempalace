@@ -156,6 +156,11 @@ prerequisites; they have not been made opt-in. Existing optional-hook and platfo
 skips are not passing tests, and Linux results do not certify native macOS/Windows
 behavior.
 
+Run the real-hub gate when updating the installed MemPalace runtime: protocol
+fixtures alone do not verify its advertised schema. The pinned hub describes
+ascending `order` as a string rather than an enum; replay must still explicitly
+request `asc` and use append-order cursors.
+
 Root configuration disables pytest's repository-local cache and uses `prepend`
 imports to preserve existing bare-module identities. Do not add parallel
 execution: tests share process-global module and environment state.
