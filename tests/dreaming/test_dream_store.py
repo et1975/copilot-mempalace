@@ -77,6 +77,44 @@ def test_native_document_event_roundtrip_and_readonly_reopen(native, monkeypatch
     assert snapshot(palace) == before
 
 
+@pytest.mark.parametrize("topic", [None, "ci-schema"])
+def test_native_topic_routing_preserves_control_documents_readonly(native, topic):
+    palace, log = native
+    event = log.append_event(
+        type="coord.note", stream="coordination", room="updates",
+        from_agent="test", topic=topic, body="Unrelated native coordination event",
+    )
+    store = api().DreamStore(str(palace), call_tool=caller(log))
+    store.publish_document(
+        record(), {"original": "review evidence"}, field="manifest", purpose="manifest",
+    )
+    log.close()
+    before = snapshot(palace)
+
+    reopened = api().DreamStore(str(palace))
+    assert reopened.load_run("run") == {"original": "review evidence"}
+    assert len(reopened.events()) == 1
+    assert snapshot(palace) == before
+    assert event["topic"] == topic
+
+
+@pytest.mark.parametrize("change", ["missing-topic", "unknown-column"])
+def test_unsupported_native_event_columns_fail_without_mutation(native, change):
+    palace, log = native
+    if change == "missing-topic":
+        log._conn().execute("DROP INDEX events_topic_created_idx")
+        log._conn().execute("ALTER TABLE events DROP COLUMN topic")
+    else:
+        log._conn().execute("ALTER TABLE events ADD COLUMN unsupported TEXT")
+    log._conn().commit()
+    log.close()
+    before = snapshot(palace)
+
+    with pytest.raises(api().StoreError, match="unsupported native logstream schema: events"):
+        api().DreamStore(str(palace)).events()
+    assert snapshot(palace) == before
+
+
 def test_healthy_empty_native_namespace_is_empty_without_bootstrap(native):
     palace, log = native
     log.close()

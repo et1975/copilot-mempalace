@@ -34,7 +34,7 @@ RECORD_TYPES = frozenset({
 _SHA = re.compile(r"^[0-9a-f]{64}$")
 _SCHEMA = {
     "events": {
-        "id", "type", "stream", "room", "from_agent", "to_agent", "correlation_id",
+        "id", "type", "stream", "room", "topic", "from_agent", "to_agent", "correlation_id",
         "branch", "base_commit", "status", "body", "created_at", "metadata_json",
         "origin_replica", "origin_seq", "hlc",
     },

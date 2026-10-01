@@ -45,6 +45,12 @@ It additionally requires preinstalled `uv` on PATH and the sidecar's
 `setuptools>=68`, plus `wheel` if the chosen backend requires it. These are
 development/build prerequisites, not runtime dependencies.
 
+Dreaming's read-only logstream reader targets that pinned native schema,
+including `events.topic`. Local validation must use the same MemPalace source
+pin, not an older installation exposed through `PYTHONPATH` or a `.pth` file.
+Check the environment's `mempalace-*.dist-info/direct_url.json` against the
+source URL and archive hash in `requirements-ci-source.txt`.
+
 [`test_distribution.py`](test_distribution.py) is part of the default root
 suite. It builds a real wheel and source distribution, then rebuilds a wheel
 from that source distribution, offline in external temporary storage. The
