@@ -1,9 +1,9 @@
 """mempalace integration adapter for the dreaming pipeline.
 
 All mempalace imports are isolated here so ``dream_lib`` (and its tests) stay
-dependency-free. Reads go through ``mempalace.palace.get_collection``; writes go
-through the sanctioned MCP tool handlers in ``mempalace.mcp_server.TOOLS`` — the
-same code path the MCP server uses.
+dependency-free. Vector writes use the sanctioned local transport, either the
+active native HTTP owner or embedded MCP handlers with native preflight.
+Dreaming maintenance documents live in native artifacts/events, not sidecars.
 
 The target palace is selected via the ``MEMPALACE_PALACE_PATH`` environment
 variable, which mempalace's config layer reads. Call ``bind_palace(path)``
@@ -1040,8 +1040,16 @@ def _palace_embed(palace_path: str, texts: list[str]) -> list[list[float]]:
     if not texts:
         return []
     from mempalace.palace import get_collection  # lazy: heavy import
+    from mempalace.backends.embedding_wrapper import EmbeddingCollection
 
-    embed_fn = _resolve_embed_fn(get_collection(palace_path))
+    collection = get_collection(palace_path, create=False, read_only=True)
+    if isinstance(collection, EmbeddingCollection):
+        # Explicit-vector backends use the configured native embedder rather
+        # than exposing Chroma's collection-bound embedding-function property.
+        from mempalace.embedding import get_embedding_function
+        embed_fn = get_embedding_function()
+    else:
+        embed_fn = _resolve_embed_fn(collection)
     return [[float(value) for value in vector] for vector in embed_fn(list(texts))]
 
 
@@ -1051,7 +1059,7 @@ def load_logical_drawers(
     """Read drawers (optionally scoped) and return logical drawers with mean embeddings."""
     from mempalace.palace import get_collection  # lazy: heavy import
 
-    col = get_collection(palace_path)
+    col = get_collection(palace_path, create=False, read_only=True)
     kwargs: dict[str, Any] = {"include": ["documents", "metadatas", "embeddings"]}
     where = _where(wing, room)
     if where:
@@ -1129,7 +1137,7 @@ def find_duplicate_clusters(
         raise ValueError("max_clusters must be a positive integer")
     server = _embedded_mcp_server(palace_path)
     from mempalace.palace import get_collection
-    from dream_metadata import is_procedural_record
+    from dream_metadata import is_control_record, is_procedural_record
 
     # Native discovery's raw two-key where is not valid for every backend.
     native_room = None if wing else room
@@ -1181,7 +1189,7 @@ def find_duplicate_clusters(
                       for r in rows if r["id"] in drawer["member_ids"]}
             if len(scopes) != 1:
                 raise RuntimeError(f"native duplicate chunks span scopes: {did}")
-            if (not is_procedural_record(drawer)
+            if (not is_procedural_record(drawer) and not is_control_record(drawer)
                     and not excluded.intersection([did, *drawer["member_ids"]])
                     and (room is None or drawer["room"] == room)):
                 members[did] = drawer
@@ -1965,14 +1973,23 @@ def kg_protection_degree(palace_path: str) -> dict[str, int]:
         con.close()
 
 
-class MempalaceWriter:
-    """Writes through the sanctioned MCP tool handlers against the bound palace."""
+class DrawerWriteUncertain(RuntimeError):
+    """A sanctioned write lacks an exact receipt; another writer must not retry."""
 
-    def __init__(self, palace_path: str | None = None) -> None:
+    uncertain = True
+
+
+class MempalaceWriter:
+    """Write through the sanctioned local owner and verify exact drawer receipts."""
+
+    def __init__(self, palace_path: str | None = None, *, call_tool=None) -> None:
         mcp_server = _embedded_mcp_server(palace_path)
         self._server = mcp_server
         self._tools = mcp_server.TOOLS
         self.palace_path = os.path.realpath(os.path.expanduser(mcp_server._config.palace_path))
+        if call_tool is None:
+            from dream_transport import call_tool
+        self._call_tool = call_tool
 
     @contextmanager
     def mutation(self, tool_name: str = "mempalace_add_drawer") -> Iterator[None]:
@@ -1980,6 +1997,12 @@ class MempalaceWriter:
         server = self._server
         if os.path.realpath(os.path.expanduser(server._config.palace_path)) != self.palace_path:
             raise RuntimeError("MCP palace binding changed after writer construction")
+        if getattr(self, "_call_tool", None) is not None:
+            # The transport owns native preflight/lease acquisition for the
+            # selected embedded or active-hub route. Never acquire a competing
+            # embedded vector lease before discovering that route.
+            yield
+            return
         already_owned = server._MCP_WRITER_LOCK_CM is not None
         try:
             refusal = server._mcp_tool_preflight_refusal(None, tool_name)
@@ -1998,6 +2021,31 @@ class MempalaceWriter:
         added_by: str = "dreaming",
         metadata: dict[str, Any] | None = None,
     ) -> Any:
+        transport = getattr(self, "_call_tool", None)
+        if transport is not None:
+            kwargs = {"wing": wing, "room": room, "content": content, "added_by": added_by}
+            if metadata:
+                trailer = json.dumps(metadata, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                kwargs["content"] = f"{content}\n\n<!--dreaming-meta: {trailer}-->"
+            with self.mutation():
+                result = transport(self.palace_path, "mempalace_add_drawer", kwargs, vector=True)
+                if not isinstance(result, dict):
+                    raise DrawerWriteUncertain("add_drawer returned no verifiable receipt")
+                if result.get("success") is False or result.get("error"):
+                    raise RuntimeError(f"add_drawer failed: {result.get('error', result)}")
+                drawer_id = result.get("drawer_id")
+                if not isinstance(drawer_id, str) or not drawer_id:
+                    raise DrawerWriteUncertain("add_drawer returned no verifiable receipt")
+                try:
+                    receipt = transport(self.palace_path, "mempalace_get_drawer",
+                                        {"drawer_id": drawer_id}, vector=True)
+                except Exception as error:
+                    raise DrawerWriteUncertain("add_drawer receipt readback failed") from error
+                if (not isinstance(receipt, dict) or receipt.get("drawer_id") != drawer_id
+                        or receipt.get("content") != kwargs["content"]
+                        or receipt.get("wing") != wing or receipt.get("room") != room):
+                    raise DrawerWriteUncertain(f"add_drawer exact readback failed: {drawer_id}")
+                return result
         handler = self._tools["mempalace_add_drawer"]["handler"]
         kwargs: dict[str, Any] = {"wing": wing, "room": room, "content": content, "added_by": added_by}
         if metadata:
@@ -2028,10 +2076,14 @@ class MempalaceWriter:
             col = protection_collection(self.palace_path)
             if drawer_id in live_protected_drawer_ids(self.palace_path, collection=col):
                 raise ValueError("procedural evidence/event drawer is protected")
-            result = self._tools["mempalace_delete_drawer"]["handler"](drawer_id=drawer_id)
+            transport = getattr(self, "_call_tool", None)
+            result = (transport(self.palace_path, "mempalace_delete_drawer",
+                                {"drawer_id": drawer_id}, vector=True) if transport is not None
+                      else self._tools["mempalace_delete_drawer"]["handler"](drawer_id=drawer_id))
             if isinstance(result, dict) and result.get("success") is False:
                 raise RuntimeError(f"delete_drawer failed: {result.get('error', result)}")
-            if load_source_drawer(self.palace_path, drawer_id, collection=col) is not None:
+            readback = protection_collection(self.palace_path) if transport is not None else col
+            if load_source_drawer(self.palace_path, drawer_id, collection=readback) is not None:
                 raise RuntimeError(f"delete_drawer readback failed: {drawer_id}")
             return result
 
@@ -2051,9 +2103,10 @@ class MempalaceTunneler:
 
 
 class Archiver:
-    """Archive-before-delete guarantees reversibility.
+    """Retain and verify complete native archives before each sanctioned delete.
 
-    Deletes go through the sanctioned handler so the closet/AAAK index is purged.
+    Optional JSONL is only an export. Per-member starts/outcomes permit recovery
+    without a vanished export or an unsafe retry of an outstanding request.
     """
 
     def __init__(
@@ -2064,10 +2117,8 @@ class Archiver:
         collection: Any | None = None,
     ) -> None:
         self.palace_path = os.path.abspath(os.path.expanduser(palace_path))
-        if archive_path is None:
-            archive_path = os.path.join(self.palace_path, "dream-archive.jsonl")
-        self.archive_path = os.path.abspath(os.path.expanduser(archive_path))
-        self._writer = writer if writer is not None else MempalaceWriter()
+        self.archive_path = os.path.abspath(os.path.expanduser(archive_path)) if archive_path else None
+        self._writer = writer if writer is not None else MempalaceWriter(self.palace_path)
         self._collection = collection
 
     def _get_collection(self) -> Any:
@@ -2095,59 +2146,192 @@ class Archiver:
             return self._archive_then_delete_locked(record)
 
     def _archive_then_delete_locked(self, record: dict[str, Any]) -> dict[str, Any]:
+        from dream_metadata import is_control_record
         from dream_procedural_palace import live_protected_drawer_ids
+        from dream_store import DreamStore
+        from dream_transport import NotDispatchedError
 
         member_ids = list(record.get("member_ids") or [record["id"]])
+        if (not member_ids or len(set(member_ids)) != len(member_ids)
+                or any(not isinstance(value, str) or not value for value in member_ids)):
+            raise ValueError("archive requires unique nonempty physical member IDs")
         protected = live_protected_drawer_ids(self.palace_path, collection=self._get_collection())
         if protected.intersection(member_ids + [record["id"]]):
             raise ValueError("procedural evidence/event drawer is protected")
-        rows = self._reload_rows(member_ids)
-        archive_record = {
-            "schema": 1,
-            "id": record["id"],
-            "member_ids": member_ids,
-            "wing": record.get("wing"),
-            "room": record.get("room"),
-            "salience": record.get("salience"),
-            "reason": record.get("reason", "prune"),
-            "archived_at": datetime.now(timezone.utc).isoformat(),
-            "rows": [
-                {
-                    "id": row["id"],
-                    "document": row.get("text", ""),
-                    "metadata": row.get("metadata") or {},
-                    "embedding": row.get("embedding") or [],
-                }
-                for row in rows
-            ],
-        }
+        request = {key: record.get(key) for key in ("id", "wing", "room", "salience")}
+        request.update(member_ids=member_ids, reason=record.get("reason", "prune"))
+        request_hash = _maintenance_hash(request)
+        store = DreamStore(self.palace_path)
+        events = store.events()
+        previous = [event for event in events if event["record_type"] == "archive"
+                    and event.get("request_hash") == request_hash]
+        if previous:
+            publication = previous[-1]
+            archive_record = store.get_document(publication["document"])
+            _validate_archive_record(archive_record)
+        else:
+            rows = self._reload_rows(member_ids)
+            if any(is_control_record(row) for row in rows):
+                raise ValueError("internal control records are protected from archival maintenance")
+            archive_record = {
+                "schema": 1,
+                "id": record["id"],
+                "member_ids": member_ids,
+                "wing": record.get("wing"),
+                "room": record.get("room"),
+                "salience": record.get("salience"),
+                "reason": record.get("reason", "prune"),
+                "archived_at": datetime.now(timezone.utc).isoformat(),
+                "rows": [_archive_row(row) for row in rows],
+            }
+            _validate_archive_record(archive_record)
+            publication = _publish_maintenance_document(
+                store, "archive", archive_record, fields={"request_hash": request_hash})
 
-        parent = os.path.dirname(self.archive_path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-
-        with open(self.archive_path, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(archive_record, ensure_ascii=False))
-            fh.write("\n")
-            fh.flush()
-            os.fsync(fh.fileno())
+        archive_id = publication["operation_id"]
+        if self.archive_path and not previous:
+            _append_jsonl_export(self.archive_path, [archive_record])
 
         deleted = []
         for drawer_id in member_ids:
+            attempts = [event for event in store.events()
+                        if event.get("archive_id") == archive_id and event.get("member_id") == drawer_id]
+            settled = {event["attempt_id"]: event for event in attempts
+                       if event["record_type"] == "archive_delete_settled"
+                       and event.get("outcome") in {"deleted", "not_dispatched"}}
+            outstanding = [event for event in attempts if event["record_type"] == "archive_delete_started"
+                           and event["operation_id"] not in settled]
+            current = _rows_from_collection_result(self._get_collection().get(
+                ids=[drawer_id], include=["documents", "metadatas", "embeddings"]))
+            if any(event.get("outcome") == "deleted" for event in settled.values()):
+                if current:
+                    raise ValueError(f"archived member reappeared after deletion: {drawer_id}")
+                deleted.append(drawer_id)
+                continue
+            if outstanding:
+                if current:
+                    raise RuntimeError(f"unsettled archive deletion requires reconciliation: {drawer_id}")
+                _publish_maintenance_record(store, "archive_delete_settled", {
+                    "archive_id": archive_id, "member_id": drawer_id,
+                    "attempt_id": outstanding[-1]["operation_id"], "outcome": "deleted"})
+                deleted.append(drawer_id)
+                continue
+            expected = next(row for row in archive_record["rows"] if row["id"] == drawer_id)
+            if len(current) != 1 or _archive_row(current[0]) != expected:
+                raise ValueError(f"archive member missing or changed before deletion: {drawer_id}")
+            start = _publish_maintenance_record(store, "archive_delete_started", {
+                "archive_id": archive_id, "member_id": drawer_id,
+                "attempt": len(settled) + 1})
             try:
                 result = self._writer.delete_drawer(drawer_id)
                 if isinstance(result, dict) and result.get("success") is False:
                     raise RuntimeError(f"delete failed: {result}")
             except Exception as ex:
+                # Unchanged data is not proof of no dispatch. Only native
+                # pre-dispatch evidence permits another deletion attempt.
+                if isinstance(ex, NotDispatchedError):
+                    after = _rows_from_collection_result(self._get_collection().get(
+                        ids=[drawer_id], include=["documents", "metadatas", "embeddings"]))
+                    if len(after) == 1 and _archive_row(after[0]) == expected:
+                        _publish_maintenance_record(store, "archive_delete_settled", {
+                            "archive_id": archive_id, "member_id": drawer_id,
+                            "attempt_id": start["operation_id"],
+                            "outcome": "not_dispatched"})
                 ex.args = (*ex.args, {"deleted": deleted.copy(), "failed": drawer_id})
                 raise
             else:
+                if self._get_collection().get(ids=[drawer_id], include=["metadatas"])["ids"]:
+                    raise RuntimeError(f"delete readback failed: {drawer_id}")
+                _publish_maintenance_record(store, "archive_delete_settled", {
+                    "archive_id": archive_id, "member_id": drawer_id,
+                    "attempt_id": start["operation_id"], "outcome": "deleted"})
                 deleted.append(drawer_id)
         remaining = _rows_from_collection_result(self._get_collection().get(
             ids=member_ids, include=["metadatas"]))
         if remaining:
             raise RuntimeError(f"delete readback failed: {[r['id'] for r in remaining]}")
         return {"archived": record["id"], "deleted": deleted}
+
+
+def _maintenance_hash(value: Any) -> str:
+    return hashlib.sha256(json.dumps(
+        value, sort_keys=True, ensure_ascii=False, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")).hexdigest()
+
+
+def _publish_maintenance_record(store, record_type: str, fields: dict) -> dict:
+    record = {"schema_version": 1, "record_type": record_type, **fields}
+    record["operation_id"] = _maintenance_hash(record)
+    old = next((item for item in store.events() if item["operation_id"] == record["operation_id"]), None)
+    if old is None:
+        store.publish(record, artifacts=[])
+    published = next((item for item in store.events()
+                      if item["operation_id"] == record["operation_id"]), None)
+    if published is None or any(published.get(key) != value for key, value in record.items()):
+        raise RuntimeError("native maintenance publication readback failed")
+    return published
+
+
+def _publish_maintenance_document(store, record_type: str, document: dict, *, fields=None) -> dict:
+    semantic = {"schema_version": 1, "record_type": record_type,
+                "document_hash": _maintenance_hash(document), **(fields or {})}
+    operation_id = _maintenance_hash(semantic)
+    old = next((item for item in store.events() if item["operation_id"] == operation_id), None)
+    if old is None:
+        reference = store.put_document(document, purpose=record_type)
+        store.publish({**semantic, "operation_id": operation_id, "document": reference},
+                      artifacts=[reference])
+    published = next((item for item in store.events() if item["operation_id"] == operation_id), None)
+    if (published is None or any(published.get(key) != value for key, value in semantic.items())
+            or store.get_document(published["document"]) != document):
+        raise RuntimeError("native maintenance document readback failed")
+    return published
+
+
+def _archive_row(row: dict) -> dict:
+    return {"id": row["id"], "document": row.get("text", ""),
+            "metadata": row.get("metadata") or {}, "embedding": row.get("embedding") or []}
+
+
+def _validate_archive_record(record: dict) -> None:
+    if not isinstance(record, dict) or record.get("schema") != 1:
+        raise ValueError("unsupported archive schema")
+    ids, rows = record.get("member_ids"), record.get("rows")
+    if (not isinstance(record.get("id"), str) or not record["id"]
+            or not isinstance(ids, list) or not ids
+            or any(not isinstance(value, str) or not value for value in ids)
+            or len(set(ids)) != len(ids) or not isinstance(rows, list)
+            or len(rows) != len(ids) or any(not isinstance(row, dict) for row in rows)
+            or {row.get("id") for row in rows} != set(ids)):
+        raise ValueError("archive does not contain every exact physical member")
+    for row in rows:
+        if (not isinstance(row.get("document"), str) or not isinstance(row.get("metadata"), dict)
+                or not isinstance(row.get("embedding"), list)
+                or any(isinstance(x, bool) or not isinstance(x, (int, float))
+                       or not math.isfinite(x) for x in row["embedding"])):
+            raise ValueError("archive physical record is malformed")
+
+
+def _append_jsonl_export(path: str, records: list[dict]) -> None:
+    parent = os.path.dirname(os.path.abspath(path))
+    os.makedirs(parent, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as handle:
+        for record in records:
+            handle.write(json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def retain_archive_records(palace: str, records: list[dict]) -> None:
+    """Explicitly import legacy archives without deleting or modifying originals."""
+    from dream_store import DreamStore
+
+    for record in records:
+        _validate_archive_record(record)
+    with palace_mutation_lock(palace):
+        store = DreamStore(palace)
+        for record in records:
+            _publish_maintenance_document(store, "archive", record, fields={"legacy_import": True})
 
 
 class KgWriter:
@@ -2267,8 +2451,11 @@ class KgWriter:
 
 load_active_triples_with_ids = load_active_triples  # alias: proofs need t.id (already returned)
 
-def load_ontology_config(path):
-    if not path or not os.path.exists(path):
+def load_ontology_config(path=None, *, palace=None):
+    if not path:
+        from dream_ontology import read_ontology_doc
+        return read_ontology_doc(palace=palace)["rules"] if palace else []
+    if not os.path.exists(path):
         return []
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -2278,8 +2465,15 @@ def load_ontology_config(path):
         return list(data)
     return []
 
-def load_skip_markers(path):
-    if not path or not os.path.exists(path):
+def load_skip_markers(path=None, *, palace=None):
+    if not path:
+        if not palace:
+            return []
+        from dream_store import DreamStore
+        store = DreamStore(palace)
+        return [store.get_document(event["document"])
+                for event in store.events() if event["record_type"] == "derive_skip"]
+    if not os.path.exists(path):
         return []
     out = []
     with open(path, "r", encoding="utf-8") as f:
@@ -2289,13 +2483,20 @@ def load_skip_markers(path):
                 out.append(json.loads(line))
     return out
 
-def append_skip_markers(path, markers):
+def append_skip_markers(path, markers, *, palace=None):
     if not markers:
         return
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    with open(path, "a", encoding="utf-8") as f:
-        for m in markers:
-            f.write(json.dumps(m, separators=(",", ":")) + "\n")
+    if not palace:
+        raise ValueError("derive skip persistence requires an explicit palace")
+    from dream_store import DreamStore
+    with palace_mutation_lock(palace):
+        store = DreamStore(palace)
+        for marker in markers:
+            if not isinstance(marker, dict):
+                raise ValueError("derive skip marker must be an object")
+            _publish_maintenance_document(store, "derive_skip", marker)
+        if path:
+            _append_jsonl_export(path, markers)
 
 
 def _normalize_dt_for_kg(value):

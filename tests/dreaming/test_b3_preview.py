@@ -11,6 +11,9 @@ import unittest
 
 import dream_contemplate
 import dream_palace
+import dream_ontology
+from test_dream_maintenance_state import initialize_logstream
+from test_dream_procedural_palace import installed_palace
 
 
 def _test_tmpdir():
@@ -48,9 +51,10 @@ class B3PreviewAndDisableTests(unittest.TestCase):
 
     def _write_ontology(self, palace: str, rules: list[dict] | None = None) -> str:
         rules_path = self._rules_path(palace)
-        with open(rules_path, "w", encoding="utf-8") as fh:
-            json.dump({"version": 1, "rules": list(rules or [])}, fh)
-            fh.write("\n")
+        with installed_palace(palace):
+            initialize_logstream(palace)
+            dream_ontology.write_ontology_doc(
+                None, {"version": 1, "rules": list(rules or [])}, palace=palace)
         return rules_path
 
     def _add_durable_triple(self, palace: str, subject: str, predicate: str, object_: str) -> str:
@@ -165,7 +169,7 @@ class B3PreviewAndDisableTests(unittest.TestCase):
     # Disable
     # ------------------------------------------------------------------
     def _enabled_ids(self, palace: str) -> list[str]:
-        rules = dream_palace.load_ontology_config(self._rules_path(palace))
+        rules = dream_palace.load_ontology_config(palace=palace)
         return [str(r.get("id")) for r in rules if bool(r.get("enabled", False))]
 
     def test_disable_rules_flips_enabled_false(self):

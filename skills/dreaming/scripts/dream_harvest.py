@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""dream_harvest — phase 1 of the dreaming pipeline (READ-ONLY).
+"""dream_harvest — freeze an incremental run, or generate an explicit preview.
 
-By default, exports all unreviewed sessions and original wing memories in a
-frozen incremental window to ``worklist.json``. Explicit tasks retain their legacy
-meaning, including drawer-cluster reflection without --source. Writes nothing
-to the palace for reflection. The agent then fills each item's ``decision`` in
-an ``adjudicate`` phase to produce ``decisions.json`` for ``dream_adopt.py``.
+By default, saves all unreviewed sessions and original memories across wings in
+a native immutable run. Optional exports are working copies, not authority.
+Explicit tasks retain their legacy meaning, including drawer-cluster reflection
+without --source. Harvest never adopts lessons; explicit ontology suggestion
+tasks save disabled candidates. Review is saved by run ID before adoption.
 
 Usage:
     "$MPY" "$DREAM_SCRIPTS/dream_harvest.py" --palace ~/.mempalace/palace \\
@@ -28,7 +28,7 @@ import sys
 
 import dream_ontology
 import dream_palace
-from dream_metadata import is_generated_observation
+from dream_metadata import is_generated_observation, is_control_record
 from dream_procedural_palace import exclude_protected_drawers, live_protected_drawer_ids
 from dream_lib import (
     WORKLIST_VERSION,
@@ -68,7 +68,7 @@ def _default_palace() -> str | None:
 
 
 def _is_surfaced_lesson(entry: dict) -> bool:
-    return is_generated_observation(entry)
+    return is_generated_observation(entry) or is_control_record(entry)
 
 
 def _stamp_merge_hashes(worklist: dict) -> None:
@@ -94,6 +94,7 @@ def _degree_for(drawer: dict, degrees: dict[str, int]) -> int:
 def score_prune_drawers(drawers: list[dict], degrees: dict[str, int],
                         usage: dict[str, dict]) -> list[dict]:
     """Score the current scoped population, including topic-retention context."""
+    drawers = [drawer for drawer in drawers if not is_control_record(drawer)]
     redundancy = compute_redundancy(drawers)
     now = datetime.now()
     scored = []
@@ -154,7 +155,9 @@ def main(argv: list[str] | None = None) -> int:
         "merge", "contradiction", "pattern", "prune", "derive", "gaps", "suggest-rules", "induce-rules", "reflect"
     ], default=None,
                     help="Explicit preview/maintenance task (default: incremental sessions and original memories)")
-    ap.add_argument("--wing", help="Required memory wing for incremental review; drawer scope for explicit tasks")
+    memory_scope = ap.add_mutually_exclusive_group()
+    memory_scope.add_argument("--wing", help="Optional exact memory wing; sessions are unaffected")
+    memory_scope.add_argument("--wings", help="Optional comma-separated exact memory wings (default all)")
     ap.add_argument("--room", help="Drawer room scope for explicit tasks, not incremental review")
     ap.add_argument("--tau", type=float,
                     help="Cosine-similarity threshold; defaults to 0.9 for merge and 0.75 for pattern")
@@ -182,11 +185,11 @@ def main(argv: list[str] | None = None) -> int:
                     help="Explicit preview session cap; no default cap and not allowed for incremental review")
     ap.add_argument("--instructions", help="Optional steering note recorded in the worklist")
     ap.add_argument("--rules", default=None,
-                    help="Path to ontology config (default: <palace>/ontology.json)")
+                    help="Explicit legacy ontology input (default: native palace configuration)")
     ap.add_argument("--ontology-out", default=None,
-                    help="Path to ontology output for rule suggestion/induction (default: <palace>/ontology.json)")
+                    help="Optional ontology JSON export for rule suggestion/induction; imports use --rules")
     ap.add_argument("--skips", default=None,
-                    help="Path to skip-markers file (default: <palace>/dream-derive-skips.jsonl)")
+                    help="Explicit legacy skip-markers input (default: native palace markers)")
     ap.add_argument("--max-depth", type=int, default=3,
                     help="Maximum derivation depth for derive (default 3)")
     ap.add_argument("--max-iterations", type=int, default=10,
@@ -195,7 +198,7 @@ def main(argv: list[str] | None = None) -> int:
                     help="Explicit task candidate cap (default 500); not an incremental input limit")
     ap.add_argument("--target-subject", default=None,
                     help="Restrict gaps (--task gaps) to conclusions about this subject (entity id or display name)")
-    ap.add_argument("--out", default="worklist.json", help="Output worklist path (default worklist.json)")
+    ap.add_argument("--out", default=None, help="Optional native-run export; explicit previews default to worklist.json")
     args = ap.parse_args(argv)
 
     effective_palace = args.palace or _default_palace()
@@ -206,22 +209,32 @@ def main(argv: list[str] | None = None) -> int:
 
     implicit = args.task is None
     if implicit:
-        if not (args.repository or "").strip() or not (args.wing or "").strip():
-            ap.error("incremental dreaming requires explicit nonblank --repository and --wing")
         if any(value is not None for value in (
                 args.source, args.since, args.limit_sessions, args.max_candidates, args.room,
                 args.rooms, args.tau, args.min_support)):
             ap.error("partial source/since/limit/room options require an explicit --task reflect preview")
         import dream_incremental
+        wings = args.wings.split(",") if args.wings is not None else None
+        try:
+            dream_incremental.normalize_scope(args.repository, args.wing, wings=wings)
+        except ValueError as exc:
+            ap.error(str(exc))
         try:
             path = dream_palace.bind_palace(effective_palace)
-            worklist = dream_incremental.harvest(path, args.repository, args.wing, args.instructions)
+            worklist = dream_incremental.harvest(
+                path, args.repository, args.wing, args.instructions, wings=wings)
         except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
             print(f"error: incremental harvest failed: {exc}", file=sys.stderr)
             return 2
-        with open(args.out, "w", encoding="utf-8") as fh:
-            json.dump(worklist, fh, indent=2, ensure_ascii=False)
+        if args.out:
+            with open(args.out, "w", encoding="utf-8") as fh:
+                json.dump(worklist, fh, indent=2, ensure_ascii=False)
+        print(json.dumps({"run_id": worklist["incremental"]["run_id"],
+                          "review_required": len(worklist["coverage"])}))
         return 0
+    if args.wings is not None:
+        ap.error("--wings is only supported for incremental review; use --wing for explicit previews")
+    args.out = args.out or "worklist.json"
     raw_sessions = args.source in ("sessions", "both")
     if args.source and args.task not in ("reflect", "pattern"):
         ap.error("--source is only supported for reflect or pattern")
@@ -282,20 +295,21 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.task == "suggest-rules":
-        ontology_out = args.ontology_out or os.path.join(path, "ontology.json")
+        ontology_out = args.ontology_out
         triples = dream_palace.load_premises(path, purpose="audit")
         predicates = sorted({
             triple.get("predicate") for triple in triples
             if isinstance(triple.get("predicate"), str) and triple.get("predicate")
         })
         cands = dream_ontology.suggest_rules_from_predicates(predicates)
-        existing = dream_ontology.read_ontology_doc(ontology_out)
-        merged, stats = dream_ontology.merge_ontology_candidates(existing.get("rules", []), cands)
-        doc = dream_ontology.build_ontology_doc(merged, existing.get("version", 1))
-        dream_ontology.write_ontology_doc(ontology_out, doc)
+        with dream_palace.palace_mutation_lock(path):
+            existing = dream_ontology.read_ontology_doc(args.rules, palace=path)
+            merged, stats = dream_ontology.merge_ontology_candidates(existing.get("rules", []), cands)
+            doc = dream_ontology.build_ontology_doc(merged, existing.get("version", 1))
+            dream_ontology.write_ontology_doc(ontology_out, doc, palace=path)
         print(
             f"suggest-rules: proposed {len(cands)} candidate(s), added {stats['added']} "
-            f"(skipped {stats['skipped_existing']} existing) -> {ontology_out}",
+            f"(skipped {stats['skipped_existing']} existing) -> {ontology_out or 'native palace state'}",
             file=sys.stderr,
         )
         print(
@@ -305,18 +319,19 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.task == "induce-rules":
-        ontology_out = args.ontology_out or os.path.join(path, "ontology.json")
+        ontology_out = args.ontology_out
         triples = dream_palace.load_premises(path, purpose="audit")
-        existing = dream_ontology.read_ontology_doc(ontology_out)
-        base = dream_ontology.filter_base_triples(triples, existing.get("rules", []))
         min_support = args.min_support if args.min_support is not None else 2
-        cands = dream_ontology.induce_rules_from_triples(base, min_support=min_support)
-        merged, stats = dream_ontology.merge_ontology_candidates(existing.get("rules", []), cands)
-        doc = dream_ontology.build_ontology_doc(merged, existing.get("version", 1))
-        dream_ontology.write_ontology_doc(ontology_out, doc)
+        with dream_palace.palace_mutation_lock(path):
+            existing = dream_ontology.read_ontology_doc(args.rules, palace=path)
+            base = dream_ontology.filter_base_triples(triples, existing.get("rules", []))
+            cands = dream_ontology.induce_rules_from_triples(base, min_support=min_support)
+            merged, stats = dream_ontology.merge_ontology_candidates(existing.get("rules", []), cands)
+            doc = dream_ontology.build_ontology_doc(merged, existing.get("version", 1))
+            dream_ontology.write_ontology_doc(ontology_out, doc, palace=path)
         print(
             f"induce-rules: min_support={min_support} proposed {len(cands)} candidate(s), "
-            f"added {stats['added']} (skipped {stats['skipped_existing']} existing) -> {ontology_out}",
+            f"added {stats['added']} (skipped {stats['skipped_existing']} existing) -> {ontology_out or 'native palace state'}",
             file=sys.stderr,
         )
         print(
@@ -326,15 +341,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.task == "derive":
-        rules_path = args.rules or os.path.join(path, "ontology.json")
-        skips_path = args.skips or os.path.join(path, "dream-derive-skips.jsonl")
-        rules = dream_palace.load_ontology_config(rules_path)
+        rules_path = args.rules
+        skips_path = args.skips
+        rules = dream_palace.load_ontology_config(rules_path, palace=path)
         onto_ver = ontology_version(rules)
         triples = dream_palace.load_premises(path, purpose="durable")
         candidates = deductive_closure(
             triples, rules, max_depth=args.max_depth,
             max_iterations=args.max_iterations, max_candidates=args.max_candidates)
-        skips = dream_palace.load_skip_markers(skips_path)
+        skips = dream_palace.load_skip_markers(skips_path, palace=path)
         candidates = filter_skipped(candidates, skips, onto_ver)
         for c in candidates:
             c["ontology_version"] = onto_ver
@@ -348,8 +363,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.task == "gaps":
-        rules_path = args.rules or os.path.join(path, "ontology.json")
-        rules = dream_palace.load_ontology_config(rules_path)
+        rules_path = args.rules
+        rules = dream_palace.load_ontology_config(rules_path, palace=path)
         onto_ver = ontology_version(rules)
         triples = dream_palace.load_premises(path, purpose="durable")
         gaps = find_transitive_gaps(

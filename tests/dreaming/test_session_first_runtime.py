@@ -125,12 +125,12 @@ def test_survey_forwards_scope_bounds_and_steering(session_store, tmp_path):
 
 
 @pytest.mark.parametrize("main", [dh.main, ds.main])
-@pytest.mark.parametrize("repository", [[], ["--repository", ""], ["--repository", "  "]])
-def test_implicit_session_scan_requires_nonblank_repository(main, repository, tmp_path, capsys):
+@pytest.mark.parametrize("repository", [["--repository", ""], ["--repository", "  "]])
+def test_supplied_repository_filter_must_be_nonblank(main, repository, tmp_path, capsys):
     with pytest.raises(SystemExit) as error:
         main(["--palace", str(tmp_path), "--out", str(tmp_path / "unexpected.json"), *repository])
     assert error.value.code == 2
-    assert "--repository" in capsys.readouterr().err
+    assert "repository" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("main", [dh.main, ds.main])
@@ -144,7 +144,7 @@ def test_invalid_bounds_fail_before_reading_sources(main, flag, value, tmp_path)
 
 
 @pytest.mark.parametrize("options", [
-    ["--wings", "first,second"],
+    ["--wings", "first,"],
     ["--tasks", "reflect,pattern", "--source", "sessions"],
     ["--tasks", "merge", "--source", "sessions"],
     ["--source", "diary", "--repository", "owner/project"],

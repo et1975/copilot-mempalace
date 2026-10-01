@@ -9,6 +9,8 @@ import tempfile
 import unittest
 
 import dream_restore
+from test_dream_procedural_palace import installed_palace
+from test_dream_maintenance_state import initialize_logstream
 
 
 def _test_tmpdir():
@@ -129,6 +131,27 @@ class TestRecordToContent(unittest.TestCase):
             "logical-1 second\nlogical-1 first",
         )
 
+    def test_native_contiguous_chunks_restore_without_inventing_newlines(self):
+        record = _record("logical")
+        for row in record["rows"]:
+            index = row["metadata"]["chunk_index"]
+            row["id"] = f"logical_chunk_{index:06d}"
+            row["metadata"].update(id_recipe="v3", parent_drawer_id="logical", added_by="dreaming")
+        record["member_ids"] = ["logical_chunk_000000", "logical_chunk_000001"]
+        self.assertEqual(dream_restore.record_to_content(record), "logical secondlogical first")
+
+    def test_mined_v3_chunks_keep_newline_reconstruction(self):
+        record = {
+            "id": "legacy", "member_ids": ["legacy_chunk_000000", "legacy_chunk_000001"],
+            "rows": [
+                {"id": f"legacy_chunk_{index:06d}", "document": text,
+                 "metadata": {"id_recipe": "v3", "parent_drawer_id": "legacy",
+                              "chunk_index": index, "added_by": "copilot-cli", "normalize_version": 1}}
+                for index, text in enumerate(["first", "second"])
+            ],
+        }
+        self.assertEqual(dream_restore.record_to_content(record), "first\nsecond")
+
 
 class TestRestore(unittest.TestCase):
     def test_restores_each_record_with_original_location_content_and_metadata(self):
@@ -173,7 +196,9 @@ class TestRestore(unittest.TestCase):
         self.assertIn("chars=32", out.getvalue())
 
     def test_main_id_filter_restores_only_matching_record_with_fake_writer(self):
-        with _test_tmpdir() as td:
+        with _test_tmpdir() as td, installed_palace(td):
+            from dream_store import DreamStore
+            initialize_logstream(td)
             archive = os.path.join(td, "archive.jsonl")
             _write_archive(archive, [_record("logical-1"), _record("logical-2")])
             writer = FakeWriter()
@@ -186,6 +211,7 @@ class TestRestore(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertEqual(len(writer.calls), 1)
             self.assertEqual(writer.calls[0]["metadata"]["original_id"], "logical-2")
+            self.assertEqual(len(dream_restore.load_native_archive_records(td)), 2)
 
     def test_record_failure_is_recorded_and_does_not_stop_later_records(self):
         records = [_record("bad"), _record("good")]

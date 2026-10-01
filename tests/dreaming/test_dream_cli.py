@@ -13,7 +13,8 @@ from unittest import mock
 
 import dream_adopt
 import dream_harvest
-from test_dream_procedural_palace import DrawerCollection, installed_palace
+import dream_ontology
+from test_dream_procedural_palace import DrawerCollection, initialize_logstream, installed_palace
 
 try:
     from mempalace.knowledge_graph import KnowledgeGraph as _RealKG
@@ -37,6 +38,11 @@ def _load_json(path):
 def _dump_json(path, value):
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(value, fh)
+
+
+def _write_native_ontology(palace, rules):
+    initialize_logstream(palace)
+    dream_ontology.write_ontology_doc(None, {"version": 1, "rules": rules}, palace=palace)
 
 
 class TestHarvestContradictionTask(unittest.TestCase):
@@ -345,6 +351,7 @@ class TestHarvestOntologyTasks(unittest.TestCase):
     def _palace_with_kg(self, td):
         palace = os.path.join(td, "palace")
         os.makedirs(palace)
+        initialize_logstream(palace)
         con = sqlite3.connect(os.path.join(palace, "knowledge_graph.sqlite3"))
         con.executescript(
             """
@@ -462,6 +469,7 @@ class TestHarvestOntologyTasks(unittest.TestCase):
             with open(ontology, encoding="utf-8") as fh:
                 second_doc = json.load(fh)
             self.assertEqual(second_doc, first_doc)
+            self.assertEqual(dream_ontology.read_ontology_doc(palace=palace), second_doc)
             self.assertIn(f"added 0 (skipped {first_count} existing)", stderr)
 
     def test_suggest_rules_preserves_preexisting_enabled_colliding_rule(self):
@@ -482,6 +490,7 @@ class TestHarvestOntologyTasks(unittest.TestCase):
             rc, _stderr = self._run_harvest([
                 "--task", "suggest-rules",
                 "--palace", palace,
+                "--rules", ontology,
                 "--ontology-out", ontology,
             ])
 
@@ -489,6 +498,31 @@ class TestHarvestOntologyTasks(unittest.TestCase):
             rules = self._read_rules(ontology)
             self.assertEqual(rules[0], existing_rule)
             self.assertTrue(rules[0]["enabled"])
+            self.assertEqual(dream_ontology.read_ontology_doc(palace=palace)["rules"], rules)
+
+    def test_default_suggest_rules_preserves_native_enablement_without_sidecars(self):
+        with _test_tmpdir() as td:
+            palace = self._palace_with_kg(td)
+            approved = {
+                "id": "transitive:depends_on",
+                "family": "transitive",
+                "predicate": "depends_on",
+                "enabled": True,
+                "rationale": "human approved",
+            }
+            _write_native_ontology(palace, [approved])
+            argv = ["--task", "suggest-rules", "--palace", palace]
+            rc, _stderr = self._run_harvest(argv)
+            self.assertEqual(rc, 0)
+            first = dream_ontology.read_ontology_doc(palace=palace)
+            self.assertEqual(first["rules"][0], approved)
+            self.assertGreater(len(first["rules"]), 1)
+            self.assertTrue(all(rule["enabled"] is False for rule in first["rules"][1:]))
+            rc, stderr = self._run_harvest(argv)
+            self.assertEqual(rc, 0)
+            self.assertEqual(dream_ontology.read_ontology_doc(palace=palace), first)
+            self.assertIn(f"added 0 (skipped {len(first['rules'])} existing)", stderr)
+            self.assertFalse(os.path.exists(os.path.join(palace, "ontology.json")))
 
 
 class TestAdoptContradictionTask(unittest.TestCase):
@@ -857,6 +891,7 @@ class TestAdoptMergeArchiveAndVerify(unittest.TestCase):
 
     def test_actual_chunked_merge_archive_roundtrip(self):
         from mempalace.palace import get_collection
+        from dream_restore import load_native_archive_records
         with _test_tmpdir() as td, installed_palace(td) as server:
             writer = dream_adopt.dream_palace.MempalaceWriter()
             common = "The cluster uses stable canonical identities and archives evidence. "
@@ -889,6 +924,7 @@ class TestAdoptMergeArchiveAndVerify(unittest.TestCase):
             self.assertIn("0 residual", stderr.getvalue())
             with open(archive_path, encoding="utf-8") as fh:
                 archives = [json.loads(line) for line in fh]
+            self.assertEqual(load_native_archive_records(td), archives)
             rows = [row for archive in archives for row in archive["rows"]]
             self.assertEqual({row["id"] for row in rows}, expected_ids)
             self.assertTrue(all(archive["reason"] == "merge" for archive in archives))
@@ -1504,10 +1540,9 @@ class DeriveCliTests(unittest.TestCase):
         kg.add_triple("A", "depends_on", "B", valid_from="2026-01-01")
         kg.add_triple("B", "depends_on", "C", valid_from="2026-01-01")
         kg.close()
-        with open(os.path.join(palace, "ontology.json"), "w") as f:
-            json.dump({"version": 1, "rules": [{"id": "transitive:depends_on",
-                "family": "transitive", "predicate": "depends_on", "enabled": True,
-                "max_depth": 3}]}, f)
+        _write_native_ontology(palace, [{"id": "transitive:depends_on",
+            "family": "transitive", "predicate": "depends_on", "enabled": True,
+            "max_depth": 3}])
         return palace
 
     def test_harvest_derive_emits_one_closure_candidate(self):
@@ -1518,6 +1553,7 @@ class DeriveCliTests(unittest.TestCase):
             self.assertEqual(wl["task"], "contemplate")
             self.assertEqual(len(wl["items"]), 1)
             self.assertEqual(wl["items"][0]["conclusion"]["predicate"], "depends_on_closure")
+            self.assertFalse(os.path.exists(os.path.join(palace, "ontology.json")))
 
     def test_adopt_materialize_then_verify_reaches_fixpoint(self):
         with _test_tmpdir() as td:
@@ -1540,9 +1576,14 @@ class DeriveCliTests(unittest.TestCase):
             wl = _load_json(out); wl["items"][0]["action"] = "skip"
             wl["items"][0]["reason"] = "noise"
             dec = os.path.join(td, "dec.json"); _dump_json(dec, wl)
-            dream_adopt.main(["--task", "derive", "--palace", palace, "--decisions", dec])
+            self.assertEqual(dream_adopt.main([
+                "--task", "derive", "--palace", palace, "--decisions", dec]), 0)
             dream_harvest.main(["--task", "derive", "--palace", palace, "--out", out])
             self.assertEqual(len(_load_json(out)["items"]), 0)  # skip-marker suppresses
+            markers = dream_adopt.dream_palace.load_skip_markers(palace=palace)
+            self.assertEqual(len(markers), 1)
+            self.assertEqual(markers[0]["candidate_id"], wl["items"][0]["candidate_id"])
+            self.assertFalse(os.path.exists(os.path.join(palace, "dream-derive-skips.jsonl")))
 
     def test_adopt_reject_rule_suppresses_via_skip_markers(self):
         with _test_tmpdir() as td:
@@ -1583,6 +1624,7 @@ class DeriveCliTests(unittest.TestCase):
         # Zero-item contemplate worklist should adopt as a clean no-op (rc 0) without --task
         with _test_tmpdir() as td:
             palace = os.path.join(td, "palace"); os.makedirs(palace)
+            initialize_logstream(palace)
             _RealKG(db_path=os.path.join(palace, "knowledge_graph.sqlite3")).close()
             out = os.path.join(td, "wl.json")
             dream_harvest.main(["--task", "derive", "--palace", palace, "--out", out])
@@ -1601,10 +1643,9 @@ class DeriveHarvestCliTests(unittest.TestCase):
         kg.add_triple("A", "depends_on", "B", valid_from="2026-01-01")
         kg.add_triple("B", "depends_on", "C", valid_from="2026-01-01")
         kg.close()
-        with open(os.path.join(palace, "ontology.json"), "w") as f:
-            json.dump({"version": 1, "rules": [{"id": "transitive:depends_on",
-                "family": "transitive", "predicate": "depends_on", "enabled": True,
-                "max_depth": 3}]}, f)
+        _write_native_ontology(palace, [{"id": "transitive:depends_on",
+            "family": "transitive", "predicate": "depends_on", "enabled": True,
+            "max_depth": 3}])
         return palace
 
     def test_harvest_derive_emits_one_closure_candidate(self):
@@ -1620,6 +1661,7 @@ class DeriveHarvestCliTests(unittest.TestCase):
     def test_harvest_derive_empty_config_yields_zero(self):
         with _test_tmpdir() as td:
             palace = os.path.join(td, "palace"); os.makedirs(palace)
+            initialize_logstream(palace)
             _RealKG(db_path=os.path.join(palace, "knowledge_graph.sqlite3")).close()
             out = os.path.join(td, "wl.json")
             rc = dream_harvest.main(["--task", "derive", "--palace", palace, "--out", out])
@@ -1636,10 +1678,9 @@ class GapsCliTests(unittest.TestCase):
         kg.add_triple("A", "depends_on", "B", valid_from="2026-01-01")
         kg.add_triple("C", "depends_on", "D", valid_from="2026-01-01")
         kg.close()
-        with open(os.path.join(palace, "ontology.json"), "w") as f:
-            json.dump({"version": 1, "rules": [{"id": "transitive:depends_on",
-                "family": "transitive", "predicate": "depends_on", "enabled": True,
-                "max_depth": 3}]}, f)
+        _write_native_ontology(palace, [{"id": "transitive:depends_on",
+            "family": "transitive", "predicate": "depends_on", "enabled": True,
+            "max_depth": 3}])
         return palace
 
     def test_harvest_gaps_emits_bridging_gap(self):
@@ -1663,6 +1704,7 @@ class GapsCliTests(unittest.TestCase):
     def test_harvest_gaps_empty_ontology_yields_zero(self):
         with _test_tmpdir() as td:
             palace = os.path.join(td, "palace"); os.makedirs(palace)
+            initialize_logstream(palace)
             kg = _RealKG(db_path=os.path.join(palace, "knowledge_graph.sqlite3"))
             kg.add_triple("A", "depends_on", "B", valid_from="2026-01-01")
             kg.close()
@@ -1692,10 +1734,9 @@ class B11RewireCliTests(unittest.TestCase):
         kg.add_triple("A", "depends_on", "B", valid_from="2026-01-01")
         kg.add_triple("B", "depends_on", "C", valid_from="2026-01-01")
         kg.close()
-        with open(os.path.join(palace, "ontology.json"), "w", encoding="utf-8") as fh:
-            json.dump({"version": 1, "rules": [{"id": "transitive:depends_on",
-                "family": "transitive", "predicate": "depends_on", "enabled": True,
-                "max_depth": 3}]}, fh)
+        _write_native_ontology(palace, [{"id": "transitive:depends_on",
+            "family": "transitive", "predicate": "depends_on", "enabled": True,
+            "max_depth": 3}])
         return palace
 
     def _gaps_palace(self, td):
@@ -1705,15 +1746,15 @@ class B11RewireCliTests(unittest.TestCase):
         kg.add_triple("A", "depends_on", "B", valid_from="2026-01-01")
         kg.add_triple("C", "depends_on", "D", valid_from="2026-01-01")
         kg.close()
-        with open(os.path.join(palace, "ontology.json"), "w", encoding="utf-8") as fh:
-            json.dump({"version": 1, "rules": [{"id": "transitive:depends_on",
-                "family": "transitive", "predicate": "depends_on", "enabled": True,
-                "max_depth": 3}]}, fh)
+        _write_native_ontology(palace, [{"id": "transitive:depends_on",
+            "family": "transitive", "predicate": "depends_on", "enabled": True,
+            "max_depth": 3}])
         return palace
 
     def _audit_palace(self, td):
         palace = os.path.join(td, "palace")
         os.makedirs(palace)
+        initialize_logstream(palace)
         kg = _RealKG(db_path=os.path.join(palace, "knowledge_graph.sqlite3"))
         kg.add_triple("Alice", "lives_in", "Portland", valid_from="2024-01-01")
         kg.add_triple("Alice", "lives_in", "Seattle", valid_from="2025-01-01")

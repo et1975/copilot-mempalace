@@ -13,7 +13,7 @@ contradiction, ontology, drawer reflection and prune tasks remain available.
 Cognition lives here (in you, the agent); mechanics live in Python scripts;
 storage stays in mempalace.
 
-Announcement: "Using dreaming to review this repository and memory wing since
+Announcement: "Using dreaming to review eligible sessions and original memories across wings since
 the last completed dream; five lessons is an output budget, not an input limit."
 
 > **Run this in a dedicated/fresh session, never inline during feature work.**
@@ -26,10 +26,11 @@ Use a dedicated context, or a background subagent when requested. Keep mechanica
 steps bounded; unattended execution does not waive semantic review or authorize
 adoption when only proposals were requested.
 
-1. **Harvest once** for an exact repository and explicit memory wing using the
-   default survey below. Freeze the complete timestamp window.
+1. **Harvest once** across all eligible sessions and original-memory wings using
+   the default survey below. Optional source filters are independent; freeze
+   one joint complete timestamp window in MemPalace.
 2. **Review every original source and dedup**; propose at most five lessons
-   total, or abstain. Keep proposals in the worklist, not in memory.
+   total, or abstain. Keep proposals in the native review, not lesson drawers.
 3. **Complete reviewed adoption** through `dream_adopt.py`, including an explicit
    no-lesson or empty-window completion. Only success advances the checkpoint.
    Review may be
@@ -43,7 +44,7 @@ adoption when only proposals were requested.
 ```
 Cognition  = this skill (you)      → inspect evidence, propose actionable lessons, review
 Mechanics  = scripts/*.py          → collect coverage / explicit clustering, validate, adopt
-Substrate  = mempalace             → passive: embeddings, search, add/delete
+Substrate  = mempalace             → drawers, embeddings, exact artifacts + event log
 ```
 
 mempalace deliberately has no model. Never push judgement into it.
@@ -64,31 +65,40 @@ Artifacts are never committed; replace angle-bracket placeholders in examples.
 **Default reconnaissance: the complete interval since the last dream.**
 
 ```bash
-"$MPY" "$DREAM_SCRIPTS/dream_survey.py" --palace <p> --repository owner/repository \
-  --wings <project-wing> --worklists-dir <session-files>/dream-worklists
+"$MPY" "$DREAM_SCRIPTS/dream_survey.py" --palace <p>
 ```
 
 The implicit workflow covers **all eligible history** on first use, then all
 eligible sources in the frozen UTC **`[lower, upper)`** window: lower is the
 previous successfully completed cutoff; upper is the current **run start**.
-There is **no input-count or candidate-seed cap**. Five lessons is an output
-budget only. Exact `--repository` and one explicit memory `--wings` value are
-required; do not infer aliases, a wing from the repository, or cross-project
-scope. The window includes:
+There is **no input-count or candidate-seed cap**. Five lessons total is an
+output budget only, across **one joint** run rather than per wing or repository.
+The bare default includes every eligible session repository, **repositoryless**
+sessions, and original memories from **all eligible wings**. Optional exact
+`--repository owner/repository` filters **only sessions**; `--wings A,B` filters
+**only memories**. There is no repository/wing inference or mapping. These
+selectors are independent of each proposal's explicit destination wing and
+`lessons` room. No manual wing selection is required. The window includes:
 
 - New sessions and **continuing sessions** with new timestamped turns, with full
   original user/assistant turn records before upper in `coverage[].turns`.
   Inspect these records, not just the cleaned user text or a cropped summary.
-- New **original memories from all project rooms** in that wing, using their
+- New **original memories** from all eligible wings and rooms, using their
   filing/creation timestamps, not only diary entries. Generated lessons,
-  reflections, procedural records and control records are excluded as fresh
-  evidence.
+  reflections, procedural/control records and identified raw-session diary
+  mirrors are not independent evidence. Wing names alone do not prove provenance.
+  This support exclusion is not a novelty exclusion: **existing lessons** and
+  reflections remain dedup targets across **all wings**, even outside source
+  filters. Only internal control records are excluded from the novelty corpus.
 
-Survey writes `reflect.incremental.json`, including an **empty window**.
+Survey returns a native `run_id`, including an **empty window**.
 `coverage` holds originals with `review: null`; `items` initially contains no
 proposals. Empty items do not prove review or abstention. Missing stores,
 invalid timestamps or incomplete sources are errors, never diary fallback or
-successful empty coverage. No maintenance, KG work or adoption runs at harvest.
+successful empty coverage. Harvest **persists** the full immutable manifest and
+originals as native **control** state; it is **not read-only**. No maintenance,
+KG work or lesson adoption runs at harvest. `--worklists-dir` optionally exports
+`reflect.incremental.json`; it is a working copy, never required authority.
 `--instructions` may steer review but is not evidence.
 
 Partial `--source`, `--since`, `--limit-sessions`, `--max-candidates`, room
@@ -113,32 +123,41 @@ are rejected for non-reflection tasks. Use the separate diary-reflection command
 above when needed, or a separate session pass for raw history. Individual
 `--tasks merge,prune --wings <w>` runs remain available.
 Explicit legacy session tasks retain their existing
-oldest-first, uncapped scan behavior unless bounds are supplied. Explicit tasks
+oldest-first, uncapped scan behavior unless bounds are supplied, including
+substring `--repository` matching in those previews (not the exact incremental
+selector). Explicit tasks
 never advance the incremental checkpoint, including after legacy adoption.
-Survey never adopts; `induce-rules` candidates use a throwaway
-ontology. "Read-only" means no adoption, not a universal filesystem guarantee:
-legacy collection/KG opens may initialize or reconcile storage. Optional
+Survey never adopts lessons; its explicit `induce-rules` is a nonpublishing
+preview. Explicit harvest rule generation persists disabled candidates, without
+enabling rules. Legacy collection/KG opens may initialize or reconcile
+storage; do not label these previews universally read-only. Native control
+inspection and incremental dry-run are genuinely read-only. Optional
 procedural reads have their own [strict contract](references/procedural.md).
 
 | # | Phase | Who | Command / action |
 |---|-------|-----|------------------|
-| 0 | Scope | you | default: exact repository + explicit memory wing, complete incremental window; explicit alternatives: merge (`--wing`, optional `--room`, `--tau`), contradiction, pattern (`--wing`, `--rooms`, `--min-support`, `--source {diary,sessions,both}`), drawer reflect, rule induction, or prune + optional `--instructions` |
-| 1 | Harvest | script | default: `dream_harvest.py --palace <p> --repository owner/repository --wing <project-wing> --out worklist.json`; merge: `dream_harvest.py --palace <p> --task merge --wing <w> --tau 0.9 --out worklist.json`; contradiction: `dream_harvest.py --palace <p> --task contradiction --out worklist.json`; pattern: `dream_harvest.py --palace <p> --task pattern --wing <w> --rooms diary --min-support 3 --out worklist.json`; diary reflect: `dream_harvest.py --palace <p> --task reflect --wing <w> --rooms diary --source diary --min-support 2 --out worklist.json`; rule induction: `dream_harvest.py --palace <p> --task induce-rules --min-support 2 --ontology-out <p>/ontology.json`; prune: `dream_harvest.py --palace <p> --task prune --wing <w> --room <r> --v-min 0.35 --age-floor-days 30 --out worklist.json` (no adoption; ontology candidate writes for `induce-rules`) |
-| 2 | Adjudicate | **you** | incremental: review every coverage record, author supported proposal items and explicit completion; legacy: fill each item's `decision`. Save the intact worklist as `decisions.json` |
+| 0 | Scope | you | default: all eligible session repositories and memory wings, one complete incremental window; optional exact repository / source-wing filters; explicit alternatives: merge, contradiction, pattern, drawer reflect, rule induction, or prune |
+| 1 | Harvest | script | default: `dream_harvest.py --palace <p>` (native run, optional `--out worklist.json`); merge: `dream_harvest.py --palace <p> --task merge --wing <w> --tau 0.9 --out worklist.json`; contradiction: `--task contradiction`; pattern: `--task pattern --wing <w> --rooms diary --min-support 3`; diary reflect: `--task reflect --wing <w> --rooms diary --source diary --min-support 2`; rule induction: `--task induce-rules --min-support 2`; prune: `--task prune --wing <w> --room <r> --v-min 0.35 --age-floor-days 30` (no lesson adoption) |
+| 2 | Adjudicate | **you** | incremental: review every coverage record, author supported proposal items and explicit completion, then durably save the intact review with `dream_decide.py --palace <p> --run-id <id> --decisions decisions.json`; legacy: fill each item's `decision` in its file |
 | 3 | Review | human/authorized agent | compare proposals with original evidence, scope and existing knowledge; accept a subset or none |
-| 4 | Adopt | script | `dream_adopt.py --palace <p> --decisions decisions.json [--verify]` (incremental: accepted lessons then completed cutoff; merge: add merged/delete originals; contradiction: soft-invalidate stale KG facts; pattern: add lessons only; prune: archive then delete) |
+| 4 | Adopt | script | incremental: `dream_adopt.py --palace <p> --run-id <id>`; explicit file import: `--decisions decisions.json`; legacy: `--decisions decisions.json [--verify]` (merge: add merged/delete originals; contradiction: soft-invalidate; pattern: add-only; prune: archive then delete) |
 | 5 | Verify | script/you | incremental: check successful completion and cutoff advancement to frozen upper; legacy merge/contradiction/prune: `--verify` measures residual candidates. Reflection is not a fixpoint claim |
 
-`dream_adopt.py --dry-run` previews writes. A request to review/propose stops
+`dream_adopt.py --dry-run` previews without saving reviews or advancing native
+state. A request to review/propose stops
 before adoption; unattended operation is not an exception.
 
 To harvest the default incremental worklist directly:
 
 ```bash
-"$MPY" "$DREAM_SCRIPTS/dream_harvest.py" --palace <p> --repository owner/repository \
-  --wing <project-wing> --out worklist.json
+"$MPY" "$DREAM_SCRIPTS/dream_harvest.py" --palace <p>
+# Export the native run for editing; the file is optional, not authority:
+"$MPY" "$DREAM_SCRIPTS/dream_show.py" --palace <p> --run-id <id> --out decisions.json
+# Edit reviews/items/completion, then save a native review revision:
+"$MPY" "$DREAM_SCRIPTS/dream_decide.py" --palace <p> --run-id <id> --decisions decisions.json
+"$MPY" "$DREAM_SCRIPTS/dream_adopt.py" --palace <p> --run-id <id> --dry-run
 # Only after review and acceptance:
-"$MPY" "$DREAM_SCRIPTS/dream_adopt.py" --palace <p> --decisions decisions.json
+"$MPY" "$DREAM_SCRIPTS/dream_adopt.py" --palace <p> --run-id <id>
 ```
 
 For a report without adoption, use the same merge candidate pipeline:
@@ -185,9 +204,9 @@ never double-counts a session that appears in both a diary entry and its raw
 turns. Output volume tracks history volume: sparse or topically-diverse history
 legitimately yields few themes.
 
-Prune and merge both archive superseded/deleted records to an append-only JSONL
-before the sanctioned delete; `--archive-file` sets the path for either (default
-`<palace>/dream-archive.jsonl`):
+Prune and merge both archive full superseded/deleted records to native artifacts
+and events, verifying the archive before sanctioned deletion. `--archive-file`
+requests an additional explicit JSONL export, not the default or sole authority:
 
 ```bash
 "$MPY" "$DREAM_SCRIPTS/dream_harvest.py" --palace <palace> --task prune --wing <wing> \
@@ -195,6 +214,39 @@ before the sanctioned delete; `--archive-file` sets the path for either (default
 "$MPY" "$DREAM_SCRIPTS/dream_adopt.py" --palace <palace> --decisions decisions.json \
   --archive-file archive.jsonl --verify
 ```
+
+Restore previews read native archives by default; no JSONL file is required:
+
+```bash
+"$MPY" "$DREAM_SCRIPTS/dream_restore.py" --palace <p> --dry-run
+# Only after approving restoration; optionally also export the native archive:
+"$MPY" "$DREAM_SCRIPTS/dream_restore.py" --palace <p> --export-file archive.jsonl
+# Explicit legacy import, retained natively before non-dry restoration:
+"$MPY" "$DREAM_SCRIPTS/dream_restore.py" --palace <p> --archive-file legacy-archive.jsonl
+```
+
+`--id` and `--reason` can narrow the selected archive records. This is archive
+restoration, not automatic undo of external effects or proof of semantic
+preservation.
+
+### Ontology preview and persistence
+
+Explicit `dream_survey.py --tasks induce-rules` computes a **nonpublishing**
+preview. In contrast, `dream_harvest.py --task induce-rules` or
+`--task suggest-rules` saves disabled candidates natively; existing enabled
+rules keep their enablement.
+`--rules FILE` is the sole file import input for ontology; native publication
+imports the resulting configuration while preserving enabled flags.
+`--ontology-out FILE` is strictly output only, even for an existing export.
+Its old contents never seed or merge rule enablement into native configuration.
+There is no `--ontology`
+flag. `--skips FILE` remains explicit legacy preview input or optional adoption
+export; the default authority is native skip state.
+Non-dry derive adoption imports supplied rules and existing skip inputs natively
+before KG writer creation or effects. A missing `--rules` file is an error; a
+missing `--skips` file is allowed as a new optional export target. Dry-run
+imports nothing. Selecting these files during harvest preview does not import
+them or publish native state.
 
 ## Session lesson review
 
@@ -210,8 +262,9 @@ before the sanctioned delete; `--archive-file` sets the path for either (default
 
 2. Propose **at most five actionable lessons across all worklists** in the
    dream. This is an **output** budget, not five source records or cluster seeds.
-   Dedup against existing knowledge with ordinary project-scoped
-   recall and the existing duplicate check; already-covered advice is not new.
+   Dedup against existing knowledge across all wings, including existing lessons
+   and reflections, with ordinary recall and the existing duplicate check;
+   already-covered advice is not new. Source filters do not narrow novelty.
 3. Create each `items` entry with a unique `proposal_id`, `source_ids` naming
    covered originals and the **existing reflect/converge** conclusion fields.
    Put the following template in `decision.conclusion.text`; these labels are
@@ -265,8 +318,9 @@ before the sanctioned delete; `--archive-file` sets the path for either (default
    ordinary memory filing, but is not a multi-session generalization. Explicit
    legacy reflection retains its declared `min_support` and existing gates.
 5. Review proposals separately from adoption. Only accepted lessons go through
-   add-only reflection adoption into the relevant project wing's non-mined
-   `lessons` room, with explicit destination fields. Keep task terms in the
+   add-only reflection adoption into an explicitly chosen destination wing's
+   non-mined `lessons` room, independent of harvest wing inputs. Supported
+   original-memory conclusions may quote originals across wings. Keep task terms in the
    opening trigger so later searches can retrieve the lesson. No automatic
    procedural enrollment or outcomes, ontology enablement, KG "truth", or
    durable task tracking follows from this review.
@@ -278,7 +332,10 @@ before the sanctioned delete; `--archive-file` sets the path for either (default
    ```
 
    These examples are edits to the harvested worklist, not standalone replacement
-   manifests. Save the full result as `decisions.json` for adoption.
+   manifests. Save the full result through `dream_decide.py --palace <p>
+   --run-id <id> --decisions decisions.json`; partial reviews may be saved but
+   cannot complete adoption. File-only previews remain explicit compatibility
+   workflows and cannot replace a native incremental manifest.
 
 For future use, follow `mempalace`'s **Task-relevant lessons** recipe after
 ordinary recall: at most three directly applicable accepted lessons, grounded
@@ -287,26 +344,35 @@ or proven efficacy; an unrelated task gets no advice.
 
 ## Incremental completion and recovery
 
-Version 2 of palace-local `dream-checkpoints.json` records the completed cutoff,
-session store reference, run ID, review hash and cumulative `reviewed_versions`
-source fingerprints for each exact repository + memory wing. The worklist's
-`incremental` metadata fixes `version`, `scope`
-(`repository`, `wing`, `session_store`), `lower`, `upper`, prior `base`,
-`source_hash` and `run_id`. Never edit these to skip history or change scope.
+MemPalace native artifacts and the `dreaming/v1` logstream are the sole durable
+authority: full manifests/originals, review revisions, accepted intents, proposal
+receipts, completions, cumulative `reviewed_versions`, archives, ontology and
+derive skips. Local JSON/JSONL files are optional exports or explicit imports.
+They are not a checkpoint sidecar or recovery prerequisite.
 
-`dream_adopt.py --palace <p> --decisions decisions.json` checks every coverage
-record, the explicit completion, unchanged originals and prior checkpoint.
-Only after accepted additions succeed and are verified does it atomically
-advance to the **frozen upper**, not adoption time. A reviewed no-lesson or
-empty window also requires successful adoption to advance.
+Scope identity is `{"scope_schema":1,"repository":null,"wings":null}` for the
+default all-sources run. Optional exact repository and sorted, deduplicated,
+case-preserving nonempty wing lists have independent checkpoints. Reject blank
+filters. Palace paths, session store paths and discovered wing inventories do
+not define scope; the immutable manifest freezes actual inventory and source
+locators separately. Global and filtered scopes never inherit one another's
+cutoffs. Never edit frozen boundaries, source hashes or scope to skip history.
+
+`dream_adopt.py --palace <p> --run-id <id>` checks every coverage record, explicit
+completion, unchanged originals and current checkpoint/review heads. Explicit
+`--decisions decisions.json` input must match the native immutable manifest and
+is saved before actual adoption. Only after accepted additions and exact
+readback succeed is completion published to the **frozen upper**, not adoption
+time. A reviewed no-lesson or empty window still requires successful adoption.
 
 - Harvest, proposal-only review, `--dry-run`, explicit legacy previews, missing
   reviews, partial input and failed writes **do not advance** the cutoff.
   Finish the same intact worklist after interruption; never mark unseen
   records reviewed to fit a context budget.
-- Generated adoption receipts support **retry** of an unchanged review after
-  a partial write without duplicating accepted lessons. Do not remove receipts
-  or change the review to force replay.
+- Verified adoption receipts support **retry** of an unchanged review after
+  partial writes across destinations. Logical operation identity uses stage,
+  scope/run, predecessor and semantic content, never random native artifact IDs.
+  Reconcile existing operations before creating replacement artifacts.
 - Source drift, an incomplete source, changed session store or a stale
   overlapping run fails closed. Restore the intended source when appropriate;
   otherwise **re-harvest** and review against the current checkpoint. Account
@@ -320,9 +386,48 @@ empty window also requires successful adoption to advance.
 - Native memory `filed_at` values without offsets use the writer's local time
   (including DST); naive host-session timestamps use UTC. Explicit offsets are
   honored and window boundaries are UTC.
-- A version 1 checkpoint lacks fingerprints, so the next harvest performs a
-  full reconciliation without advancing it. Successful completion writes
-  version 2. Re-harvest pending version 1 worklists rather than editing them.
+- New wings enter the next wildcard run without changing scope identity or
+  erasing its reviewed-version history. A legacy JSON checkpoint remains
+  untouched and cannot certify the new native scope. Perform conservative
+  all-history reconciliation; re-harvest legacy incremental worklists rather
+  than silently reinterpreting their schema.
+
+**Concurrency and uncertain effects.** Supported writers cooperate on one
+local palace's shared cross-process mutation lock. Native append is not CAS;
+this is **not distributed** coordination, a mesh protocol, or an atomic
+lesson-plus-checkpoint transaction. Review/checkpoint/maintenance control writes
+are synchronous embedded native calls under that lock, not deferred hub writes.
+Vector lesson writes may use the sanctioned native HTTP hub, with a durable
+proposal-start record before dispatch. An unresolved write pins the scope and
+accepted review, even after the client dies. A timeout or absent immediate
+receipt is **not proof** of failure or permission to retry through another
+writer. Require an exact receipt or positive settlement evidence; inspection
+reports blocked proposals. Reject stale overlapping completion; never claim
+distributed exactly-once. A peer stdio writer with no sanctioned usable
+transport blocks adoption, not read-only recovery.
+
+**Inspection, bootstrap and restore.** Native inspection, completed-run replay
+and incremental `--dry-run` are genuinely read-only: no saved review, completion,
+initialization or migration. Missing/corrupt native storage or artifact
+references are an error, not empty history. For a genuinely new control store in
+an existing valid palace, explicitly run `dream_store.py --palace <p>
+--initialize`; never initialize to conceal a failed restore. A healthy native
+logstream with an empty Dreaming namespace needs no extra bootstrap.
+
+A coherent **full-palace** backup/restore includes native logstream and
+artifacts, so completed runs can be shown/recovered without exports or the
+original source DB. A **wing-only** logical export does not retain this native
+control state. Frozen originals let pending review continue, but **new adoption**
+and completion remain blocked when required originals are missing or drifted.
+An explicitly moved source locator must pass full identity/hash/coverage checks;
+snapshots alone never authorize adoption. Native archive restore and
+ontology/derive-skip recovery likewise do not require local sidecar files.
+For a moved session database, explicitly set `COPILOT_SESSION_STORE` to its new
+location; validation checks the full frozen session corpus, not only proposed
+lesson sources. Missing or changed records still block new completion.
+Maintenance remains explicit, with legacy archive/config imports and exports
+only by request; existing procedural event drawers and KG authorities are not
+migrated or automatically enrolled.
 
 ## Phase 2 — explicit maintenance adjudication
 
@@ -389,15 +494,15 @@ never re-surface a lesson that already exists. Current `--task pattern` routes
 to `reflect/converge`; other reflect kinds also construct net-new insights.
 Use the reflect contract below for newly harvested worklists.
 
-For `--task induce-rules`, the pattern-family induction target is
-`ontology.json`, not drawer text. It scans observed base KG triples for
+For `--task induce-rules`, the pattern-family induction target is the native
+ontology, not drawer text. It scans observed base KG triples for
 inverse, symmetric, and transitive co-occurrence at `--min-support`, then writes
 candidate ontology rules through the same `dream_harvest.py` /
 `dream_ontology.py` rails.
 
 - **Never auto-enable** — candidates are always written with `enabled: false`.
-  A human must review the rationale/evidence and flip only approved rules to
-  `enabled: true`.
+  A human must review the rationale/evidence and explicitly enable only approved
+  rules. File flags are explicit imports/exports, not default storage.
 - **Base-triples only** — induction excludes derived `*_closure` triples and
   derivation lineage so generated rules do not feed on their own closure.
 - **Support threshold** — sparse KGs legitimately yield few or no candidates
@@ -410,7 +515,7 @@ LongMemEval/LoCoMo-style methodology is deferred.
 For each `"kind": "prune"` item, read the drawer text and salience components
 (`age_days`, `kg_degree`, `redundancy`, `negatives`, `usage`, `usage_boost`, `v`). Default to **KEEP**:
 omitted decisions are treated as keep, and pruning should be deliberate even
-though it is archived to JSONL and reversible.
+though native archives make deletion recoverable.
 
 - **Prune** — only for clearly low-value, stale, redundant, or one-off drawers:
   ```json
@@ -451,12 +556,16 @@ entries without it contribute no pattern support.
 ## Guarantees (why this is safe)
 
 - **Approved adoption** — ordinary worklists do not adopt until Phase 4;
-  existing collection/KG reconciliation and explicit ontology candidate writes
-  are exceptions to a blanket read-only claim. A failed add never deletes; KG
+  native harvest persists control state, while existing collection/KG
+  reconciliation and explicit ontology candidate writes also prevent a blanket
+  read-only claim. A failed add never deletes; KG
   contradiction adoption sets `valid_to` instead of deleting facts; pattern
   and reflect adoption are add-only. Both merge and prune delete originals
-  only after full-record JSONL archival (fsynced); a failed archive deletes
-  nothing. Semantic fact preservation is a review obligation, not proved by
+  only after native archive publication and exact readback before delete.
+  Archives preserve complete physical records, embeddings, order, identity and
+  reason. Failed publication/readback deletes nothing. Native restore does not
+  need JSONL; explicit legacy imports/exports remain available. Semantic fact
+  preservation is a review obligation, not proved by
   an archive or an embedding.
 - **Provenance** — every merge carries `supersedes` (the ids it replaces).
   Contradiction adoption resolves kept objects from candidate identities,
@@ -485,9 +594,10 @@ entries without it contribute no pattern support.
 
 Implemented tasks:
 
-- `reflect` is the default when `--task` is omitted: incremental sessions and
-  original memories, with exact `--repository` and explicit `--wing` required.
-  It has no input/seed cap; five reviewed lesson proposals is an output budget.
+- `reflect` is the default when `--task` is omitted: all eligible incremental
+  sessions and original-memory wings, with optional independent exact
+  `--repository` and `--wing` / `--wings` source filters.
+  It has no input/seed cap; five total reviewed lesson proposals is an output budget.
   Explicit `--task reflect` without `--source`
   retains the drawer-cluster path; add `--source sessions` for raw sessions.
   Explicit reflect keeps its existing seed caps (survey: 10 per wing;
@@ -507,11 +617,13 @@ Implemented tasks:
   `generalize`, `name_gap`, `connect`, `converge`, `tension`,
   `shared_constraint`. See "Reflect step" below for detail.
 - `induce-rules`: pattern-family ontology induction over observed base KG
-  triples. It writes disabled transitive/inverse/symmetric rule candidates to
-  `--ontology-out` and never auto-enables them.
+  triples. Harvest writes disabled transitive/inverse/symmetric candidates to
+  native ontology state; survey computes a nonpublishing preview. Neither
+  auto-enables candidates. `--ontology-out` is an explicit file export,
+  not the default authority.
 - `prune` / `forget`: low-salience drawer candidates selected by a conservative
   multi-gate AND (`v < v_min`, age floor, `kg_degree == 0`, not pinned). Adoption
-  archives to JSONL before deleting through the sanctioned handler.
+  verifies native archives before deleting through the sanctioned handler.
 
 ## Reflect step — constructive synthesis
 

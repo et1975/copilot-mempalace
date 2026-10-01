@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""dream_adopt — phase 4 of the dreaming pipeline (the only live write).
+"""dream_adopt — adopt a saved native review or an explicit legacy decisions file.
 
 Reads a ``decisions.json`` (a worklist whose merge items have an approved
 ``decision``) and applies it to the palace: each approved merge adds the
@@ -47,7 +47,7 @@ from dream_lib import (
 )
 from dream_palace import load_logical_drawers, _palace_embed
 from dream_reflect import validate_reflect, is_novel
-from dream_metadata import content_hash, is_generated_observation, is_procedural_record
+from dream_metadata import content_hash, is_generated_observation, is_procedural_record, is_control_record, strict_json
 
 
 def _resolve_decisions(worklist: dict[str, Any]) -> list[dict[str, Any]]:
@@ -317,7 +317,7 @@ def _recurrence_error(dec, live_by_id):
 
 def _preflight_reflect_decisions(path, decisions):
     """Validate reflect decisions: grounding + novelty. Fail-closed."""
-    drawers = load_logical_drawers(path)
+    drawers = [drawer for drawer in load_logical_drawers(path) if not is_control_record(drawer)]
     live_by_id = {str(d["id"]): d for d in drawers}
     full_by_id = {str(d["id"]): d.get("text", "") for d in drawers}
     existing_vecs = [d.get("embedding") or [] for d in drawers]
@@ -465,7 +465,9 @@ def _min_support(worklist: dict[str, Any]) -> int:
     return int((worklist.get("params") or {}).get("min_support", 1))
 
 
-def _archive_writability_errors(archive_file: str) -> list[dict[str, Any]]:
+def _archive_writability_errors(archive_file: str | None) -> list[dict[str, Any]]:
+    if archive_file is None:
+        return []
     parent = os.path.abspath(os.path.dirname(archive_file) or os.getcwd())
     probe = parent
     while probe and not os.path.exists(probe):
@@ -689,17 +691,19 @@ def _verify_reharvest(task: str, worklist: dict[str, Any], path: str) -> int:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--palace", default=None, help="Path to the mempalace palace directory")
-    ap.add_argument("--decisions", required=True, help="Path to the adjudicated decisions.json")
+    source = ap.add_mutually_exclusive_group(required=True)
+    source.add_argument("--decisions", help="Path to the adjudicated decisions.json")
+    source.add_argument("--run-id", help="Adopt the saved native review for this run")
     ap.add_argument("--task", default=None,
                     choices=["merge", "contradiction", "pattern", "prune", "derive", "reflect"],
                     help="Override task (default: derived from worklist)")
     ap.add_argument("--archive-file", default=None,
-                    help="Append-only archive JSONL path for merge/prune deletes (default: <palace>/dream-archive.jsonl)")
+                    help="Optional JSONL export in addition to the mandatory native archive")
     ap.add_argument("--dry-run", action="store_true", help="Print planned changes; write nothing")
     ap.add_argument("--rules", default=None,
-                    help="Path to ontology config (default: <palace>/ontology.json)")
+                    help="Explicit legacy ontology input (default: native palace configuration)")
     ap.add_argument("--skips", default=None,
-                    help="Path to skip-markers file (default: <palace>/dream-derive-skips.jsonl)")
+                    help="Optional skip-marker JSONL export (default: native palace markers)")
     ap.add_argument("--max-depth", type=int, default=3,
                     help="Maximum derivation depth for derive (default 3)")
     ap.add_argument("--max-iterations", type=int, default=10,
@@ -722,10 +726,16 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     path = dream_palace.bind_palace(args.palace)
-    if args.archive_file is None:
-        args.archive_file = os.path.join(path, "dream-archive.jsonl")
-    with open(args.decisions, encoding="utf-8") as fh:
-        worklist = json.load(fh)
+    try:
+        if args.run_id:
+            import dream_incremental
+            worklist = dream_incremental.load_run(path, args.run_id)
+        else:
+            with open(args.decisions, encoding="utf-8") as fh:
+                worklist = strict_json(fh.read())
+    except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
+        print(f"error: cannot load decisions: {exc}", file=sys.stderr)
+        return 1
     if "incremental" in worklist:
         import dream_incremental
         try:
@@ -900,18 +910,31 @@ def main(argv: list[str] | None = None) -> int:
         )
     elif task == "derive":
         decisions = _resolve_derive_decisions(worklist)
+        try:
+            if args.rules:
+                import dream_ontology
+                if not os.path.isfile(args.rules):
+                    raise FileNotFoundError(f"explicit ontology input is missing: {args.rules}")
+                imported = dream_ontology.read_ontology_doc(args.rules)
+                dream_ontology.write_ontology_doc(None, imported, palace=path)
+            if args.skips and os.path.exists(args.skips):
+                imported_skips = dream_palace.load_skip_markers(args.skips)
+                dream_palace.append_skip_markers(None, imported_skips, palace=path)
+        except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
+            print(f"error: native derive state import failed: {exc}", file=sys.stderr)
+            return 1
         writer = dream_palace.KgDeriveWriter(args.palace)
         try:
             report, skip_markers = apply_derive_decisions(decisions, writer)
         finally:
             writer.close()
         onto_ver = worklist.get("ontology_version") or _dream_lib.ontology_version(
-            dream_palace.load_ontology_config(args.rules or os.path.join(path, "ontology.json")))
+            dream_palace.load_ontology_config(args.rules, palace=path))
         rejected = [(d.get("rule") or {}).get("id") for d in decisions if d.get("action") == "reject_rule"]
         skip_markers += skip_markers_for_rejected_rules(
             worklist.get("items", []), [r for r in rejected if r], onto_ver)
-        skips_path = args.skips or os.path.join(path, "dream-derive-skips.jsonl")
-        dream_palace.append_skip_markers(skips_path, skip_markers)
+        skips_path = args.skips
+        dream_palace.append_skip_markers(skips_path, skip_markers, palace=path)
         print(json.dumps(report, indent=2))
         _print_errors(report)
         print(
@@ -920,13 +943,13 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         if args.verify:
-            rules = dream_palace.load_ontology_config(args.rules or os.path.join(path, "ontology.json"))
+            rules = dream_palace.load_ontology_config(args.rules, palace=path)
             triples = dream_palace.load_premises(path, purpose="durable")
             residual = _dream_lib.deductive_closure(
                 triples, rules, max_depth=args.max_depth,
                 max_iterations=args.max_iterations, max_candidates=args.max_candidates)
             residual = _dream_lib.filter_skipped(
-                residual, dream_palace.load_skip_markers(skips_path), _dream_lib.ontology_version(rules))
+                residual, dream_palace.load_skip_markers(skips_path, palace=path), _dream_lib.ontology_version(rules))
             print(f"verify: {len(residual)} residual candidate(s)", file=sys.stderr)
             if args.strict and residual:
                 return 1

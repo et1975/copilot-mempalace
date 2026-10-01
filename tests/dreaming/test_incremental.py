@@ -5,7 +5,6 @@ from datetime import datetime, timedelta, timezone
 import json
 import os
 import sqlite3
-import stat
 import sys
 import time
 
@@ -21,6 +20,13 @@ from test_dream_procedural_palace import DrawerCollection
 
 @pytest.fixture
 def inputs(tmp_path, monkeypatch):
+    import dream_incremental
+    from dream_store import DreamStore
+    from mempalace.logstream import Logstream
+    from test_dream_store import caller
+    log = Logstream(str(tmp_path / "logstream.sqlite3"), replica_id="runtime-test")
+    monkeypatch.setattr(dream_incremental, "_store",
+                        lambda palace: DreamStore(palace, call_tool=caller(log)))
     store = tmp_path / "sessions.db"
     with sqlite3.connect(store) as con:
         con.executescript("""
@@ -62,7 +68,8 @@ def inputs(tmp_path, monkeypatch):
     monkeypatch.setattr(dream_palace, "_palace_embed",
                         lambda path, texts: [[0., 1.] for text in texts])
     monkeypatch.setattr(dream_adopt, "_palace_embed", dream_palace._palace_embed)
-    return store, drawers
+    yield store, drawers
+    log.close()
 
 
 def harvest(tmp_path, *options):
@@ -87,8 +94,12 @@ def adopt(tmp_path, worklist, *options):
 
 
 def checkpoint(tmp_path):
-    path = tmp_path / "dream-checkpoints.json"
-    return json.loads(path.read_text()) if path.exists() else None
+    from dream_store import DreamStore
+    store = DreamStore(str(tmp_path))
+    events = store.events()
+    scopes = {event["scope_id"]: store.checkpoint(event["scope_id"])
+              for event in events if event["record_type"] == "completed"}
+    return {"version": 3, "scopes": scopes} if scopes else None
 
 
 def test_default_includes_all_older_unprocessed_sessions_and_original_memories(inputs, tmp_path):
@@ -112,11 +123,11 @@ def test_partial_options_require_explicit_legacy_preview(inputs, tmp_path, optio
     assert checkpoint(tmp_path) is None
 
 
-def test_required_memory_wing_is_not_inferred_from_repository(inputs, tmp_path):
-    with pytest.raises(SystemExit) as exc:
-        dream_harvest.main(["--palace", str(tmp_path), "--repository", "owner/project",
-                           "--out", str(tmp_path / "unexpected.json")])
-    assert exc.value.code == 2
+def test_memory_wing_is_optional_and_not_inferred_from_repository(inputs, tmp_path):
+    output = tmp_path / "all-wings.json"
+    assert dream_harvest.main(["--palace", str(tmp_path), "--repository", "owner/project",
+                               "--out", str(output)]) == 0
+    assert json.loads(output.read_text())["incremental"]["scope"]["wings"] is None
 
 
 @pytest.mark.parametrize("option", [["--tau", "0.9"], ["--min-support", "2"]])
@@ -265,6 +276,7 @@ def writer(inputs, monkeypatch):
         def __init__(self):
             self.calls = 0
             self.fail_on = None
+            self.fail_after_on = None
 
         @contextmanager
         def mutation(self):
@@ -277,6 +289,8 @@ def writer(inputs, monkeypatch):
             drawer_id = f"saved-{self.calls}"
             drawers.append({"id": drawer_id, "text": content, "wing": wing, "room": room,
                             "metadata": {**metadata, "wing": wing, "room": room}, "embedding": [0., 1.]})
+            if self.calls == self.fail_after_on:
+                raise TimeoutError("fixture reply lost after durable write")
             return {"drawer_id": drawer_id}
 
     instance = Writer()
@@ -299,18 +313,18 @@ def test_reflection_adoption_then_checkpoint_is_retry_safe(inputs, tmp_path, wri
 def test_partial_write_failure_does_not_advance_and_retry_does_not_duplicate(inputs, tmp_path, writer):
     worklist = review(harvest(tmp_path))
     worklist["items"] = [proposal(), proposal("lesson-2", ["session:s2", "session:s3"])]
-    writer.fail_on = 2
+    writer.fail_after_on = 2
     assert adopt(tmp_path, worklist) == 1
     assert checkpoint(tmp_path) is None
     assert writer.calls == 2
-    writer.fail_on = None
+    writer.fail_after_on = None
     # Use a different novel vector for the still-unwritten second lesson.
     dream_adopt._palace_embed = lambda path, texts: [[-1., 0.] for _ in texts]
     try:
         assert adopt(tmp_path, worklist) == 0
     finally:
         dream_adopt._palace_embed = dream_palace._palace_embed
-    assert writer.calls == 3
+    assert writer.calls == 2
     assert len([d for d in inputs[1] if d["id"].startswith("saved-")]) == 2
 
 
@@ -443,17 +457,19 @@ def test_checkpoint_write_failure_retries_using_existing_lesson_receipt(inputs, 
     import dream_incremental
     worklist = review(harvest(tmp_path))
     worklist["items"] = [proposal()]
-    replace = dream_incremental.os.replace
+    publish = dream_incremental._publish
 
-    def fail(*args):
-        raise OSError("fixture atomic replacement failure")
+    def fail(store, kind, *args, **kwargs):
+        if kind == "completed":
+            raise OSError("fixture completion publication failure")
+        return publish(store, kind, *args, **kwargs)
 
-    monkeypatch.setattr(dream_incremental.os, "replace", fail)
+    monkeypatch.setattr(dream_incremental, "_publish", fail)
     assert adopt(tmp_path, worklist) == 1
     assert writer.calls == 1
     assert checkpoint(tmp_path) is None
     assert not list(tmp_path.glob(".dream-checkpoints-*"))
-    monkeypatch.setattr(dream_incremental.os, "replace", replace)
+    monkeypatch.setattr(dream_incremental, "_publish", publish)
     assert adopt(tmp_path, worklist) == 0
     assert writer.calls == 1
 
@@ -466,16 +482,18 @@ def test_retry_rejects_generated_lesson_provenance_drift(inputs, tmp_path, write
     import dream_incremental
     worklist = review(harvest(tmp_path))
     worklist["items"] = [proposal()]
-    write = dream_incremental._write_state
+    publish = dream_incremental._publish
 
-    def fail(*args):
-        raise OSError("fixture checkpoint failure")
+    def fail(store, kind, *args, **kwargs):
+        if kind == "completed":
+            raise OSError("fixture completion publication failure")
+        return publish(store, kind, *args, **kwargs)
 
-    monkeypatch.setattr(dream_incremental, "_write_state", fail)
+    monkeypatch.setattr(dream_incremental, "_publish", fail)
     assert adopt(tmp_path, worklist) == 1
     saved = next(d for d in inputs[1] if d["id"].startswith("saved-"))
     saved["metadata"][field] = value
-    monkeypatch.setattr(dream_incremental, "_write_state", write)
+    monkeypatch.setattr(dream_incremental, "_publish", publish)
     assert adopt(tmp_path, worklist) == 1
     assert checkpoint(tmp_path) is None
     assert writer.calls == 1
@@ -491,7 +509,7 @@ def test_removed_proposal_after_partial_adoption_cannot_certify_completion(input
     assert checkpoint(tmp_path) is None
 
 
-def test_source_drift_after_partial_write_can_be_reharvested_without_loss_or_deadlock(inputs, tmp_path, writer):
+def test_source_drift_after_uncertain_write_allows_inspection_but_holds_competing_completion(inputs, tmp_path, writer):
     worklist = review(harvest(tmp_path))
     worklist["items"] = [proposal(), proposal("lesson-2", ["session:s2", "session:s3"])]
     writer.fail_on = 2
@@ -503,7 +521,7 @@ def test_source_drift_after_partial_write_can_be_reharvested_without_loss_or_dea
     fresh = harvest(tmp_path)
     assert len(fresh["coverage"]) == 62
     assert next(s for s in fresh["coverage"] if s["id"] == "session:s0")["text"] == "corrected original evidence"
-    assert adopt(tmp_path, review(fresh)) == 0
+    assert adopt(tmp_path, review(fresh)) == 1
     assert writer.calls == 2
 
 
@@ -591,6 +609,8 @@ def test_incremental_reads_existing_chroma_without_procedural_opt_in(tmp_path, m
         collection.add(ids=["memory"], documents=["Original Chroma memory"],
                        metadatas=[{"wing": "project", "room": "architecture", "filed_at": "2000-01-01"}],
                        embeddings=[[1., 0.]])
+        from dream_store import DreamStore
+        DreamStore.initialize(str(palace))
         worklist = harvest(palace)
         assert [source["id"] for source in worklist["coverage"]] == ["memory"]
         assert worklist["coverage"][0]["text"] == "Original Chroma memory"
@@ -600,49 +620,14 @@ def test_incremental_reads_existing_chroma_without_procedural_opt_in(tmp_path, m
         backend.close_palace(str(palace))
 
 
-def test_checkpoint_replacement_without_directory_open_capability(tmp_path, monkeypatch):
-    import dream_incremental
-    monkeypatch.delattr(os, "O_DIRECTORY", raising=False)
-    sync = os.fsync
-    kinds = []
-
-    def record(fd):
-        kinds.append(stat.S_ISREG(os.fstat(fd).st_mode))
-        sync(fd)
-
-    monkeypatch.setattr(os, "fsync", record)
-    state = {"version": 1, "scopes": {}}
-    dream_incremental._write_state(str(tmp_path), state)
-    assert checkpoint(tmp_path) == state
-    assert kinds == [True]
-
-
-def test_checkpoint_directory_sync_error_is_not_suppressed(tmp_path, monkeypatch):
-    import dream_incremental
-    sync = os.fsync
-
-    def fail_directory(fd):
-        if stat.S_ISDIR(os.fstat(fd).st_mode):
-            raise OSError("fixture directory sync failure")
-        sync(fd)
-
-    monkeypatch.setattr(os, "fsync", fail_directory)
-    with pytest.raises(OSError, match="directory sync failure"):
-        dream_incremental._write_state(str(tmp_path), {"version": 1, "scopes": {}})
-
-
-def test_checkpoint_file_sync_error_preserves_previous_state(tmp_path, monkeypatch):
-    import dream_incremental
+def test_legacy_checkpoint_is_diagnostic_not_new_scope_authority(inputs, tmp_path):
     path = tmp_path / "dream-checkpoints.json"
-    path.write_text('{"version":1,"scopes":{}}')
+    path.write_text('{"version":1,"scopes":{"old":{"cutoff":"2099-01-01"}}}')
     before = path.read_bytes()
-
-    def fail_file(fd):
-        raise OSError("fixture file sync failure")
-
-    monkeypatch.setattr(os, "fsync", fail_file)
-    with pytest.raises(OSError, match="file sync failure"):
-        dream_incremental._write_state(str(tmp_path), {"version": 1, "scopes": {"different": {}}})
+    worklist = harvest(tmp_path)
+    assert len(worklist["coverage"]) == 62
+    assert worklist["incremental"]["lower"] is None
+    assert adopt(tmp_path, review(worklist)) == 0
     assert path.read_bytes() == before
     assert not list(tmp_path.glob(".dream-checkpoints-*"))
 
@@ -719,6 +704,8 @@ def test_native_writer_new_memory_after_dream_is_included_in_new_york(
         dream_palace.bind_palace(str(palace))
         writer = dream_palace.MempalaceWriter()
         writer.add_drawer("project", "architecture", "Initial original memory", added_by="user")
+        from dream_store import DreamStore
+        DreamStore.initialize(str(palace))
         first = review(harvest(palace))
         assert adopt(palace, first) == 0
         writer.add_drawer("project", "architecture", "New original memory after dreaming", added_by="user")
@@ -740,10 +727,12 @@ def test_source_persisted_after_final_validation_is_recovered_despite_older_time
     clock = {"now": datetime(2026, 9, 29, 18, 41, 27, 614616, tzinfo=timezone.utc)}
     monkeypatch.setattr(dream_incremental, "utc_now", lambda: clock["now"].isoformat())
     first = review(harvest(tmp_path))
-    publish = dream_incremental._write_state
+    publish = dream_incremental._publish
     old_event = "2026-09-29T18:41:27.612Z"
 
-    def insert_after_validation(palace, state):
+    def insert_after_validation(native_store, kind, *args, **kwargs):
+        if kind != "completed":
+            return publish(native_store, kind, *args, **kwargs)
         if arrival == "memory":
             drawers.append({"id": "late-memory", "text": "Late visible original memory",
                             "wing": "project", "room": "architecture",
@@ -756,11 +745,11 @@ def test_source_persisted_after_final_validation_is_recovered_despite_older_time
                                 (identity, "owner/project", "main", "late session", old_event, old_event, "/project"))
                 con.execute("INSERT INTO turns VALUES (?,?,?,?,?)",
                             (identity, 1, "Late persisted original request", "Late response", old_event))
-        publish(palace, state)
+        return publish(native_store, kind, *args, **kwargs)
 
-    monkeypatch.setattr(dream_incremental, "_write_state", insert_after_validation)
+    monkeypatch.setattr(dream_incremental, "_publish", insert_after_validation)
     assert adopt(tmp_path, first) == 0
-    monkeypatch.setattr(dream_incremental, "_write_state", publish)
+    monkeypatch.setattr(dream_incremental, "_publish", publish)
     clock["now"] += timedelta(seconds=1)
     second = harvest(tmp_path)
     expected = {"continuing-turn": "session:s0", "session": "session:late-session", "memory": "late-memory"}[arrival]
@@ -802,20 +791,17 @@ def test_historical_source_edit_without_new_timestamp_requires_review(inputs, tm
 
 
 def test_v1_checkpoint_requires_full_reconciliation_without_writing_during_harvest(inputs, tmp_path):
-    assert adopt(tmp_path, review(harvest(tmp_path))) == 0
-    old = checkpoint(tmp_path)
-    old["version"] = 1
-    for scope in old["scopes"].values():
-        scope.pop("reviewed_versions", None)
+    old = {"version": 1, "scopes": {"old": {"cutoff": "2026-01-01"}}}
     path = tmp_path / "dream-checkpoints.json"
     path.write_text(json.dumps(old))
     before = path.read_bytes()
     reconciled = harvest(tmp_path)
     assert len(reconciled["coverage"]) == 62
     assert path.read_bytes() == before
-    assert reconciled["incremental"]["version"] == 2
+    assert reconciled["incremental"]["version"] == 3
     assert adopt(tmp_path, review(reconciled)) == 0
-    assert checkpoint(tmp_path)["version"] == 2
+    assert checkpoint(tmp_path)["version"] == 3
+    assert path.read_bytes() == before
     assert len(next(iter(checkpoint(tmp_path)["scopes"].values()))["reviewed_versions"]) == 62
     assert harvest(tmp_path)["coverage"] == []
 
@@ -832,15 +818,17 @@ def test_old_pending_worklist_must_be_reharvested(inputs, tmp_path, capsys):
 
 
 @pytest.mark.parametrize("invalid", [None, [], {"session:s0": "not-a-digest"}])
-def test_malformed_v2_reviewed_versions_is_not_empty_history(inputs, tmp_path, invalid):
+def test_malformed_native_reviewed_versions_is_not_empty_history(inputs, tmp_path, invalid, monkeypatch):
+    import dream_incremental
     assert adopt(tmp_path, review(harvest(tmp_path))) == 0
     broken = checkpoint(tmp_path)
-    broken["version"] = 2
-    next(iter(broken["scopes"].values()))["reviewed_versions"] = invalid
-    (tmp_path / "dream-checkpoints.json").write_text(json.dumps(broken))
+    scope = next(iter(broken["scopes"].values()))
+    scope["reviewed_versions"] = invalid
+    native = dream_incremental._store(str(tmp_path))
+    monkeypatch.setattr(native, "checkpoint", lambda scope_id: scope)
+    monkeypatch.setattr(dream_incremental, "_store", lambda palace: native)
     assert dream_harvest.main(["--palace", str(tmp_path), "--repository", "owner/project",
                               "--wing", "project", "--out", str(tmp_path / "invalid.json")]) == 2
-    assert checkpoint(tmp_path) == broken
 
 
 def test_installed_sqlite_palace_preserves_full_memory_and_retries_generated_receipts(tmp_path, monkeypatch):
@@ -859,6 +847,8 @@ def test_installed_sqlite_palace_preserves_full_memory_and_retries_generated_rec
     with installed_palace(str(palace)):
         dream_palace.bind_palace(str(palace))
         dream_palace.MempalaceWriter().add_drawer("project", "architecture", text, added_by="user")
+        from dream_store import DreamStore
+        DreamStore.initialize(str(palace))
         before = (palace / "sqlite_exact.sqlite3").read_bytes()
         worklist = harvest(palace)
         assert len(worklist["coverage"]) == 1

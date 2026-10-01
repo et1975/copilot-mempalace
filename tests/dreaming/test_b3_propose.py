@@ -12,6 +12,8 @@ import unittest
 import dream_contemplate
 import dream_ontology
 import dream_palace
+from test_dream_maintenance_state import initialize_logstream
+from test_dream_procedural_palace import installed_palace
 
 
 def _test_tmpdir():
@@ -39,9 +41,10 @@ class B3PlainLanguageProposalTests(unittest.TestCase):
 
     def _write_ontology(self, palace: str, rules: list[dict] | None = None) -> str:
         rules_path = self._rules_path(palace)
-        with open(rules_path, "w", encoding="utf-8") as fh:
-            json.dump({"version": 1, "rules": list(rules or [])}, fh)
-            fh.write("\n")
+        with installed_palace(palace):
+            initialize_logstream(palace)
+            dream_ontology.write_ontology_doc(
+                None, {"version": 1, "rules": list(rules or [])}, palace=palace)
         return rules_path
 
     def _add_durable_triple(self, palace: str, subject: str, predicate: str, object_: str) -> str:
@@ -187,7 +190,7 @@ class B3PlainLanguageProposalTests(unittest.TestCase):
 
         self.assertIn("transitive:depends_on", result["enabled"])
         self.assertGreaterEqual(result["now_enabled_count"], 1)
-        rules = dream_palace.load_ontology_config(self._rules_path(tmp.name))
+        rules = dream_palace.load_ontology_config(palace=tmp.name)
         enabled_rule = next(rule for rule in rules if rule.get("id") == "transitive:depends_on")
         self.assertIs(enabled_rule.get("enabled"), True)
         reproposed = dream_contemplate.propose_rules(tmp.name)
@@ -221,7 +224,7 @@ class B3PlainLanguageProposalTests(unittest.TestCase):
         self.assertEqual(enable_code, 0)
         enable_payload = json.loads(stdout.getvalue())
         self.assertIn("transitive:depends_on", enable_payload["enabled"])
-        rules = dream_palace.load_ontology_config(self._rules_path(tmp.name))
+        rules = dream_palace.load_ontology_config(palace=tmp.name)
         self.assertTrue(any(rule.get("id") == "transitive:depends_on" and rule.get("enabled") for rule in rules))
 
     def test_summarize_proposals_avoids_rule_family_jargon(self):

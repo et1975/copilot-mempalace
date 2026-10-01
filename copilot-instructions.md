@@ -119,15 +119,35 @@ For deeper workflow docs (init, mine, full search/status walkthrough), invoke th
 ## Reasoning vs consolidation
 
 - Use `contemplate` when the user asks to derive, infer, reason, contemplate, or asks "what follows from this?" / "what can we conclude?" It runs on-demand/inline over the active KG with explicit rules and approved materialization.
-- Use `dreaming` in a fresh/off-hours session to inspect real repository-scoped
-  sessions and original memories since the last completed dream, then propose
+- Use `dreaming` in a fresh/off-hours session to inspect all eligible sessions
+  and original memories since the last completed dream, then propose
   at most five actionable lessons total, deduplicated against existing knowledge.
-  Default survey requires an exact repository and explicit memory wing, covers
-  all eligible history on first use, and has no input-count/seed cap. Review every
+  Bare survey covers all eligible session repositories (including repositoryless
+  sessions) and original-memory wings. Optional exact `--repository` filters only
+  sessions; `--wings` filters only memories, with no inferred mapping or manual
+  selection requirement. One joint run covers all eligible history on first use
+  and has no input-count/seed cap. Review every
   source before successful adoption advances the frozen timestamp checkpoint;
   five is the lesson output budget, not a source limit. Merge, contradiction, ontology,
-  drawer reflection and prune remain explicit tasks. Accepted lessons return
+  drawer reflection and prune remain explicit tasks. Source filters do not
+  select destinations: accepted proposals name a wing and non-mined `lessons`
+  room. Generated/procedural/control records and identified diary mirrors cannot
+  supply independent evidence; existing lessons and reflections remain dedup
+  targets across all wings. Accepted lessons return
   through ordinary task-relevant recall, without a new hook or scheduler.
+  MemPalace native artifacts/events own manifests, saved reviews, intents,
+  receipts, checkpoints/fingerprints, archives, ontology and derive skips;
+  local files are optional exports/imports. Harvest persists control state, not
+  lessons. Inspect/save/adopt by native run ID; incremental dry-run and native
+  inspection never initialize or publish. Missing/corrupt storage is an error,
+  requiring explicit bootstrap only for genuinely new storage.
+  Same-local-palace cooperating writers use the shared mutation lock, not
+  distributed CAS. Unresolved vector writes pin accepted intent until exact
+  receipts or positive settlement; timeout is not retry permission.
+  Full-palace restore retains native progress; wing-only exports do not.
+  Completed-run inspection survives loss of the original source DB, but new
+  adoption still requires original-source revalidation. No implicit KG,
+  procedural-learning or durable-task enrollment follows.
 
 ## Optional durable task coordination
 

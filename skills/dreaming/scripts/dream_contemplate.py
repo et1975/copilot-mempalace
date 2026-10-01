@@ -199,13 +199,13 @@ def summarize_recall_report(report: dict) -> str:
 def derive_worklist(
     palace: str,
     *,
-    rules_path: str,
-    skips_path: str,
+    rules_path: str | None = None,
+    skips_path: str | None = None,
     max_depth: int = 3,
     max_iterations: int = 10,
     max_candidates: int = 500,
 ) -> tuple[dict, list[dict], list[dict]]:
-    rules = dream_palace.load_ontology_config(rules_path)
+    rules = dream_palace.load_ontology_config(rules_path, palace=palace)
     onto_ver = ontology_version(rules)
     triples = dream_palace.load_premises(palace, purpose="durable")
     candidates = deductive_closure(
@@ -215,7 +215,8 @@ def derive_worklist(
         max_iterations=max_iterations,
         max_candidates=max_candidates,
     )
-    candidates = filter_skipped(candidates, dream_palace.load_skip_markers(skips_path), onto_ver)
+    candidates = filter_skipped(
+        candidates, dream_palace.load_skip_markers(skips_path, palace=palace), onto_ver)
     for candidate in candidates:
         candidate["ontology_version"] = onto_ver
     worklist = build_contemplate_worklist(
@@ -235,10 +236,17 @@ def derive_worklist(
 def bootstrap_ontology(
     *,
     triples: list[dict],
-    ontology_path: str,
+    ontology_path: str | None,
     min_support: int,
+    palace: str,
 ) -> dict:
-    existing = dream_ontology.read_ontology_doc(ontology_path)
+    with dream_palace.palace_mutation_lock(palace):
+        return _bootstrap_ontology_locked(triples=triples, ontology_path=ontology_path,
+                                          min_support=min_support, palace=palace)
+
+
+def _bootstrap_ontology_locked(*, triples, ontology_path, min_support, palace):
+    existing = dream_ontology.read_ontology_doc(palace=palace)
     existing_rules = existing.get("rules", [])
     predicates = sorted({
         triple.get("predicate") for triple in triples
@@ -251,9 +259,9 @@ def bootstrap_ontology(
     merged_candidates, _candidate_stats = dream_ontology.merge_ontology_candidates([], candidates)
     merged, stats = dream_ontology.merge_ontology_candidates(existing_rules, merged_candidates)
     doc = dream_ontology.build_ontology_doc(merged, existing.get("version", 1))
-    dream_ontology.write_ontology_doc(ontology_path, doc)
+    dream_ontology.write_ontology_doc(ontology_path, doc, palace=palace)
     return {
-        "target": ontology_path,
+        "target": ontology_path or "native MemPalace ontology",
         "stats": stats,
         "proposed_disabled_rules": merged_candidates,
     }
@@ -327,9 +335,9 @@ def _plain_evidence_text(evidence) -> str:
 
 def propose_rules(palace, *, rules_path=None, min_support=2) -> dict:
     path = dream_palace.bind_palace(palace)
-    effective_rules_path = rules_path or os.path.join(path, "ontology.json")
+    effective_rules_path = rules_path
     triples = dream_palace.load_premises(path, purpose="durable")
-    current_rules = dream_palace.load_ontology_config(effective_rules_path)
+    current_rules = dream_palace.load_ontology_config(effective_rules_path, palace=path)
     already_enabled = sorted(
         str(rule.get("id"))
         for rule in current_rules
@@ -420,8 +428,13 @@ def _summarize_disable_result(report: dict) -> str:
 
 def enable_rules(palace, rule_ids: list[str], *, rules_path=None, min_support=2) -> dict:
     path = dream_palace.bind_palace(palace)
-    effective_rules_path = rules_path or os.path.join(path, "ontology.json")
-    doc = dream_ontology.read_ontology_doc(effective_rules_path)
+    with dream_palace.palace_mutation_lock(path):
+        return _enable_rules_locked(path, rule_ids, rules_path=rules_path, min_support=min_support)
+
+
+def _enable_rules_locked(path, rule_ids, *, rules_path, min_support):
+    effective_rules_path = rules_path
+    doc = dream_ontology.read_ontology_doc(effective_rules_path, palace=path)
     current_rules, version = _ontology_rules_doc(doc)
     triples = dream_palace.load_premises(path, purpose="durable")
     candidates = {
@@ -454,7 +467,7 @@ def enable_rules(palace, rule_ids: list[str], *, rules_path=None, min_support=2)
         enabled.append(rule_id)
 
     updated_doc = dream_ontology.build_ontology_doc(current_rules, version)
-    dream_ontology.write_ontology_doc(effective_rules_path, updated_doc)
+    dream_ontology.write_ontology_doc(None, updated_doc, palace=path)
     return {
         "palace": path,
         "rules_path": effective_rules_path,
@@ -467,8 +480,13 @@ def enable_rules(palace, rule_ids: list[str], *, rules_path=None, min_support=2)
 def disable_rules(palace, rule_ids: list[str], *, rules_path=None) -> dict:
     """Set enabled=false for the named rules in the palace ontology."""
     path = dream_palace.bind_palace(palace)
-    effective_rules_path = rules_path or os.path.join(path, "ontology.json")
-    doc = dream_ontology.read_ontology_doc(effective_rules_path)
+    with dream_palace.palace_mutation_lock(path):
+        return _disable_rules_locked(path, rule_ids, rules_path=rules_path)
+
+
+def _disable_rules_locked(path, rule_ids, *, rules_path):
+    effective_rules_path = rules_path
+    doc = dream_ontology.read_ontology_doc(effective_rules_path, palace=path)
     current_rules, version = _ontology_rules_doc(doc)
 
     existing_by_id = {rule.get("id"): rule for rule in current_rules if rule.get("id")}
@@ -487,7 +505,7 @@ def disable_rules(palace, rule_ids: list[str], *, rules_path=None) -> dict:
         disabled.append(rule_id)
 
     updated_doc = dream_ontology.build_ontology_doc(current_rules, version)
-    dream_ontology.write_ontology_doc(effective_rules_path, updated_doc)
+    dream_ontology.write_ontology_doc(None, updated_doc, palace=path)
     return {
         "palace": path,
         "rules_path": effective_rules_path,
@@ -511,8 +529,8 @@ def run(
 ) -> dict:
     path = dream_palace.bind_palace(palace)
     kg_path = dream_palace._resolve_kg_path(path)
-    effective_rules_path = rules_path or os.path.join(path, "ontology.json")
-    effective_skips_path = skips_path or os.path.join(path, "dream-derive-skips.jsonl")
+    effective_rules_path = rules_path
+    effective_skips_path = skips_path
     worklist, rules, triples = derive_worklist(
         path,
         rules_path=effective_rules_path,
@@ -523,11 +541,12 @@ def run(
     )
     bootstrap_report = None
     if bootstrap:
-        bootstrap_target = os.path.abspath(os.path.expanduser(ontology_out or os.path.join(path, "ontology.json")))
+        bootstrap_target = os.path.abspath(os.path.expanduser(ontology_out)) if ontology_out else None
         bootstrap_report = bootstrap_ontology(
             triples=triples,
             ontology_path=bootstrap_target,
             min_support=min_support,
+            palace=path,
         )
     return build_report(
         palace=path,
@@ -567,7 +586,7 @@ def run_recall(
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--palace", help="Path to the mempalace palace directory (default: mempalace config)")
-    ap.add_argument("--rules", default=None, help="Path to ontology config (default: <palace>/ontology.json)")
+    ap.add_argument("--rules", default=None, help="Explicit legacy ontology input (default: native MemPalace state)")
     ap.add_argument("--min-support", type=int, default=2, help="Minimum support for induced bootstrap rules (default 2)")
     ap.add_argument("--bootstrap", action="store_true", help="Write disabled ontology candidates for review")
     ap.add_argument("--propose", action="store_true", help="Show plain-language ontology rule proposals")
@@ -576,7 +595,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--out",
         default=None,
-        help="Ontology output path for --bootstrap (default: <palace>/ontology.json)",
+        help="Optional ontology JSON export for --bootstrap; native state is always retained",
     )
     ap.add_argument("--format", choices=["summary", "json"], default="summary", help="Output format (default summary)")
     ap.add_argument("--recall", default=None, help="Reasoning query for relevance-ranked past session recall")
@@ -585,7 +604,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--since", default=None, help="Lower date/time bound passed through to --recall retrieval")
     ap.add_argument("--limit-sessions", type=int, default=None, help="Maximum sessions to inspect for --recall")
     ap.add_argument("--min-similarity", type=float, default=0.0, help="Minimum similarity for --recall (default 0.0)")
-    ap.add_argument("--skips", default=None, help="Path to skip-markers file (default: <palace>/dream-derive-skips.jsonl)")
+    ap.add_argument("--skips", default=None, help="Explicit legacy skip input (default: native MemPalace state)")
     ap.add_argument("--max-depth", type=int, default=3, help="Maximum derivation depth (default 3)")
     ap.add_argument("--max-iterations", type=int, default=10, help="Maximum closure iterations (default 10)")
     ap.add_argument("--max-candidates", type=int, default=500, help="Maximum derive candidates (default 500)")

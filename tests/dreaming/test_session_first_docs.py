@@ -44,14 +44,14 @@ def shell_commands(path, script):
 
 
 @pytest.mark.parametrize("path", (DREAM, PIPELINE, "README.md"))
-def test_first_survey_example_covers_exact_repository_and_memory_wing(path):
+def test_first_survey_example_defaults_to_joint_unfiltered_native_run(path):
     commands = shell_commands(path, "dream_survey.py")
     assert commands, f"{path} needs a runnable default survey example"
     first = commands[0]
     assert first[:2] == ["$MPY", "$DREAM_SCRIPTS/dream_survey.py"]
-    assert first[first.index("--repository") + 1] == "owner/repository"
-    assert first[first.index("--wings") + 1] == "<project-wing>"
-    assert first[first.index("--worklists-dir") + 1] == "<session-files>/dream-worklists"
+    assert first == ["$MPY", "$DREAM_SCRIPTS/dream_survey.py", "--palace", "<p>"], (
+        "the bare default must not require source selection or a local export"
+    )
     assert "--tasks" not in first, "the first example must exercise the safe default"
     assert not {
         "--source", "--since", "--limit-sessions", "--max-candidates", "--tau",
@@ -79,9 +79,8 @@ def test_old_sweep_keeps_legacy_sources_and_diary_reflection_is_separate(path):
 
 def test_harvest_examples_do_not_accidentally_reinterpret_legacy_merge():
     for args in shell_commands(DREAM, "dream_harvest.py"):
-        assert "--task" in args or "--repository" in args
         if "--task" not in args:
-            assert args[args.index("--wing") + 1] == "<project-wing>"
+            assert args == ["$MPY", "$DREAM_SCRIPTS/dream_harvest.py", "--palace", "<p>"]
     phases = section(DREAM, "The 5-phase pipeline")
     assert "--task merge --wing" in phases
 
@@ -94,7 +93,7 @@ def test_default_window_is_complete_instead_of_a_recent_count_sample(path, title
     text = " ".join(section(path, title).split()).lower()
     for required in (
         "all eligible history", "[lower, upper)", "run start", "no input-count",
-        "continuing sessions", "original memories", "all project rooms",
+        "continuing sessions", "original memories", "all eligible wings",
     ):
         assert required in text
 
@@ -103,9 +102,10 @@ def test_default_window_is_complete_instead_of_a_recent_count_sample(path, title
     (DREAM, "The 5-phase pipeline"),
     (PIPELINE, "Default: session review, then relevant recall"),
 ))
-def test_successful_abstention_retains_auditable_worklist(path, title):
+def test_successful_abstention_retains_auditable_native_run(path, title):
     contract = " ".join(section(path, title).split()).lower()
-    assert "reflect.incremental.json" in contract
+    assert "run_id" in contract
+    assert "native" in contract
     assert "empty window" in contract
     assert "abstention" in contract
 
@@ -156,7 +156,7 @@ def test_documented_incremental_proposal_uses_existing_reflect_conclusion():
         )
     ]
     worklist = {
-        "scope": {"wing": "<project-wing>"},
+        "scope": {"scope_schema": 1, "repository": None, "wings": None},
         "incremental": {"run_id": "example-run"},
         "items": [item],
     }
@@ -189,7 +189,7 @@ def test_documented_review_and_completion_edits_are_explicit():
 
 
 @pytest.mark.parametrize("case,required", (
-    ("checkpoint scope", ("dream-checkpoints.json", "repository", "wing", "session store")),
+    ("checkpoint scope", ("native", "repository", "wings", "session store", "scope")),
     ("partial review", ("every coverage record", "missing reviews", "do not advance")),
     ("frozen boundary", ("frozen upper", "source drift", "re-harvest")),
     ("failed adoption", ("failed writes", "receipts", "retry")),
@@ -197,11 +197,128 @@ def test_documented_review_and_completion_edits_are_explicit():
     ("overlapping run", ("stale overlapping", "checkpoint", "re-harvest")),
     ("late source versions", ("reviewed_versions", "late", "historical edits", "unchanged")),
     ("producer timestamps", ("local time", "utc", "filed_at")),
-    ("checkpoint upgrade", ("version 2", "version 1", "reconciliation", "re-harvest")),
+    ("checkpoint upgrade", ("legacy json", "untouched", "reconciliation", "re-harvest")),
 ))
 def test_incremental_completion_pressure_contract(case, required):
     contract = " ".join(section(DREAM, "Incremental completion and recovery").lower().split())
     assert all(term in contract for term in required), case
+
+
+@pytest.mark.parametrize("path", (DREAM, PIPELINE, "README.md"))
+def test_native_run_examples_do_not_require_external_worklist_authority(path):
+    show, = [
+        args for args in shell_commands(path, "dream_show.py")
+        if "--run-id" in args
+    ]
+    assert "--palace" in show
+    decide, = [
+        args for args in shell_commands(path, "dream_decide.py")
+        if "--run-id" in args
+    ]
+    assert "--palace" in decide and "--decisions" in decide
+    adoption = [
+        args for args in shell_commands(path, "dream_adopt.py")
+        if "--run-id" in args
+    ]
+    assert adoption and all("--decisions" not in args for args in adoption)
+    assert any("--dry-run" in args for args in adoption)
+    assert any("--dry-run" not in args for args in adoption)
+
+
+@pytest.mark.parametrize("path,title", (
+    (DREAM, "The 5-phase pipeline"),
+    (PIPELINE, "Default: session review, then relevant recall"),
+))
+@pytest.mark.parametrize("case,required", (
+    ("unfiltered sources", ("repositoryless", "all eligible wings", "one joint")),
+    ("independent filters", ("--repository", "only sessions", "--wings", "only memories")),
+    ("no destination inference", ("destination", "independent", "no", "inference")),
+    ("bounded output", ("five", "total", "output", "no input-count")),
+    ("native harvest effect", ("harvest", "persists", "control", "not read-only")),
+    ("support is not novelty", ("independent evidence", "novelty", "existing lessons", "all wings")),
+))
+def test_joint_scope_pressure_contract(path, title, case, required):
+    contract = " ".join(section(path, title).lower().split())
+    assert all(term in contract for term in required), case
+
+
+@pytest.mark.parametrize("case,required", (
+    ("only palace backup", ("full-palace", "wing-only", "artifacts", "logstream")),
+    ("missing originals", (
+        "completed", "source db", "new adoption", "missing", "drifted",
+        "copilot_session_store", "full frozen",
+    )),
+    ("read-only inspection", ("read-only", "dry-run", "--initialize", "missing", "error")),
+    ("one local authority", ("shared", "local", "lock", "not distributed", "cas")),
+    ("late write", ("synchronous", "unresolved", "timeout", "not proof", "receipt")),
+    ("semantic retries", ("operation", "semantic", "random", "artifact")),
+    ("native maintenance", ("archive", "ontology", "derive", "explicit", "imports")),
+))
+def test_native_recovery_pressure_contract(case, required):
+    contract = " ".join(section(DREAM, "Incremental completion and recovery").lower().split())
+    assert all(term in contract for term in required), case
+
+
+@pytest.mark.parametrize("path,title", (
+    (DREAM, "Guarantees (why this is safe)"),
+    (PIPELINE, "Task: prune / forget"),
+))
+def test_archive_contract_requires_native_readback_before_delete(path, title):
+    contract = " ".join(section(path, title).lower().split())
+    for required in ("native", "archive", "before", "delete", "readback", "physical", "embeddings"):
+        assert required in contract
+
+
+def test_archive_restore_examples_default_native_with_explicit_file_controls():
+    commands = shell_commands(DREAM, "dream_restore.py")
+    assert commands, "document native restore without a legacy archive sidecar"
+    assert commands[0] == [
+        "$MPY", "$DREAM_SCRIPTS/dream_restore.py", "--palace", "<p>", "--dry-run",
+    ]
+    assert any("--archive-file" in args for args in commands), "retain explicit legacy import"
+    assert any("--export-file" in args for args in commands), "retain optional native export"
+
+
+@pytest.mark.parametrize("path", (
+    "skills/contemplate/SKILL.md", "skills/contemplate/references/derive.md",
+))
+def test_contemplation_native_state_does_not_implicitly_enable_rules(path):
+    contract = " ".join(document(path).lower().split())
+    for required in (
+        "native", "artifacts", "skip", "explicit", "enabled: false",
+        "full-palace", "wing-only", "imports", "exports",
+    ):
+        assert required in contract
+    first = shell_commands(path, "dream_harvest.py")[0]
+    assert "--rules" not in first, "native defaults must not depend on a JSON sidecar"
+    assert "edit `ontology.json`" not in contract, (
+        "an optional file edit must not be advertised as changing native rule authority"
+    )
+
+
+@pytest.mark.parametrize("path", (
+    "skills/contemplate/SKILL.md", "skills/contemplate/references/derive.md",
+))
+def test_contemplation_file_overrides_preserve_legacy_input(path):
+    contract = " ".join(section(path, "Native ontology file compatibility").lower().split())
+    for required in (
+        "--rules", "--skips", "read-only input", "enable", "disable",
+        "natively", "does not modify", "legacy input file", "--out", "export",
+    ):
+        assert required in contract
+
+
+@pytest.mark.parametrize("path", (DREAM, PIPELINE))
+def test_ontology_survey_preview_is_distinct_from_native_harvest(path):
+    contract = " ".join(section(path, "Ontology preview and persistence").lower().split())
+    for required in (
+        "survey", "nonpublishing", "harvest", "disabled candidates", "natively",
+        "--rules", "--ontology-out", "enabled", "output only", "sole file import",
+        "existing export",
+        "before kg", "dry-run", "imports nothing", "new optional export target",
+    ):
+        assert required in contract
+    assert "legacy merge behavior" not in contract, "an export must not import stale rule enablement"
 
 
 @pytest.mark.parametrize("case,required", (

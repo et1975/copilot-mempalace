@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Read-only incremental session/memory review, with opt-in maintenance tasks.
+"""Freeze native incremental session/memory review, with explicit legacy previews.
 
 Instead of shelling out to ``dream_harvest.py`` once per (task, wing) — which
-generates dozens of invocations — the default exports one repository and wing's
-complete input window since the last successful dream for agent review. Explicit
+generates dozens of invocations — the default freezes one joint complete input
+window across all repositories and original-memory wings for agent review. Optional
+repository and wing selectors filter their own source type independently. Explicit
 tasks retain wing-scoped maintenance behavior.
 
-READ-ONLY: it never adopts. ``induce-rules`` candidates are written to a
-temporary ontology and reported, never to the live ``<palace>/ontology.json``.
+It never adopts lessons. Default run manifests are persisted in native artifacts;
+exports are optional. Explicit ``induce-rules`` survey candidates are computed
+without publishing ontology configuration.
 
 Usage::
 
@@ -264,12 +266,10 @@ def harvest(task: str, palace: str, wing: str | None = None, *, tau: float = 0.9
 
 
 def induce(palace: str, min_support: int = 2) -> list:
-    """Run induce-rules to a throwaway ontology and return the candidate rules."""
-    with tempfile.TemporaryDirectory() as td:
-        onto = os.path.join(td, "ontology.json")
-        _run_main(["--palace", palace, "--task", "induce-rules",
-                   "--min-support", str(min_support), "--ontology-out", onto])
-        return dream_ontology.read_ontology_doc(onto).get("rules", [])
+    """Compute explicit preview candidates without publishing maintenance state."""
+    triples = dream_palace.load_premises(palace, purpose="audit")
+    base = dream_ontology.filter_base_triples(triples, [])
+    return dream_ontology.induce_rules_from_triples(base, min_support=min_support)
 
 
 def survey(palace: str, wings: list | None = None, tasks: list | None = None, *,
@@ -280,13 +280,11 @@ def survey(palace: str, wings: list | None = None, tasks: list | None = None, *,
            max_candidates: int | None = None, instructions: str | None = None) -> dict:
     implicit = tasks is None
     if implicit:
-        if not (repository or "").strip() or len(wings or []) != 1 or not wings[0].strip():
-            raise ValueError("incremental dreaming requires nonblank --repository and exactly one --wings destination")
         if any(value is not None for value in (source, since, limit_sessions, max_candidates)):
             raise ValueError("partial source/since/limit options require an explicit --tasks reflect preview")
         import dream_incremental
         palace = dream_palace.bind_palace(os.path.abspath(os.path.expanduser(palace)))
-        worklist = dream_incremental.harvest(palace, repository, wings[0], instructions)
+        worklist = dream_incremental.harvest(palace, repository, instructions=instructions, wings=wings)
         if worklists_dir:
             os.makedirs(worklists_dir, exist_ok=True)
             _dump(worklists_dir, "reflect.incremental.json", worklist)
@@ -375,7 +373,7 @@ def main(argv: list | None = None) -> int:
     ap.add_argument("--tasks", default=None,
                     help="Explicit preview/maintenance tasks (default: incremental session and memory review)")
     ap.add_argument("--wings", default=None,
-                    help="One required memory wing for incremental review; explicit legacy tasks default to all wings")
+                    help="Optional comma-separated exact memory wings (default all); does not filter sessions")
     ap.add_argument("--source", choices=["diary", "sessions", "both"], default=None,
                     help="Explicit reflection preview source; requires --tasks")
     ap.add_argument("--repository", help="Exact repository for incremental review; substring for explicit previews")
@@ -401,7 +399,7 @@ def main(argv: list | None = None) -> int:
     tasks = [t.strip() for t in args.tasks.split(",") if t.strip()] if args.tasks is not None else None
     if tasks is None and (args.tau is not None or args.min_support is not None):
         ap.error("candidate thresholds require an explicit --tasks preview, not incremental review")
-    wings = [w.strip() for w in args.wings.split(",") if w.strip()] if args.wings else None
+    wings = [w.strip() for w in args.wings.split(",")] if args.wings is not None else None
     effective_palace = args.palace or _default_palace()
     if effective_palace is None:
         config_path = os.environ.get("MEMPALACE_CONFIG") or "~/.mempalace/config.json"

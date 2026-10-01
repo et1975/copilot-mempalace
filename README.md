@@ -66,8 +66,9 @@ audit hook that nags when an external tool is about to run without a prior `memp
   review all new sessions and original memories since the last completed dream,
   propose at most five actionable lessons
   total, then retain only reviewed/accepted lessons for relevant future recall.
-  The default requires an exact repository and explicit memory wing, covers
-  all eligible history on first use, and advances a timestamp checkpoint only
+  The default covers all eligible session repositories (including repositoryless
+  sessions) and original-memory wings, with independent optional source filters.
+  It covers all eligible history on first use and advances a native checkpoint only
   after a complete reviewed adoption. Five is an output budget, not an input cap.
   Explicit maintenance still merges near-duplicate drawers and resolves
   adjudicated KG contradiction/staleness candidates, plus constructive `reflect`
@@ -77,9 +78,13 @@ audit hook that nags when an external tool is about to run without a prior `memp
   Cognition stays in the agent, mechanics in Python scripts
   ([`skills/dreaming/scripts/`](skills/dreaming/scripts/)), storage in mempalace. The optional read-only
   `dream_sessions.py` adapter uses Copilot's host session store for original evidence.
-  Both merge and prune archive full originals before sanctioned deletion; semantic preservation still
+  MemPalace native artifacts/events own manifests, reviews, accepted intents,
+  receipts, checkpoints, archives, ontology and derive skips; local files are
+  optional exports/imports, not authority. Both merge and prune archive full
+  originals natively before sanctioned deletion; semantic preservation still
   requires review. Re-harvest measures residual work, not a guaranteed global fixpoint. Existing KG
-  premise loading can reconcile legacy provenance and ontology candidate commands explicitly write,
+  premise loading can reconcile legacy provenance and harvest ontology commands
+  explicitly write disabled candidates (survey rule previews do not),
   so the whole pipeline is not strictly read-only. Merge discovery uses the native
   duplicate finder while preserving canonical chunk identities and procedural
   evidence exclusions. Native drawer usage adds protection-only prune salience;
@@ -115,6 +120,8 @@ audit hook that nags when an external tool is about to run without a prior `memp
   For **per-wing** archival/migration/cloning (which restic cannot do, since wings share physical storage), it also
   ships [`scripts/palace_wing.py`](skills/mempalace-backup/scripts/palace_wing.py) — a logical wing export/import that
   reads the palace SQLite directly into a portable JSONL bundle and replays it back.
+  A wing-only export does not include native Dreaming control state; use a coherent
+  full-palace backup to retain Dreaming artifacts, history and checkpoints.
 - **[skills/mempalace-restore/SKILL.md](skills/mempalace-restore/SKILL.md)** — restore / disaster-recovery
   counterpart: offline, reversible private-staging restore with explicit
   validation before publication/reconnection.
@@ -209,35 +216,75 @@ MemPalace and `DREAM_SCRIPTS` to the absolute checkout/installed
 replace the placeholders:
 
 ```bash
-"$MPY" "$DREAM_SCRIPTS/dream_survey.py" --palace <p> --repository owner/repository \
-  --wings <project-wing> --worklists-dir <session-files>/dream-worklists
+"$MPY" "$DREAM_SCRIPTS/dream_survey.py" --palace <p>
 ```
 
 Default: incremental reflection over **all** eligible sessions and original
 memories since the prior successfully completed dream; the first run covers all
-eligible history. Exact repository and explicit memory-wing scope are required,
-not inferred aliases. The UTC window is frozen at run start: `[lower, upper)`.
+eligible history across all eligible session repositories, including
+repositoryless sessions, and original-memory wings. No manual selection is
+required. Optional exact `--repository owner/repository` selects sessions only;
+`--wings A,B` selects memories only. There is no inferred repository/wing mapping
+and neither filter chooses a lesson destination. The UTC window is frozen at
+run start: `[lower, upper)`.
 Continuing sessions with new turns are included, with full original user/assistant
-records, alongside new memory drawers from all project rooms. Generated lessons,
-reflections, procedural and control records are not fresh evidence.
+records, alongside new memory drawers from all eligible rooms. Generated lessons,
+reflections, procedural/control records and identified raw-session diary mirrors
+are not independent evidence. Existing lessons and reflections remain novelty
+targets across all wings, even outside source filters; only internal control
+records are excluded from that dedup corpus.
 
 There is no input-count or candidate-seed cap. Review every `coverage` record
-in `reflect.incremental.json`, in batches for a large window. Add at most five
+in the native run, in batches for a large window. Add at most five total
 lesson proposals with trigger, action/avoidance, scope/exceptions, original
 evidence and expected difference; five is an **output budget only**. Dedup and
 abstain when support is weak. Each source needs its own reasoned review, and
 top-level completion is explicit even for an empty window. Missing sources
-are errors, not empty success.
+are errors, not empty success. This is one joint run, not five proposals per
+wing. Harvest persists immutable native control state and returns `run_id`; it
+is not read-only. `--worklists-dir` optionally exports `reflect.incremental.json`.
 
-The existing adoption command validates unchanged coverage/sources and reviews,
-persists accepted lessons, then atomically advances palace-local
-`dream-checkpoints.json` for that repository/wing to frozen upper. Harvest,
+```bash
+"$MPY" "$DREAM_SCRIPTS/dream_show.py" --palace <p> --run-id <id> --out decisions.json
+# Edit the full worklist, preserving originals and immutable metadata:
+"$MPY" "$DREAM_SCRIPTS/dream_decide.py" --palace <p> --run-id <id> --decisions decisions.json
+"$MPY" "$DREAM_SCRIPTS/dream_adopt.py" --palace <p> --run-id <id> --dry-run
+# Only after complete review and acceptance:
+"$MPY" "$DREAM_SCRIPTS/dream_adopt.py" --palace <p> --run-id <id>
+```
+
+MemPalace is the sole durable store. Native artifacts and `dreaming/v1` events
+retain full originals, saved reviews, accepted intents, receipts, checkpoints
+and cumulative source fingerprints; files are optional exports/imports.
+Adoption validates unchanged coverage/sources and reviews, files accepted lessons
+in explicit destination wings' `lessons` rooms, verifies receipts, then publishes
+completion to frozen upper. Independent global/filtered scopes do not share
+cutoffs; scope identity excludes paths and dynamically discovered inventories.
+Harvest,
 proposal-only, dry-run, failed writes, drift, missing reviews or stale overlapping
-runs do not advance. Unchanged retries use generated adoption receipts.
+runs do not advance. Unchanged retries reconcile verified adoption receipts.
 Cumulative source fingerprints also recover late-persisted turns, backfilled
 memories and historical edits whose timestamps predate the checkpoint; unchanged
 reviewed versions are not reviewed again. This checks source versions as well
 as timestamps, without reconstructing versions the source no longer holds.
+New wings enter the next wildcard run without erasing its history.
+
+Only cooperating clients of one local palace are supported for mutations, under
+the shared cross-process lock: native append is not distributed CAS, and lesson
+effects plus completion are not one atomic transaction. Native control writes
+are synchronous. Unresolved vector writes hold accepted intent and scope after
+timeouts/client death; absent immediate receipts do not justify another writer.
+Native inspection and incremental dry-run are genuinely read-only. Absent or
+corrupt native storage is an error; `dream_store.py --palace <p> --initialize`
+is explicit bootstrap for genuinely new control storage, not restore repair.
+
+A coherent full-palace restore retains native state, including archive,
+ontology and derive-skip records. Wing-only exports do not. Completed runs can
+be inspected without the original source DB or exports; frozen originals
+preserve review progress. New adoption still blocks if required original
+sources are missing or drifted. Explicit moved locators need full validation.
+Legacy JSON checkpoints remain untouched and cannot certify new native scope;
+reconcile all eligible history and re-harvest legacy incremental worklists.
 See the [completion contract](skills/dreaming/SKILL.md#incremental-completion-and-recovery).
 
 Accepted lessons live in the project wing's non-mined `lessons` room. At task
@@ -249,8 +296,8 @@ No new hook, scheduler or task tracker is involved, and no procedural outcomes,
 KG truth or ontology rules are enabled. Historic procedural records remain
 behind explicit repository opt-in and `guidance` / `explain`.
 
-**Migration:** bare harvest now selects incremental reflection and needs
-exact `--repository` plus `--wing`; add `--task merge` to former implicit merge
+**Migration:** bare `dream_harvest.py --palace <p>` selects unfiltered incremental
+reflection; add `--task merge` to former implicit merge
 commands. Partial source/since/count/room/threshold controls require explicit
 `--task` / `--tasks` previews; they never advance the incremental checkpoint.
 `--instructions` may steer the complete default review. Explicit

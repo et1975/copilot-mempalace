@@ -11,6 +11,9 @@ import unittest
 from unittest import mock
 
 import dream_contemplate as dc
+import dream_ontology
+from test_dream_maintenance_state import initialize_logstream
+from test_dream_procedural_palace import installed_palace
 
 
 def _test_tmpdir():
@@ -201,6 +204,7 @@ class TestCliSmoke(unittest.TestCase):
         )
         con.commit()
         con.close()
+        initialize_logstream(palace)
         return palace
 
     def _run_json(self, argv):
@@ -229,15 +233,17 @@ class TestCliSmoke(unittest.TestCase):
                 "enabled": True,
                 "rationale": "human approved",
             }
-            with open(ontology_path, "w", encoding="utf-8") as fh:
-                json.dump({"version": 1, "rules": [existing_enabled]}, fh)
+            with installed_palace(palace):
+                dream_ontology.write_ontology_doc(
+                    None, {"version": 1, "rules": [existing_enabled]}, palace=palace)
 
             report, _stderr = self._run_json(["--palace", palace, "--format", "json"])
             self.assertGreaterEqual(report["derive_candidate_count"], 1)
 
-            report, _stderr = self._run_json(["--palace", palace, "--bootstrap", "--format", "json"])
-            with open(ontology_path, encoding="utf-8") as fh:
-                ontology = json.load(fh)
+            with installed_palace(palace):
+                report, _stderr = self._run_json(["--palace", palace, "--bootstrap", "--format", "json"])
+            ontology = dream_ontology.read_ontology_doc(palace=palace)
+            self.assertFalse(os.path.exists(ontology_path))
             self.assertEqual(ontology["rules"][0], existing_enabled)
             disabled = [rule for rule in ontology["rules"][1:] if rule.get("enabled") is False]
             self.assertTrue(disabled)

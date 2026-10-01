@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 import dream_palace
 from test_dream_procedural_palace import DrawerCollection, installed_palace
+from test_dream_maintenance_state import initialize_logstream
 
 
 def _test_tmpdir():
@@ -248,7 +249,9 @@ class TestKgSourceDegree(unittest.TestCase):
 
 class TestArchiver(unittest.TestCase):
     def test_archive_then_delete_appends_jsonl_before_deleting_members(self):
-        with _test_tmpdir() as td:
+        with _test_tmpdir() as td, installed_palace(td):
+            from dream_store import DreamStore
+            initialize_logstream(td)
             archive_path = os.path.join(td, "cold", "archive.jsonl")
             record = {
                 "id": "logical-1",
@@ -314,7 +317,9 @@ class TestArchiver(unittest.TestCase):
             self.assertEqual(result, {"archived": "logical-1", "deleted": ["chunk-1", "chunk-2"]})
 
     def test_archive_failure_does_not_delete(self):
-        with _test_tmpdir() as td:
+        with _test_tmpdir() as td, installed_palace(td):
+            from dream_store import DreamStore
+            initialize_logstream(td)
             archive_path = os.path.join(td, "archive-dir")
             os.mkdir(archive_path)
 
@@ -334,8 +339,11 @@ class TestArchiver(unittest.TestCase):
                 archiver.archive_then_delete({"id": "d1", "member_ids": ["d1"]})
             self.assertEqual(writer.deleted, [])
 
-    def test_archive_defaults_to_palace_local_path(self):
-        with _test_tmpdir() as palace:
+    def test_archive_defaults_to_native_palace_records(self):
+        with _test_tmpdir() as palace, installed_palace(palace):
+            from dream_store import DreamStore
+            from dream_restore import load_native_archive_records
+            initialize_logstream(palace)
             collection = DrawerCollection({"d1": {"id": "d1", "text": "doc", "metadata": {}}})
 
             class FakeWriter:
@@ -350,10 +358,13 @@ class TestArchiver(unittest.TestCase):
             dream_palace.Archiver(palace, writer=writer, collection=collection).archive_then_delete(
                 {"id": "d1", "member_ids": ["d1"]}
             )
-            self.assertTrue(os.path.exists(os.path.join(palace, "dream-archive.jsonl")))
+            self.assertFalse(os.path.exists(os.path.join(palace, "dream-archive.jsonl")))
+            self.assertEqual(load_native_archive_records(palace)[0]["id"], "d1")
 
     def test_missing_member_preflight_raises_without_archiving_or_deleting(self):
-        with _test_tmpdir() as palace:
+        with _test_tmpdir() as palace, installed_palace(palace):
+            from dream_store import DreamStore
+            initialize_logstream(palace)
             archive_path = os.path.join(palace, "archive.jsonl")
 
             collection = DrawerCollection({
@@ -1092,7 +1103,9 @@ class TestMempalaceWriter(unittest.TestCase):
 
         originals = self._with_fake_tools(handler)
         try:
-            result = dream_palace.MempalaceWriter().add_drawer(
+            writer = dream_palace.MempalaceWriter()
+            writer._call_tool = None
+            result = writer.add_drawer(
                 "wing", "room", "content", metadata={"kind": "pattern"}
             )
         finally:
@@ -1110,7 +1123,9 @@ class TestMempalaceWriter(unittest.TestCase):
 
         originals = self._with_fake_tools(handler)
         try:
-            dream_palace.MempalaceWriter().add_drawer(
+            writer = dream_palace.MempalaceWriter()
+            writer._call_tool = None
+            writer.add_drawer(
                 "wing", "room", "content", metadata={"supersedes": ["old"], "kind": "merge"}
             )
         finally:
@@ -1326,6 +1341,11 @@ class TestNativeDuplicateAdapter(unittest.TestCase):
                 with self.assertRaises((RuntimeError, ValueError)):
                     self.scan()
 
+    def test_internal_control_drawers_are_not_merge_evidence(self):
+        for row in self.collection.rows.values():
+            row["metadata"]["kind"] = "dream_control"
+        self.assertEqual(self.scan(), [])
+
     def test_requested_cap_is_not_exhaustive_success(self):
         self.result["clusters"] = [
             {"drawer_ids": ["a", "bridge"], "pairs": [{"a": "a", "b": "bridge", "distance": .01}]},
@@ -1376,13 +1396,16 @@ class TestNativeDuplicateAdapter(unittest.TestCase):
         self.assertEqual(live["content_hash"], hashlib.sha256(b"firstsecond").hexdigest())
         harvested = {d["id"]: d for d in dream_palace.load_logical_drawers("/palace")}
         self.assertEqual(harvested["a"]["text"], live["text"])
-        with _test_tmpdir() as path:
+        with _test_tmpdir() as path, installed_palace(path) as server, \
+                patch.object(dream_palace, "_embedded_mcp_server", return_value=server):
+            from dream_store import DreamStore
+            from dream_restore import load_native_archive_records
+            initialize_logstream(path)
             archive = dream_palace.Archiver(
                 path, collection=self.collection,
                 writer=types.SimpleNamespace(delete_drawer=self.collection.delete))
             archive.archive_then_delete(cluster["members"][0])
-            with open(archive.archive_path, encoding="utf-8") as stream:
-                record = json.loads(stream.readline())
+            record = load_native_archive_records(path)[0]
             self.assertEqual(record["id"], "a")
             self.assertEqual(record["member_ids"], ["a_chunk_000000", "a_chunk_000001"])
             self.assertEqual([r["document"] for r in record["rows"]], ["first", "second"])
@@ -1554,10 +1577,13 @@ class OntologyLoaderTests(unittest.TestCase):
 
 class SkipMarkerIOTests(unittest.TestCase):
     def test_append_then_load_roundtrip(self):
-        with _test_tmpdir() as d:
+        with _test_tmpdir() as d, installed_palace(d):
+            initialize_logstream(d)
             path = os.path.join(d, "skips.jsonl")
-            dream_palace.append_skip_markers(path, [{"candidate_id": "derive:a", "ontology_version": "v"}])
-            dream_palace.append_skip_markers(path, [{"candidate_id": "derive:b", "ontology_version": "v"}])
+            dream_palace.append_skip_markers(
+                path, [{"candidate_id": "derive:a", "ontology_version": "v"}], palace=d)
+            dream_palace.append_skip_markers(
+                path, [{"candidate_id": "derive:b", "ontology_version": "v"}], palace=d)
             got = dream_palace.load_skip_markers(path)
             self.assertEqual([m["candidate_id"] for m in got], ["derive:a", "derive:b"])
 
@@ -1889,8 +1915,10 @@ class EpistemicFirewallB10AcceptanceTests(unittest.TestCase):
             json.dump(value, fh)
 
     def _write_transitive_ontology(self, palace):
-        with open(os.path.join(palace, "ontology.json"), "w", encoding="utf-8") as fh:
-            json.dump({
+        from dream_ontology import write_ontology_doc
+        with installed_palace(palace):
+            initialize_logstream(palace)
+            write_ontology_doc(None, {
                 "version": 1,
                 "rules": [{
                     "id": "transitive:depends_on",
@@ -1899,7 +1927,7 @@ class EpistemicFirewallB10AcceptanceTests(unittest.TestCase):
                     "enabled": True,
                     "max_depth": 3,
                 }],
-            }, fh)
+            }, palace=palace)
 
     def _chain_palace(self, td):
         palace = os.path.join(td, "palace")
