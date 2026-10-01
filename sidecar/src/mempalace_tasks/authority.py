@@ -718,6 +718,7 @@ class TaskAuthority:
         return filters
 
     def _row(self, task, now):
+        from .native import pending_review
         eligibility = task_eligibility(self._log.state, task, now)
         attempt = task["attempt"]
         due = (task.get("coordination_mode") != "cooperative_native"
@@ -738,6 +739,7 @@ class TaskAuthority:
                 "ready": eligibility["ready"], "reasons": eligibility["reasons"],
                 "needs_attention": bool(due or task["status"] in {"recovering", "quarantined"}
                                         or task["escalation"] is not None
+                                        or pending_review(task)
                                         or any(reason["code"] == "native_reconciliation_required"
                                                for reason in eligibility["reasons"])),
                 "blockers": [edge["source"] for edge in self._log.state.edges

@@ -450,6 +450,13 @@ customization pattern. These are prompt guidance, not a supervisor or task-servi
 installation; [Tasks registration](#optional-tasks-registration) and each goal's
 tracking opt-in are separate.
 
+Keep this checkout's skill, reference files and agent as the canonical sources.
+When using copies, update the installed skill directory and agent together and
+compare them with the checkout before declaring deployment complete; editing only
+`~/.copilot/` does not deliver a repository change. Preserve local customizations
+before replacing copies. Refresh the MemPalace section of merged instructions
+without overwriting instructions contributed by other packs.
+
 ### Seeding Copilot user memory
 
 The auto-loaded reflex stub in `memories/mempalace-first.md` is meant for Copilot's `/memories/` store,

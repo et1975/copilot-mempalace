@@ -80,6 +80,111 @@ class NativeTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, code)
         self.assertEqual(len(self.log.events), before)
 
+    def repository_leaves(self):
+        self.bootstrap()
+        self.start()
+        self.complete()
+        result = self.call("expand", self.scope(
+            expected_graph_revision=self.task(self.goal)["graph_revision"],
+            source_disposition="continue", tasks=[
+                {"intent_key": "example/api:contract", "title": "R1: Update contract",
+                 "description": "Repository example/api; worktree /worktrees/api",
+                 "acceptance": "API contract tests pass"},
+                {"intent_key": "example/cli:contract", "title": "R1: Update contract",
+                 "description": "Repository example/cli; worktree /worktrees/cli",
+                 "acceptance": "CLI contract tests pass"},
+                {"intent_key": "example/api:verify", "title": "R2: Verify contract",
+                 "description": "Repository example/api; worktree /worktrees/api",
+                 "acceptance": "Verify the completed API contract"},
+            ], edges=[{"source": "example/api:contract", "target": "example/api:verify",
+                       "edge_type": "blocks"}]))
+        return result["admitted_task_ids"]
+
+    def test_one_parent_can_publish_concurrent_leaves_in_distinct_repositories(self):
+        api, cli, _ = self.repository_leaves()
+        ready = self.authority.ready({"goal_id": self.goal})["tasks"]
+        self.assertEqual({task["id"] for task in ready}, {api, cli})
+        self.start(api, agent="returned-api-worker")
+        self.start(cli, agent="returned-cli-worker")
+
+        self.assertNotEqual(self.tokens(api)["attempt_id"], self.tokens(cli)["attempt_id"])
+        for task_id, agent in ((api, "returned-api-worker"), (cli, "returned-cli-worker")):
+            with self.subTest(task_id=task_id):
+                current = self.authority.get(task_id)
+                self.assertEqual(current["task"]["status"], "in_progress")
+                self.assertEqual(current["task"]["attempt"]["native_agent_id"], agent)
+                self.assertEqual(current["task"]["attempt"]["owner"], SESSION)
+                self.assertTrue(current["authorization"]["authorized"])
+                self.call("checkpoint", {
+                    **self.tokens(task_id), "checkpoint_sequence": 1,
+                    "reference": f"artifact:verified/{agent}",
+                })
+
+        for task_id in (cli, api):
+            self.complete(task_id)
+            self.assertEqual(self.task(task_id)["status"], "closed")
+            self.assertEqual(self.task(task_id)["completion"]["actor"], SESSION)
+        self.assertEqual(self.task(self.goal)["native"]["session_id"], SESSION)
+
+    def test_other_repository_session_cannot_claim_leaf_or_revoke_existing_attempt(self):
+        api, cli, _ = self.repository_leaves()
+        self.start(api, agent="returned-api-worker")
+        running, goal = self.task(api), self.task(self.goal)
+
+        self.assertRejected("not_owner", "claim", self.scope(
+            task_id=cli, expected_version=self.task(cli)["version"]), session=OTHER)
+
+        self.assertEqual(self.task(api), running)
+        self.assertEqual(self.task(self.goal), goal)
+        self.assertTrue(self.authority.get(api)["authorization"]["authorized"])
+        self.assertTrue(self.authority.get(cli)["eligibility"]["ready"])
+        self.assertIsNone(self.task(cli)["attempt"])
+        self.call("checkpoint", {
+            **self.tokens(api), "checkpoint_sequence": 1, "reference": "artifact:still-authorized",
+        })
+        self.complete(api)
+
+    def test_goal_enumeration_retains_active_and_blocked_repo_work_across_cursors(self):
+        api, cli, verify = self.repository_leaves()
+        self.start(api, agent="returned-api-worker")
+        self.assertEqual(self.authority.snapshot(
+            filters={"goal_id": self.goal, "project": "example/api"})["rows"], [])
+        self.assertEqual(
+            [task["id"] for task in self.authority.ready({"goal_id": self.goal})["tasks"]],
+            [cli])
+        with self.assertRaises(AuthorityError) as caught:
+            self.authority.get("R1")
+        self.assertEqual(caught.exception.code, "not_found")
+
+        page = self.authority.snapshot(filters={"goal_id": self.goal}, limit=1)
+        rows = list(page["rows"])
+        snapshot_id = page["snapshot_id"]
+        for _ in range(4):
+            self.assertIsNotNone(page["next_cursor"])
+            page = self.authority.snapshot(
+                filters={"goal_id": self.goal}, limit=1, cursor=page["next_cursor"])
+            self.assertEqual(page["snapshot_id"], snapshot_id)
+            self.assertFalse(page["fresh"])
+            self.assertEqual(page["reason"], "pinned_snapshot")
+            rows.extend(page["rows"])
+        self.assertIsNone(page["next_cursor"])
+        self.assertEqual(len(rows), 5)
+        indexed = {row["id"]: row for row in rows}
+        self.assertEqual(set(indexed), {self.goal, self.planner, api, cli, verify})
+        self.assertEqual({row["project"] for row in rows}, {"demo"})
+        self.assertEqual(indexed[self.planner]["status"], "closed")
+        self.assertEqual(indexed[api]["status"], "in_progress")
+        self.assertFalse(indexed[api]["ready"])
+        self.assertEqual(indexed[verify]["blockers"], [api])
+        self.assertFalse(indexed[verify]["ready"])
+        self.assertTrue(indexed[cli]["ready"])
+        self.assertEqual(indexed[api]["title"], indexed[cli]["title"])
+        for task_id, intent in ((api, "example/api:contract"), (cli, "example/cli:contract")):
+            current = self.authority.get(task_id)
+            self.assertTrue(current["fresh"])
+            self.assertEqual(current["task"]["intent_key"], intent)
+            self.assertIn(intent.split(":")[0], current["task"]["description"])
+
     def test_bootstrap_atomic_without_native_actor_or_supervisor_and_idempotent(self):
         request = definition()
         result = self.call("bootstrap", request, number=11)
@@ -224,19 +329,26 @@ class NativeTests(unittest.TestCase):
 
     def test_resume_is_cas_transfer_and_never_accepts_old_parent_results(self):
         self.bootstrap()
-        self.start(agent="old-agent")
+        started = self.start(agent="old-agent")
+        self.assertEqual(started["outcome"], "committed")
+        self.assertTrue(self.authority.get(self.planner)["authorization"]["authorized"])
+        successful_attempt = self.task(self.planner)
         stale = self.tokens()
         old_goal = self.task(self.goal)
         payload = self.scope(expected_version=old_goal["version"], expected_session_id=SESSION,
                              reason="Explicitly resume opted goal", observations=["Old parent interrupted"])
         self.call("resume", payload, session=OTHER)
         inherited = self.authority.get(self.planner)
+        self.assertEqual(inherited["task"], successful_attempt)
         self.assertEqual(inherited["task"]["status"], "in_progress")
         self.assertFalse(inherited["authorization"]["authorized"])
         self.assertEqual(inherited["authorization"]["reason"], "native_reconciliation_required")
         self.assertEqual(self.task(self.goal)["native"]["issuing_session_id"], SESSION)
         self.assertEqual(self.task(self.goal)["native"]["session_id"], OTHER)
         self.assertRejected("version_conflict", "resume", payload, session=uid(802))
+        self.assertRejected("not_owner", "checkpoint", {
+            **stale, "checkpoint_sequence": 1, "reference": "artifact:late-checkpoint"},
+        )
         self.assertRejected("not_owner", "complete", {
             **stale, "summary": "Old result", "evidence": ["artifact:old"], "parent_acceptance": "Old"},
         )

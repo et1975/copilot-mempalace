@@ -389,7 +389,8 @@ class _Runtime:
         completion = (name in {"renew", "checkpoint", "release", "recover", "transition"}
                       or name == "attempt_report" and arguments.get("report_kind") != "started"
                       or name == "native" and arguments.get("action") in {
-                          "checkpoint", "complete", "release", "reconcile", "cancel", "goal_close"})
+                          "checkpoint", "complete", "request_changes", "release", "reconcile",
+                          "cancel", "goal_close"})
         if self.lifecycle.phase != "draining" or not completion:
             raise AuthorityError("service_draining", "New task intake is disabled")
 
