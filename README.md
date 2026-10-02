@@ -121,17 +121,27 @@ audit hook that nags when an external tool is about to run without a prior `memp
   `agentName == "Explore"`, second-or-later `grep_search`/`file_search` in the same window, and
   `run_in_terminal` commands matching broad-probe patterns (`find ./…`, `grep -r/-R`, `ls -*R`, `locate`,
   `(apt-cache|brew|npm|pip|cargo|gem) search`).
-- **[hooks/mempalace-save.json](hooks/mempalace-save.json) + [hooks/copilot_transcript.py](hooks/copilot_transcript.py)** —
-  `Stop` + `PreCompact` **save** hook (the automated counterpart to the read-first nudge). MemPalace's built-in
-  `mempalace hook run --harness claude-code` writes a diary entry via silent-save, but its transcript parsers only
-  understand Claude Code and Codex schemas — Copilot CLI writes `events.jsonl` in a third schema
-  (`{"type":"user.message","data":{"content":…}}`, `cwd` nested under `session.start`), so wiring the CLI hook
-  directly is a **silent no-op**: 0 messages counted, no wing derived, nothing saved. `copilot_transcript.py`
-  bridges that: it translates `events.jsonl` into a temporary Claude-format JSONL (top-level `cwd` on every line so
-  wing derivation works), then invokes `mempalace hook run`, reusing all of mempalace's count/theme/save/ingest
-  logic. Any error → `{}` exit 0; a save helper, never a gate. Posix-only (`python3` `command`), matching
-  the `palace-reflex` hook; Windows is untested. Fires the actual save every `SAVE_INTERVAL` (15) human messages;
-  `PreCompact` is the emergency save before context loss.
+- **[hooks/mempalace-save.json](hooks/mempalace-save.json) +
+  [hooks/copilot_transcript.py](hooks/copilot_transcript.py) +
+  [hooks/copilot_capture.py](hooks/copilot_capture.py)** —
+  `Stop` + `PreCompact` + `SessionEnd` **save** hooks (the automated counterpart to the read-first nudge).
+  The stdlib adapter validates Copilot's `events.jsonl` and invokes its companion helper with an
+  explicitly configured, already-provisioned `MEMPALACE_PYTHON` interpreter. The helper files
+  deterministic `copilot-observation-v2` envelopes through MemPalace's installed stdio MCP dispatcher,
+  not raw tool handlers. Bounded, lossless parts retain original user/assistant text,
+  session/message IDs, roles, timestamps and content hashes.
+  It uses `data.content`, not injected `transformedContent`; tool events are not captured.
+  This is not the sweep CLI, the upstream hook's bounded diary snippet, or detached mining.
+  `Stop` means the main agent finished a **turn**, not that the CLI exited; capture runs after
+  15 new user messages since the last confirmed capture. `PreCompact` and `SessionEnd` flush
+  pending messages regardless of that interval, including an assistant-only tail.
+  Observations go into the source session's derived project wing and `diary` room.
+  The installed **hooks** policy must permit the supported MCP route, whose normal writer
+  admission still applies. A daemon-selected route is explicitly unsupported; there is no
+  silent fallback or daemon auto-start.
+  The version-1 registration uses PascalCase event names and snake_case payloads.
+  POSIX-only (`python3` `command`); Windows is untested. See
+  [save-hook verification](#verifying-the-save-hook) for lifecycle and notification limits.
 - **[memories/mempalace-first.md](memories/mempalace-first.md)** — terse auto-loaded reflex stub designed for
   Copilot's user memory (`/memories/`). First 200 lines of user memory are auto-loaded into every conversation,
   so the rule is in context even when the full instructions get pushed out.
@@ -141,7 +151,11 @@ audit hook that nags when an external tool is about to run without a prior `memp
 - [MemPalace](https://github.com/mempalace/mempalace) installed (`uv tool install mempalace` or `pip install mempalace`).
   Verify with `mempalace status`.
 - MemPalace exposed as an MCP server in your harness — see [Step 0](#step-0--register-mempalace-as-an-mcp-server) below.
-- Python 3 on `PATH` (for the hook). The hook fails silently if Python is missing.
+- Python 3 on `PATH` (for the hook). If Python is missing, the adapter cannot run or report capture status.
+- For save hooks, `MEMPALACE_PYTHON` must name the absolute path of an executable Python
+  interpreter with the compatible MemPalace APIs and model prerequisites already provisioned.
+  Configure it persistently in each installed save-hook entry as shown below. Neither the
+  adapter nor helper downloads/installs dependencies or guesses an interpreter from a CLI launcher.
 - For the backup/restore skills only: [`restic`](https://restic.net/) on `PATH`
   (`zypper in restic`, `apt install restic`, `brew install restic`, …).
 - For the optional Tasks sidecar: Python **3.11+**, MCP SDK **1.30.0**, and
@@ -287,14 +301,48 @@ mkdir -p ~/.copilot/hooks
 ln -s "$(pwd)/hooks/palace-reflex.json" ~/.copilot/hooks/palace-reflex.json
 ln -s "$(pwd)/hooks/palace-reflex.py"   ~/.copilot/hooks/palace-reflex.py
 
-# 1.4 Save hook (Stop + PreCompact → automated diary save). Requires the
-#     mempalace binary on PATH (or set MEMPALACE_BIN). Both files together.
-ln -s "$(pwd)/hooks/mempalace-save.json"   ~/.copilot/hooks/mempalace-save.json
-ln -s "$(pwd)/hooks/copilot_transcript.py" ~/.copilot/hooks/copilot_transcript.py
+# 1.4 Save hooks: turn-stop, pre-compaction, and final session end.
+#     Install all three files together; configure MEMPALACE_PYTHON below.
+COPILOT_HOOKS_DIR="${COPILOT_HOME:-$HOME/.copilot}/hooks"
+mkdir -p "$COPILOT_HOOKS_DIR"
+cp hooks/mempalace-save.json hooks/copilot_transcript.py hooks/copilot_capture.py \
+  "$COPILOT_HOOKS_DIR/"
 ```
 
-The hook JSON references `python3 ~/.copilot/hooks/palace-reflex.py`. If you'd rather keep the script outside
-`~/.copilot/hooks/`, edit the `command` field accordingly.
+The read-first audit hook JSON references `python3 ~/.copilot/hooks/palace-reflex.py`. If you'd rather keep
+that script outside `~/.copilot/hooks/`, edit its `command` field accordingly.
+The save-hook commands instead use the quoted
+`"${COPILOT_HOME:-$HOME/.copilot}/hooks/copilot_transcript.py"` path, so they follow
+the CLI's configured home without interpreting spaces or shell metacharacters in it.
+The other customization examples above retain their default `~/.copilot/` locations.
+Keep the filenames `copilot_transcript.py` and `copilot_capture.py`, with both
+Python files in the same directory. Installing only the JSON or adapter is incomplete.
+The save-hook example uses copies: the helper's safe-path checks reject symlinked
+helper paths, and the installed JSON needs a local interpreter setting. For upgrades,
+preserve local customizations and replace old save-hook symlinks before copying;
+do not copy through links into the checkout.
+Update all three files together;
+do not add a second copy of the registrations in another loaded hooks directory.
+Copilot combines registrations from multiple sources, so duplicate entries can invoke the adapter twice.
+
+In the **installed copy** of `mempalace-save.json`, add this field to each existing
+command object under `Stop`, `PreCompact` and `SessionEnd`, replacing the placeholder
+with your already-provisioned interpreter's absolute path:
+
+```json
+"env": {
+  "MEMPALACE_PYTHON": "/absolute/path/to/preprovisioned/bin/python"
+}
+```
+
+This per-hook setting persists across fresh CLI launches; keep it when updating
+the installed JSON. Do not add it at the JSON root or create duplicate event entries.
+The shipped commands also inherit `MEMPALACE_PYTHON` from the CLI's environment,
+but a one-time shell export does not configure future CLI launches from other shells.
+The generic repository JSON deliberately contains no machine-specific interpreter.
+The helper is executed directly with this interpreter, without shell evaluation,
+launcher-shebang inference, package installation or daemon auto-start.
+`MEMPALACE_BIN` is not used by this save path.
 
 For the optional [per-goal task workflow](sidecar/README.md#per-goal-native-fleet-workflow),
 copy or link `skills/mempalace-tasks/` into `~/.copilot/skills/` and
@@ -346,32 +394,142 @@ from passing tests.
 ```bash
 export PYTHONDONTWRITEBYTECODE=1
 export TMPDIR="$SESSION_FILES"
+export DREAMING_TEST_TMPDIR="$SESSION_FILES"
 "$TEST_PY" -m pytest --basetemp "$SESSION_FILES/pytest-hooks" tests/hooks -q
 
-# Smoke test the adapter with a Copilot Stop payload + a tiny events.jsonl. A short
-# transcript is below the 15-message save threshold, so it prints {} (nothing saved yet):
-printf '%s\n' '{"type":"user.message","data":{"content":"hello palace"}}' \
-  > "$SESSION_FILES/hook-smoke-events.jsonl"
-printf '{"hook_event_name":"Stop","session_id":"t","transcript_path":"%s/hook-smoke-events.jsonl","cwd":"%s"}\n' \
-  "$SESSION_FILES" "$SESSION_FILES" \
-  | python3 hooks/copilot_transcript.py   # -> {}
-rm "$SESSION_FILES/hook-smoke-events.jsonl"
+# After installation, verify both Python files match this checkout.
+COPILOT_HOOKS_DIR="${COPILOT_HOME:-$HOME/.copilot}/hooks"
+cmp hooks/copilot_transcript.py "$COPILOT_HOOKS_DIR/copilot_transcript.py"
+cmp hooks/copilot_capture.py "$COPILOT_HOOKS_DIR/copilot_capture.py"
+# Expected local JSON differences: the per-hook MEMPALACE_PYTHON env fields only.
+diff -u hooks/mempalace-save.json "$COPILOT_HOOKS_DIR/mempalace-save.json"
 ```
 
-Once installed, a real session that crosses 15 human messages prints
-`✦ N memories woven into the palace — …` at a turn end (the `Stop` hook), and `PreCompact` forces a save
-before compaction. The save is silent (writes a diary entry directly); it never blocks the agent.
+The JSON comparison normally exits 1 for those intentional interpreter additions;
+review any other difference rather than overwriting local settings blindly.
+The config regression covers version 1, all three event registrations, and command
+resolution against an isolated fixture adapter under default, empty and custom
+`COPILOT_HOME` values. It does not invoke live memory writes or prove that an
+already-running CLI has loaded the registration. Start a fresh disposable CLI
+session after installation when checking actual lifecycle dispatch.
+Isolated SQLiteExact integration exercises the actual fresh-process installed
+MCP dispatcher and writer admission, substituting only deterministic embeddings.
+This validates that runtime boundary, not production-model behavior or observation
+of a live host's exit callback.
+
+The [official hook contract](https://docs.github.com/en/copilot/reference/hooks-reference)
+distinguishes these events:
+
+| Registration | Capture opportunity | What it does not prove |
+| --- | --- | --- |
+| `Stop` | Main-agent turn completion; capture after 15 unsaved user messages | CLI exit or capture of a short session's final tail |
+| `PreCompact` | Flush pending messages before context compaction, including assistant-only tails | A session-end callback |
+| `SessionEnd` | Flush pending messages at session termination, including graceful CLI exit | Delivery after an abrupt kill, crash or power loss |
+
+`SessionEnd` supplies `hook_event_name`, `session_id`, ISO `timestamp`, `cwd`
+and `reason`; the documented payload does **not** include `transcript_path`.
+Register the PascalCase event to retain the adapter's snake_case input contract.
+The adapter resolves the transcript as
+`$COPILOT_HOME/session-state/<session_id>/events.jsonl` (default home: `~/.copilot`).
+Legacy payloads with an explicit `transcript_path` remain supported. Session identity,
+message IDs, timezone-aware timestamps and safe paths are validated before capture; an explicit
+path does not bypass those checks.
+The authoritative project comes from `session.start.data.context.cwd`, not the
+helper's working directory. A supplied callback `cwd` must agree after path
+normalization; conflicting context fails instead of redirecting capture.
+Only legacy sessions that entirely omit the `context` member may use an explicit
+absolute callback `cwd`. Malformed modern context does not take that fallback.
+The chosen project destination is pinned in session state across captures and
+resumes; a changed destination is refused.
+Final callbacks are best-effort; keeping incremental `Stop` and `PreCompact`
+capture matters because abrupt termination cannot guarantee exit callbacks.
+
+Observation envelopes use schema `copilot-observation-v2`. A message is split
+deterministically into content parts of at most 10,000 characters, retaining its
+session/event identity, role, timestamp, zero-based `part_index`, `part_count` and
+the complete original text's `content_sha256`. To verify a message, gather every
+part for that original event, order by index, concatenate the part content and
+check the SHA-256 of its UTF-8 text. Parts are lossless storage units, not separate
+independent observations or summaries.
+
+The adapter writes `{}` to stdout and returns exit 0 for handled failures as well
+as successful captures: it is not an agent-blocking policy gate. A content-free
+JSON diagnostic on stderr reports `saved`, `skipped`, `failed` or `unknown`.
+The per-session durable result, when available, is recorded in
+`$COPILOT_HOME/session-state/<session_id>/mempalace-save/status.json`
+(under `~/.copilot` by default); input, filesystem or locking failures may only
+report stderr.
+Exit 0 or `{}` alone is **not** evidence that capture succeeded.
+
+`saved` means the adapter accepted a complete helper receipt for the pending
+batch and advanced its confirmed transcript prefix. Status format **version 3**
+retains the prefix digest, pinned project and bounded receipt metadata: batch
+digest, first/last drawer IDs, wing, room, route `mcp` and part count. A multipart
+message produces more parts than original messages; those counts are not interchangeable.
+This is separate from the hook
+registration's version 1. Incompatible saved state is refused, not silently reset.
+A repeated unchanged callback skips already captured messages.
+Timeout, a nonzero helper exit or an incomplete/unrecognized receipt can
+leave an **unknown** write outcome. The adapter retains the pending intent in
+`status.json` and the snapshot in the same directory's `pending.jsonl`, and blocks
+automatic retry until explicit reconciliation. Do not delete these files to force
+a retry: the earlier attempt may already have written some or all messages.
+The snapshot contains original message text and can remain after confirmed capture;
+protect it like the source transcript. Its existence alone does not mean an attempt
+is unsettled: inspect the status's pending intent and outcome.
+Recovery needs independent evidence of what actually committed before uncertain
+state can be reconciled. This pack does not automatically settle unknown writes
+or migrate older status formats.
+
+The helper honors MemPalace's auto-save setting and resolves the **hooks**, not CLI,
+write-routing policy. If policy requires a missing daemon, it reports
+`daemon_required_unavailable`. If policy selects a running daemon, it reports
+`daemon_capture_unavailable`: that installed runtime's daemon tool path lacks the
+required writer admission. Neither case starts a daemon or falls back silently.
+
+For a policy-permitted non-daemon route, the helper uses the installed stdio MCP dispatcher,
+with its existing hub forwarding or guarded local writer admission. It does not
+invoke a raw add-drawer handler or replace a collection writer. Read-only policy
+and peer writer locks remain effective: an active non-hub writer can prevent
+capture, yielding `writer_unavailable`; read-only rejection before any write yields
+`capture_read_only`. Do not delete locks or bypass the dispatcher to force a save.
+Resolve writer ownership and deployment policy explicitly; having a working
+interactive MCP connection does not prove a fresh hook process can acquire a writer.
+
+Missing interpreter/helper/APIs or palace are reported rather than installed or
+initialized. A confirmed no-write failure or disabled auto-save can clear pending
+intent without claiming a save; after the prerequisite is corrected, a future
+callback can try again. There is no automatic retry scheduler, and an unknown
+partial attempt remains held even after its original error disappears.
+This path does not call the upstream
+`mempalace hook run` silent-save/toast path. There is no promised desktop toast or
+`systemMessage`. The CLI can display progress messages while a command hook runs,
+but `SessionEnd` output is not processed into the model. Do not use visible exit
+text or an injected follow-up message as the success criterion.
+For end-to-end verification, use an isolated test palace and inspect persisted
+observations and capture status after a turn, compaction and graceful exit rather
+than sending synthetic save events to your live palace. Verify the recorded
+project wing, `diary` room and drawer receipt against the original observation
+envelopes; hook settings and registration alone do not prove persistence.
+
+Captured transcripts are source evidence, not automatic reflection, accepted
+lessons, procedural outcomes or causal credit for retrieved advice. The adapter
+does not start feedback or dreaming. Review and any separately opted-in learning
+workflow remain explicit.
 
 ## Harness compatibility
 
-The hook protocol matches Claude Code's: stdin JSON with `tool_name` / `tool_input` / `session_id`, stdout
+The **read-first audit** hook protocol matches Claude Code's: stdin JSON with `tool_name` / `tool_input` / `session_id`, stdout
 JSON with `hookSpecificOutput.additionalContext` to inject context. Verified with VS Code Copilot Chat and
 Copilot CLI. Should work in any harness that consumes the same shape (Claude Code, Cursor).
+This context-injection behavior does not apply to the `SessionEnd` save hook.
 
-The **save** hook is Copilot-CLI-specific: it bridges Copilot's `events.jsonl` transcript schema to the
-`claude-code` transcript schema mempalace expects (see the `hooks/copilot_transcript.py` bullet above). VS Code
-Copilot writes a Claude-compatible transcript, so there the upstream `mempalace hook run --harness claude-code`
-config from [discussion #1419](https://github.com/MemPalace/mempalace/discussions/1419) works without the adapter.
+The **save** hook is Copilot-CLI-specific: it validates Copilot session state and
+uses the companion helper to file original observations through MemPalace's
+installed stdio MCP dispatcher and writer-admission path. The upstream
+`mempalace hook run --harness claude-code` configuration
+for other harnesses is a different capture route; its diary/mining behavior is not
+the full-message receipt contract described here.
 
 ## License
 
