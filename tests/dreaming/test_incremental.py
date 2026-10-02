@@ -111,6 +111,58 @@ def test_default_includes_all_older_unprocessed_sessions_and_original_memories(i
     assert checkpoint(tmp_path) is None
 
 
+@pytest.mark.parametrize("wing", [None, "project"])
+def test_memory_scan_pages_without_capping_sources_and_reassembles_chunks(tmp_path, monkeypatch, wing):
+    import dream_incremental
+    import mempalace.palace
+
+    class PagedCollection(DrawerCollection):
+        def get(self, *, limit=None, **kwargs):
+            if limit is None or limit > 1000:
+                raise RuntimeError("unbounded memory query exceeds SQL variable limit")
+            return super().get(limit=min(limit, 2), **kwargs)
+
+    collection = PagedCollection()
+    first = collection.add("project", "architecture", "first original")["drawer_id"]
+    chunked = collection.add(
+        "project", "architecture", "abcdefgh", chunk_size=3, metadata={"id_recipe": "v3"},
+    )["drawer_id"]
+    other = collection.add("other", "architecture", "other wing original")["drawer_id"]
+    monkeypatch.setattr(mempalace.palace, "get_collection", lambda *a, **k: collection)
+
+    result = dream_incremental._drawers(str(tmp_path), wing)
+    expected = {first: "first original", chunked: "abcdefgh"}
+    if wing is None:
+        expected[other] = "other wing original"
+    assert {drawer["id"]: drawer["text"] for drawer in result} == expected
+    assert [drawer["id"] for drawer in result] == sorted(expected)
+
+
+@pytest.mark.parametrize("broken", ["truncated", "repeated", "missing-document"])
+def test_memory_scan_rejects_incomplete_pages(tmp_path, monkeypatch, broken):
+    import dream_incremental
+    import mempalace.palace
+
+    class BrokenCollection(DrawerCollection):
+        def get(self, *, limit=None, offset=0, **kwargs):
+            if broken == "repeated":
+                offset = 0
+            result = super().get(limit=1, offset=offset, **kwargs)
+            if broken == "truncated" and offset > 0:
+                return {"ids": [], "documents": [], "metadatas": []}
+            if broken == "missing-document":
+                result["documents"] = []
+            return result
+
+    collection = BrokenCollection()
+    collection.add("project", "architecture", "first")
+    collection.add("project", "architecture", "second")
+    monkeypatch.setattr(mempalace.palace, "get_collection", lambda *a, **k: collection)
+
+    with pytest.raises(RuntimeError, match="incomplete|repeated"):
+        dream_incremental._drawers(str(tmp_path))
+
+
 @pytest.mark.parametrize("option", [
     ["--limit-sessions", "50"], ["--max-candidates", "5"], ["--since", "2001-01-01"],
     ["--source", "sessions"], ["--rooms", "architecture"],

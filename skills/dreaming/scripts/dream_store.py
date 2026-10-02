@@ -236,7 +236,9 @@ class DreamStore:
                 raise StoreError("unsupported native logstream schema version")
             for table, columns in _SCHEMA.items():
                 actual = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
-                if actual != columns:
+                # Existing palaces may predate native topic routing; reads must not migrate them.
+                pre_topic = table == "events" and actual == columns - {"topic"}
+                if actual != columns and not pre_topic:
                     raise StoreError(f"unsupported native logstream schema: {table}")
             yield conn
         except sqlite3.Error as exc:

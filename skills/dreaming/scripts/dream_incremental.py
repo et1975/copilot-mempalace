@@ -127,18 +127,11 @@ def _original(drawer: dict) -> bool:
 def _drawers(palace: str, wing: str | None = None) -> list[dict]:
     from mempalace.palace import get_collection
     collection = get_collection(palace, create=False, read_only=True)
-    options = {"include": ["documents", "metadatas"]}
-    if wing is not None:
-        options["where"] = {"wing": wing}
-    rows = dream_palace._rows_from_collection_result(collection.get(**options))
-    ids = sorted({(row.get("metadata") or {}).get("parent_drawer_id") or row["id"] for row in rows})
-    drawers = []
-    for identity in ids:
-        drawer = dream_palace.load_source_drawer(palace, identity, collection=collection)
-        if drawer is None:
-            raise ValueError(f"memory disappeared while reading coverage: {identity}")
-        drawers.append(drawer)
-    return drawers
+    rows = dream_palace._complete_drawer_rows(collection, wing=wing)
+    by_id = {row["id"]: row for row in rows}
+    drawers = [dream_palace._canonical_drawer(logical, by_id)
+               for logical in dream_palace._group_by_parent(rows, ("parent_drawer_id",))]
+    return sorted(drawers, key=lambda drawer: drawer["id"])
 
 
 def collect_sources(palace: str, scope: dict, lower: str | None, upper: str, *,

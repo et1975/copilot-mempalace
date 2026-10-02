@@ -95,6 +95,9 @@ class DrawerCollection:
     def __init__(self, rows=None):
         self.rows = rows if rows is not None else {}
 
+    def count(self):
+        return len(self.rows)
+
     def get(self, *, ids=None, where=None, include=None, limit=None, offset=0):
         rows = [deepcopy(row) for key, row in sorted(self.rows.items())
                 if (ids is None or key in ids) and matches(row["metadata"], where)]

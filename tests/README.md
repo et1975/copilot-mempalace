@@ -45,11 +45,21 @@ It additionally requires preinstalled `uv` on PATH and the sidecar's
 `setuptools>=68`, plus `wheel` if the chosen backend requires it. These are
 development/build prerequisites, not runtime dependencies.
 
-Dreaming's read-only logstream reader targets that pinned native schema,
-including `events.topic`. Local validation must use the same MemPalace source
-pin, not an older installation exposed through `PYTHONPATH` or a `.pth` file.
+Dreaming's read-only logstream reader accepts that pinned native schema,
+including `events.topic`, and the exact pre-topic schema still present in
+existing palaces. Reading either layout must not initialize, migrate or
+checkpoint storage, including an open writer's committed WAL. Other missing
+or unknown columns remain errors; native writers own schema migration.
+Local validation must use the same MemPalace source pin, not an older
+installation exposed through `PYTHONPATH` or a `.pth` file.
 Check the environment's `mempalace-*.dist-info/direct_url.json` against the
 source URL and archive hash in `requirements-ci-source.txt`.
+
+Incremental memory coverage uses complete, count-checked metadata pages rather
+than an unbounded Chroma query, which can exceed SQLite's variable limit on
+large palaces. Pagination must retain every source and reassemble chunks across
+page boundaries; short backend pages are not a source cap. Repeated, malformed
+or incomplete pages fail instead of publishing partial coverage.
 
 [`test_distribution.py`](test_distribution.py) is part of the default root
 suite. It builds a real wheel and source distribution, then rebuilds a wheel

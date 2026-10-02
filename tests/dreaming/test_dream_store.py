@@ -98,12 +98,48 @@ def test_native_topic_routing_preserves_control_documents_readonly(native, topic
     assert event["topic"] == topic
 
 
-@pytest.mark.parametrize("change", ["missing-topic", "unknown-column"])
-def test_unsupported_native_event_columns_fail_without_mutation(native, change):
+def remove_topic(log):
+    log._conn().execute("DROP INDEX events_topic_created_idx")
+    log._conn().execute("ALTER TABLE events DROP COLUMN topic")
+    log._conn().commit()
+
+
+@pytest.mark.parametrize("open_writer", [False, True])
+def test_pre_topic_native_documents_remain_readable_without_migration(native, monkeypatch, open_writer):
     palace, log = native
-    if change == "missing-topic":
-        log._conn().execute("DROP INDEX events_topic_created_idx")
-        log._conn().execute("ALTER TABLE events DROP COLUMN topic")
+    module = api()
+    store = module.DreamStore(str(palace), call_tool=caller(log))
+    store.publish_document(
+        record(), {"original": "pre-topic evidence"}, field="manifest", purpose="manifest",
+    )
+    remove_topic(log)
+    if not open_writer:
+        log.close()
+    before = snapshot(palace)
+    monkeypatch.setattr(module, "native_call_tool", lambda *a, **k: pytest.fail("read dispatched native handler"))
+
+    reopened = module.DreamStore(str(palace))
+    assert reopened.load_run("run") == {"original": "pre-topic evidence"}
+    assert len(reopened.events()) == 1
+    assert reopened.checkpoint("scope") is None
+    after = snapshot(palace)
+    assert after.keys() == before.keys()
+    for name, original in before.items():
+        # WAL readers may update shared-memory read marks, not database/WAL contents.
+        if name.endswith("-shm"):
+            assert after[name][1:] == original[1:]
+        else:
+            assert after[name] == original
+
+
+@pytest.mark.parametrize("with_topic", [False, True])
+@pytest.mark.parametrize("change", ["missing-body", "unknown-column"])
+def test_unsupported_native_event_columns_fail_without_mutation(native, change, with_topic):
+    palace, log = native
+    if not with_topic:
+        remove_topic(log)
+    if change == "missing-body":
+        log._conn().execute("ALTER TABLE events DROP COLUMN body")
     else:
         log._conn().execute("ALTER TABLE events ADD COLUMN unsupported TEXT")
     log._conn().commit()
