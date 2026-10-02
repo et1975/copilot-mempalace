@@ -3,7 +3,7 @@
 This is the supported path from an installed package to usable task MCP tools.
 Use `mempalace-tasks setup`, included in the Python task package. It reuses the
 existing authority operations, not a second writer or a custom task database.
-It works outside the checkout; no F# or .NET runtime is required.
+It works outside the checkout using the installed Python environment.
 
 **Do not equate installed files with readiness.** These are separate results:
 

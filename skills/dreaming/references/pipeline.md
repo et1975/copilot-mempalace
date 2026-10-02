@@ -11,8 +11,8 @@ remain outside the checkout and installed skill.
 
 ## Layered responsibilities
 
-- **Substrate — mempalace** (passive): stores drawers + embeddings + KG; serves
-  read (`get_collection`) and write (MCP tool handlers). No cognition.
+- **Substrate — mempalace** (passive): stores drawers + embeddings + KG and exact
+  native artifacts/events; serves reads and sanctioned tool writes. No cognition.
 - **Mechanics — Python scripts**: `dream_lib.py` (pure core), `dream_palace.py`
   (mempalace adapter), `dream_harvest.py`, `dream_adopt.py`.
 - **Cognition — the dreaming skill**: the agent, in its own fresh context.
@@ -23,6 +23,252 @@ Consolidation must not claim/release/complete work or infer current ownership or
 readiness from those memories. Preserve source task/event IDs when retaining
 evidence and use the sidecar for current state. The task projection pipeline and
 its rebuild command were removed; dreaming does not recreate task projections.
+
+## Default: session review, then relevant recall
+
+Use the already provisioned MemPalace interpreter (`MPY`, absolute path) and
+the checkout/installed `skills/dreaming/scripts/` directory (`DREAM_SCRIPTS`,
+absolute path). Run examples from the external session workspace.
+
+```bash
+"$MPY" "$DREAM_SCRIPTS/dream_survey.py" --palace <p>
+```
+
+Implicit dreaming includes all eligible session repositories, repositoryless
+sessions, and original memories from **all eligible wings** in **one joint** run.
+Optional exact `--repository owner/repository` filters **only sessions**;
+`--wings A,B` filters **only memories**. The selectors are independent, with no
+alias, repository/wing inference or required manual selection. Each proposal's
+explicit destination wing and `lessons` room are independent of source filters.
+The first run covers **all eligible history**.
+Later runs cover the frozen UTC **`[lower, upper)`** interval, from the prior
+successfully completed cutoff to the current **run start**. There is **no
+input-count or candidate-seed cap**. Sources include new sessions, continuing
+sessions with new timestamped turns, and original memories from every eligible
+room, using memory filing/creation timestamps. Session coverage
+contains full original user/assistant turns before upper, not a cropped body.
+Generated lessons, reflections, procedural/control records and identified
+raw-session diary mirrors cannot supply independent evidence. Original memory
+IDs do not establish independent sessions; wing names alone do not establish
+provenance. Novelty uses a different corpus: **existing lessons** and reflections
+remain dedup targets across **all wings**, not merely selected source wings.
+Only internal control records are excluded from novelty.
+
+Survey returns a native `run_id`, including an **empty window**. Its manifest
+contains full source `coverage` with `review: null`, empty proposal `items` and
+`completion: null`. Empty items alone do not establish review or abstention.
+Missing/incomplete sources and invalid timestamps are errors, not successful
+empty input. Harvest **persists** the complete immutable manifest/originals as
+native **control** state and is **not read-only**. Optional `--worklists-dir`
+exports `reflect.incremental.json` as a reproducible working copy, not authority.
+No default maintenance, KG scan, ontology work or lesson adoption runs.
+`--instructions` steers review only. Partial source/since/count/room filters
+and candidate thresholds require explicit preview tasks and cannot complete
+an incremental window.
+
+The agent reviews **every coverage record**, in batches if necessary, dedups
+against existing knowledge and proposes at most **five actionable lessons
+total**. This is an output budget, never a source limit. Each lesson describes
+a trigger, action/avoidance, scope/exceptions, original evidence and expected
+difference in the existing reflect conclusion text. Missing/weak support or
+no useful novelty means abstention. A one-off factual correction uses ordinary
+filing, not a weakened generalization gate.
+
+Proposals remain native review artifacts until reviewed and accepted. Add-only
+adoption files accepted lessons in an explicitly chosen destination wing's
+non-mined `lessons` room. Supported original-memory conclusions may quote
+originals across wings; session convergence still needs distinct raw sessions.
+Lead with task/trigger vocabulary for retrieval. After ordinary
+task-start recall, reuse the same scoped search to consider at most three directly
+applicable lessons, checking trigger, scope, exceptions and original evidence.
+No match means no advice; search failure is not empty recall. Advice is fallible
+context, not instructions or proof of efficacy. This does not enroll procedural
+learning/outcomes, enable ontology rules, write KG truth, or track durable tasks;
+historic procedural records still require explicit opt-in and `guidance` /
+`explain`. The [skill](../SKILL.md#session-lesson-review) owns the review recipe.
+
+Native review and adoption by ID:
+
+```bash
+"$MPY" "$DREAM_SCRIPTS/dream_show.py" --palace <p> --run-id <id> --out decisions.json
+# Edit source reviews, proposal items and completion; preserve frozen originals:
+"$MPY" "$DREAM_SCRIPTS/dream_decide.py" --palace <p> --run-id <id> --decisions decisions.json
+"$MPY" "$DREAM_SCRIPTS/dream_adopt.py" --palace <p> --run-id <id> --dry-run
+# Only after acceptance:
+"$MPY" "$DREAM_SCRIPTS/dream_adopt.py" --palace <p> --run-id <id>
+```
+
+Local files are optional imports/exports. Once saved, the native run and review
+can be recovered without the exported file. A proposal-only request stops
+before adoption.
+
+### Migration: explicit maintenance
+
+The previous full survey is still available by explicit request:
+
+```bash
+"$MPY" "$DREAM_SCRIPTS/dream_survey.py" --palace <p> \
+  --tasks contradiction,induce-rules,pattern,reflect,merge,prune \
+  --worklists-dir <session-files>/dream-maintenance
+# Separate explicit diary reflection:
+"$MPY" "$DREAM_SCRIPTS/dream_survey.py" --palace <p> --tasks reflect --source diary \
+  --worklists-dir <session-files>/dream-diary
+```
+
+The full sweep keeps pattern diary-backed and reflect drawer-cluster-backed;
+it rejects `--source diary` on the mixed maintenance list. Explicit diary
+reflection is a separate command above, not the default session review. Bare
+`dream_harvest.py --palace <p>` now means unfiltered incremental reflection;
+old implicit merge callers must add `--task merge`. Explicit task selections
+keep their meaning: `--task pattern` defaults to diary, and `--task reflect`
+without `--source` retains drawer-cluster reflection. Use `--source sessions`
+explicitly for raw-session reflection. Explicit legacy session tasks retain
+oldest-first, uncapped behavior unless bounds are supplied. Explicit tasks
+are previews/legacy operations and never advance incremental completion.
+Their legacy `--repository` substring matching is preserved, unlike the exact
+incremental selector. File-only `dream_show.py --worklist` and
+`dream_decide.py --worklist` remain explicit compatibility surfaces.
+The specialized contracts below are unchanged; a survey never adopts, and
+legacy collection/KG initialization remains subject to the read boundary below.
+
+### Ontology preview and persistence
+
+Explicit survey `--tasks induce-rules` is a nonpublishing preview; it does not
+save ontology candidates. Harvest `--task induce-rules` / `--task suggest-rules`
+saves disabled candidates natively, preserving existing enabled rules.
+`--rules FILE` is the sole file import input for ontology; native publication
+imports the resulting configuration without discarding enabled flags.
+`--ontology-out FILE` is strictly output only, including an existing export.
+Old export contents cannot seed or merge stale rule enablement into native
+configuration. No `--ontology` flag exists.
+`--skips FILE` is explicit legacy preview input or optional adoption export;
+omitting it uses native skip state.
+Non-dry derive adoption imports explicit rules and existing skip inputs natively
+before KG writer creation or effects; dry-run imports nothing. A supplied
+missing `--rules` file fails explicitly. A missing `--skips` file can instead be
+a new optional export target. Harvest compatibility previews do not import or
+publish those input files.
+
+## Incremental checkpoint contract
+
+The Python API retains positional singleton compatibility and the existing
+completion entry point:
+
+```python
+harvest(palace, repository=None, wing=None, instructions=None, *, wings=None)
+save_review(palace, run_id, worklist, *, expected_review_hash=None)
+load_run(palace, run_id)
+complete(palace, worklist, *, dry_run=False)
+```
+
+`wing` and `wings` are mutually exclusive. CLI adoption by ID loads the native
+run before completion; it does not replace `complete(palace, worklist, ...)`
+with a run-ID-only Python interface.
+
+MemPalace artifacts and append-ordered `dreaming/v1` events, not external
+checkpoint files, own all Dreaming state. They retain full manifests/originals,
+saved review revisions, accepted intents, proposal starts/receipts, completed
+cutoffs and cumulative `reviewed_versions`. These control records are never
+lesson evidence. Native archive, ontology and derive-skip records use the same
+authority; existing procedural event drawers and KG facts remain unchanged.
+
+Canonical default scope is
+`{"scope_schema":1,"repository":null,"wings":null}`. Supplied wing lists are
+nonempty, case-preserving, sorted and deduplicated; blank filters are errors.
+Singleton `--wing` on harvest is compatible but cannot be combined with
+`--wings`. Exact repository and source-wing selectors have independent
+checkpoints, not inherited global/filtered cutoffs. Scope hashes exclude palace
+paths, session-store paths and discovered wing inventories; the immutable
+manifest freezes actual inventory, source locators, bounds and prior checkpoint.
+
+- Keep source contents and metadata intact. Each `coverage` record needs
+  `review: {"action":"reviewed","reason":"<specific rationale/abstention>"}`.
+- Author `items` as `{proposal_id, source_ids, decision}` referencing coverage.
+  `decision.conclusion` uses existing `text`, `kind`, `decision_or_prediction`.
+  `converge` requires at least two independent raw session sources and empty
+  premises; memory-grounded kinds require at least two original memories and
+  exact `{drawer_id, quote}` premises. Never invent session support for memories.
+- Set top-level `completion: {"action":"complete","reason":"<review summary>"}`
+  only after all sources and proposals were reviewed, including no-lesson and
+  empty windows. The [skill's examples](../SKILL.md#session-lesson-review) are
+  edits to a harvested manifest, not replacements for its evidence.
+- `dream_decide.py --palace <p> --run-id <id> --decisions decisions.json` saves
+  an immutable native review revision. Partial reviews can be retained but not
+  adopted. `dream_adopt.py --palace <p> --run-id <id>` revalidates full coverage,
+  original rereads/hashes and checkpoint/review heads. The explicit
+  `--decisions` alternative validates against the native manifest and saves
+  the review before actual adoption. After accepted additions and exact write
+  readback succeed, completion advances to frozen upper.
+  Harvest, proposal-only, dry-run, missing reviews, partial input, failed writes,
+  source drift and stale overlapping runs do not advance.
+- Retry the unchanged review after settled partial writes; verified receipts
+  identify already-adopted proposals across destinations. An unresolved attempt
+  is a hold, not permission to issue another write. For drift/stale scope,
+  re-harvest and review from
+  the current completed checkpoint rather than editing cutoff/hash metadata.
+  New events at or after upper wait for the next run. Unseen or changed source
+  versions with older timestamps are also included, recovering late-persisted
+  turns, backfilled memories and historical edits. Unchanged reviewed versions
+  stay excluded across empty windows. Source versions are checked, not merely
+  filtered by event time; deleted intermediate versions cannot be reconstructed.
+- Native naive memory `filed_at` values are local time; naive session timestamps
+  are UTC. Explicit offsets are honored and boundaries normalized to UTC.
+- Newly discovered wings and backdated sources enter wildcard runs without
+  changing scope identity or erasing history. Legacy JSON checkpoints remain
+  untouched and cannot certify native coverage. Reconcile all eligible history
+  conservatively and re-harvest legacy incremental manifests; never silently
+  reinterpret their schema.
+
+### Native storage, concurrency and recovery
+
+`dream_store.py` uses exact native artifacts/events, not another database or
+new tables. Ordered UTF-8 fragments preserve complete manifests over the native
+artifact limit; verify references, exact hashes and fragment order rather than
+truncate originals. Exhaust append-order event pages and reject missing,
+corrupt, conflicting or unsupported records. Logical operation identity uses
+stage, run/scope, predecessor and semantic document content, never random native
+artifact IDs. Reconcile an existing logical operation before creating artifacts.
+
+Mutation is supported only for cooperating clients of the same local palace,
+using its shared cross-process lock. Refresh heads and reject stale predecessors
+under that lock. Native append is not CAS: no distributed/mesh completion,
+exactly-once promise, or atomic lesson-plus-checkpoint transaction. Control
+artifact/event writes are synchronous embedded native calls, never a deferred
+hub request that may outlive the lock. Sanctioned vector writes may use the
+authenticated local native HTTP hub; otherwise embedded writer preflight
+must allow the write. A foreign stdio writer without usable transport blocks
+adoption, not native persistence or read-only recovery.
+
+Persist accepted review intent and proposal-start records before effects.
+Outstanding intent pins the scope and prevents replacing the accepted review
+even if the process dies. A timeout or missing immediate receipt is not proof
+that a vector write failed. Only exact receipt reconciliation or positive
+settlement evidence releases it; inspection reports unresolved proposals.
+Never switch vector writers after an uncertain hub call. Completion requires
+verified content, provenance and destination receipts, then native readback.
+
+Native inspection, completed replay and incremental dry-run are genuinely
+read-only: no initialization, migration, saved reviews or completion writes.
+Use version-checked WAL-aware native reads. Missing/corrupt native storage is an
+error, not empty history. `dream_store.py --palace <p> --initialize` explicitly
+bootstraps a genuinely new control store in an existing valid palace; it is not
+restore recovery. Healthy native storage with an empty Dreaming namespace needs
+no extra initialization.
+
+A coherent full-palace restore retains native artifacts/logstream and all
+Dreaming progress, without any export files. A wing-only logical export omits
+native control records and is not equivalent. Completed runs remain inspectable
+with a missing original session source DB. Frozen originals permit continued
+review; **new adoption/completion** still requires original source revalidation
+and blocks on missing/drifted originals. Explicit relocated source locators
+must pass full identity/hash/coverage validation. Never reset corrupt state to
+empty or use snapshots alone as adoption authority.
+Set `COPILOT_SESSION_STORE` explicitly to rebind a moved session database; the
+full frozen session corpus must match, not just sources cited by proposals.
+`dream_show.py --run-id` prints a digest with status and unresolved proposal IDs;
+use `--out` for the complete editable worklist JSON only. `dream_decide.py`
+accepts optional `--expected-review-hash` for a
+local-lock-protected expected revision check and `--out` for an optional export.
 
 ## The dream as a function
 
@@ -35,16 +281,30 @@ equivalent to "no filesystem writes."
 
 ### Task: dedup / merge (v1)
 
-- Similarity `sim(a,b) = cos(mean_embed(a), mean_embed(b))`.
+- Merge candidate edges come from native `mempalace_find_duplicates` distances,
+  converted to similarity with `sim = 1 - distance`. The native representative
+  and neighbor-search semantics are not assumed identical to the historical
+  local mean-embedding all-pairs implementation.
 - Near-duplicate `a ~_τ b ⟺ sim ≥ τ`. Symmetric but **not transitive** →
-  clusters are connected components of the `~_τ` graph (union-find).
+  clusters are connected components of the returned `~_τ` graph (union-find).
+  Room partitioning and logical/physical protected-ID exclusions precede
+  component rebuilding, so an excluded drawer cannot bridge two survivors.
+  Canonical text and physical chunk membership still come from the existing
+  drawer loader; native display text is not used as an archival identity.
 - Fold `μ(C)` = one synthesised drawer per cluster (the agent's job, Phase 2).
 - Soundness constraint: `μ(C)` must preserve every atomic fact in `C`.
   This is an agent review obligation, not proved by cosine similarity.
-- Both merge and prune archive full original records to fsynced JSONL before
-  sanctioned deletion. A successful add or an archive alone does not establish
+- Both merge and prune archive and verify full original records in native
+  artifacts/events before sanctioned deletion. JSONL is an optional explicit
+  export, not sole recovery authority. A successful add or an archive alone does not establish
   semantic preservation. Re-harvest is a residual-work measurement; skipped
   groups and concurrent changes mean zero clusters is not guaranteed.
+  Native errors, unavailable vectors and truncated responses are failures, not
+  zero candidates. Limits cannot be applied before client-side scope/protection
+  filtering and then interpreted as an exhaustive result.
+  Standalone `dream_verify.py` and adoption's `--verify` share the harvest
+  candidate definition; raw cross-room or protected-only matches do not make
+  an otherwise empty actionable worklist fail convergence.
 
 ### Task: contradiction / staleness
 
@@ -57,8 +317,17 @@ equivalent to "no filesystem writes."
   `(valid_from || "", extracted_at || "")` descending, but it never auto-resolves.
 - Adjudication is cognitive: the agent decides whether the predicate should be
   functional, which object is authoritative, and which objects to retire.
-- Adoption is non-destructive belief revision: `KnowledgeGraph.invalidate(...)`
-  sets `valid_to` on retired facts. It does **not** delete rows.
+- Adoption is non-destructive belief revision: it sets `valid_to` on retired
+  facts and ends their supporting provenance, cascading invalidation to
+  dependent conclusions without an alternative valid proof. It does **not**
+  delete rows. Reports count affected root facts, not requested IDs or cascades;
+  a shortfall is an explicit adoption failure.
+- A functional single-old-object resolution uses one transactional supersession
+  boundary. `keep` may identify an object or candidate triple, but is resolved
+  to the canonical kept candidate before writing. The kept fact already exists:
+  preserve its identity, interval and support rather than creating a new
+  unsupported assertion. Multi-retire decisions use exact triple-ID
+  invalidation through the same support-aware machinery.
 - Fixpoint: re-harvest after adoption should remove the resolved functional
   contradiction. Legitimately multi-valued skipped groups may still surface.
 
@@ -69,8 +338,9 @@ equivalent to "no filesystem writes."
 > no such flag, so the handler can target the user's default
 > `~/.mempalace/knowledge_graph.sqlite3` regardless of
 > `MEMPALACE_PALACE_PATH`. `dream_palace.KgWriter` therefore constructs
-> `KnowledgeGraph(db_path=os.path.join(palace_path, "knowledge_graph.sqlite3"))`
-> directly and calls `.invalidate(...)`.
+> `KnowledgeGraph` against the explicitly resolved palace KG and performs
+> support-aware mutations there. A bare native supersede/invalidate call alone
+> does not maintain this package's provenance tables.
 
 ### Task: reflect / pattern
 
@@ -129,24 +399,41 @@ Harvest:
   is therefore inverted: **remove carefully, reversibly**. `merge` preserves
   source facts by add-then-delete, `contradiction` soft-invalidates KG facts,
   and `pattern` is add-only; `prune` may delete drawers after approval.
-- Ideal salience is `v(d) = usage-freq × recency × KG-degree`. Because
-  mempalace v1 has no per-drawer usage counter and only `filed_at` (filing
-  time, not last-use time), the shipped score is a composite of observable
-  signals: age from `filed_at`, KG source-degree (`source_drawer_id` triple
-  count), redundancy (maximum cosine similarity to neighbours), and ephemeral
-  marker negatives (`for now`, `one-off`, `scratch`, etc.). True usage-frequency
-  is deferred to a session-store oracle or native upstream salience.
+- The base score combines age from `filed_at`, KG protection degree, redundancy
+  (maximum cosine similarity to neighbours), and ephemeral marker negatives
+  (`for now`, `one-off`, `scratch`, etc.). Native usage is an additive,
+  protection-only signal with default weight `0.2`, not a replacement for these
+  gates. Missing telemetry and zero `access_count` leave the base score
+  unchanged, including a never-accessed drawer with high initial strength.
+  Strength uses the native `0.05..5` scale, normalized above its floor; usage
+  snapshots and the added boost are included in salience for review. For
+  positive access count `n`, the usage signal averages `n/(n+1)` with
+  `clamp((strength-0.05)/4.95, 0, 1)`. Its weighted contribution is added before
+  the existing final score clamp; positive usage never lowers the score.
+- Usage is read across the complete scoped metadata set and combined
+  conservatively across physical chunks. The native `drawer_salience` tool
+  returns at most 100 records with no pagination, so absence from that response
+  cannot be treated as absence of usage. Reads do not potentiate drawers.
+  Partial snapshots omit unavailable fields; reading must not invent a fresh
+  activation timestamp or count.
+  Retrieval is not a helpful outcome and never promotes procedural advice.
 - Candidate selection is the guardrail heart: **multi-gate AND**, never OR. A
   drawer is proposed only when `v < v_min` AND `age_days >= age_floor_days` AND
   `kg_degree == 0` AND it is not pinned. The `kg_degree == 0` gate also means the
   pruned drawer sourced no KG triples, so deletion cannot orphan the graph.
-- Adoption is archive-**before**-delete: each pruned drawer is appended as a full record
-  (including `salience` and `archived_at`) to an append-only JSONL cold store,
-  flushed and `fsync`ed, and only then deleted through the sanctioned
+- Adoption is archive-**before**-delete: publish each full original to native
+  artifacts/events, preserving physical records, embeddings, order, identity,
+  reason, `salience` and `archived_at`. Require exact native archive readback
+  before deleting through the sanctioned
   `mempalace_delete_drawer` handler, which purges the closet/AAAK index. A
-  failed archive deletes nothing; the archive is lossless and reversible.
+  failed archive publication/readback deletes nothing. Native restore reads
+  those archives without JSONL. Explicit legacy JSONL imports/exports remain
+  available, but are not the sole retained archive.
 - Apply has a protected re-check: drawers with `kg_degree > 0` or `pinned` are
-  refused even if adjudication said `prune`.
+  refused even if adjudication said `prune`. Usage is also refreshed under the
+  existing mutation lock. Retrieval advanced since harvest or a refreshed score
+  outside the approved worklist's eligibility policy invalidates prune approval.
+  The same core scorer is used at harvest and apply.
 - All retained procedural events and their original source/lineage drawers
   are excluded at harvest and checked live under the shared mutation lock at
   apply, including logical/physical chunk IDs. Terminal/out-of-scope history
@@ -201,15 +488,18 @@ cache; legacy destructive safety lookups keep their existing backend semantics.
 
 ## Artifacts (session workspace — never commit)
 
-Phase-2 adjudication should use the human-readable renderer instead of opening
-large raw JSON:
+For explicit legacy worklists, Phase-2 adjudication can use the human-readable
+renderer instead of opening large raw JSON:
 
 ```bash
 "$MPY" "$DREAM_SCRIPTS/dream_show.py" --worklist <worklist.json>
 "$MPY" "$DREAM_SCRIPTS/dream_show.py" --worklist <worklist.json> --task derive --full
 ```
 
-The renderer prints one compact block/line per candidate and avoids the 20KB file
+Incremental worklists initially have no candidate items. Review their full
+`coverage` in batches; an empty candidate rendering is not completed review.
+
+The renderer prints one compact block/line per legacy candidate and avoids the 20KB file
 view limit. Use it for merge, contradiction, pattern, prune, and derive worklists
 before filling `item["decision"]`.
 
@@ -468,46 +758,61 @@ exact chunk reads and strict nonmutation boundary.
   and `TOOLS["mempalace_delete_drawer"]["handler"](drawer_id=...)`. The durable
   alternative `mempalace.service.run_mcp_tool` accepts write-classified tools
   only.
-- **Palace targeting**: handlers resolve the palace via
-  `MEMPALACE_PALACE_PATH`; set it before importing mempalace
-  (`dream_palace.bind_palace(path)`).
+- **Palace targeting**: bind and verify the requested palace before native
+  reads. Changing `MEMPALACE_PALACE_PATH` alone is not a cache-refresh guarantee
+  after the embedded server has already been imported. Embedded imports must
+  restore Python stdout and descriptor 1; the server's startup redirection is
+  not appropriate for JSON-producing command-line clients.
 - **KG read/write**: the palace-local KG is
   `<palace_path>/knowledge_graph.sqlite3`; active triples are rows where
   `valid_to IS NULL`. For contradiction adoption, use
-  `KnowledgeGraph(db_path=<palace-local KG>)` directly instead of the MCP
+  the explicit-path, support-aware `KgWriter` instead of the MCP
   `mempalace_kg_invalidate` handler because of the `_palace_flag_given` gate
-  described above.
+  described above. The package's provenance records are part of the mutation
+  contract, not supplied by the native supersede signature.
 
 ## Invariants
 
 | Invariant | Enforced by |
 |-----------|-------------|
-| Approved mutations / reversibility | no implicit adoption; legacy initialization/reconciliation and explicit ontology candidates are read-only exceptions; failed add skips delete; merge/prune archive full records before delete; failed archive deletes nothing |
+| Approved mutations / reversibility | no implicit adoption; harvest persists control state; legacy reconciliation and explicit ontology candidates may write; failed add skips delete; native archive readback precedes merge/prune deletion |
 | Provenance | `supersedes` on every merge |
 | Groundedness | converge revalidates declared `min_support`, original session IDs and hashes; mirrors/generated records cannot inflate support; quotes do not prove semantic entailment |
-| Salience-gated protected classes | prune requires `v < v_min` AND age floor AND `kg_degree == 0` AND not pinned; apply refuses KG-connected or pinned drawers |
+| Salience-gated protected classes | prune requires `v < v_min` AND age floor AND `kg_degree == 0` AND not pinned; apply refreshes protected state and usage before honoring approval |
 | Auditability | merge/prune archives retain drawer text, physical members and `archived_at`; procedural events retain all original evidence even after retirement |
 | Operational verification | Phase 5 measures remaining candidates, not a universal zero-cluster guarantee; reflection/pattern/prune are maintenance loops |
-| Bounded cost | scope by wing/room; `tau` gates the pairwise graph |
+| Coverage / bounded output | default reviews all eligible source versions, at most five total lessons; explicit maintenance may scope by wing/room and `tau` |
 | Procedural authority | optional reviewed advice only; explicit attributed outcomes, no feedback from retrieval and no automatic KG/ontology authority |
 
-## Upstream evolution (why harvest imports mempalace)
+## Substrate capabilities and limitations
 
-Harvest reads the ChromaDB collection directly (via `mempalace.palace.get_collection`)
-because **no MCP tool exposes raw embeddings or a bulk near-duplicate scan** —
-`mempalace_search` is query-based top-N only, and `mempalace dedup` is
-destructive keep-longest, not a cluster finder. That direct read is the sole
-reason the scripts need a Python that can `import mempalace`.
+The scripts still require a Python interpreter that can import the installed
+MemPalace package. Merge uses its native `mempalace_find_duplicates` handler,
+not a separate MCP transport. Canonical source reconstruction, complete usage
+metadata, prune redundancy and reflective operations still need collection
+access. This is not a claim that the whole pipeline is remote-MCP-native or
+universally read-only.
 
-The clean long-term fix is a **read-only server-side cluster finder** upstream in
-MemPalace, which would make this pipeline fully MCP-native (no library/venv
-coupling), exact-cosine, and scalable. See
+The duplicate handler must provide logical member IDs, valid pairwise distances
+and a successful, non-truncated scan. Missing capabilities, malformed responses,
+unavailable vectors and explicit incompleteness are errors. A package version
+number alone is not proof of this contract. No runtime package or model download
+is attempted, and the adapter does not silently switch to a different clustering
+algorithm when a capability fails.
+
+The installed native finder also bounds neighbor discovery (currently 512
+physical records). The adapter refuses scans when that bound cannot establish
+coverage of the actual native scope. On builds with the two-key filter defect,
+requesting both wing and room scans the wing natively and filters the room
+locally; a small room therefore cannot hide an incomplete wing scan. Narrow
+to a supported native scope or use a substrate with sufficient coverage.
+This limitation is explicit rather than a claim of unlimited consolidation.
+
+Usage metadata is additive: older drawers without it retain the previous score.
+The capped native salience listing is unsuitable as an exhaustive usage oracle.
+Contradiction supersession additionally requires this package's support-aware
+transactional writer, rather than bare native KG calls.
+
+The historical proposals explain the motivation:
 [`upstream-find-duplicates-proposal.md`](upstream-find-duplicates-proposal.md)
-for the paste-ready proposal. Until that lands, the script-based harvest here is
-the working approach.
-
-For prune, the clean long-term fix is native per-drawer salience dynamics:
-MemPalace/mempalace#1921 would add drawer usage-frequency / last-activated
-signals so `usage-freq` becomes native instead of proxied by host session data or
-observable heuristics. See
-[`upstream-drawer-salience-proposal.md`](upstream-drawer-salience-proposal.md).
+and [`upstream-drawer-salience-proposal.md`](upstream-drawer-salience-proposal.md).

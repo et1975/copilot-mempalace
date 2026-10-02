@@ -2,6 +2,12 @@
 
 # Upstream proposal — per-drawer salience dynamics
 
+> Historical proposal, not the current integration contract. Dreaming now reads
+> complete native usage metadata for protection-only scoring. The capped
+> `mempalace_drawer_salience` listing is not an exhaustive usage oracle, and
+> retrieval does not establish helpful procedural feedback. See
+> [the current pipeline contract](pipeline.md#substrate-capabilities-and-limitations).
+
 Paste-ready GitHub issue for **MemPalace/mempalace**. File at:
 <https://github.com/MemPalace/mempalace/issues/new>
 

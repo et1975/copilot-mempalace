@@ -27,6 +27,13 @@ SESSION = "11111111-1111-4111-8111-111111111111"
 SOURCE_TEXT = f"SESSION_ID: {SESSION}\nobserved result"
 
 
+def initialize_logstream(path):
+    """Initialize disposable native state before exercising non-initializing readers."""
+    from mempalace.logstream import Logstream
+
+    Logstream(str(Path(path, "logstream.sqlite3"))).close()
+
+
 @contextmanager
 def installed_palace(path):
     """Isolate installed MCP config, audit log and lease files, not storage I/O."""
@@ -60,6 +67,7 @@ def installed_palace(path):
              patch.object(mcp_server, "_READ_ONLY", False), \
              patch.object(wal, "_WAL_FILE", Path(home, ".mempalace/wal/write_log.jsonl")):
             try:
+                initialize_logstream(path)
                 yield mcp_server
             finally:
                 mcp_server._release_mcp_writer_lock()
@@ -86,6 +94,9 @@ class DrawerCollection:
     """A shared fake storage boundary with real query/chunk/delete semantics."""
     def __init__(self, rows=None):
         self.rows = rows if rows is not None else {}
+
+    def count(self):
+        return len(self.rows)
 
     def get(self, *, ids=None, where=None, include=None, limit=None, offset=0):
         rows = [deepcopy(row) for key, row in sorted(self.rows.items())
@@ -144,6 +155,7 @@ class StorageTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(prefix="procedural-", dir=os.environ["DREAMING_TEST_TMPDIR"])
         self.addCleanup(self.tmp.cleanup)
         self.path = self.tmp.name
+        initialize_logstream(self.path)
         self.collection = DrawerCollection()
         seed_source(self.collection)
         self.reader_patch = patch.object(dream_palace, "procedural_collection",
@@ -426,14 +438,20 @@ class StorageTests(unittest.TestCase):
                                                "--decisions", str(worklist)]), 1)
         self.assertEqual(self.collection.rows, before)
 
-    def test_delete_handler_failure_and_false_acknowledgment_are_not_success(self):
-        for response in ({"success": False, "error": "delete refused"}, {"success": True}):
-            writer = sanctioned_writer(self.path, self.collection)
-            writer._tools["mempalace_delete_drawer"]["handler"] = lambda **kw: response
-            with self.subTest(response=response), self.assertRaises(RuntimeError):
-                dream_palace.Archiver(self.path, collection=self.collection, writer=writer).archive_then_delete(
-                    {"id": "source", "member_ids": ["source"]})
-            self.assertIn("source", self.collection.rows)
+    def _assert_delete_handler_error(self, response, expected):
+        writer = sanctioned_writer(self.path, self.collection)
+        writer._tools["mempalace_delete_drawer"]["handler"] = lambda **kw: response
+        with self.assertRaisesRegex(RuntimeError, expected):
+            dream_palace.Archiver(self.path, collection=self.collection, writer=writer).archive_then_delete(
+                {"id": "source", "member_ids": ["source"]})
+        self.assertIn("source", self.collection.rows)
+
+    def test_delete_handler_failure_is_not_success(self):
+        self._assert_delete_handler_error(
+            {"success": False, "error": "delete refused"}, "delete refused")
+
+    def test_delete_handler_false_acknowledgment_is_not_success(self):
+        self._assert_delete_handler_error({"success": True}, "readback failed")
 
     def test_sanctioned_writer_delete_also_guards_reflect_rollback_and_direct_callers(self):
         self.append()
@@ -549,17 +567,24 @@ class InstalledPalaceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=os.environ["DREAMING_TEST_TMPDIR"]) as path, \
              installed_palace(path) as server:
             writer = dream_palace.MempalaceWriter()
-            with self.assertRaisesRegex(RuntimeError, "add_drawer failed"):
+            with self.assertRaisesRegex(RuntimeError, "wing must be a non-empty string"):
                 writer.add_drawer("", "diary", SOURCE_TEXT)
             self.assertIsNone(server._MCP_WRITER_LOCK_CM)
-            with writer.mutation():
+            ok, reason = server._acquire_mcp_writer_lock()
+            self.assertTrue(ok, reason)
+            try:
                 owner = server._MCP_WRITER_LOCK_CM
-                with self.assertRaisesRegex(RuntimeError, "add_drawer failed"):
+                self.assertIsNotNone(owner)
+                with self.assertRaisesRegex(RuntimeError, "wing must be a non-empty string"):
                     writer.add_drawer("", "diary", SOURCE_TEXT)
                 self.assertIs(server._MCP_WRITER_LOCK_CM, owner)
+            finally:
+                server._release_mcp_writer_lock()
             self.assertIsNone(server._MCP_WRITER_LOCK_CM)
 
     def test_archiver_readback_survives_writer_handle_retirement_between_calls(self):
+        from dream_restore import load_native_archive_records
+
         with tempfile.TemporaryDirectory(dir=os.environ["DREAMING_TEST_TMPDIR"]) as path, \
              installed_palace(path) as server:
             writer = dream_palace.MempalaceWriter()
@@ -570,8 +595,9 @@ class InstalledPalaceTests(unittest.TestCase):
                 self.assertEqual(archiver.archive_then_delete({"id": source_id})["deleted"], [source_id])
                 self.assertIsNone(server._MCP_WRITER_LOCK_CM)
                 self.assertIsNone(dream_palace.load_source_drawer(path, source_id))
-            archive = [json.loads(line) for line in Path(path, "dream-archive.jsonl").read_text().splitlines()]
+            archive = load_native_archive_records(path)
             self.assertEqual([item["id"] for item in archive], ids)
+            self.assertFalse(Path(path, "dream-archive.jsonl").exists())
 
     def test_throwaway_palace_roundtrip_reopen_without_application_schema_growth(self):
         from dream_procedural_palace import append_event, read_events
@@ -679,6 +705,7 @@ class ProcessLockTests(unittest.TestCase):
             for first in ("append", "prune"):
                 with self.subTest(first=first), tempfile.TemporaryDirectory(
                         dir=os.environ["DREAMING_TEST_TMPDIR"]) as path:
+                    initialize_logstream(path)
                     rows = manager.dict()
                     collection = DrawerCollection(rows)
                     seed_source(collection)

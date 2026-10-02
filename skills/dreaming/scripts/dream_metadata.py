@@ -90,6 +90,13 @@ def is_procedural_record(drawer: dict) -> bool:
     return metadata.get("kind") == "procedural_event" or metadata.get("room") == "procedural"
 
 
+def is_control_record(drawer: dict) -> bool:
+    metadata = decode_dream_metadata(drawer)
+    kinds = {"control", "dream_control", "dream_checkpoint", "task", "task_event"}
+    return (metadata.get("kind") in kinds or metadata.get("source_kind") in kinds
+            or metadata.get("room") == "__control__")
+
+
 def decode_procedural_chunks(rows: list[dict]) -> list[dict]:
     """Reassemble procedural-only rows without altering a single character.
 

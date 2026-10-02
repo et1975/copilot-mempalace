@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 import sys
 from typing import Any
 
@@ -82,8 +83,13 @@ def _selected(item_id: str, only: set[str], except_ids: set[str]) -> bool:
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--worklist", required=True, help="Input worklist JSON path")
-    ap.add_argument("--out", required=True, help="Output decisions JSON path")
+    source = ap.add_mutually_exclusive_group(required=True)
+    source.add_argument("--worklist", help="Input explicit preview JSON path")
+    source.add_argument("--run-id", help="Native Dreaming run to save")
+    ap.add_argument("--palace", help="Palace owning --run-id")
+    ap.add_argument("--decisions", help="Complete or partial reviewed worklist to save")
+    ap.add_argument("--expected-review-hash", help="Optional review revision compare-and-set")
+    ap.add_argument("--out", help="Optional native review export; required for legacy stamping")
     ap.add_argument("--all", dest="all_action", metavar="ACTION", help="Apply ACTION to every item")
     ap.add_argument("--only", help="Comma-separated item ids to receive the decision")
     ap.add_argument("--except", dest="except_ids", help="Comma-separated item ids to exclude")
@@ -93,6 +99,29 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
+    if args.run_id:
+        if not args.palace or not args.decisions or any(
+                (args.all_action, args.action, args.only, args.except_ids)):
+            print("decide: --run-id requires --palace and --decisions, not blanket actions", file=sys.stderr)
+            return 2
+        try:
+            from dream_metadata import strict_json
+            import dream_incremental
+            with open(args.decisions, encoding="utf-8") as fh:
+                worklist = strict_json(fh.read())
+            saved = dream_incremental.save_review(
+                args.palace, args.run_id, worklist, expected_review_hash=args.expected_review_hash)
+            if args.out:
+                with open(args.out, "w", encoding="utf-8") as fh:
+                    json.dump(worklist, fh, indent=2, ensure_ascii=False)
+        except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
+            print(f"decide: {exc}", file=sys.stderr)
+            return 2
+        print(json.dumps(saved, sort_keys=True))
+        return 0
+    if not args.out or args.decisions or args.expected_review_hash or args.palace:
+        print("decide: file-only stamping requires --worklist and --out", file=sys.stderr)
+        return 2
 
     if args.all_action and args.action:
         print("decide: use either --all ACTION or --action ACTION, not both", file=sys.stderr)

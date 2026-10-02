@@ -1,7 +1,7 @@
 """Pure ontology rule-candidate helpers for dreaming.
 
-This module intentionally has no palace coupling. It reads/writes only plain
-``ontology.json`` documents and operates on in-memory predicate/triple dicts.
+Rule helpers remain pure. Configuration is stored in native MemPalace artifacts;
+explicit paths are compatibility imports/exports, never the default authority.
 """
 import json
 import os
@@ -264,8 +264,22 @@ def build_ontology_doc(rules: list[dict], version: int = 1) -> dict:
     return {"version": version, "rules": rules}
 
 
-def read_ontology_doc(path: str) -> dict:
-    """Read an ontology.json document, defaulting missing/empty files to v1 empty."""
+def read_ontology_doc(path: str | None = None, *, palace: str | None = None) -> dict:
+    """Read native state by default, or an explicitly selected legacy document."""
+    if not path:
+        if not palace:
+            raise ValueError("ontology read requires an explicit palace or file")
+        from dream_store import DreamStore
+        store = DreamStore(palace)
+        events = [event for event in store.events() if event["record_type"] == "ontology_saved"]
+        previous = None
+        doc = _empty_doc()
+        for event in events:
+            if event.get("previous_operation_id") != previous:
+                raise ValueError("conflicting native ontology history")
+            doc = _validate_ontology_doc(store.get_document(event["document"]))
+            previous = event["operation_id"]
+        return doc
     if not os.path.exists(path):
         return _empty_doc()
     with open(path, "r", encoding="utf-8") as handle:
@@ -275,14 +289,43 @@ def read_ontology_doc(path: str) -> dict:
     return json.loads(text)
 
 
-def write_ontology_doc(path: str, doc: dict) -> None:
-    """Write an ontology.json document as pretty UTF-8 JSON."""
+def write_ontology_doc(path: str | None, doc: dict, *, palace: str | None = None) -> None:
+    """Persist native configuration before an optional explicit JSON export."""
+    _validate_ontology_doc(doc)
+    if palace:
+        from dream_palace import palace_mutation_lock, _publish_maintenance_document
+        from dream_store import DreamStore
+        with palace_mutation_lock(palace):
+            store = DreamStore(palace)
+            current = read_ontology_doc(palace=palace)
+            events = [event for event in store.events() if event["record_type"] == "ontology_saved"]
+            if not events or current != doc:
+                _publish_maintenance_document(
+                    store, "ontology_saved", doc,
+                    fields={"previous_operation_id": events[-1]["operation_id"] if events else None})
+    elif not path:
+        raise ValueError("ontology write requires an explicit palace")
+    if not path:
+        return
     parent = os.path.dirname(path)
     if parent:
         os.makedirs(parent, exist_ok=True)
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(doc, handle, indent=2, ensure_ascii=False)
         handle.write("\n")
+
+
+def _validate_ontology_doc(doc: dict) -> dict:
+    if (not isinstance(doc, dict) or doc.get("version") != ONTOLOGY_VERSION
+            or not isinstance(doc.get("rules"), list)
+            or any(not isinstance(rule, dict) or not isinstance(rule.get("id"), str)
+                   or not rule["id"] or ("enabled" in rule and not isinstance(rule["enabled"], bool))
+                   for rule in doc["rules"])):
+        raise ValueError("malformed ontology document")
+    ids = [rule["id"] for rule in doc["rules"]]
+    if len(set(ids)) != len(ids):
+        raise ValueError("duplicate ontology rule IDs")
+    return doc
 
 
 def _add_inverse_rule(rules_by_id: dict[str, dict], predicate: str, inverse_predicate: str, rationale: str) -> None:
