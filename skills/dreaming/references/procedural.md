@@ -10,14 +10,14 @@ reconciles KG provenance or changes KG authority.
 
 ## Storage and support boundary
 
-All durable records are ordinary drawers in an explicit wing's `procedural`
+Events are ordinary drawers in an explicit wing's `procedural`
 room. Each holds `kind=procedural_event`, `schema_version=1`, and `event`
 metadata, natively or in the existing `<!--dreaming-meta: ...-->` trailer.
 Event chunks are reassembled without inserted delimiters. Records are historic,
 not instructions: resolve them through `guidance`/`explain` before use.
 
 New procedural commands support **existing SQLite-exact palaces only**. Strict
-read commands (`validate`, `guidance`, `explain`, and write-command preparation/
+read commands (`validate`, `guidance`, `explain`, `status`, `draft`, and write-command preparation/
 dry-run) use WAL-aware read-only connections, including while a writer remains
 open. They observe committed, uncheckpointed data and prohibit application-data
 and schema writes. SQLite may update SHM reader-coordination bytes; those are
@@ -44,8 +44,97 @@ The read path calls the existing MiniLM forward pass, not its download bootstrap
 identity is checked by the palace backend; procedural embedding also rejects
 unknown stored identity and dimension mismatches. Unavailable/invalid embeddings
 are explicit errors. A separate local
-Copilot session store supplies original repository/session authority. New paths
-open it read-only, without creating a missing file.
+Copilot session store supplies original repository/session authority **at
+acquisition**, opened read-only without creating a missing file. Published
+evidence resolves from the selected palace and wing, not from that host store.
+
+### Self-contained evidence and explicit legacy capture
+
+Publication captures admitted source witnesses in `procedural-sources`
+(`kind=procedural_source`, schema version 1, author `dream-procedure-source`).
+These are generated provenance records, never additional independent support.
+Validation can resolve a search hit on a capture back to the verified original
+raw field; it never uses the record ID as evidence. Raw-turn records contain the **exact full
+original field**, preserving whitespace, Unicode and code fences; drawer
+witnesses do not copy the original drawer body. Each witness preserves the
+verified repository, original session, observation timestamp and source hash.
+Its key includes the exact as-written source ID, including a physical chunk ID,
+but excludes the quotation. Capture actor/time are audit data, not new sessions.
+
+Every append path, including direct `append_event` without a callback, performs
+mandatory admission under the package mutation lock. It first recognizes an
+already committed event, then checks policy and original/captured sources,
+preflights every missing record's size, captures missing sources, verifies fresh
+palace-only readback, and finally appends/verifies the event. Source capture may
+leave protected orphan records if publication fails; retry the **same immutable
+event artifact**. Already captured sources do not need their old host input.
+An already committed retry succeeds before fresh acquisition, freshness or
+head checks. No event/reference IDs, hashes, quotes, timestamps or scoring
+anchors are rewritten.
+
+Once captured, raw evidence survives removal of the session DB and the entire
+host session directory. Drawer evidence still requires its original palace
+drawer: deletion, changed text/stamps, generated reclassification or conflicting
+provenance remains a failure. Captured record corruption or conflicting
+same-key witnesses fails closed. Hashes/digests are integrity checks, not
+authentication against an attacker able to rewrite all palace records.
+
+Old retained events are **not** silently repaired on `guidance`, `explain` or
+`validate`. While their original session store is still available, run:
+
+```bash
+"$MPY" "$DREAM_SCRIPTS/dream_procedure.py" capture-sources --palace "$PALACE" --wing project \
+  --session-store "$STORE" --dry-run
+"$MPY" "$DREAM_SCRIPTS/dream_procedure.py" capture-sources --palace "$PALACE" --wing project \
+  --session-store "$STORE"
+```
+
+`--session-store` is mandatory for this explicit migration. All retained
+references are checked, including retired/replaced rules and adverse history.
+Missing/conflicting originals or legacy references without `session_id` return
+`status=blocked`, nonzero exit and diagnostic counts; they are never inferred
+from caller metadata, generated mirrors or a new session. Preflight failures
+write nothing. Storage failures after some captures can leave durable witnesses;
+rerun the command to resume. Events are never rewritten.
+
+Migration JSON includes `event_count`, `reference_count`, `source_count`, `origin_count`,
+`already_captured`, `pending`, `captured`, `failed`, `failures`, `record_count`,
+`encoded_bytes`, `pending_encoded_bytes`, `capacity` and `warnings`.
+Statuses are `dry_run`, `complete`, or `blocked`. Capacity reports projected
+record/byte totals, the 4-MiB per-record bound, and remaining headroom before
+warnings (80% of 5,000 records / 64 MiB); aggregate thresholds are warnings,
+not publication caps. Warnings also appear on stderr. `pending_encoded_bytes`
+is the preflight's trailer-inclusive estimate, even after a successful write.
+
+`explain.source_diagnostics` and migration failures include a `code`:
+`uncaptured`, `missing_session`, `original_drawer_missing`,
+`original_drawer_drift`, `corrupt_capture`, `session_store_unavailable`,
+`original_session_missing`, `original_turn_missing`, `invalid_original`,
+`invalid_evidence`, or `source_size`, as applicable. Ambiguous preparation uses
+`ambiguous_source` (invalid request, exit 2). Storage-envelope errors
+can stop the whole command rather than produce a partial report. Uncaptured
+legacy evidence is not equivalent to an original drawer that has drifted.
+
+The read-only Python integration point
+`dream_procedural_validate.inspect_published_sources(palace, wing)` acquires a
+shared read scope, checks all retained capture bodies (including orphans), and
+checks origin-drawer availability and chunk integrity for every retained
+proposal, including retired history. It returns source coverage/counts/capacity
+plus reference failures, with status `ok` or `blocked`. Corrupt storage can raise
+rather than yield a partial report.
+`reference_count` and `source_count` count evidence references and capture keys;
+`origin_count` separately counts distinct lineage drawer IDs, never additional
+evidence or support. `failed` includes unresolved references and origin IDs.
+Origin failures carry `reference_kind: "origin"` and `origin_drawer_missing`
+or `origin_drawer_invalid`, distinct from missing/drifting evidence or captures.
+Origin IDs carry no stored content hash; the check uses the same existing
+drawer-assembly integrity boundary as published reads, not a new provenance claim.
+It has no session-store argument, writer, acquisition or repair side effect.
+For lifecycle policy, callers can use the public `read_events`, `project_rules`
+and `revalidate_sources` with `EvidenceReader(palace, wing)` inside
+`nonmutating_read(palace)`. A reader/index belongs to one read scope; discard
+it across mutation. `AdmissionReader(palace, wing, session_store)` is a separate
+explicit input-acquisition interface, not a published-read fallback.
 
 ## CLI and artifacts
 
@@ -53,7 +142,7 @@ Set `MPY` to the absolute path of the Python interpreter that already owns
 MemPalace, and `DREAM_SCRIPTS` to the absolute path of the dreaming skill's
 `scripts/` directory. Examples also use `$PALACE`, `$ARTIFACTS` and `$STORE`
 (session-store.db). `$ARTIFACTS` must be outside the palace and checkout.
-All six commands require `--palace PATH --wing PROJECT`.
+All commands require `--palace PATH --wing PROJECT`.
 
 ```bash
 "$MPY" "$DREAM_SCRIPTS/dream_procedure.py" propose --palace "$PALACE" --wing project \
@@ -79,11 +168,137 @@ digest, then performs the same preflight without constructing a writer. It
 does not invent quotations, event IDs, timestamps, reviews or outcomes. Existing
 digests are checked, not silently repaired. Output is exclusively created so an
 immutable retry artifact cannot be accidentally overwritten. `--dry-run` uses
-the same preflight without a writer. Retain prepared artifacts across retries.
+the same admission and source-size preflight without a writer or source capture.
+For a missing hash, preparation can use a uniquely captured version. Multiple
+captured versions of the exact identity require an explicit `source_hash`;
+there is no latest-wins rule. Retain prepared artifacts across retries.
+`guidance`, `explain` and `status` never consult `--session-store`, even if supplied.
 
 Stdout is JSON; diagnostics go to stderr. Exit 0 is a valid result (including
 valid abstention), 1 means storage/integrity/evidence unavailable, 2 means an
 invalid request. A missing source/store is not a successful empty validation.
+
+### Read-only health
+
+```bash
+"$MPY" "$DREAM_SCRIPTS/dream_procedure.py" status --palace "$PALACE" --wing project \
+  --repository owner/repository
+```
+
+Schema 1 reports `repository`, UTC `as_of`, `status` (`ok`/`blocked`),
+`readiness` (`no_rules`, `ready`, `requires_review`, `blocked`),
+`capture_coverage`, `rule_counts`, `suppression_counts`, `evidence_errors`,
+`record_count`, `encoded_bytes`, `warnings` and `capacity`.
+`ready` means at least one eligible established/proven rule, **not** evidence
+that any rule is useful for the current task. A healthy empty repository is
+`no_rules`, not an unavailable palace disguised as empty.
+
+Rule/maturity/suppression counts are repository-scoped. Capture integrity is
+wing-wide (`coverage_scope="wing"`), including retained adverse/retired history
+and orphan records. Coverage contains `event_count`, `reference_count`,
+`source_count` (distinct as-written source keys), `failed`, and
+`resolved_reference_count`. Reference counts include distinct quotations;
+record copies do not increase original-source counts or support. Errors retain
+source/event IDs and distinguish uncaptured or missing-session legacy evidence
+from missing original drawers, drift and corrupt captures. Storage envelopes
+that cannot be trusted return an error/nonzero exit, not partial healthy counts.
+Conflicts/stale reviews remain visible in suppression counts. Capacity uses the
+same per-record limit and aggregate warning headroom as explicit capture.
+
+Health uses no embedding, host-session lookup, writer, capture, migration,
+repair or stored score. Python:
+`dream_procedural_palace.procedural_status(palace, wing, repository, *, as_of)`.
+
+### Nonpublishing grounded drafts
+
+```bash
+"$MPY" "$DREAM_SCRIPTS/dream_procedure.py" draft --palace "$PALACE" --wing project \
+  --repository owner/repository --input "$ARTIFACTS/receipt.json" \
+  --session-store "$STORE" --out "$ARTIFACTS/new-draft.json"
+```
+
+`--session-store` is optional **explicit input** here. Drafting never consults
+the default host DB. If supplied, it opens SQLite read-only and selects only
+the unique exact task text in the receipt's original session/repository,
+checking turn identity and original timestamp. It never chooses a nearby
+successful task or a matching older task when a newer turn is present.
+A missing/unpersisted task, absent response, duplicate identity
+or ambiguous repeated task remains `pending_original_evidence`. If the input
+store/session is absent, bounded palace capture lookup can recover exact raw
+task fields; missing/incomplete capture is also pending, not invented evidence.
+
+Receipt schema 1 has **exactly** these fields:
+
+```json
+{
+  "schema_version": 1,
+  "repository": "owner/repository",
+  "session_id": "<original session>",
+  "generation": 1,
+  "task": "<exact task text>",
+  "task_digest": "<SHA256 of UTF-8 task, without newline>",
+  "delivered_rule_ids": ["proc:<64 lowercase hex characters>"],
+  "guidance_as_of": "2026-09-23T00:00:00Z"
+}
+```
+
+`guidance_as_of` can be null. Generation is a nonnegative integer, not a turn
+index; IDs are distinct, at most five. Receipt JSON is capped at 24 KiB, task
+UTF-8 at 16 KiB. Repository/digest/type/ID mismatches are invalid requests.
+A receipt proves neither following advice nor causal attribution.
+
+Stdout and the exclusively created file contain the same complete canonical
+UTF-8 JSON plus newline, capped at 64 KiB:
+
+```json
+{
+  "schema_version": 1,
+  "kind": "procedural_draft",
+  "status": "pending_original_evidence",
+  "repository": "owner/repository",
+  "session_id": "<original session>",
+  "task_digest": "<task hash>",
+  "delivered_rule_ids": [],
+  "original_references": [],
+  "lineage_references": [],
+  "missing_requirements": ["original_task_turn_missing"],
+  "independent_sessions": 0,
+  "omitted_count": 1
+}
+```
+
+This illustrates the core fields, not a publishable event template. Actual
+lineage includes the receipt's session, generation, task digest and guidance
+timestamp. Original references use the unchanged `session_turn` evidence
+schema with full-field hashes and exact quotes of at most 800 characters.
+Known generated transport echoes go to lineage with
+`reason="generated_transport_echo"` instead of independent originals.
+`independent_sessions` deduplicates the original session; source-record copies,
+raw user/assistant fields and repeated draft creation cannot multiply support.
+`omitted_count` counts unavailable/omitted lookup or field conditions, **not**
+an estimate of all unseen sources.
+
+Even `requires_review` always retains explicit missing requirements for
+rule-specific causal attribution, polarity, applicability/exceptions and
+original-evidence review. There is no automatic statement, applicability,
+disposition, polarity, outcome, score, capture or publication. No `event_kind`
+or event `digest` is present; `propose`, `review` and `outcome` reject a draft.
+Output must be a new file outside the palace. Stop, retrieval, completed tasks,
+passing tests, receipt repetition and reflection echoes cannot award credit.
+
+Original SQLite fields are projected only when their complete UTF-8 encoding
+fits 256 KiB; oversized fields are omitted, never prefix-hashed. Palace fallback
+verifies at most 64 stored records / 8 MiB of canonical bodies and reports
+`captured_lookup_limit` when incomplete. These are **post-discovery** limits:
+the current collection API still requires the existing O(total source bytes)
+header scan and has a 4-MiB per-record integrity bound. No extra index/database
+or cache is written. Drafting is not a full health scan; run `status` separately.
+
+Known JSON transport signatures (including fenced copies) and explicit
+`[procedural-context]` markers are conservatively excluded. Unmarked paraphrases
+cannot be classified mechanically; original text, provenance, applicability
+and causality still require human/agent review. The receipt does not contain
+a stable original turn index, so ambiguity must not be resolved by guessing.
 
 ### Exact envelope
 
@@ -146,7 +361,7 @@ lessons, marked summaries and procedural records cannot supply independent
 support; reflections are permitted only as lineage in `origin_drawer_ids`.
 Each drawer needs an unambiguous `SESSION_ID:` stamp plus `observed_at` metadata
 or an `OBSERVED_AT: <UTC>` line; these must agree if both exist. `filed_at` is not
-an observation timestamp. The session must exist in the local source store;
+an observation timestamp. For a not-yet-captured source, the session must exist in the local source store;
 its exact repository must match, not a substring. Drawer repository metadata,
 if present, must agree with the source session. Source hashes cover full
 logical text, not just the quotation or a 4,000-character mining snippet.
@@ -162,12 +377,25 @@ independently authored and reviewed.
 
 ### Validation and review
 
-`validate` executes exactly two queries: the statement and the explicit
-contrast query, at most ten palace hits each, deduplicated by source ID. Marked
+`validate` executes two logical queries: the statement and the explicit
+contrast query. Each uses an ordinary-drawer channel excluding procedural
+storage and, when captures exist, a separate captured-source channel, at most
+ten hits per channel. Interleaving and original-identity deduplication expose
+at most ten references per logical query (twenty across support/contrast).
+References are deduplicated by original
+kind/ID/session/turn/field/hash rather than by snapshot record or quotation. Marked
 generated/unattributed text is not admitted as original evidence. The current
-search is wing-local palace retrieval; raw turns can be supplied as grounded
-references but are not an additional unbounded search. Results from the two
-queries are interleaved before applying the storage budget, so large supporting
+search is wing-local palace retrieval, including captured raw fields without
+opening the host store. A capture hit is only a locator: all matching records
+are verified before exposing the original raw identity once. Drawer witnesses
+themselves are never substituted for original drawers. Copies can consume
+capture-channel slots, never ordinary-source slots; there is no unbounded
+refill/search. Search reuses verified
+admitted drawer identities where available, including a
+physical-ID witness when search finds another chunk of that same live original.
+This does not rewrite its identity or create a logical-key witness. New search
+evidence still requires original acquisition and is not captured by `validate`.
+Results from the two queries are interleaved before applying the storage budget, so large supporting
 results do not automatically crowd out counterevidence. Exact quotations are
 limited to 256 characters, and selected references must fit a 24-KiB review
 encoding estimate that includes duplicated disposition references and reserves
@@ -253,6 +481,32 @@ dominates helpful. The earliest timestamp for the winning polarity anchors
 decay. Later submissions cannot refresh weight. Correctness of causal wording
 remains the reviewer's responsibility: code does not prove causality.
 
+## Prune-archive replay boundary
+
+`dream_restore.py` is a logical replay, not identity-preserving recovery. It
+preflights the complete selected archive before constructing a CLI writer or
+performing any writes. Native archive/row metadata is checked independently;
+physical row text is never interpreted without the rest of its logical drawer.
+Text checks use both the complete ordered physical concatenation and the
+complete legacy newline-rendered replay, retaining the original `added_by`
+context. Conflicting writer identities are an explicit preflight failure.
+
+The shared metadata decoder peels only recognized terminal trailers. This
+preserves complete fence context: a closed fenced example remains ordinary
+whether chunked or not, while a sanctioned writer's genuine appended trailer
+still counts after an unfinished fence. An ordinary outer wrapper cannot erase
+a protected inner trailer. Peeling is bounded to 32 trailers per complete view;
+exceeding the limit is an error, not truncated success. Any protected claim
+blocks the complete selection, including earlier ordinary records. Reserved
+source-author metadata also remains protected.
+
+Dry-run reports the same refusal with a nonzero CLI exit, not a misleading
+`WOULD restore` preview. Duplicate JSON keys cannot hide protected metadata,
+even without `--strict`. Valid `--id`/`--reason` filters still limit the selection;
+ordinary replay, reconstruction and per-write error reporting remain supported.
+Use a coherent whole-palace physical snapshot for procedural recovery. A
+historical archive or generated source witness cannot authorize new identities.
+
 ## Guidance and explanation
 
 After ordinary evidence recall, explicitly opt into repository-scoped advice:
@@ -291,6 +545,9 @@ not a token guarantee. `--max-items 1..5` and `--max-chars 512..6000` can lower
 these bounds. Whole lowest-ranked items are dropped until output fits;
 conditions/exceptions are never truncated. `omitted_count` counts scoped
 definitions not delivered (safety, maturity, relevance and budget omissions).
+`--max-bytes 8192` adds an optional UTF-8 wire bound to the same complete
+serialized result, without raising the item/character ceilings or truncating
+conditions. This does not bind advice to a current task or authorize its use.
 `no_rules` differs from `no_eligible_rules` (also used when relevance/budget
 filters withhold all items). Scoped missing/drifted sources produce exit 1
 `evidence_unavailable`, never success-shaped empty guidance. Explain still

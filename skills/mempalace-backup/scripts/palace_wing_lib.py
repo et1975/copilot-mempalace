@@ -19,6 +19,7 @@ provenance only, never authoritative after import.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 BUNDLE_VERSION = 1
@@ -131,12 +132,29 @@ def dump_jsonl(records: list[dict[str, Any]]) -> str:
     return "\n".join(lines) + ("\n" if lines else "")
 
 
-def parse_jsonl(text: str) -> list[dict[str, Any]]:
-    """Parse newline-delimited JSON, skipping blank lines."""
+def _replay_json_decoder() -> json.JSONDecoder:
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate record metadata key {key!r}")
+            result[key] = value
+        return result
+
+    return json.JSONDecoder(object_pairs_hook=unique_object)
+
+
+def parse_replay_json(text: str) -> Any:
+    """Decode without silently overwriting duplicate record/metadata keys."""
+    return _replay_json_decoder().decode(text)
+
+
+def parse_jsonl(text: str, *, for_replay: bool = False) -> list[dict[str, Any]]:
+    """Parse newline-delimited JSON; replay refuses ambiguous duplicate keys."""
     records = []
     for line in text.splitlines():
         if line.strip():
-            records.append(json.loads(line))
+            records.append(parse_replay_json(line) if for_replay else json.loads(line))
     return records
 
 
@@ -173,6 +191,71 @@ def validate_manifest(obj: Any) -> None:
                 raise ValueError(
                     f"manifest 'counts.{key}' must be a non-negative integer"
                 )
+
+
+_PROCEDURAL_METADATA = {
+    "room": ("procedural", "procedural-sources"),
+    "kind": ("procedural_event", "procedural_source"),
+    "added_by": ("dream-procedure", "dream-procedure-source"),
+    "agent": ("dream-procedure", "dream-procedure-source"),
+}
+_METADATA_COMMENT = re.compile(r"<!--(?:dreaming-meta|wing-meta)\b")
+_METADATA_VALUE_PREFIX = re.compile(r"\s*:\s*")
+_METADATA_VALUE_SUFFIX = re.compile(r"\s*-->")
+
+
+def _validate_replay_metadata(metadata: Any) -> None:
+    if not isinstance(metadata, dict):
+        raise ValueError("record metadata must be an object for safe replay")
+    for field, protected in _PROCEDURAL_METADATA.items():
+        value = metadata.get(field)
+        if value in protected:
+            raise ValueError(
+                "Cannot replay procedural events or procedural sources: new drawer IDs "
+                "cannot preserve immutable references and digests. Use whole-palace "
+                "physical backup/restore instead."
+            )
+        if value is not None and not isinstance(value, str):
+            raise ValueError(f"record metadata {field!r} must be a string")
+
+
+def validate_replay_records(records: list[dict[str, Any]]) -> None:
+    """Refuse identity-bound records across the complete bundle before writes.
+
+    Inspect every metadata trailer, not only the last one: wing provenance may
+    wrap dreaming metadata. Invalid metadata cannot be treated as absent.
+    Ordinary source archives are not procedural sources.
+    """
+    decoder = _replay_json_decoder()
+    for record in records:
+        if not isinstance(record, dict):
+            raise ValueError("bundle record must be an object")
+        _validate_replay_metadata(record)
+        for field in ("extra", "metadata"):
+            if record.get(field) is not None:
+                _validate_replay_metadata(record[field])
+        content = record.get("content", "")
+        if not isinstance(content, str):
+            raise ValueError("bundle record content must be a string")
+        cursor = 0
+        while marker := _METADATA_COMMENT.search(content, cursor):
+            prefix = _METADATA_VALUE_PREFIX.match(content, marker.end())
+            if prefix is None:
+                raise ValueError("malformed record metadata trailer")
+            try:
+                metadata, end = decoder.raw_decode(content, prefix.end())
+            except ValueError as exc:
+                raise ValueError("malformed record metadata trailer") from exc
+            suffix = _METADATA_VALUE_SUFFIX.match(content, end)
+            if suffix is None:
+                raise ValueError("unterminated or malformed record metadata trailer delimiter")
+            _validate_replay_metadata(metadata)
+            cursor = suffix.end()
+        if record.get("type") == "manifest" and "drawers" in record:
+            entries = record["drawers"]
+            if not isinstance(entries, list):
+                raise ValueError("manifest drawer records must be an array")
+            validate_replay_records(entries)
 
 
 # --------------------------------------------------------------------------- #
@@ -282,6 +365,7 @@ def decode_trailer(content: str) -> tuple[str, dict[str, Any]]:
 MD_DRAWER_MARKER = "mempalace-drawer"
 _MD_OPEN = f"<!--{MD_DRAWER_MARKER}\n"
 _MD_CLOSE = "\n-->\n"
+_MD_HEADER_FIELDS = frozenset({"wing", "room", "drawer_id", "added_by", "source_file", "extra"})
 
 
 def encode_drawer_md(record: dict[str, Any]) -> str:
@@ -304,11 +388,12 @@ def encode_drawer_md(record: dict[str, Any]) -> str:
     return _MD_OPEN + "\n".join(meta_lines) + _MD_CLOSE + (record.get("content") or "")
 
 
-def decode_drawer_md(text: str) -> dict[str, Any]:
+def decode_drawer_md(text: str, *, for_replay: bool = False) -> dict[str, Any]:
     """Parse a drawer markdown file back into a ``drawer`` bundle record.
 
     Inverse of ``encode_drawer_md``. Raises ``ValueError`` if ``text`` is not a
-    mempalace drawer markdown file.
+    mempalace drawer markdown file. ``for_replay`` also rejects unsafe header
+    metadata before tolerant archive decoding could discard it.
     """
     if not text.startswith(_MD_OPEN):
         raise ValueError("not a mempalace drawer markdown file")
@@ -322,14 +407,26 @@ def decode_drawer_md(text: str) -> dict[str, Any]:
         if not line.strip():
             continue
         key, sep, value = line.partition(":")
+        if for_replay and (not sep or key.strip() not in _MD_HEADER_FIELDS):
+            raise ValueError("malformed or unrecognized drawer header metadata")
         if sep:
+            if for_replay and key.strip() in meta:
+                raise ValueError(f"duplicate drawer header metadata key {key.strip()!r}")
             meta[key.strip()] = value.strip()
     try:
-        extra = json.loads(meta.get("extra") or "{}")
-    except json.JSONDecodeError:
+        raw_extra = meta.get("extra") or "{}"
+        extra = parse_replay_json(raw_extra) if for_replay else json.loads(raw_extra)
+    except ValueError as exc:
+        if for_replay:
+            raise ValueError("malformed drawer header metadata") from exc
         extra = {}
     if not isinstance(extra, dict):
+        if for_replay:
+            raise ValueError("drawer header metadata must be an object")
         extra = {}
+    if for_replay:
+        _validate_replay_metadata(meta)
+        _validate_replay_metadata(extra)
     return {
         "type": "drawer",
         "wing": meta.get("wing") or "",

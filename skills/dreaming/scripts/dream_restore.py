@@ -4,6 +4,9 @@
 Restores archived logical drawers by adding new drawers with the original
 wing/room and reconstructed content. The original physical ids and chunking are
 not resurrected: mempalace mints new drawer ids and recomputes embeddings.
+Procedural events/source records are refused before any selected archive
+record is replayed, including during dry-run. Use coherent physical recovery
+for identity-bound procedural state.
 
 Usage:
     "$MPY" "$DREAM_SCRIPTS/dream_restore.py" --palace ~/.mempalace/palace
@@ -23,6 +26,12 @@ from collections.abc import Callable, Iterable
 from typing import Any, TextIO
 
 import dream_palace
+from dream_metadata import (
+    decode_dream_metadata, is_procedural_record, is_source_record_metadata,
+    split_dream_metadata, strict_json,
+)
+
+MAX_ARCHIVE_TRAILERS = 32
 
 
 def iter_archive_records(
@@ -40,11 +49,13 @@ def iter_archive_records(
             if not raw:
                 continue
             try:
-                record = json.loads(raw)
+                record = strict_json(raw)
             except json.JSONDecodeError as ex:
                 if strict:
                     raise ValueError(f"malformed JSON on line {line_no} of {path}: {ex.msg}") from ex
                 continue
+            except ValueError as ex:
+                raise ValueError(f"ambiguous archive JSON on line {line_no} of {path}: {ex}") from ex
             if not isinstance(record, dict):
                 if strict:
                     raise ValueError(f"archive line {line_no} is not a JSON object")
@@ -57,23 +68,72 @@ def iter_archive_records(
     return records
 
 
-def record_to_content(record: dict[str, Any]) -> str:
-    """Reconstruct a logical drawer by concatenating row documents in member order."""
+def _ordered_rows(record: dict[str, Any]) -> list[dict[str, Any]]:
     rows = record.get("rows") or []
     by_id = {row.get("id"): row for row in rows if isinstance(row, dict)}
     member_ids = list(record.get("member_ids") or [])
 
     ordered_rows: list[dict[str, Any]] = []
-    seen: set[str] = set()
     for member_id in member_ids:
         row = by_id.get(member_id)
         if row is not None:
             ordered_rows.append(row)
-            seen.add(member_id)
     if not member_ids:
         ordered_rows.extend(row for row in rows if isinstance(row, dict))
+    return ordered_rows
 
-    return "\n".join(str(row.get("document") or "") for row in ordered_rows if isinstance(row, dict))
+
+def record_to_content(record: dict[str, Any]) -> str:
+    """Reconstruct a logical drawer by concatenating row documents in member order."""
+    return "\n".join(str(row.get("document") or "") for row in _ordered_rows(record))
+
+
+def _archive_metadata_claims(drawer: dict[str, Any]) -> Iterable[dict[str, Any]]:
+    text = drawer["text"]
+    for peeled in range(MAX_ARCHIVE_TRAILERS + 1):
+        body, metadata = split_dream_metadata({"text": text, "metadata": drawer["metadata"]})
+        if body == text:
+            return
+        if peeled == MAX_ARCHIVE_TRAILERS:
+            raise ValueError(f"archive metadata trailer limit ({MAX_ARCHIVE_TRAILERS}) exceeded")
+        yield metadata
+        text = body
+
+
+def _reject_procedural_metadata(metadata: dict[str, Any]) -> None:
+    if is_procedural_record({"metadata": metadata}) or is_source_record_metadata(metadata):
+        raise ValueError(
+            "Cannot replay procedural events or source records with new drawer IDs; "
+            "use a coherent whole-palace physical backup/restore instead")
+
+
+def _preflight_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    errors = []
+    for record in records:
+        try:
+            native = [
+                record, record.get("metadata"),
+                *(row.get("metadata")
+                  for row in record.get("rows") or [] if isinstance(row, dict)),
+            ]
+            writers = set()
+            for claim in native:
+                metadata = decode_dream_metadata({"metadata": claim})
+                _reject_procedural_metadata(metadata)
+                if "added_by" in metadata:
+                    writers.add(metadata["added_by"])
+            if len(writers) > 1:
+                raise ValueError("conflicting archive writer context")
+            writer_context = {"added_by": next(iter(writers))} if writers else {}
+            # Inspect complete original and replay views, never isolated chunk
+            # text: chunks can split fence delimiters or metadata tokens.
+            original = "".join(str(row.get("document") or "") for row in _ordered_rows(record))
+            for text in dict.fromkeys((original, record_to_content(record))):
+                for metadata in _archive_metadata_claims({"text": text, "metadata": writer_context}):
+                    _reject_procedural_metadata(metadata)
+        except (TypeError, ValueError) as ex:
+            errors.append({"id": record.get("id"), "error": f"archive preflight: {ex}"})
+    return errors
 
 
 def _metadata_for_record(record: dict[str, Any]) -> dict[str, Any]:
@@ -106,9 +166,13 @@ def restore(
     dry_run: bool = False,
     out: TextIO | None = None,
 ) -> dict[str, Any]:
-    """Restore records through ``writer.add_drawer``; keep going after failures."""
+    """Preflight the complete selection, then keep going after ordinary write failures."""
     output = out if out is not None else sys.stdout
-    report: dict[str, Any] = {"restored": 0, "skipped": 0, "errors": [], "new_drawers": []}
+    records = list(records)
+    report: dict[str, Any] = {
+        "restored": 0, "skipped": 0, "errors": _preflight_records(records), "new_drawers": []}
+    if report["errors"]:
+        return report
     for record in records:
         content = record_to_content(record)
         wing = record.get("wing")
@@ -173,6 +237,11 @@ def main(argv: list[str] | None = None, *, writer_factory: Callable[[], Any] | N
         if _selected(record, args.id_filter, args.reason_filter)
     ]
     filtered = len(all_records) - len(records)
+    errors = _preflight_records(records)
+    if errors:
+        for error in errors:
+            print(f"  ERROR {error['id']}: {error['error']}", file=sys.stderr)
+        return 1
     writer = writer_factory() if writer_factory is not None else (object() if args.dry_run else dream_palace.MempalaceWriter())
 
     report = restore(records, writer, dry_run=args.dry_run)

@@ -164,9 +164,10 @@ def resolve_data_path(
 
 
 def sqlite_paths(palace: Path, data_path: Path) -> tuple[Path, ...]:
-    """Database locations: KG stays HOME-relative, Chroma/logstream use data."""
+    """KG is HOME-relative; Chroma, exact storage and logstream use data."""
     return (palace / "knowledge_graph.sqlite3",
-            data_path / "chroma.sqlite3", data_path / "logstream.sqlite3")
+            data_path / "chroma.sqlite3", data_path / "sqlite_exact.sqlite3",
+            data_path / "logstream.sqlite3")
 
 
 def _validate_logstream(db_path: Path) -> None:
@@ -565,6 +566,140 @@ def staged_data_path(stage, palace, override=None):
     return data
 
 
+_PROCEDURAL_MARKERS = {
+    "room": ("procedural", "procedural-sources"),
+    "kind": ("procedural_event", "procedural_source"),
+    "added_by": ("dream-procedure", "dream-procedure-source"),
+    "agent": ("dream-procedure", "dream-procedure-source"),
+}
+
+
+def _has_procedural_storage(data):
+    """Metadata-only dependency gate, not evidence parsing or wing discovery."""
+    for filename, table in (("sqlite_exact.sqlite3", "documents"),
+                            ("chroma.sqlite3", "embedding_metadata")):
+        db = data / filename
+        if not db.is_file():
+            continue
+        with closing(sqlite3.connect(db.as_uri() + "?mode=ro", uri=True)) as con:
+            if not con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                               (table,)).fetchone():
+                continue
+            if table == "documents":
+                clauses = [f"json_extract(metadata_json, '$.{key}') IN (?, ?)"
+                           for key in _PROCEDURAL_MARKERS]
+                params = [value for values in _PROCEDURAL_MARKERS.values() for value in values]
+            else:
+                clauses = ["(key=? AND string_value IN (?, ?))" for _ in _PROCEDURAL_MARKERS]
+                params = [value for key, values in _PROCEDURAL_MARKERS.items()
+                          for value in (key, *values)]
+            if con.execute(f"SELECT 1 FROM {table} WHERE " + " OR ".join(clauses) + " LIMIT 1",
+                           params).fetchone():
+                return True
+    return False
+
+
+@contextmanager
+def _staged_procedural_environment(stage, data):
+    """Keep the read adapter's ambient configuration away from the live HOME."""
+    config_file = stage / "config.json"
+    config = json.loads(config_file.read_text(encoding="utf-8-sig")) if config_file.exists() else {}
+    if not isinstance(config, dict):
+        raise BackupError("Invalid staged config.json object")
+    from mempalace.config import DEFAULT_COLLECTION_NAME
+    if config.get("collection_name", DEFAULT_COLLECTION_NAME) != DEFAULT_COLLECTION_NAME:
+        raise BackupError("Procedural stage inspection requires the default drawer collection; "
+                          "the published read adapter cannot bind a custom collection")
+    backend = os.environ.get("MEMPALACE_BACKEND_EXPLICIT") or config.get("backend") \
+        or os.environ.get("MEMPALACE_BACKEND", "")
+    changes = {
+        "HOME": str(stage), "USERPROFILE": str(stage),
+        "MEMPALACE_PALACE_PATH": str(data), "MEMPAL_PALACE_PATH": str(data),
+        "MEMPALACE_BACKEND_EXPLICIT": backend,
+        "MEMPALACE_EMBEDDING_MODEL": os.environ.get("MEMPALACE_EMBEDDING_MODEL")
+            or config.get("embedding_model", "minilm"),
+    }
+    if any(not isinstance(value, str) for value in changes.values()):
+        raise BackupError("Invalid staged backend/embedder configuration")
+    previous = {key: os.environ.get(key) for key in changes}
+    backend_handle = None
+    try:
+        os.environ.update(changes)
+        from mempalace.palace import get_backend_for_palace
+        backend_handle = get_backend_for_palace(str(data))
+        yield
+    finally:
+        try:
+            if backend_handle is not None:
+                backend_handle.close_palace(str(data))
+        finally:
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+
+def _validate_procedural_stage(stage, data):
+    """Inspect every published source/reference before any stage publication."""
+    try:
+        if not _has_procedural_storage(data):
+            return
+        # Import the installed runtime before adding the adjacent complete script
+        # tree: MemPalace's first import removes inherited PYTHONPATH entries.
+        import mempalace
+        from mempalace.backends.base import BackendError
+        scripts = str(Path(__file__).resolve().parents[2] / "dreaming" / "scripts")
+        old_path = sys.path[:]
+        try:
+            sys.path.insert(0, scripts)
+            import dream_palace
+            from dream_procedural_palace import nonmutating_read
+            from dream_procedural_validate import inspect_published_sources
+
+            with _staged_procedural_environment(stage, data), nonmutating_read(str(data)):
+                collection = dream_palace.procedural_collection(str(data))
+                where = {"$or": [{key: value} for key, values in _PROCEDURAL_MARKERS.items()
+                                  for value in values]}
+                wings, seen, offset = set(), set(), 0
+                while True:
+                    page = collection.get(where=where, include=["metadatas"], limit=256, offset=offset)
+                    ids, metadata = page["ids"], page["metadatas"]
+                    if len(ids) != len(metadata) or len(ids) > 256:
+                        raise BackupError("Invalid procedural discovery page")
+                    if not ids:
+                        break
+                    for physical_id, meta in zip(ids, metadata):
+                        if physical_id in seen:
+                            raise BackupError("Repeated row during procedural wing discovery")
+                        seen.add(physical_id)
+                        wing = meta.get("wing") if isinstance(meta, dict) else None
+                        if not isinstance(wing, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", wing) \
+                                or meta.get("room") not in _PROCEDURAL_MARKERS["room"]:
+                            raise BackupError("Invalid procedural wing/room metadata")
+                        wings.add(wing)
+                    offset += len(ids)
+                if not wings:
+                    raise BackupError("Procedural storage exists but the selected collection cannot read it")
+                for wing in sorted(wings):
+                    report = inspect_published_sources(str(data), wing)
+                    if report["status"] != "ok":
+                        codes = sorted({failure["code"] for failure in report["failures"]})
+                        raise BackupError(f"Procedural stage blocked in wing {wing}: "
+                                          f"{report['failed']} unavailable references; {', '.join(codes)}")
+        except BackendError as exc:
+            raise BackupError(f"Procedural stage backend failure: {exc}") from exc
+        finally:
+            sys.path[:] = old_path
+    except ImportError as exc:
+        raise BackupError("Procedural stage validation requires preinstalled MemPalace and the "
+                          "complete adjacent dreaming/scripts tree; no source repair was attempted") from exc
+    except (ValueError, RuntimeError, OSError, sqlite3.Error) as exc:
+        if isinstance(exc, BackupError):
+            raise
+        raise BackupError(f"Procedural stage integrity failure: {exc}") from exc
+
+
 def _validate_stage(stage, data, *, required=False, expected=(), allow_incomplete_preparation=False):
     if (stage / RESTORE_MARKER).exists():
         raise BackupError("Incomplete publication marker found in staged HOME; inspect before recovery")
@@ -575,6 +710,7 @@ def _validate_stage(stage, data, *, required=False, expected=(), allow_incomplet
     origin = _covered_path(stage, data / ".mempalace/origin.json")
     if not origin.is_file():
         raise BackupError(f"Restored tree lacks embedder identity: {origin}")
+    _validate_procedural_stage(stage, data)
     if not (data / "logstream.sqlite3").exists():
         return None
     with task_safety() as (restore, snapshot):

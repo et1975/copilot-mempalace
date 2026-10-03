@@ -180,7 +180,8 @@ Additional worklist `kind`s should keep the same harvest/adjudicate/adopt shape.
 ### Optional procedural lifecycle (separate CLI)
 
 `dream_procedure.py` owns `propose`, `validate`, `review`, `outcome`, `guidance`,
-and `explain`. It does not add a harvest task, migrate old reflections, enable
+`explain`, explicit `capture-sources`, read-only `status`, and nonpublishing
+`draft`. It does not add a harvest task, migrate old reflections implicitly, enable
 ontology rules, update KG schemas or infer task outcomes. The existing dreaming
 skill reviews normative statements; mechanics project immutable drawer events.
 
@@ -196,6 +197,21 @@ Guidance has a combined five-item / 6,000-character serialized ceiling; explain
 retains full score terms, review dispositions and lineage. No retrieval creates
 feedback and no read writes scores. Unsupported read-only backends, incomplete
 WAL/SHM states, missing models/evidence and incomplete histories fail explicitly.
+
+`status` uses the published source/event projection without host reads or
+embeddings; wing-wide capture coverage is separate from repository eligibility.
+`guidance --max-bytes 8192` adds a UTF-8 wire cap to the existing combined item
+and serialized Unicode-character caps. Core ranking/formatting removes whole
+items; adapters do not truncate or rerank statements, applicability or exceptions.
+
+`draft --repository --input RECEIPT --out NEW_FILE` exclusively creates a
+bounded review packet outside the palace. An explicit optional original
+session store or captured raw fields supply exact original references; missing
+current turns remain pending. Generated guidance/transcript/reflection echoes
+are lineage, never new support. No Stop, successful task, repeated filing or
+delivery receipt chooses polarity, creates a source capture, publishes an event,
+repairs state or awards credit. The receipt and draft schemas, omission limits
+and remaining semantic review obligations are in the procedural contract.
 Verified support is WAL-aware SQLite-exact storage and an installed local MiniLM
 cache; legacy destructive safety lookups keep their existing backend semantics.
 

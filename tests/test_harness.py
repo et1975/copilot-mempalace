@@ -26,6 +26,7 @@ def project(pytester, monkeypatch):
     monkeypatch.setenv("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
     monkeypatch.setenv("PYTHONDONTWRITEBYTECODE", "1")
     monkeypatch.delenv("PYTEST_ADDOPTS", raising=False)
+    monkeypatch.delenv("DREAMING_TEST_MODEL_CACHE", raising=False)
     for name in ROOT_VARIABLES:
         monkeypatch.delenv(name, raising=False)
     for name in ("TMPDIR", "TEMP", "TMP"):
@@ -175,7 +176,7 @@ def test_session_teardown_restores_environment_and_tempfile_cache(project):
         import tempfile
 
         _variables = ("TMPDIR", "TEMP", "TMP", "DREAMING_TEST_TMPDIR", "MPTASK_TEST_TMPDIR",
-                      "PYTHONPATH", "PYTHONDONTWRITEBYTECODE")
+                      "DREAMING_TEST_MODEL_CACHE", "PYTHONPATH", "PYTHONDONTWRITEBYTECODE")
         _before = None
         _cached = None
 
@@ -306,6 +307,32 @@ def test_backup_isolation_is_per_test_and_does_not_change_other_suites(project, 
     run_project(project).assert_outcomes(passed=3)
     assert list(live.iterdir()) == [sentinel]
     assert sentinel.read_text(encoding="utf-8") == "live palace"
+
+
+@pytest.mark.parametrize("override", (False, True), ids=("default", "explicit"))
+def test_model_cache_is_pinned_before_home_isolation(project, monkeypatch, override):
+    _, external = project
+    home = external / "caller-home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    cache = external / "custom-model-cache" if override else (
+        home / ".cache" / "chroma" / "onnx_models" / "all-MiniLM-L6-v2")
+    cache.mkdir(parents=True)
+    if override:
+        monkeypatch.setenv("DREAMING_TEST_MODEL_CACHE", str(cache))
+    monkeypatch.setenv("EXPECTED_MODEL_CACHE", str(cache))
+    write_test(project, "tests/mempalace-backup/test_model_cache.py", """
+        import os
+        from pathlib import Path
+
+        def test_cache_is_not_rebased_to_disposable_home():
+            cache = Path(os.environ["DREAMING_TEST_MODEL_CACHE"])
+            assert str(cache) == os.environ["EXPECTED_MODEL_CACHE"]
+            assert cache.is_dir()
+            assert not cache.is_relative_to(Path.home())
+    """)
+    run_project(project).assert_outcomes(passed=1)
 
 
 def test_native_fork_checks_are_isolated_from_other_suites_threads(tmp_path):

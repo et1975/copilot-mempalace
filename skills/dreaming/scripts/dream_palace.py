@@ -257,6 +257,16 @@ def load_source_drawer(palace: str, drawer_id: str, *, collection=None) -> dict[
         return None
     logical = _group_by_parent(list(rows.values()), ("parent_drawer_id",))[0]
     members = [rows[member_id] for member_id in logical["member_ids"]]
+    provenance = {}
+    for member in members:
+        meta = member.get("metadata") or {}
+        for key in ("wing", "room", "kind", "source_kind", "generated_from", "added_by",
+                    "generated_summary", "repository", "session_id", "observed_at"):
+            if key in meta:
+                if key in provenance and provenance[key] != meta[key]:
+                    raise ValueError(f"conflicting source chunk provenance: {key}")
+                provenance[key] = meta[key]
+    logical["metadata"] = {**logical["metadata"], **provenance}
     # MCP add_drawer slices verbatim characters; mined chunks retain the
     # legacy newline convention. Recipe/author alone are shared by both.
     handler_chunks = all(
@@ -1006,7 +1016,8 @@ def load_logical_drawers(
         kwargs["where"] = where
     res = col.get(**kwargs)
     rows = _rows_from_collection_result(res)
-    from dream_metadata import decode_procedural_chunks
+    from dream_metadata import decode_procedural_chunks, is_source_record_metadata
+    rows = [r for r in rows if not is_source_record_metadata(r.get("metadata", {}))]
     procedural = [r for r in rows if (r.get("metadata") or {}).get("room") == "procedural"]
     ordinary = [r for r in rows if (r.get("metadata") or {}).get("room") != "procedural"]
     return _group_by_parent(ordinary, ("parent_drawer_id",)) + decode_procedural_chunks(procedural)
@@ -1079,6 +1090,8 @@ def load_observation_entries(
             kwargs["where"] = where
         rows.extend(_rows_from_collection_result(col.get(**kwargs)))
 
+    from dream_metadata import is_source_record_metadata
+    rows = [r for r in rows if not is_source_record_metadata(r.get("metadata", {}))]
     entries = []
     for logical in _group_by_parent(rows, ("parent_entry_id", "parent_drawer_id")):
         from dream_metadata import decode_dream_metadata, content_hash

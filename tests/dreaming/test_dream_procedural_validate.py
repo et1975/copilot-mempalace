@@ -56,8 +56,19 @@ class GroundedFixture(unittest.TestCase):
         return project_rules(events, as_of=NOW, policy=Policy())
 
     def reader(self):
+        from dream_procedural_validate import AdmissionReader
+        return AdmissionReader(self.path, "w", self.store)
+
+    def published_reader(self):
         from dream_procedural_validate import EvidenceReader
-        return EvidenceReader(self.path, self.store)
+        return EvidenceReader(self.path, "w")
+
+    def publish(self, *events):
+        from dream_procedural_palace import append_event
+        from test_dream_procedural_palace import sanctioned_writer
+        for event in events:
+            append_event(self.path, "w", event, writer=sanctioned_writer(self.path, self.collection),
+                         session_store=self.store, clock=lambda: NOW)
 
     def review(self, number=2, **changes):
         packet = {"rule_id": self.proposal().rule_id, "repository": "owner/repo",
@@ -75,6 +86,59 @@ class GroundedFixture(unittest.TestCase):
 
 
 class GroundingTests(GroundedFixture):
+    def test_validation_finds_captured_raw_fields_once_without_host_or_generated_copies(self):
+        from dream_procedural_validate import build_validation_packet, ValidationLimits
+        from dream_procedural_sources import AUTHOR
+        for ref in self.refs:
+            ref.update(source_kind="session_turn", source_id=ref["session_id"],
+                       turn_index=0, field="user_message")
+        self.publish(self.proposal())
+        record = next(v for v in self.collection.rows.values()
+                      if v["metadata"]["room"] == "procedural-sources")
+        self.collection.add("w", "procedural-sources", record["text"], AUTHOR, record["metadata"])
+        self.collection.rows["reflection"] = {"id": "reflection", "text": self.refs[0]["quote"],
+            "metadata": {"wing": "w", "room": "diary", "kind": "reflect"}}
+        ids = [k for k, v in self.collection.rows.items()
+               if v["metadata"]["room"] == "procedural-sources"] + ["reflection"]
+        self.collection.query = lambda **kwargs: {
+            "ids": [ids], "documents": [[self.collection.rows[i]["text"] for i in ids]],
+            "metadatas": [[self.collection.rows[i]["metadata"] for i in ids]]}
+        self.collection.embedding_function = lambda texts: [[1., 0.] for _ in texts]
+        os.unlink(self.store)
+        before = deepcopy(self.collection.rows)
+        with patch("dream_procedural_validate._session_repository", side_effect=AssertionError("host")):
+            reader = self.reader()
+            packet = build_validation_packet(self.proposal().payload.definition,
+                queries=[definition()["statement"], "When does it fail?"],
+                source_reader=lambda q, n: reader.search("w", q, n, as_of=NOW),
+                limits=ValidationLimits(), as_of=NOW)
+        self.assertEqual(len(packet.evidence), 3)
+        self.assertEqual({ref.source_kind for ref in packet.evidence}, {"session_turn"})
+        self.assertEqual({ref.source_id for ref in packet.evidence},
+                         {ref["session_id"] for ref in self.refs[:3]})
+        self.assertEqual(self.collection.rows, before)
+
+    def test_packet_keeps_distinct_raw_fields_but_not_snapshot_copies(self):
+        from dream_procedural import EvidenceReference
+        from dream_procedural_validate import build_validation_packet, ValidationLimits
+        refs = [
+            EvidenceReference("session_turn", self.refs[0]["session_id"], self.refs[0]["session_id"],
+                              "original", "a" * 64, index, field)
+            for index, field in ((0, "user_message"), (0, "assistant_response"), (1, "user_message"))]
+        packet = build_validation_packet(self.proposal().payload.definition,
+            queries=[definition()["statement"], "When does it fail?"],
+            source_reader=lambda q, n: refs + refs, limits=ValidationLimits(), as_of=NOW)
+        self.assertEqual(len(packet.evidence), 3)
+
+    def test_original_acquisition_rejects_cross_session_turn_identity(self):
+        from dataclasses import replace
+        from dream_procedural_validate import acquire_original
+        ref = replace(self.proposal().payload.evidence[0], source_kind="session_turn",
+                      source_id=self.refs[1]["session_id"], turn_index=0, field="user_message",
+                      source_hash=self.refs[1]["source_hash"], quote=self.refs[1]["quote"])
+        with self.assertRaisesRegex(ValueError, "session"):
+            acquire_original(ref, palace=self.path, session_store=self.store)
+
     def test_three_original_sessions_required_not_three_references(self):
         self.assertEqual(self.preflight(self.proposal()).independent_sessions, 3)
         for refs in (self.refs[:2], [self.refs[0]] * 3):

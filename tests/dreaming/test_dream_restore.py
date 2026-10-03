@@ -2,11 +2,16 @@
 from __future__ import annotations
 
 import contextlib
+from copy import deepcopy
+from datetime import datetime, timezone
 import io
 import json
 import os
 import tempfile
 import unittest
+from unittest.mock import Mock
+
+import pytest
 
 import dream_restore
 
@@ -197,6 +202,285 @@ class TestRestore(unittest.TestCase):
         self.assertEqual(len(report["errors"]), 1)
         self.assertEqual(report["errors"][0]["id"], "bad")
         self.assertEqual(writer.calls[0]["metadata"]["original_id"], "good")
+
+
+def _source_archive_record():
+    from dream_metadata import canonical_json, content_hash
+    from dream_procedural import EvidenceReference
+    from dream_procedural_sources import OriginalSource, source_record_data
+
+    session = "11111111-1111-4111-8111-111111111111"
+    observed = datetime(2026, 9, 23, tzinfo=timezone.utc)
+    text = "original observation"
+    reference = EvidenceReference(
+        "session_turn", session, session, text, content_hash(text), 0, "user_message")
+    body, metadata = source_record_data(
+        OriginalSource(reference, "owner/repo", observed, text),
+        captured_at=observed, captured_by="archive-test")
+    record = _record("captured-source", room="procedural-sources")
+    record["member_ids"] = ["captured-source"]
+    record["rows"] = [{
+        "id": "captured-source",
+        "document": body + "\n\n<!--dreaming-meta: " + canonical_json(metadata) + "-->",
+        "metadata": {"room": "procedural-sources", "added_by": "dream-procedure-source"},
+    }]
+    return record
+
+
+@pytest.mark.parametrize("dry_run", (False, True))
+@pytest.mark.parametrize("mixed", (False, True), ids=("protected-only", "ordinary-first"))
+def test_procedural_source_archive_blocks_complete_batch_before_writes(dry_run, mixed):
+    protected = _source_archive_record()
+    records = ([_record("ordinary")] if mixed else []) + [protected]
+    before = deepcopy(records)
+    writer, out = FakeWriter(), io.StringIO()
+
+    report = dream_restore.restore(iter(records), writer, dry_run=dry_run, out=out)
+
+    assert report["restored"] == 0
+    assert writer.calls == []
+    assert report["errors"] and report["errors"][0]["id"] == "captured-source"
+    assert "procedural" in report["errors"][0]["error"].lower()
+    assert "physical" in report["errors"][0]["error"].lower()
+    assert "WOULD restore" not in out.getvalue()
+    assert records == before
+
+
+@pytest.mark.parametrize("location", ("archive-scope", "archive-metadata", "row-metadata",
+                                     "omitted-row", "row-trailer", "wrapped-trailer", "split-trailer"))
+@pytest.mark.parametrize("kind,room", (("procedural_source", "procedural-sources"),
+                                    ("procedural_event", "procedural")))
+def test_all_archive_provenance_channels_preflight_before_ordinary_replay(location, kind, room):
+    record = _record("protected")
+    if location == "archive-scope":
+        record["room"] = room
+    elif location == "archive-metadata":
+        record["metadata"] = {"kind": kind}
+    elif location in {"row-metadata", "omitted-row"}:
+        record["rows"][0]["metadata"]["kind"] = kind
+        if location == "omitted-row":
+            record["member_ids"] = [record["rows"][1]["id"]]
+    elif location in {"row-trailer", "wrapped-trailer"}:
+        record["rows"][0]["document"] += '\n\n<!--dreaming-meta: {"kind":"' + kind + '"}-->'
+        if location == "wrapped-trailer":
+            record["rows"][0]["document"] += '\n\n<!--dreaming-meta: {"restored":true}-->'
+    else:
+        record["rows"][1]["document"] = "payload\n\n<!--dreaming-met"
+        record["rows"][0]["document"] = 'a: {"kind":"' + kind + '"}-->'
+    writer = FakeWriter()
+
+    report = dream_restore.restore([_record("ordinary"), record], writer)
+
+    assert report["restored"] == 0 and writer.calls == []
+    assert report["errors"] and "procedural" in report["errors"][0]["error"].lower()
+
+
+@pytest.mark.parametrize("metadata", ({"added_by": "dream-procedure-source"},
+                                     {"kind": "procedural_source", "room": "ordinary"}))
+def test_source_reservation_metadata_blocks_archive_replay(metadata):
+    record = _record("protected")
+    record["rows"][0]["metadata"].update(metadata)
+    writer = FakeWriter()
+
+    report = dream_restore.restore([_record("ordinary"), record], writer)
+
+    assert writer.calls == [] and report["restored"] == 0
+    assert report["errors"]
+
+
+def test_malformed_selected_trailer_cannot_hide_protected_metadata():
+    record = _record("broken")
+    record["rows"][0]["document"] = '<!--dreaming-meta: {"kind":"procedural_source"'
+    writer = FakeWriter()
+
+    report = dream_restore.restore([_record("ordinary"), record], writer)
+
+    assert writer.calls == [] and report["restored"] == 0
+    assert report["errors"] and report["errors"][0]["id"] == "broken"
+
+
+@pytest.mark.parametrize("dry_run", (False, True))
+def test_cli_rejects_selected_procedural_archive_before_writer_construction(tmp_path, capsys, dry_run):
+    archive = tmp_path / "archive.jsonl"
+    _write_archive(str(archive), [_record("ordinary"), _source_archive_record()])
+    before = archive.read_bytes()
+    factory = Mock(return_value=FakeWriter())
+    args = ["--palace", str(tmp_path), "--archive-file", str(archive)]
+    if dry_run:
+        args.append("--dry-run")
+
+    result = dream_restore.main(args, writer_factory=factory)
+
+    assert result == 1
+    factory.assert_not_called()
+    output = capsys.readouterr()
+    assert "procedural" in output.err.lower() and "physical" in output.err.lower()
+    assert "WOULD restore" not in output.out
+    assert archive.read_bytes() == before
+
+
+def test_cli_preflight_is_scoped_to_selected_records_and_preserves_ordinary_restore(tmp_path):
+    archive = tmp_path / "archive.jsonl"
+    _write_archive(str(archive), [_source_archive_record(), _record("ordinary")])
+    writer = FakeWriter()
+
+    result = dream_restore.main(
+        ["--palace", str(tmp_path), "--archive-file", str(archive), "--id", "ordinary"],
+        writer_factory=lambda: writer)
+
+    assert result == 0
+    assert [call["metadata"]["original_id"] for call in writer.calls] == ["ordinary"]
+
+
+def test_fenced_metadata_examples_are_not_procedural_archives():
+    record = _record("ordinary")
+    record["rows"][0]["document"] = (
+        'Metadata example:\n```html\n<!--dreaming-meta: {"kind":"procedural_source"}-->\n```')
+    record["rows"][0]["metadata"]["added_by"] = "dreaming"
+    writer = FakeWriter()
+
+    report = dream_restore.restore([record], writer)
+
+    assert report["restored"] == 1 and not report["errors"]
+    assert writer.calls[0]["content"] == dream_restore.record_to_content(record)
+
+
+@pytest.mark.parametrize("location", ("scope", "row-metadata"))
+@pytest.mark.parametrize("strict", (False, True))
+def test_cli_refuses_duplicate_keys_that_hide_procedural_archive_provenance(tmp_path, location, strict):
+    record = _record("protected")
+    if location == "scope":
+        raw = json.dumps(record).replace(
+            '"room": "room"', '"room": "procedural-sources", "room": "room"')
+    else:
+        record["rows"][0]["metadata"]["kind"] = "ordinary"
+        raw = json.dumps(record).replace(
+            '"kind": "ordinary"', '"kind": "procedural_source", "kind": "ordinary"')
+    archive = tmp_path / "ambiguous.jsonl"
+    _write_archive(str(archive), [_record("ordinary"), raw])
+    before = archive.read_bytes()
+    factory = Mock(return_value=FakeWriter())
+    args = ["--palace", str(tmp_path), "--archive-file", str(archive)]
+    if strict:
+        args.append("--strict")
+
+    result = dream_restore.main(args, writer_factory=factory)
+
+    assert result == 1
+    factory.assert_not_called()
+    assert archive.read_bytes() == before
+
+
+def _logical_archive(text, split_at=None, *, added_by="dreaming"):
+    pieces = [text] if split_at is None else [text[:split_at], text[split_at:]]
+    rows = [
+        {"id": f"logical-{index}", "document": piece,
+         "metadata": {"added_by": added_by, "chunk_index": index}}
+        for index, piece in enumerate(pieces)
+    ]
+    record = _record("logical")
+    record["member_ids"] = [row["id"] for row in rows]
+    record["rows"] = list(reversed(rows))
+    return record
+
+
+@pytest.mark.parametrize("kind", ("procedural_source", "procedural_event"))
+@pytest.mark.parametrize("split", (False, True), ids=("whole", "split-marker"))
+@pytest.mark.parametrize("dry_run", (False, True))
+def test_unfinished_fence_writer_trailer_and_wrapper_block_whole_batch(kind, split, dry_run):
+    text = (
+        '```text\nunfinished original field\n\n'
+        '<!--dreaming-meta: {"kind":"' + kind + '"}-->\n\n'
+        '<!--dreaming-meta: {}-->')
+    split_at = text.index("<!--dreaming-meta:") + len("<!--dreaming-") if split else None
+    protected = _logical_archive(text, split_at)
+    records = [_record("ordinary"), protected]
+    before = deepcopy(records)
+    writer, output = FakeWriter(), io.StringIO()
+
+    report = dream_restore.restore(iter(records), writer, dry_run=dry_run, out=output)
+
+    assert report["restored"] == 0 and writer.calls == []
+    assert report["errors"] and report["errors"][0]["id"] == "logical"
+    assert "procedural" in report["errors"][0]["error"].lower()
+    assert "WOULD restore" not in output.getvalue()
+    assert records == before
+
+
+@pytest.mark.parametrize("split", ("whole", "before-marker", "inside-marker",
+                                 "inside-opening-fence", "inside-closing-fence"))
+@pytest.mark.parametrize("dry_run", (False, True))
+def test_closed_fenced_metadata_example_has_whole_and_chunked_equivalence(split, dry_run):
+    text = (
+        'Ordinary documentation\n```html\n'
+        '<!--dreaming-meta: {"kind":"procedural_source"}-->\n'
+        '```\n\n<!--dreaming-meta: {"topic":"documentation"}-->')
+    cuts = {
+        "whole": None,
+        "before-marker": text.index("<!--dreaming-meta:"),
+        "inside-marker": text.index("<!--dreaming-meta:") + len("<!--dreaming-"),
+        "inside-opening-fence": text.index("```html") + 1,
+        "inside-closing-fence": text.index("\n```\n") + 2,
+    }
+    ordinary = _logical_archive(text, cuts[split])
+    records = [_record("first-ordinary"), ordinary]
+    writer, output = FakeWriter(), io.StringIO()
+
+    report = dream_restore.restore(records, writer, dry_run=dry_run, out=output)
+
+    assert report["errors"] == []
+    if dry_run:
+        assert report["skipped"] == 2 and writer.calls == []
+        assert "WOULD restore logical" in output.getvalue()
+    else:
+        assert report["restored"] == 2
+        assert writer.calls[1]["content"] == dream_restore.record_to_content(ordinary)
+
+
+@pytest.mark.parametrize("dry_run", (False, True))
+def test_cli_combined_fence_split_and_wrapper_refuses_before_writer(tmp_path, capsys, dry_run):
+    text = (
+        '```text\nunfinished\n<!--dreaming-meta: {"kind":"procedural_source"}-->\n'
+        '<!--dreaming-meta: {"restored":true}-->')
+    record = _logical_archive(text, text.index("<!--dreaming-meta:") + 8)
+    archive = tmp_path / "combined.jsonl"
+    _write_archive(str(archive), [_record("ordinary"), record])
+    factory = Mock(return_value=FakeWriter())
+    args = ["--palace", str(tmp_path), "--archive-file", str(archive)]
+    if dry_run:
+        args.append("--dry-run")
+
+    assert dream_restore.main(args, writer_factory=factory) == 1
+
+    factory.assert_not_called()
+    output = capsys.readouterr()
+    assert "procedural" in output.err.lower()
+    assert "WOULD restore" not in output.out
+
+
+@pytest.mark.parametrize("trailers", (32, 33))
+def test_terminal_trailer_peeling_has_explicit_exact_limit(trailers):
+    text = "ordinary" + '\n\n<!--dreaming-meta: {}-->' * trailers
+    writer = FakeWriter()
+
+    report = dream_restore.restore([_logical_archive(text)], writer)
+
+    if trailers == 32:
+        assert report["restored"] == 1 and not report["errors"]
+    else:
+        assert writer.calls == [] and report["restored"] == 0
+        assert "limit" in report["errors"][0]["error"].lower()
+
+
+def test_conflicting_logical_writer_context_is_not_silently_discarded():
+    record = _logical_archive("ordinary content", 8)
+    record["rows"][0]["metadata"]["added_by"] = "another-writer"
+    writer = FakeWriter()
+
+    report = dream_restore.restore([_record("ordinary-first"), record], writer)
+
+    assert writer.calls == [] and report["restored"] == 0
+    assert "writer" in report["errors"][0]["error"].lower()
 
 
 if __name__ == "__main__":

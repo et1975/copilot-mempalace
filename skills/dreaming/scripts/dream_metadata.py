@@ -7,7 +7,7 @@ import re
 from typing import Any
 
 MARKER = "<!--dreaming-meta:"
-GENERATED_KINDS = frozenset({"lesson", "reflect", "procedural_event"})
+GENERATED_KINDS = frozenset({"lesson", "reflect", "procedural_event", "procedural_source"})
 
 
 def canonical_json(value: Any) -> str:
@@ -36,8 +36,8 @@ def strict_json(text: str) -> Any:
     return json.loads(text, object_pairs_hook=_unique_pairs, parse_constant=_invalid_constant)
 
 
-def decode_dream_metadata(drawer: dict) -> dict:
-    """Merge native/trailer metadata; malformed or disagreeing encodings raise."""
+def split_dream_metadata(drawer: dict) -> tuple[str, dict]:
+    """Peel one recognized terminal trailer and return body/merged metadata."""
     native = drawer.get("metadata")
     if native is None:
         native = {}
@@ -47,6 +47,7 @@ def decode_dream_metadata(drawer: dict) -> dict:
     text = drawer.get("text", "")
     if not isinstance(text, str):
         raise ValueError("drawer text must be a string")
+    body_text = text
     lines = text.rstrip().split("\n")
     fence = None
     for line in lines[:-1]:
@@ -59,7 +60,8 @@ def decode_dream_metadata(drawer: dict) -> dict:
                 fence = None
     # Writers append one canonical JSON line. Inline examples and quoted code
     # are content, not provenance, even when they contain the marker.
-    generated_writer = native.get("added_by") in {"dreaming", "dream-reflect", "dream-procedure"}
+    generated_writer = native.get("added_by") in {
+        "dreaming", "dream-reflect", "dream-procedure", "dream-procedure-source"}
     if lines and (fence is None or generated_writer) and lines[-1].startswith(MARKER):
         decoder = json.JSONDecoder(object_pairs_hook=_unique_pairs, parse_constant=_invalid_constant)
         body = lines[-1][len(MARKER):].lstrip()
@@ -70,10 +72,16 @@ def decode_dream_metadata(drawer: dict) -> dict:
             if key in result and result[key] != value:
                 raise ValueError(f"conflicting dreaming metadata: {key}")
             result[key] = value
+        body_text = text[:len(text.rstrip()) - len(lines[-1])]
     for key in ("kind", "source_kind", "generated_from", "added_by"):
         if key in result and (not isinstance(result[key], str) or not result[key].strip()):
             raise ValueError(f"invalid dreaming metadata field: {key}")
-    return result
+    return body_text, result
+
+
+def decode_dream_metadata(drawer: dict) -> dict:
+    """Merge native/trailer metadata; malformed or disagreeing encodings raise."""
+    return split_dream_metadata(drawer)[1]
 
 
 def is_generated_observation(drawer: dict) -> bool:
@@ -81,28 +89,33 @@ def is_generated_observation(drawer: dict) -> bool:
     return (metadata.get("kind") in GENERATED_KINDS
             or metadata.get("source_kind") in GENERATED_KINDS
             or metadata.get("generated_from") in GENERATED_KINDS
-            or metadata.get("added_by") in {"dream-procedure", "dream-reflect"}
+            or metadata.get("added_by") in {"dream-procedure", "dream-reflect", "dream-procedure-source"}
+            or metadata.get("room") == "procedural-sources"
             or bool(metadata.get("generated_summary")))
 
 
 def is_procedural_record(drawer: dict) -> bool:
     metadata = decode_dream_metadata(drawer)
-    return metadata.get("kind") == "procedural_event" or metadata.get("room") == "procedural"
+    return (metadata.get("kind") in {"procedural_event", "procedural_source"}
+            or metadata.get("room") in {"procedural", "procedural-sources"})
 
 
-def decode_procedural_chunks(rows: list[dict]) -> list[dict]:
-    """Reassemble procedural-only rows without altering a single character.
-
-    Unlike legacy mined text, arbitrary offsets can split JSON tokens. Chunk
-    indices are zero-based and total_chunks (when present) must match.
-    """
+def exact_chunk_groups(rows: list[dict]) -> list[tuple[str, list[dict], dict]]:
+    """Validate/order arbitrary-offset chunks, also usable with metadata only."""
     groups: dict[str, list[dict]] = {}
     physical = set()
     for row in rows:
+        if not isinstance(row.get("id"), str) or not row["id"]:
+            raise ValueError("invalid physical chunk ID")
         if row["id"] in physical:
             raise ValueError("duplicate physical chunk")
         physical.add(row["id"])
-        meta = row.get("metadata") or {}
+        meta = row.get("metadata", {})
+        if not isinstance(meta, dict):
+            raise ValueError("chunk metadata must be an object")
+        if "parent_drawer_id" in meta and (
+                not isinstance(meta["parent_drawer_id"], str) or not meta["parent_drawer_id"]):
+            raise ValueError("invalid parent chunk ID")
         groups.setdefault(meta.get("parent_drawer_id") or row["id"], []).append(row)
     result = []
     for parent, members in sorted(groups.items()):
@@ -117,7 +130,6 @@ def decode_procedural_chunks(rows: list[dict]) -> list[dict]:
             total = (member.get("metadata") or {}).get("total_chunks", len(members))
             if type(total) is not int or total != len(members):
                 raise ValueError(f"incomplete procedural chunks: {parent}")
-        text = "".join(m.get("text", "") for m in members)
         native = {}
         for member in members:
             for key, value in (member.get("metadata") or {}).items():
@@ -126,7 +138,28 @@ def decode_procedural_chunks(rows: list[dict]) -> list[dict]:
                 if key in native and native[key] != value:
                     raise ValueError(f"conflicting chunk metadata: {key}")
                 native[key] = value
-        meta = decode_dream_metadata({"text": text, "metadata": native})
+        result.append((parent, members, native))
+    return result
+
+
+def assemble_exact_chunks(rows: list[dict]) -> list[dict]:
+    """Reassemble without legacy newline insertion or event-specific parsing."""
+    result = []
+    for parent, members, native in exact_chunk_groups(rows):
+        if any(not isinstance(m.get("text"), str) for m in members):
+            raise ValueError("chunk text must be a string")
+        text = "".join(m["text"] for m in members)
+        result.append({"id": parent, "member_ids": [m["id"] for m in members],
+                       "text": text, "metadata": native, "wing": native.get("wing"),
+                       "room": native.get("room"), "content_hash": content_hash(text)})
+    return result
+
+
+def decode_procedural_chunks(rows: list[dict]) -> list[dict]:
+    """Strict event validation layered over shared arbitrary-offset assembly."""
+    result = []
+    for drawer in assemble_exact_chunks(rows):
+        meta = decode_dream_metadata(drawer)
         if meta.get("kind") != "procedural_event" or type(meta.get("schema_version")) is not int \
                 or meta["schema_version"] != 1:
             raise ValueError("invalid procedural metadata/schema version")
@@ -134,7 +167,14 @@ def decode_procedural_chunks(rows: list[dict]) -> list[dict]:
         if not isinstance(event, dict) or event.get("digest") != content_hash(
                 canonical_json({k: v for k, v in event.items() if k != "digest"})):
             raise ValueError("procedural event digest mismatch")
-        result.append({"id": parent, "member_ids": [m["id"] for m in members],
-                       "text": text, "metadata": meta, "wing": meta.get("wing"),
-                       "room": meta.get("room"), "content_hash": content_hash(text)})
+        result.append({**drawer, "metadata": meta})
     return result
+
+
+def is_source_record_metadata(metadata: dict) -> bool:
+    """Native-only reservation check, safe before legacy chunk concatenation."""
+    if not isinstance(metadata, dict):
+        raise ValueError("drawer metadata must be an object")
+    return (metadata.get("room") == "procedural-sources"
+            or metadata.get("kind") == "procedural_source"
+            or metadata.get("added_by") == "dream-procedure-source")

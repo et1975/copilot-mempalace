@@ -18,7 +18,8 @@ from dream_procedural import (
 )
 from dream_procedural_palace import _scope_check, append_event, read_events
 from dream_procedural_validate import (
-    EvidenceReader, EvidenceUnavailable, ValidationLimits, build_validation_packet, preflight_event,
+    AdmissionReader, EvidenceReader, EvidenceUnavailable, SourceInvalid, ValidationLimits,
+    build_validation_packet, capture_retained_sources, preflight_event,
 )
 
 
@@ -38,17 +39,26 @@ class Parser(argparse.ArgumentParser):
 def _parser():
     parser = Parser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True, parser_class=Parser)
-    for name in ("propose", "review", "outcome", "validate", "guidance", "explain"):
+    for name in ("propose", "review", "outcome", "validate", "guidance", "explain",
+                 "capture-sources", "status", "draft"):
         sub = commands.add_parser(name)
         sub.add_argument("--palace", required=True)
         sub.add_argument("--wing", required=True)
-        sub.add_argument("--session-store", help="Original Copilot SQLite session store; opened read-only")
+        sub.add_argument("--session-store", required=name == "capture-sources",
+                         help="Original Copilot SQLite session store; opened read-only for acquisition")
         if name in {"propose", "review", "outcome"}:
             sub.add_argument("--input", required=True)
             mode = sub.add_mutually_exclusive_group()
             mode.add_argument("--dry-run", action="store_true")
             mode.add_argument("--prepare", action="store_true", help="Fill missing digests; no palace writes")
             sub.add_argument("--out", help="Prepared artifact destination (required with --prepare)")
+        elif name == "capture-sources":
+            sub.add_argument("--dry-run", action="store_true")
+        elif name in {"status", "draft"}:
+            sub.add_argument("--repository", required=True)
+            if name == "draft":
+                sub.add_argument("--input", required=True)
+                sub.add_argument("--out", required=True)
         elif name == "validate":
             sub.add_argument("--rule-id", required=True)
             sub.add_argument("--contrast-query", required=True)
@@ -59,6 +69,7 @@ def _parser():
             sub.add_argument("--include-candidates", action="store_true")
             sub.add_argument("--max-items", type=int, default=5)
             sub.add_argument("--max-chars", type=int, default=6000)
+            sub.add_argument("--max-bytes", type=int)
         else:
             sub.add_argument("--rule-id", required=True)
     return parser
@@ -106,7 +117,37 @@ def _execute(args):
     # Offline before any installed-library lazy import (including storage).
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
-    reader = EvidenceReader(palace, args.session_store)
+    if args.command == "status":
+        from dream_procedural_palace import procedural_status
+        return procedural_status(palace, args.wing, args.repository, as_of=as_of)
+    if args.command == "draft":
+        from dream_procedural_drafts import build_draft, read_receipt
+        if Path(args.out).expanduser().is_symlink():
+            raise RequestError("draft output must be a new regular file, not a symlink")
+        target = _artifact_path(args.out, palace)
+        receipt = read_receipt(args.input, args.repository)
+        # No host default, source capture, publication or lifecycle mutation.
+        dream_palace.procedural_collection(palace)
+        result = build_draft(receipt, repository=args.repository,
+                             session_store=args.session_store, as_of=as_of,
+                             evidence_reader=EvidenceReader(palace, args.wing))
+        _write_artifact(target, result)
+        return result
+    reader = (EvidenceReader(palace, args.wing) if args.command in {"guidance", "explain"}
+              else AdmissionReader(palace, args.wing, args.session_store))
+    if args.command == "capture-sources":
+        report = capture_retained_sources(palace, args.wing, session_store=args.session_store, as_of=as_of)
+        if args.dry_run or report["failed"]:
+            return report
+        if report["pending"] == 0:
+            return {**report, "status": "complete"}
+        dream_palace.bind_palace(palace)
+        from dream_procedural_palace import local_embedder
+        local_embedder()
+        writer = dream_palace.MempalaceWriter()
+        with writer.mutation():
+            return capture_retained_sources(palace, args.wing, session_store=args.session_store,
+                                             as_of=now_utc(), writer=writer)
     event = None
     if args.command in {"propose", "review", "outcome"}:
         if bool(args.prepare) != bool(args.out):
@@ -134,7 +175,9 @@ def _execute(args):
                 raise RuntimeError("event ID already has a different digest")
             return {"status": "already_exists", "event_id": event.event_id,
                     "projection": to_data(projection)}
-        preflight_event(event, projection=projection, evidence_reader=reader, as_of=as_of)
+        if args.prepare or args.dry_run:
+            preflight_event(event, projection=projection, evidence_reader=reader, as_of=as_of)
+            reader.preflight_captures(at=as_of, actor=event.session_id)
         if args.prepare:
             _write_artifact(_artifact_path(args.out, palace), event_to_data(event))
             return {"status": "prepared", "event_id": event.event_id, "out": args.out}
@@ -146,9 +189,7 @@ def _execute(args):
         writer = dream_palace.MempalaceWriter()
         with writer.mutation():
             result = append_event(palace, args.wing, event, writer=writer,
-                clock=now_utc,
-                preflight=lambda ev, live: preflight_event(
-                    ev, projection=live, evidence_reader=reader, as_of=now_utc()))
+                                  clock=now_utc, session_store=args.session_store)
         return to_data(result)
     state = next((s for s in projection.rules if s.rule_id == getattr(args, "rule_id", None)), None)
     if args.command == "validate":
@@ -174,7 +215,7 @@ def _execute(args):
         return explain_rule(projection, args.rule_id, as_of=as_of, source_diagnostics=diagnostics)
     result = get_task_guidance(projection, task=args.task, repository=repository,
         embedder=lambda texts: embed_texts(dream_palace.procedural_collection(palace), texts),
-        limits=GuidanceLimits(args.max_items, args.max_chars), as_of=as_of,
+        limits=GuidanceLimits(args.max_items, args.max_chars, max_bytes=args.max_bytes), as_of=as_of,
         include_candidates=args.include_candidates)
     return result.data
 
@@ -183,20 +224,29 @@ def main(argv=None) -> int:
     try:
         args = _parser().parse_args(argv)
         from dream_procedural_palace import nonmutating_read
-        read_only = args.command in {"validate", "guidance", "explain"} or \
+        read_only = args.command in {"validate", "guidance", "explain", "status", "draft"} or \
             getattr(args, "dry_run", False) or getattr(args, "prepare", False)
         # Imported handlers/models may print; keep the command's stdout strictly JSON.
         with redirect_stdout(sys.stderr), (nonmutating_read(args.palace) if read_only else nullcontext()):
             result = _execute(args)
+        for warning in result.get("warnings", ()):
+            print(warning, file=sys.stderr)
         print(canonical_json(result))
-        return 1 if result.get("status") == "evidence_unavailable" else 0
+        return 1 if result.get("status") in {"evidence_unavailable", "blocked"} else 0
+    except SourceInvalid as exc:
+        print(canonical_json({"status": "error", "kind": "evidence_integrity",
+                              "code": exc.code, "error": str(exc)}))
+        print(f"evidence_integrity: {exc}", file=sys.stderr)
+        return 1
     except (ValueError, TypeError) as exc:
-        print(canonical_json({"status": "error", "kind": "invalid_request", "error": str(exc)}))
+        print(canonical_json({"status": "error", "kind": "invalid_request",
+                              "code": getattr(exc, "code", "invalid_request"), "error": str(exc)}))
         print(f"invalid request: {exc}", file=sys.stderr)
         return 2
     except Exception as exc:
         kind = "evidence_unavailable" if isinstance(exc, EvidenceUnavailable) else "storage_integrity"
-        print(canonical_json({"status": "error", "kind": kind, "error": str(exc)}))
+        print(canonical_json({"status": "error", "kind": kind,
+                              "code": getattr(exc, "code", kind), "error": str(exc)}))
         print(f"{kind}: {exc}", file=sys.stderr)
         return 1
 

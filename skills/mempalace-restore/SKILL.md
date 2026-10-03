@@ -13,6 +13,11 @@ Task events, accepted history, epoch controls, complete source notes and native
 artifacts live in DATA/logstream.sqlite3 with DATA/replica.json. No matching
 external pending/head/clock recovery directory is required.
 
+Published procedural events and evidence instead live in ordinary drawer
+storage (the supported strict-read backend is DATA/sqlite_exact.sqlite3).
+Raw-turn captures and original-drawer witnesses travel with those drawers;
+the host session database is ingestion-only, not a companion recovery store.
+
 **Default: validate private staging without touching the live target.**
 Publication is explicit, offline and reversible. Never restore directly over
 live files or rename the whole HOME directory: that relocates its cooperative
@@ -53,6 +58,7 @@ restic snapshots --tag palace
 restic ls <snapshot-id>
 restic find origin.json
 restic find chroma.sqlite3
+restic find sqlite_exact.sqlite3
 ```
 
 Use `latest` only when you are confident the newest snapshot is the desired
@@ -97,6 +103,25 @@ path under the target, for example
 `<snapshot-id>:"$HOME/.mempalace"` subpath syntax to strip that prefix so
 `config.json`, `palace/`, `knowledge_graph.sqlite3`, `wal/`, and `tunnels.json`
 land directly under the restore target.
+
+**Procedural closure is checked before publication or reconnection.** The helper
+discovers procedural wings and runs the read-only
+`inspect_published_sources(stage_DATA, wing)` against each. All source bodies,
+including orphans, and retained evidence/origin references, including adverse
+and retired history, must resolve. Missing captures, corrupt records or
+missing/drifted originals block publication; coverage is not current rule
+eligibility.
+
+Procedural inspection requires preinstalled MemPalace and the complete
+`skills/dreaming/scripts` tree beside `skills/mempalace-backup/scripts`. The
+helper resolves its own symlink to locate siblings, not the caller's working
+directory. It opens existing SQLite-exact storage without initialization,
+host-source acquisition, writer construction or repair. Incompatible backends
+and custom drawer collections fail explicitly instead of appearing empty.
+Ambient live HOME configuration is not a staging input. Read handles close
+before publication; existing SQLite SHM coordination bytes may change, not
+application data/schema. Stages without procedural state do not acquire this
+MemPalace dependency, and task activation retains its separate package gate.
 
 ### 4. Activate in private staging, then publish offline
 
@@ -200,6 +225,18 @@ If index repair is needed afterward, use the actual DATA path with
 maintenance window.
 
 ## Import a wing bundle
+
+Procedural event/source bundles are **not replayable**: new drawer IDs invalidate
+immutable references and digests. JSONL, markdown and legacy import reject them
+before writes, even with `--into-wing`/`--force-add`. Use a coherent whole-palace
+physical snapshot instead. The logical exporter currently reads Chroma, not
+SQLite-exact drawers.
+
+The same boundary applies to dreaming's prune archive: `dream_restore.py`
+rejects the complete selected batch before any replay if archive scope, row
+metadata or trailers identify procedural events/sources. Dry-run also refuses;
+it cannot certify an unsafe replay as a valid preview. Ordinary selected
+archive records remain restorable.
 
 Whole-palace restic restore has a logical counterpart: importing a **single
 wing** produced by the `mempalace-backup` skill's

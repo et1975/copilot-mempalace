@@ -9,14 +9,14 @@ skills or sidecar distributions.
 
 | Location | Migrated contents | Additional prerequisites |
 |---|---|---|
-| [`hooks/`](hooks/) | 1 transcript-adapter test module | Existing optional MemPalace parser integration checks |
+| [`hooks/`](hooks/) | Transcript-adapter, session-finalization configuration and optional procedural-adapter tests | Existing optional parser checks; installed MemPalace/model for procedural integration |
 | [`sidecar/`](sidecar/) | 32 test modules and 5 worker/fixture helpers | Sidecar production dependencies; preinstalled `mempalace-mcp` for the explicit live-hub gate |
-| [`dreaming/`](dreaming/) | 26 test modules | Existing MemPalace installation and local model requirements for integration tests |
+| [`dreaming/`](dreaming/) | 26 migrated modules plus captured-source and nonpublishing-draft tests | Existing MemPalace installation and local model requirements for integration tests |
 | [`mempalace-backup/`](mempalace-backup/) | 3 backup/wing test modules | Sidecar production dependencies |
 
 Root test modules additionally check layout, import targets, harness isolation
 and distribution contents. The migrated counts describe files, not executed
-test cases.
+test cases. New foundation tests remain here, not beside deployable scripts.
 
 Production modules remain under `hooks/`, `sidecar/src/`,
 `skills/dreaming/scripts/` and `skills/mempalace-backup/scripts/`. Root
@@ -97,6 +97,14 @@ model-cache lookup. Only the backup/wing subtree isolates HOME/USERPROFILE and
 clears palace overrides per test. Tests use disposable storage, never the user's
 live palace.
 
+The session fixture pins `DREAMING_TEST_MODEL_CACHE` to the original HOME's
+`.cache/chroma/onnx_models/all-MiniLM-L6-v2` before per-test HOME isolation.
+An explicit value is preserved; it names the directory containing `onnx/`.
+This only selects an existing cache and does not create or download a model.
+Installed procedural tests fail explicitly when required cache files are absent.
+The optional adapter tests use the same validated `DREAMING_TEST_TMPDIR` as
+other dreaming tests; no separate `PROCEDURAL_TEST_ROOT` setup is needed.
+
 ## Commands
 
 Run these from the repository root after the exports above.
@@ -129,6 +137,13 @@ Select the smallest relevant suite while developing:
 "$TEST_PY" -m pytest --basetemp "$SESSION_FILES/pytest-procedural" \
   tests/dreaming/test_dream_procedure.py \
   tests/dreaming/test_procedural_replay.py -q
+
+# Captured sources, health/drafts, disabled adapter and restore/replay protection.
+"$TEST_PY" -m pytest --basetemp "$SESSION_FILES/pytest-procedural-foundation" \
+  tests/dreaming/test_dream_procedur*.py tests/dreaming/test_dream_metadata.py \
+  tests/dreaming/test_dream_restore.py \
+  tests/dreaming/test_procedural_replay.py tests/hooks/test_procedural_context.py \
+  tests/test_harness.py tests/test_layout.py tests/mempalace-backup -q
 ```
 
 The existing optional real-hub gate remains explicit:

@@ -120,35 +120,76 @@ class ChronologicalReplayTests(unittest.TestCase):
 
 
 class GroundedReplayTests(GroundedFixture):
+    def test_guidance_transcript_reflection_and_repeated_drafts_do_not_feed_scores(self):
+        from copy import deepcopy
+        import sqlite3
+        from dream_metadata import content_hash
+        from dream_procedural_drafts import build_draft
+        from dream_procedural_palace import read_events
+        from test_dream_procedural import stamp
+        self.publish(self.proposal(), self.review())
+        projection, _ = revalidate_sources(self.projection(self.proposal(), self.review()),
+            evidence_reader=self.published_reader(), as_of=NOW)
+        guidance = get_task_guidance(projection, task="Fix regression", repository="owner/repo",
+            embedder=lambda texts: [[1., 0.] for _ in texts], limits=GuidanceLimits(),
+            as_of=NOW, include_candidates=True)
+        echo = "Retrieved guidance, copied into the transcript:\n```json\n" + guidance.serialized + "```"
+        with sqlite3.connect(self.store) as con:
+            con.execute("UPDATE turns SET assistant_response=? WHERE session_id=?",
+                        (echo, self.refs[0]["session_id"]))
+        for number in range(3):
+            self.collection.add("w", "diary", echo, "dream-reflect",
+                                {"kind": "reflect", "session_id": self.refs[0]["session_id"]})
+        receipt = {"schema_version": 1, "repository": "owner/repo", "session_id": self.refs[0]["session_id"],
+            "generation": 4, "task": self.refs[0]["quote"], "task_digest": content_hash(self.refs[0]["quote"]),
+            "delivered_rule_ids": [self.proposal().rule_id], "guidance_as_of": stamp()}
+        before = deepcopy(self.collection.rows)
+        packets = [build_draft(receipt, repository="owner/repo", session_store=self.store, as_of=NOW)
+                   for _ in range(3)]
+        self.assertTrue(all(packet["status"] == "pending_original_evidence" for packet in packets))
+        self.assertTrue(all([r["field"] for r in packet["original_references"]] == ["user_message"]
+                            for packet in packets))
+        after = self.projection(*read_events(self.path, "w"))
+        self.assertEqual(after.rules[0].score, projection.rules[0].score)
+        self.assertEqual(self.collection.rows, before)
+        self.assertEqual(after.rules[0].score.helpful, 0)
+
     def test_generated_mirrors_cannot_supply_support_and_drift_cannot_deliver(self):
         self.preflight(self.proposal())
         review = self.review()
         self.preflight(review, self.proposal())
         events = [self.proposal(), review]
+        self.publish(*events)
         projection, diagnostics = revalidate_sources(self.projection(*events),
-            evidence_reader=self.reader(), as_of=NOW)
+            evidence_reader=self.published_reader(), as_of=NOW)
         self.assertEqual(diagnostics, {})
         self.assertTrue(projection.rules[0].eligible)
         self.collection.rows["source-3"]["metadata"]["kind"] = "reflect"
         with self.assertRaisesRegex(ValueError, "generated"):
             self.preflight(self.proposal())
         projection, diagnostics = revalidate_sources(self.projection(*events),
-            evidence_reader=self.reader(), as_of=NOW)
+            evidence_reader=self.published_reader(), as_of=NOW)
         self.assertIn("evidence_unavailable", projection.rules[0].suppression_reasons)
         with self.assertRaises(RuntimeError):
             get_task_guidance(projection, task="regression", repository="owner/repo",
                 embedder=lambda texts: [[1., 0.] for t in texts], limits=GuidanceLimits(),
                 as_of=NOW, include_candidates=True)
 
-    def test_source_repository_drift_and_missing_lineage_fail_closed(self):
+    def test_host_repository_changes_do_not_rewrite_captured_authority_but_drawer_drift_fails(self):
         import sqlite3
         events = [self.proposal(), self.review()]
+        self.publish(*events)
         with sqlite3.connect(self.store) as con:
             con.execute("UPDATE sessions SET repository='owner/other'")
         projection, _ = revalidate_sources(self.projection(*events),
-            evidence_reader=self.reader(), as_of=NOW)
+            evidence_reader=self.published_reader(), as_of=NOW)
+        self.assertTrue(projection.rules[0].eligible)
+        self.collection.rows["source-1"]["metadata"]["repository"] = "owner/other"
+        projection, diagnostics = revalidate_sources(self.projection(*events),
+            evidence_reader=self.published_reader(), as_of=NOW)
         self.assertFalse(projection.rules[0].eligible)
         self.assertIn("evidence_unavailable", projection.rules[0].suppression_reasons)
+        self.assertEqual(diagnostics[events[0].rule_id][0]["code"], "original_drawer_drift")
 
     def test_helpful_causal_label_is_reviewed_not_proven_by_code(self):
         ref = self.refs[0]

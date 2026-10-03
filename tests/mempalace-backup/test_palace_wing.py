@@ -10,6 +10,7 @@ From the repository root, with ``PYTHONDONTWRITEBYTECODE=1`` exported:
 from __future__ import annotations
 
 import contextlib
+import json
 import sys
 import tempfile
 import uuid
@@ -126,6 +127,34 @@ def test_export_produces_manifest_and_records_with_counts():
         assert tunnel_recs[0]["target"]["wing"] == "conveyor"
     finally:
         out.unlink(missing_ok=True)
+
+
+def test_export_preserves_procedural_payloads_without_replaying_them(tmp_path):
+    bodies = [
+        'event\n\n<!--dreaming-meta: {"kind":"procedural_event","digest":"original"}-->',
+        'source\n\n<!--dreaming-meta: {"kind":"procedural_source","source_hash":"original"}-->',
+    ]
+    rows = [
+        {"id": "event-id", "text": bodies[0], "metadata": {
+            "wing": "avs", "room": "procedural", "added_by": "dream-procedure"}},
+        {"id": "source-id", "text": bodies[1], "metadata": {
+            "wing": "avs", "room": "procedural-sources", "added_by": "dream-procedure-source"}},
+    ]
+    for format in ("jsonl", "md"):
+        out = tmp_path / format
+        with patched(
+            mempalace_version=lambda: "v",
+            read_wing_drawer_rows=lambda palace, wing: rows,
+            read_wing_triples=lambda palace: [],
+            read_tunnels=lambda palace: [],
+        ):
+            assert pw.main(["export", "avs", "--format", format, "--out", str(out),
+                            "--palace", str(tmp_path / "palace")]) == 0
+        records = (pw.read_md_dir(str(out / "avs")) if format == "md"
+                   else lib.parse_jsonl(out.read_text(encoding="utf-8")))
+        assert [r["content"] for r in records[1:]] == bodies
+        assert [r["orig_drawer_id"] for r in records[1:]] == ["event-id", "source-id"]
+        assert [r["room"] for r in records[1:]] == ["procedural", "procedural-sources"]
 
 
 # --------------------------------------------------------------------------- #
@@ -484,6 +513,233 @@ def test_import_rejects_unknown_bundle_version():
         assert raised
     finally:
         bundle.unlink(missing_ok=True)
+
+
+def _assert_import_refused(bundle, palace, flags=()):
+    added, tunnels, initialized = [], [], []
+    kg = FakeKG()
+    files = list(bundle.rglob("*")) if bundle.is_dir() else [bundle]
+    before = {path: path.read_bytes() for path in files if path.is_file()}
+    error = None
+    with patched(
+        require_mempalace=lambda: initialized.append(True),
+        check_duplicate=lambda content, threshold: {"is_duplicate": False},
+        add_drawer=lambda **kw: added.append(kw),
+        open_kg=lambda palace: kg,
+        create_tunnel=lambda **kw: tunnels.append(kw) or {"tunnel_id": "x"},
+        preflight_import_target=lambda *a, **k: None,
+        palace_drawer_count=lambda *a, **k: 2,
+    ):
+        args = pw.build_parser().parse_args(
+            ["import", str(bundle), "--palace", str(palace), *flags])
+        try:
+            pw.cmd_import(args)
+        except (SystemExit, ValueError) as exc:
+            error = str(exc)
+    assert added == [] and kg.triples == [] and tunnels == []
+    assert initialized == [], "refusal must precede backend imports/initialization"
+    assert error is not None
+    assert any(word in error.lower() for word in ("procedural", "metadata", "record"))
+    assert {path: path.read_bytes() for path in before} == before
+
+
+def _marked_records(marker):
+    records = _sample_records()
+    records[0]["counts"]["drawers"] = 3
+    record = lib.drawer_record("avs", "general", "incomplete payload", None, None, "unsafe", {})
+    record.update(marker)
+    return [*records, record]
+
+
+def test_direct_jsonl_import_refuses_procedural_bundle_before_ordinary_writes(tmp_path):
+    for index, marker in enumerate((
+        {"room": "procedural"}, {"room": "procedural-sources"},
+        {"kind": "procedural_event"}, {"kind": "procedural_source"},
+        {"added_by": "dream-procedure"}, {"added_by": "dream-procedure-source"},
+        {"extra": {"kind": "procedural_event"}},
+        {"metadata": {"kind": "procedural_source"}},
+        {"content": 'payload\n\n<!--dreaming-meta: {"kind":"procedural_event"}-->'},
+        {"content": 'payload\n\n<!--dreaming-meta: {"kind":"procedural_source"}-->'},
+    )):
+        bundle = tmp_path / f"bundle-{index}.jsonl"
+        bundle.write_text(lib.dump_jsonl(_marked_records(marker)), encoding="utf-8")
+        _assert_import_refused(bundle, tmp_path / "target")
+
+
+def test_direct_markdown_import_refuses_procedural_bundle_before_ordinary_writes(tmp_path):
+    for index, marker in enumerate((
+        {"room": "procedural"}, {"room": "procedural-sources"},
+        {"added_by": "dream-procedure"}, {"added_by": "dream-procedure-source"},
+        {"extra": {"kind": "procedural_event"}},
+        {"extra": {"kind": "procedural_source"}},
+        {"content": 'payload\n\n<!--dreaming-meta: {"kind":"procedural_source"}-->'},
+    )):
+        bundle = Path(pw.write_md_dir(_marked_records(marker), str(tmp_path / str(index))))
+        _assert_import_refused(bundle, tmp_path / "target")
+
+
+def test_import_flags_cannot_bypass_procedural_refusal(tmp_path):
+    bundle = tmp_path / "bundle.jsonl"
+    bundle.write_text(lib.dump_jsonl(_marked_records({"room": "procedural"})), encoding="utf-8")
+    for flags in (("--force-add",), ("--into-wing", "clone"),
+                  ("--create-new-palace",), ("--dry-run",)):
+        _assert_import_refused(bundle, tmp_path / "target", flags)
+
+
+def test_direct_import_refuses_malformed_procedural_trailers_before_writes(tmp_path):
+    for index, body in enumerate((
+        '<!--dreaming-meta: {"kind":"procedural_event",}-->',
+        '<!--dreaming-meta: {"kind":"procedural_source"}',
+        '<!--wing-meta: {"kind":"procedural_source" BROKEN}-->',
+        '<!--dreaming-meta {"kind":"procedural_source"}-->',
+    )):
+        records = _marked_records({"content": body})
+        bundle = tmp_path / f"bundle-{index}.jsonl"
+        bundle.write_text(lib.dump_jsonl(records), encoding="utf-8")
+        _assert_import_refused(bundle, tmp_path / "target")
+        directory = Path(pw.write_md_dir(records, str(tmp_path / str(index))))
+        _assert_import_refused(directory, tmp_path / "target")
+
+
+def test_markdown_preflight_does_not_erase_malformed_or_hidden_metadata(tmp_path):
+    for index, extra in enumerate((
+        'extra: {"kind":"procedural_source",}',
+        'extra: ["procedural_event"]',
+        "extra: {}\nkind: procedural_source",
+        "extra: {}\nagent: dream-procedure",
+        "extra: {}\nkind: procedural_source\nkind: source",
+    )):
+        directory = Path(pw.write_md_dir(_marked_records({}), str(tmp_path / str(index))))
+        drawer = directory / "unsafe.md"
+        drawer.write_text(drawer.read_text(encoding="utf-8").replace("extra: {}", extra),
+                          encoding="utf-8")
+        _assert_import_refused(directory, tmp_path / "target")
+
+
+def test_markdown_preflight_refuses_unrecognized_and_malformed_header_lines(tmp_path):
+    for index, line in enumerate((
+        "kind procedural_source", 'extra {"kind":"procedural_source"}',
+        "unknown: procedural_source", ": procedural_source",
+    )):
+        directory = Path(pw.write_md_dir(_marked_records({}), str(tmp_path / str(index))))
+        drawer = directory / "unsafe.md"
+        drawer.write_text(drawer.read_text(encoding="utf-8").replace(
+            "extra: {}", f"extra: {{}}\n{line}"), encoding="utf-8")
+        _assert_import_refused(directory, tmp_path / "target")
+
+
+def test_markdown_preflight_checks_manifest_entries_not_only_decoded_drawers(tmp_path):
+    directory = Path(pw.write_md_dir(_sample_records(), str(tmp_path)))
+    manifest_path = directory / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["drawers"].append({
+        "room": "procedural-sources", "content_file": "general__0001.md"})
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    _assert_import_refused(directory, tmp_path / "target")
+
+
+def test_legacy_markdown_preflight_checks_comments_before_stripping_them(tmp_path):
+    directory = tmp_path / "legacy"
+    directory.mkdir()
+    manifest = lib.build_manifest("avs", "legacy", {"drawers": 2}, "n", "t")
+    manifest["drawers"] = [
+        {"room": "general", "content_file": "ordinary.md"},
+        {"room": "general", "content_file": "hidden.md"},
+    ]
+    (directory / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    (directory / "ordinary.md").write_text("# ordinary", encoding="utf-8")
+    (directory / "hidden.md").write_text(
+        '<!--dreaming-meta: {"kind":"procedural_source"}-->\nsource payload',
+        encoding="utf-8")
+    _assert_import_refused(directory, tmp_path / "target")
+
+
+def test_jsonl_preflight_rejects_duplicate_keys_hiding_procedural_metadata(tmp_path):
+    bundle = tmp_path / "duplicate.jsonl"
+    bundle.write_text(lib.dump_jsonl(_sample_records()) +
+                      '{"type":"drawer","room":"procedural","room":"general",'
+                      '"content":"hidden event"}\n', encoding="utf-8")
+    _assert_import_refused(bundle, tmp_path / "target")
+
+
+def test_markdown_manifest_preflight_rejects_duplicate_procedural_keys(tmp_path):
+    directory = Path(pw.write_md_dir(_sample_records(), str(tmp_path)))
+    manifest = directory / "manifest.json"
+    manifest.write_text(manifest.read_text(encoding="utf-8").replace(
+        '"room": "scripting"', '"room": "procedural", "room": "scripting"'),
+        encoding="utf-8")
+    _assert_import_refused(directory, tmp_path / "target")
+
+
+def test_preflight_rejects_duplicate_procedural_trailer_and_extra_keys(tmp_path):
+    records = _marked_records({
+        "content": '<!--dreaming-meta: {"kind":"procedural_event","kind":"source"}-->'})
+    bundle = tmp_path / "duplicate-trailer.jsonl"
+    bundle.write_text(lib.dump_jsonl(records), encoding="utf-8")
+    _assert_import_refused(bundle, tmp_path / "target")
+    directory = Path(pw.write_md_dir(_marked_records({}), str(tmp_path / "md")))
+    drawer = directory / "unsafe.md"
+    drawer.write_text(drawer.read_text(encoding="utf-8").replace(
+        "extra: {}", 'extra: {"kind":"procedural_source","kind":"source"}'), encoding="utf-8")
+    _assert_import_refused(directory, tmp_path / "target")
+
+
+def test_direct_import_keeps_ordinary_source_only_archives_supported(tmp_path):
+    content = "Archived observation mentioning procedural_event and procedural_source as prose."
+    records = [
+        lib.build_manifest("avs", "v", {"drawers": 1}, "n", "t"),
+        lib.drawer_record("avs", "sources", content, "session.jsonl", "archive-agent",
+                          "source-original", {"kind": "source", "source_hash": "a" * 64}),
+    ]
+    jsonl = tmp_path / "archive.jsonl"
+    jsonl.write_text(lib.dump_jsonl(records), encoding="utf-8")
+    directory = Path(pw.write_md_dir(records, str(tmp_path / "md")))
+    for bundle in (jsonl, directory):
+        added = []
+        with patched(
+            require_mempalace=lambda: None,
+            check_duplicate=lambda content, threshold: {"is_duplicate": False},
+            add_drawer=lambda **kw: added.append(kw),
+            preflight_import_target=lambda *a, **k: None,
+            palace_drawer_count=lambda *a, **k: 1,
+        ):
+            args = pw.build_parser().parse_args(
+                ["import", str(bundle), "--palace", str(tmp_path / "target")])
+            assert pw.cmd_import(args) == 0
+        assert len(added) == 1
+        assert added[0]["room"] == "sources"
+        assert added[0]["added_by"] == "archive-agent"
+        assert lib.decode_trailer(added[0]["content"]) == (
+            content, {"kind": "source", "source_hash": "a" * 64})
+
+
+def test_ordinary_metadata_with_comment_delimiters_survives_export_import(tmp_path):
+    topic = 'A --> B; quoted <!--wing-meta: {"kind":"procedural_source"}--> example'
+    content = lib.encode_trailer("ordinary observation", {"topic": topic})
+    rows = [{"id": "ordinary", "text": content,
+             "metadata": {"wing": "avs", "room": "sources"}}]
+    for format in ("jsonl", "md"):
+        out = tmp_path / format
+        added = []
+        with patched(
+            mempalace_version=lambda: "v",
+            read_wing_drawer_rows=lambda palace, wing: rows,
+            read_wing_triples=lambda palace: [],
+            read_tunnels=lambda palace: [],
+            require_mempalace=lambda: None,
+            check_duplicate=lambda content, threshold: {"is_duplicate": False},
+            add_drawer=lambda **kw: added.append(kw),
+            preflight_import_target=lambda *a, **k: None,
+            palace_drawer_count=lambda *a, **k: 1,
+        ):
+            assert pw.main(["export", "avs", "--format", format, "--out", str(out),
+                            "--palace", str(tmp_path / "source")]) == 0
+            bundle = out / "avs" if format == "md" else out
+            assert pw.cmd_import(pw.build_parser().parse_args(
+                ["import", str(bundle), "--palace", str(tmp_path / "target")])) == 0
+        assert len(added) == 1
+        assert added[0]["content"] == content
+        assert lib.decode_trailer(added[0]["content"]) == ("ordinary observation", {"topic": topic})
 
 
 # --------------------------------------------------------------------------- #

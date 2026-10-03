@@ -68,6 +68,107 @@ def test_validate_manifest_rejects_missing_wing():
     assert raised
 
 
+def _assert_replay_refused(records, message="procedural"):
+    before = lib.dump_jsonl(records)
+    try:
+        lib.validate_replay_records(records)
+    except ValueError as exc:
+        assert message in str(exc).lower()
+    else:
+        raise AssertionError("unsafe replay was accepted")
+    assert lib.dump_jsonl(records) == before
+
+
+def test_replay_preflight_refuses_each_procedural_metadata_indicator():
+    ordinary = lib.drawer_record("w", "sources", "ordinary source", None, None, "d0", {})
+    for marker in (
+        {"room": "procedural"}, {"room": "procedural-sources"},
+        {"kind": "procedural_event"}, {"kind": "procedural_source"},
+        {"added_by": "dream-procedure"}, {"added_by": "dream-procedure-source"},
+        {"agent": "dream-procedure"}, {"agent": "dream-procedure-source"},
+    ):
+        for container in (None, "extra", "metadata"):
+            record = lib.drawer_record("w", "general", "malformed payload", None, None, "d1", {})
+            record.update(marker if container is None else {container: marker})
+            _assert_replay_refused([ordinary, record])
+
+
+def test_replay_preflight_checks_all_procedural_trailers():
+    for trailer in ("dreaming-meta", "wing-meta"):
+        for kind in ("procedural_event", "procedural_source"):
+            body = f'payload\n\n<!--{trailer}: {{"kind":"{kind}"}}-->'
+            body = lib.encode_trailer(body, {"topic": "ordinary outer metadata"})
+            record = lib.drawer_record("w", "general", body, None, None, "d1", {})
+            _assert_replay_refused([record])
+
+
+def test_replay_preflight_parses_complete_json_before_trailer_delimiter():
+    for topic in ("A --> B", '<!--wing-meta: {"kind":"procedural_source"}-->',
+                  'literal <!--dreaming-meta: {"kind":"procedural_event"}--> example'):
+        body = lib.encode_trailer("ordinary observation", {"topic": topic})
+        record = lib.drawer_record("w", "sources", body, None, None, "d1", {})
+        before = lib.dump_jsonl([record])
+        lib.validate_replay_records([record])
+        assert lib.dump_jsonl([record]) == before
+
+
+def test_replay_preflight_still_checks_real_trailer_after_embedded_marker():
+    body = lib.encode_trailer("ordinary", {"topic": "<!--wing-meta: not a trailer -->"})
+    body += '\n\n<!--dreaming-meta: {"kind":"procedural_source"}-->'
+    _assert_replay_refused(
+        [lib.drawer_record("w", "general", body, None, None, "d1", {})])
+
+
+def test_replay_preflight_requires_delimiter_immediately_after_json():
+    for body in ('<!--wing-meta: {"topic":"ordinary"} junk -->',
+                 '<!--wing-meta: {"topic":"ordinary"}',
+                 '<!--wing-meta: {"topic":"ordinary"} {}-->'):
+        _assert_replay_refused(
+            [lib.drawer_record("w", "general", body, None, None, "d1", {})], "metadata")
+
+
+def test_replay_preflight_rejects_malformed_metadata_instead_of_erasing_it():
+    for body in (
+        '<!--dreaming-meta: {"kind":"procedural_event",}-->',
+        '<!--dreaming-meta: {"kind":"procedural_source"}',
+        '<!--wing-meta: {"kind":"procedural_source" BROKEN}-->',
+        '<!--dreaming-meta: []-->',
+    ):
+        record = lib.drawer_record("w", "general", body, None, None, "d1", {})
+        _assert_replay_refused([record], "metadata")
+    for container in ("extra", "metadata"):
+        record = {"type": "drawer", "content": "payload",
+                  container: '{"kind":"procedural_event"}'}
+        _assert_replay_refused([record], "metadata")
+
+
+def test_replay_preflight_checks_markdown_manifest_entries_even_if_files_are_shared():
+    manifest = lib.build_manifest("w", "v", {"drawers": 2}, "n", "t")
+    manifest["drawers"] = [
+        {"room": "sources", "content_file": "shared.md"},
+        {"room": "procedural-sources", "content_file": "shared.md"},
+    ]
+    _assert_replay_refused([manifest])
+
+
+def test_replay_preflight_accepts_ordinary_source_archive_without_mutation():
+    record = lib.drawer_record(
+        "w", "sources", "Source-only archive discussing procedural_event and procedural_source",
+        "session.jsonl", "archive-agent", "d1",
+        {"kind": "source", "source_id": "original-session", "source_hash": "a" * 64})
+    record["content"] = lib.encode_trailer(record["content"], {"kind": "source"})
+    records = [lib.build_manifest("w", "v", {"drawers": 1}, "n", "t"), record]
+    before = lib.dump_jsonl(records)
+    lib.validate_replay_records(records)
+    assert lib.dump_jsonl(records) == before
+
+
+def test_replay_preflight_rejects_malformed_records_before_any_replay():
+    for malformed in (None, [], "procedural_event",
+                      {"type": "drawer", "content": {"kind": "procedural_source"}}):
+        _assert_replay_refused([malformed], "record")
+
+
 # --------------------------------------------------------------------------- #
 # JSONL serialize -> parse round-trip per record type.
 # --------------------------------------------------------------------------- #
@@ -278,6 +379,40 @@ def test_decode_drawer_md_rejects_non_drawer():
         assert False, "expected ValueError"
     except ValueError:
         pass
+
+
+def test_decode_drawer_md_replay_preflight_refuses_hidden_header_metadata():
+    text = lib.encode_drawer_md(
+        lib.drawer_record("w", "general", "source payload", None, None, "d1", {}))
+    for hidden in (
+        text.replace("extra: {}", 'extra: {"kind":"procedural_source",}'),
+        text.replace("extra: {}", 'extra: ["procedural_event"]'),
+        text.replace("extra: {}", "extra: {}\nkind: procedural_source"),
+        text.replace("extra: {}", "extra: {}\nagent: dream-procedure"),
+    ):
+        try:
+            lib.decode_drawer_md(hidden, for_replay=True)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("malformed/procedural header lost during replay parsing")
+    assert lib.decode_drawer_md(text, for_replay=True)["content"] == "source payload"
+
+
+def test_decode_drawer_md_replay_refuses_malformed_and_unknown_header_lines():
+    text = lib.encode_drawer_md(
+        lib.drawer_record("w", "general", "ordinary source", None, None, "d1", {}))
+    for line in ("kind procedural_source", 'extra {"kind":"procedural_source"}',
+                 "unknown: procedural_source", ": procedural_source",
+                 "metadata: {}", "room general"):
+        malformed = text.replace("extra: {}", f"extra: {{}}\n{line}")
+        try:
+            lib.decode_drawer_md(malformed, for_replay=True)
+        except ValueError as exc:
+            assert "metadata" in str(exc).lower()
+        else:
+            raise AssertionError(f"header line was silently discarded: {line!r}")
+        assert lib.decode_drawer_md(malformed)["content"] == "ordinary source"
 
 
 def test_md_drawer_filename():

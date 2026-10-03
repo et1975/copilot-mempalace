@@ -400,6 +400,16 @@ Read [the exact artifact/CLI contract](references/procedural.md) first.
    --repository` returns eligible established/proven advice only.
    `--include-candidates` deliberately opts into labeled approved trials;
    choose a safe bounded task, never expose harm just to gather data.
+   `status --repository` provides strict read-only source health, coverage,
+   capacity and suppression counts without embeddings or host-session input.
+   Hook consumers may request `guidance --max-bytes 8192`; core formatting
+   retains the existing combined five-item / 6,000-character limits and drops
+   whole lowest-ranked items, never applicability or exceptions.
+   `draft --repository --input RECEIPT --out NEW_FILE` optionally reads an
+   explicit `--session-store`, otherwise uses bounded captured originals.
+   It creates only a review packet outside the palace. Missing current turns
+   stay `pending_original_evidence`; drafts, receipts and reflection echoes
+   are not outcomes or additional independent support.
 4. **Outcome:** at task end, record `helpful`, `harmful` or `neutral` **only**
    with original evidence and a specific attribution of what following that
    rule changed. Overall success, a passing test and repeated retrieval are

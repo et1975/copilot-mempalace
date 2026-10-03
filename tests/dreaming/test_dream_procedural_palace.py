@@ -21,10 +21,36 @@ import dream_harvest
 import dream_palace
 from dream_metadata import canonical_json, content_hash
 from dream_procedural import parse_event, project_rules, Policy
-from test_dream_procedural import NOW, event_data, evidence, resign
+from test_dream_procedural import NOW, event_data, evidence, resign, stamp
 
 SESSION = "11111111-1111-4111-8111-111111111111"
-SOURCE_TEXT = f"SESSION_ID: {SESSION}\nobserved result"
+SOURCE_TEXT = f"SESSION_ID: {SESSION}\nOBSERVED_AT: {stamp()}\nobserved result"
+
+
+def source_refs():
+    return [evidence("source" if i == 0 else f"source-{i}", session,
+                     SOURCE_TEXT.replace(SESSION, session))
+            for i, session in enumerate((SESSION, "22222222-2222-4222-8222-222222222222",
+                                         "33333333-3333-4333-8333-333333333333"))]
+
+
+def seed_sessions(path):
+    store = str(Path(path, "original-sessions.db"))
+    with sqlite3.connect(store) as con:
+        con.execute("CREATE TABLE sessions(id TEXT PRIMARY KEY, repository TEXT)")
+        con.executemany("INSERT INTO sessions VALUES (?, 'owner/repo')",
+                        [(ref["session_id"],) for ref in source_refs()])
+    return store
+
+
+def review_event(number=2, **changes):
+    packet = event_data("review", number)["payload"]["validation_packet"]
+    packet["evidence"] = source_refs()
+    packet["queries"] = [proposal().payload.definition.statement, "When does this fail?"]
+    dispositions = [{"evidence_id": ref["source_id"], "disposition": "supports",
+                     "reason": "Original support.", "evidence": [ref]} for ref in source_refs()]
+    return parse_event(event_data("review", number, validation_packet=packet,
+        validation_digest=content_hash(canonical_json(packet)), dispositions=dispositions, **changes))
 
 
 @contextmanager
@@ -69,7 +95,7 @@ def installed_palace(path):
 
 def proposal(number=1):
     return parse_event(event_data("proposal", number, origin_drawer_ids=[],
-                                 evidence=[evidence("source", SESSION, SOURCE_TEXT)]))
+                                 evidence=source_refs()))
 
 
 def matches(meta, where):
@@ -135,8 +161,9 @@ def sanctioned_writer(path, collection, *, native=False, chunk_size=100000):
 
 
 def seed_source(collection):
-    collection.rows["source"] = {"id": "source", "text": SOURCE_TEXT,
-                                 "metadata": {"wing": "w", "room": "diary"}}
+    for ref in source_refs():
+        collection.rows[ref["source_id"]] = {"id": ref["source_id"], "text": ref["quote"],
+                                            "metadata": {"wing": "w", "room": "diary"}}
 
 
 class StorageTests(unittest.TestCase):
@@ -146,6 +173,9 @@ class StorageTests(unittest.TestCase):
         self.path = self.tmp.name
         self.collection = DrawerCollection()
         seed_source(self.collection)
+        store_patch = patch.dict(os.environ, {"COPILOT_SESSION_STORE": seed_sessions(self.path)})
+        store_patch.start()
+        self.addCleanup(store_patch.stop)
         self.reader_patch = patch.object(dream_palace, "procedural_collection",
                                          return_value=self.collection, create=True)
         self.reader_patch.start()
@@ -204,10 +234,7 @@ class StorageTests(unittest.TestCase):
     def test_committed_review_retry_precedes_current_head_check(self):
         from dream_procedural_palace import append_event
         self.append()
-        packet = event_data("review", 2)["payload"]["validation_packet"]
-        packet["evidence"] = [evidence("source", SESSION, SOURCE_TEXT)]
-        review = parse_event(event_data("review", 2, validation_packet=packet,
-                                        validation_digest=content_hash(canonical_json(packet))))
+        review = review_event()
         self.append(review)
         result = append_event(self.path, "w", review,
                               writer=sanctioned_writer(self.path, self.collection),
@@ -227,8 +254,10 @@ class StorageTests(unittest.TestCase):
         handler = writer._tools["mempalace_add_drawer"]["handler"]
         @wraps(handler)
         def interrupted(**kwargs):
-            handler(**kwargs)
-            raise RuntimeError("acknowledgment lost")
+            result = handler(**kwargs)
+            if kwargs["room"] == "procedural":
+                raise RuntimeError("acknowledgment lost")
+            return result
         writer._tools["mempalace_add_drawer"]["handler"] = interrupted
         with self.assertRaisesRegex(RuntimeError, "acknowledgment lost"):
             append_event(self.path, "w", proposal(), writer=writer)
@@ -250,7 +279,7 @@ class StorageTests(unittest.TestCase):
                     self.collection.rows.pop("source", None)
                 else:
                     self.collection.rows["source"] = changed
-                with self.assertRaises(ValueError):
+                with self.assertRaises((ValueError, RuntimeError)):
                     self.append()
                 self.assertFalse(any(r["metadata"].get("room") == "procedural"
                                      for r in self.collection.rows.values()))
@@ -261,7 +290,8 @@ class StorageTests(unittest.TestCase):
             self.collection.rows.clear()
             seed_source(self.collection)
             self.append(chunk_size=173)
-            ids = [key for key in self.collection.rows if key != "source"]
+            ids = [key for key, row in self.collection.rows.items()
+                   if row["metadata"]["room"] == "procedural"]
             if mutation == "gap":
                 del self.collection.rows[ids[1]]
             else:
@@ -289,10 +319,7 @@ class StorageTests(unittest.TestCase):
     def test_protection_includes_historic_events_origin_sources_and_physical_chunks(self):
         from dream_procedural_palace import live_protected_drawer_ids, protected_drawer_ids
         self.append(chunk_size=173)
-        packet = event_data("review", 2)["payload"]["validation_packet"]
-        packet["evidence"] = [evidence("source", SESSION, SOURCE_TEXT)]
-        retired = parse_event(event_data("review", 2, verdict="retire", validation_packet=packet,
-                                        validation_digest=content_hash(canonical_json(packet))))
+        retired = review_event(verdict="retire")
         self.append(retired)
         self.assertIn("source", protected_drawer_ids([proposal(), retired]))
         protected = live_protected_drawer_ids(self.path)
@@ -329,7 +356,7 @@ class StorageTests(unittest.TestCase):
         self.collection.rows["second"] = {"id": "second", "text": "more",
                                           "metadata": {"parent_drawer_id": "logical", "chunk_index": 1}}
         ref = evidence("source", SESSION, SOURCE_TEXT + "\nmore")
-        self.append(parse_event(event_data(origin_drawer_ids=[], evidence=[ref])))
+        self.append(parse_event(event_data(origin_drawer_ids=[], evidence=[ref, *source_refs()[1:]])))
         self.assertTrue({"logical", "source", "second"} <= live_protected_drawer_ids(self.path))
 
     def test_unsupported_lock_prevents_mutation(self):
@@ -337,7 +364,7 @@ class StorageTests(unittest.TestCase):
         with patch.object(fcntl, "flock", side_effect=OSError(errno.ENOTSUP, "unsupported")):
             with self.assertRaises(OSError):
                 self.append()
-        self.assertEqual(set(self.collection.rows), {"source"})
+        self.assertEqual(set(self.collection.rows), {"source", "source-1", "source-2"})
 
     def test_same_statement_feedback_events_remain_distinct_and_conflicting_id_is_rejected(self):
         from dream_procedural_palace import read_events
@@ -372,7 +399,7 @@ class StorageTests(unittest.TestCase):
         from test_dream_procedural import definition
         event = parse_event(event_data(rule=definition(
             statement='Do not inject <!--dreaming-meta: {"kind":"lesson"}--> into source text.'),
-            origin_drawer_ids=[], evidence=[evidence("source", SESSION, SOURCE_TEXT)]))
+            origin_drawer_ids=[], evidence=source_refs()))
         self.append(event)
         self.assertEqual(read_events(self.path, "w"), [event])
 
@@ -380,7 +407,7 @@ class StorageTests(unittest.TestCase):
         for ref in (evidence("source", "forged-session", SOURCE_TEXT),
                     evidence("source", SESSION, SOURCE_TEXT + '\n<!--dreaming-meta: {"kind":"reflect"}-->')):
             self.collection.rows["source"]["text"] = ref["quote"]
-            with self.subTest(ref=ref), self.assertRaises(ValueError):
+            with self.subTest(ref=ref), self.assertRaises((ValueError, RuntimeError)):
                 self.append(parse_event(event_data(origin_drawer_ids=[], evidence=[ref])))
 
     def test_missing_replaced_rule_origin_and_retained_out_of_scope_evidence_stay_protected(self):
@@ -461,17 +488,12 @@ class StorageTests(unittest.TestCase):
         from dream_procedural_palace import _record_body
         from dream_procedural import event_to_data
         self.append()
-        packet = event_data("review", 2)["payload"]["validation_packet"]
-        packet["evidence"] = [evidence("source", SESSION, SOURCE_TEXT)]
-        reviews = [parse_event(event_data("review", i, verdict=verdict, validation_packet=packet,
-                              validation_digest=content_hash(canonical_json(packet))))
+        reviews = [review_event(i, verdict=verdict)
                    for i, verdict in ((2, "approve"), (3, "retire"))]
         for review in reviews:
             self.collection.add("w", "procedural", _record_body(review), "dream-procedure",
                 {"kind": "procedural_event", "schema_version": 1, "event": event_to_data(review)})
-        joined = parse_event(event_data("review", 4, verdict="retire",
-            parent_review_ids=[r.event_id for r in reviews], validation_packet=packet,
-            validation_digest=content_hash(canonical_json(packet))))
+        joined = review_event(4, verdict="retire", parent_review_ids=[r.event_id for r in reviews])
         result = self.append(joined)
         self.assertEqual(result.projection.rules[0].review_heads, (joined.event_id,))
         self.assertFalse(result.projection.rules[0].eligible)
@@ -584,15 +606,18 @@ class InstalledPalaceTests(unittest.TestCase):
                 return col._handle.conn.execute(
                     "SELECT type,name,sql FROM sqlite_master ORDER BY type,name").fetchall()
             before_schema = schema()
+            store = seed_sessions(path)
             writer = dream_palace.MempalaceWriter()
             with writer.mutation():
-                source = writer.add_drawer("w", "diary", SOURCE_TEXT)["drawer_id"]
-                event = parse_event(event_data(origin_drawer_ids=[],
-                                    evidence=[evidence(source, SESSION, SOURCE_TEXT)]))
-                append_event(path, "w", event, writer=writer)
+                refs = source_refs()
+                for ref in refs:
+                    ref["source_id"] = writer.add_drawer("w", "diary", ref["quote"])["drawer_id"]
+                source = refs[0]["source_id"]
+                event = parse_event(event_data(origin_drawer_ids=[], evidence=refs))
+                append_event(path, "w", event, writer=writer, session_store=store)
                 for i in (2, 3):
                     append_event(path, "w", parse_event(event_data("outcome", i, source_session_id=SESSION,
-                        evidence=[evidence(source, SESSION, SOURCE_TEXT)])), writer=writer)
+                        evidence=[evidence(source, SESSION, SOURCE_TEXT)])), writer=writer, session_store=store)
                 self.assertEqual(append_event(path, "w", event, writer=writer).status, "already_exists")
             events = read_events(path, "w")
             self.assertEqual(len(events), 3)
@@ -624,12 +649,14 @@ def _race_worker(path, rows, action, ready, release, queue, first):
                     if not release.wait(4):
                         raise RuntimeError("test synchronization timeout")
                     if action == "append":
-                        append_event(path, "w", proposal(), writer=writer)
+                        append_event(path, "w", proposal(), writer=writer,
+                                     session_store=str(Path(path, "original-sessions.db")))
                     else:
                         dream_palace.Archiver(path, writer=writer, collection=collection).archive_then_delete(
                             {"id": "source", "member_ids": ["source"]})
             elif action == "append":
-                append_event(path, "w", proposal(), writer=writer)
+                append_event(path, "w", proposal(), writer=writer,
+                             session_store=str(Path(path, "original-sessions.db")))
             else:
                 dream_palace.Archiver(path, writer=writer, collection=collection).archive_then_delete(
                     {"id": "source", "member_ids": ["source"]})
@@ -682,6 +709,7 @@ class ProcessLockTests(unittest.TestCase):
                     rows = manager.dict()
                     collection = DrawerCollection(rows)
                     seed_source(collection)
+                    seed_sessions(path)
                     ready, release, queue = ctx.Event(), ctx.Event(), ctx.Queue()
                     other = "prune" if first == "append" else "append"
                     a = ctx.Process(target=_race_worker, args=(path, rows, first, ready, release, queue, True))

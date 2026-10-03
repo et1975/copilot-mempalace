@@ -566,7 +566,7 @@ def write_md_dir(records: list[dict[str, Any]], out_dir: str) -> str:
     return wing_dir
 
 
-def read_md_dir(path: str) -> list[dict[str, Any]]:
+def read_md_dir(path: str, *, for_replay: bool = False) -> list[dict[str, Any]]:
     """Read a markdown directory back into bundle records (manifest first).
 
     Accepts the wing directory (containing ``manifest.json``) or the
@@ -579,7 +579,11 @@ def read_md_dir(path: str) -> list[dict[str, Any]]:
     manifest_path = wing_dir / "manifest.json"
     if not manifest_path.exists():
         sys.exit(f"No manifest.json under {wing_dir}")
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    raw_manifest = manifest_path.read_text(encoding="utf-8")
+    manifest = lib.parse_replay_json(raw_manifest) if for_replay else json.loads(raw_manifest)
+    if for_replay:
+        lib.validate_manifest(manifest)
+        lib.validate_replay_records([manifest])
 
     entries = manifest.get("drawers") or []
     # Detect legacy (one file per room, merged drawers) vs new (per-drawer).
@@ -588,7 +592,7 @@ def read_md_dir(path: str) -> list[dict[str, Any]]:
         if first.exists():
             head = first.read_text(encoding="utf-8")
             if not head.startswith(lib._MD_OPEN):
-                return read_legacy_md_dir(wing_dir, manifest)
+                return read_legacy_md_dir(wing_dir, manifest, for_replay=for_replay)
 
     records: list[dict[str, Any]] = [manifest]
     seen_files: set[str] = set()
@@ -598,20 +602,22 @@ def read_md_dir(path: str) -> list[dict[str, Any]]:
             continue
         seen_files.add(cf)
         text = (wing_dir / cf).read_text(encoding="utf-8")
-        records.append(lib.decode_drawer_md(text))
+        records.append(lib.decode_drawer_md(text, for_replay=for_replay))
 
     kg_file = manifest.get("kg_file")
     if kg_file and (wing_dir / kg_file).exists():
-        records.extend(lib.parse_jsonl((wing_dir / kg_file).read_text(encoding="utf-8")))
+        records.extend(lib.parse_jsonl(
+            (wing_dir / kg_file).read_text(encoding="utf-8"), for_replay=for_replay))
     tunnels_file = manifest.get("tunnels_file")
     if tunnels_file and (wing_dir / tunnels_file).exists():
         records.extend(
-            lib.parse_jsonl((wing_dir / tunnels_file).read_text(encoding="utf-8")))
+            lib.parse_jsonl((wing_dir / tunnels_file).read_text(encoding="utf-8"),
+                            for_replay=for_replay))
     return records
 
 
 def read_legacy_md_dir(
-    wing_dir: Path, manifest: dict[str, Any]
+    wing_dir: Path, manifest: dict[str, Any], *, for_replay: bool = False
 ) -> list[dict[str, Any]]:
     """Best-effort reader for the legacy one-file-per-room markdown export.
 
@@ -642,7 +648,10 @@ def read_legacy_md_dir(
     bodies: dict[str, str] = {}
     for cf in order:
         group = groups[cf]
-        text = _strip_legacy_comment((wing_dir / cf).read_text(encoding="utf-8"))
+        raw = (wing_dir / cf).read_text(encoding="utf-8")
+        if for_replay:
+            lib.validate_replay_records([{"content": raw}])
+        text = _strip_legacy_comment(raw)
         bodies[cf] = text
         contents = [text] if len(group) == 1 else _split_h2_slices(text, len(group))
         for entry, content in zip(group, contents):
@@ -747,25 +756,23 @@ def preflight_import_target(
 
 
 def cmd_import(args: argparse.Namespace) -> int:
-    # Bind the palace BEFORE importing mempalace: the config layer reads
-    # MEMPALACE_PALACE_PATH at import time, so binding after would let --palace
-    # be ignored and target the wrong palace.
+    bundle_path = Path(os.path.expanduser(args.bundle))
+    try:
+        if bundle_path.is_dir() or bundle_path.name == "manifest.json":
+            records = read_md_dir(str(bundle_path), for_replay=True)
+        else:
+            records = lib.parse_jsonl(bundle_path.read_text(encoding="utf-8"), for_replay=True)
+        if not records:
+            sys.exit(f"Bundle is empty: {args.bundle}")
+        manifest = records[0]
+        lib.validate_manifest(manifest)
+        lib.validate_replay_records(records)
+    except ValueError as exc:
+        sys.exit(f"Invalid bundle for replay: {exc}")
+
+    # Validate before any backend import, then bind before its config loads.
     palace = bind_palace(str(args.palace))
     require_mempalace()
-
-    bundle_path = Path(os.path.expanduser(args.bundle))
-    if bundle_path.is_dir() or bundle_path.name == "manifest.json":
-        records = read_md_dir(str(bundle_path))
-    else:
-        with open(args.bundle, encoding="utf-8") as fh:
-            records = lib.parse_jsonl(fh.read())
-    if not records:
-        sys.exit(f"Bundle is empty: {args.bundle}")
-    manifest = records[0]
-    try:
-        lib.validate_manifest(manifest)
-    except ValueError as exc:
-        sys.exit(f"Invalid bundle manifest: {exc}")
 
     source_wing = manifest["wing"]
     target_wing = args.into_wing or source_wing

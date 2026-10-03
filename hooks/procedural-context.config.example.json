@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "mode": "off",
+  "python": "/absolute/path/to/python",
+  "procedure_script": "/absolute/path/to/checkout/skills/dreaming/scripts/dream_procedure.py",
+  "state_root": "/absolute/private/session-artifacts/procedural-context",
+  "repositories": [
+    {
+      "root": "/absolute/path/to/exact-worktree-root",
+      "repository": "owner/repository",
+      "palace": "/absolute/path/to/existing-palace",
+      "wing": "copilot-mempalace",
+      "session_store": "/absolute/path/to/original-session-store.db"
+    }
+  ]
+}

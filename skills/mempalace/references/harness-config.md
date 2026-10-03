@@ -64,3 +64,49 @@ All sessions share one owner. The workflow agent's tool selectors assume
 `mempalace-tasks` and `mempalace` aliases; keep those names aligned with actual
 registrations. MCP connectivity alone does not supply a native fleet dispatcher
 or host heartbeat/recovery adapter.
+
+## Optional procedural context adapter — off and unregistered
+
+`hooks/procedural_context.py` is separate from MCP registration and the ordinary
+recall/save hooks, including session-finalization capture. It is POSIX-only and
+uses the preinstalled MemPalace Python environment, an existing SQLite-exact
+palace and the existing local MiniLM cache. Keep the complete
+`skills/dreaming/scripts/` directory together. No dependency download, backend
+conversion, task-service registration, rule publication or outcome follows.
+
+The two files `hooks/procedural-context.config.example.json` and
+`hooks/procedural-context.json.example` are **examples only**. The configuration
+ships with `mode: "off"`; do not install the hook example into active runtime
+configuration as part of foundation setup. Authenticated native-host delivery
+requires separate approval and isolated capability evidence before activation.
+Synthetic subprocess tests do not establish that capability.
+
+For a separately authorized isolated assessment, use exact absolute
+interpreter/script paths and a worktree-root/repository/palace/wing mapping.
+Repository keys normalize to lowercase; wing spelling is preserved. The state
+root must already be private (0700), outside the palace and repository; the
+config must be private (0600). Shared/symlinked state or configuration is
+refused; normal virtualenv interpreter symlinks are supported. Never concatenate
+the example into an existing hook object or remove ordinary memory hooks.
+
+The optional session-store path is ingestion input, not an operational
+dependency for guidance/bookkeeping. Its configured absolute spelling remains
+stable when the file or parent directory disappears. Before drafting, existing
+components are checked for unsafe ownership, writable ancestors and symlinks;
+an existing store must be private, regular and singly linked. Missing input
+goes unchanged to core's pending-evidence/captured-source fallback.
+
+Only exact search names `mempalace_search` and `mempalace-mempalace_search` are
+recognized. Unknown wrappers or semantically failed search results abstain.
+Pre-tool bookkeeping preserves start-generation identity; post-tool output
+offers a bounded private-packet pointer, not an acknowledgment or replacement
+search result. Stop/precompact can prepare a nonpublishing draft without forcing
+another turn. Shared or ambiguous worker identity latches automatic delivery
+off; a new prompt does not prove older workers stopped. Manual commands remain
+available.
+
+Errors use `[procedural-context] unavailable:`; unavailable advice is not
+healthy empty guidance. To stop optional behavior, retain `mode: "off"` or remove
+only its separately installed registration. Keep palace source/event records
+and adverse history. Local transport receipts are not durable learning,
+application reports or task state.
