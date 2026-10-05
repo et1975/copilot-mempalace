@@ -110,3 +110,24 @@ healthy empty guidance. To stop optional behavior, retain `mode: "off"` or remov
 only its separately installed registration. Keep palace source/event records
 and adverse history. Local transport receipts are not durable learning,
 application reports or task state.
+
+### Manual delivery and recovery without automatic registration
+
+Ordinary recall and its before-decision context view work in untracked sessions,
+with advice off, or when this adapter is unavailable. No task service or host
+certification is needed for that path. Use the existing explicit `task-guidance`
+and `use-check` commands only under current target consent; an emitted pointer
+is an offer to read, not reading, intent, action or helpfulness.
+
+After reading full conditions/exceptions and checking applicability, acknowledge
+intent visibly. Recheck independently current identity/context/permissions and
+sources immediately before each advised action if any tool/event/time intervened.
+Task/constraint/repository/actor changes and compaction require a refreshed
+context and packet, never adoption of another actor's packet or receipt.
+Unknown procedural identity withholds procedures, not ordinary work.
+
+This manual protocol does not certify native delivery or pinned cache slots.
+Cached epochs cannot grant permission or defer revocation. Separately consented
+historical receipts are optional; unwritten acknowledgment remains valid. An
+uncertain receipt append retries the exact immutable artifact, and Stop does
+not attribute helpfulness. The examples remain off and unregistered.

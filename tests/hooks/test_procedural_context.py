@@ -236,6 +236,19 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(list(self.state.iterdir()), [])
         self.assertEqual(self.recorded_calls(), [])
 
+    def test_pointer_offers_reading_not_acknowledgment_or_current_use_permission(self):
+        for dialect in ("camel", "snake"):
+            with self.subTest(dialect=dialect):
+                result = self.deliver(dialect=dialect)
+                output = json.loads(result.stdout)
+                text = (output.get("additionalContext")
+                        or output["hookSpecificOutput"]["additionalContext"])
+                self.assertIn("offered; not read, intended, applied or helpful", text)
+                self.assertIn("Read fully; use task-guidance/use-check before advised action", text)
+                self.assertEqual(json.loads(self.pointer(result).read_text()), packet())
+        self.assertEqual([args[0] for args in self.recorded_calls()],
+                         ["guidance", "guidance"])
+
     def test_invalid_config_is_visible_but_never_denies_before_tool(self):
         self.config.write_text("{bad")
         result = self.invoke("before-tool")

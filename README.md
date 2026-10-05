@@ -190,7 +190,25 @@ pytest `--basetemp` names a disposable child, never that directory itself.
 
 ## Opt-in procedural rollout
 
-Ordinary recall remains the baseline. First run the deterministic procedural
+Ordinary recall remains the baseline for current work, including **untracked
+activities and procedural-off sessions**. Before the relevant decision, the
+[context view](skills/mempalace/SKILL.md#before-decision-context-view) presents
+source, type, scope, relevance, full conditions/exceptions and validation limits.
+Live instructions keep their actual rank; retrieved instructions are history.
+Facts/decisions and accepted, fallible lessons need current provenance and fit,
+not procedural enrollment or maturity. Same-repository reuse is not automatic
+fit, and foreign procedural success is not target consent or proof.
+
+The [manual delivery protocol](skills/dreaming/references/procedural.md#manual-delivery-in-ordinary-work)
+uses ordinary recall, explicit task-bound guidance, full reading and fresh
+use-checks before action. Context/permission/source changes and compaction
+require independent refresh. Offered, read, intended, performed and helpful
+are distinct; optional separately consented receipts record only agent-reported
+history. Advice/receipt refusal never suppresses independent ordinary context.
+No automatic hook registration, live consent, outcome attribution or pinned-cache
+host capability is enabled here.
+
+First run the deterministic procedural
 tests on throwaway storage, using `TEST_PY` with the existing MemPalace/model
 prerequisites:
 
@@ -214,6 +232,9 @@ commands, exact artifact schemas and `--prepare` digest handling.
 Chronological synthetic replay checks no lookahead, unsafe delivery, feedback
 inflation or output-budget violations. It reports coverage/abstention against
 an unscored evidence-only baseline, **not production superiority or CASS parity**.
+Declared-fixture delivery traces retain inputs, source references and observable
+before-decision ordering; they establish protocol conformance in those fixtures,
+not universal host/agent compliance, empirical usefulness or causal credit.
 Stop using procedural commands to roll back behavior; retain events and protected
 source drawers, including retired rules and counterexamples. External deletion
 is not prevented and no cross-drawer transaction/global snapshot is claimed.

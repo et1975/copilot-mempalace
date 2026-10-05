@@ -653,7 +653,9 @@ def handle(config: Config, event: Event, runner: Runner = run_child) -> bytes:
         raw = runner(argv, config.scope.root, MAX_PACKET)
         data = validate_guidance(raw, config.scope.repository, config.procedure)
         name = f"guidance-{snapshot['attempt']}.json"
-        output = context_output(event, f"[procedural-context] {data['status']}; complete packet: {store.path / name}")
+        output = context_output(
+            event, f"[procedural-context] {data['status']}; offered; not read, intended, applied or helpful. "
+            f"Read fully; use task-guidance/use-check before advised action. Complete packet: {store.path / name}")
         with store.locked() as value:
             if value["disabled"] or any(value[key] != snapshot[key] for key in (
                     "generation", "task_digest", "attempt")):
