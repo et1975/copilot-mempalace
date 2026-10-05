@@ -862,6 +862,10 @@ historical archive or generated source witness cannot authorize new identities.
 
 ## Guidance and explanation
 
+For deliberate one-task candidate use, follow the
+[bounded trial playbook](procedural-trials.md), including compatible-local reuse,
+target-original enrollment, current permission and fresh applicability/use checks.
+
 After ordinary evidence recall, explicitly opt into repository-scoped advice:
 
 ```bash
