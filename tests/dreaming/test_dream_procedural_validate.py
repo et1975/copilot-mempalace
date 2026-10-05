@@ -86,6 +86,29 @@ class GroundedFixture(unittest.TestCase):
 
 
 class GroundingTests(GroundedFixture):
+    def test_feedback_full_field_guard_rejects_narrow_quotes_before_admission(self):
+        from dream_metadata import canonical_json, content_hash
+        from dream_procedural import EvidenceReference
+        from dream_procedural_validate import acquire_original
+        session = self.refs[0]["session_id"]
+        for kind in ("procedural_feedback", "procedural_feedback_abstention"):
+            body = canonical_json({"kind": kind, "quote": "observed defect"})
+            for encoded in (body, canonical_json(body)):
+                for wrapper in ("{}", "```json\n{}\n```", "Copied:\n{}\nEnd."):
+                    text = f"SESSION_ID: {session}\nOBSERVED_AT: {stamp()}\n" + wrapper.format(encoded)
+                    for field in ("user_message", "assistant_response", "drawer"):
+                        if field == "drawer":
+                            self.collection.rows["source-1"]["text"] = text
+                            ref = EvidenceReference("drawer", "source-1", session,
+                                                    "observed defect", content_hash(text))
+                        else:
+                            with sqlite3.connect(self.store) as con:
+                                con.execute(f"UPDATE turns SET {field}=? WHERE session_id=?", (text, session))
+                            ref = EvidenceReference("session_turn", session, session,
+                                                    "observed defect", content_hash(text), 0, field)
+                        with self.assertRaisesRegex(ValueError, "generated"):
+                            acquire_original(ref, palace=self.path, session_store=self.store)
+
     def test_transient_applicability_and_use_result_are_not_original_turn_or_drawer_support(self):
         from delivery_fixtures import applicability, case
         from dream_metadata import canonical_json, content_hash

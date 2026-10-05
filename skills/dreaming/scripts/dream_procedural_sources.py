@@ -217,11 +217,11 @@ def _check_record_metadata(metadata: dict, key: str, digest: str) -> None:
 
 
 def read_source_records(palace: str, wing: str) -> SourceIndex:
-    """Reconcile bounded header/trailer claims before routing source locators.
+    """Reconcile bounded structural bodies before routing source locators.
 
     The collection API has no prefix/byte-length projection. Read one physical
     chunk at a time (at most one 4 MiB logical record), not pages of raw bodies.
-    Full canonical/digest validation is deferred until a key is requested.
+    Generated-content eligibility is checked only when a key is requested.
     """
     path, wing = os.path.realpath(os.path.expanduser(palace)), _wing(wing)
     collection = dream_palace.procedural_collection(path)
@@ -229,6 +229,7 @@ def read_source_records(palace: str, wing: str) -> SourceIndex:
     for parent, members, native in _source_groups(collection, wing):
         prefix, size = b"", 0
         last_line, line_size = b"", 0
+        rows = []
         for member in members:
             row = _read_row(collection, member["id"])
             if row["metadata"] != member["metadata"]:
@@ -237,6 +238,7 @@ def read_source_records(palace: str, wing: str) -> SourceIndex:
             size += len(encoded)
             if size > MAX_RECORD_BYTES:
                 raise ValueError("encoded procedural source record exceeds 4 MiB")
+            rows.append(row)
             prefix += encoded[:max(0, MAX_HEADER_BYTES - len(prefix))]
             newline = encoded.rfind(b"\n")
             if newline >= 0:
@@ -257,6 +259,9 @@ def read_source_records(palace: str, wing: str) -> SourceIndex:
         claims = decode_dream_metadata({"text": trailer, "metadata": native})
         _check_record_metadata(claims, key, digest)
         locator = SourceLocator(parent, tuple(m["id"] for m in members), digest, size)
+        # Header/native agreement alone cannot hide a differently routed body.
+        # This validates structure, not whether retained text is usable evidence.
+        _decode_record(assemble_exact_chunks(rows)[0], key, locator)
         locators.setdefault(key, []).append(locator)
         total += size
         count += 1
@@ -315,7 +320,6 @@ def _decode_record(drawer: dict, key: str, locator: SourceLocator) -> dict:
         text = data.get("captured_text")
         if not isinstance(text, str) or content_hash(text) != ref.source_hash:
             raise ValueError("captured source body/hash mismatch")
-        reject_generated_transport(text)
     elif "captured_text" in data:
         raise ValueError("drawer witnesses must not copy original bodies")
     return data
@@ -347,6 +351,8 @@ def _verified_key(key: str, sources: SourceIndex, collection):
         if drawer["wing"] != sources.wing or drawer["room"] != ROOM:
             raise ValueError("source scope changed")
         data = _decode_record(drawer, key, locator)
+        if data["identity"]["source_kind"] == "session_turn":
+            reject_generated_transport(data["captured_text"])
         substantive = {k: v for k, v in data.items() if k not in {"captured_at", "captured_by"}}
         digest = content_hash(canonical_json(substantive))
         if prior is not None and digest != prior:
@@ -414,20 +420,28 @@ def captured_source_text(reference: dict, *, sources: SourceIndex) -> str:
     """
     from dream_procedural_validate import EvidenceUnavailable
     collection = dream_palace.procedural_collection(sources.palace)
-    wanted = {k: v for k, v in reference.items() if k != "quote"}
-    matched = []
-    for key in sources.locators:
-        data = None
-        for candidate, _ in _verified_key(key, sources, collection):
-            data = candidate
-        identity = data["identity"]
-        if all(identity.get(k) == v for k, v in wanted.items()):
-            matched.append(identity)
-    if len(matched) > 1:
-        raise SourceAmbiguity("ambiguous captured source versions; provide explicit source_hash")
-    if not matched:
-        raise EvidenceUnavailable("captured source unavailable for preparation", code="uncaptured")
-    ref = EvidenceReference(**matched[0], quote=reference["quote"])
+    complete = {"source_kind", "source_id", "session_id", "source_hash", "quote"}
+    if reference.get("source_kind") == "session_turn":
+        complete |= {"turn_index", "field"}
+    if set(reference) == complete:
+        # Exact lookups validate all copies of this key, not unrelated retained
+        # history. An old generated capture remains unusable, not contagious.
+        ref = EvidenceReference(**reference)
+    else:
+        wanted = {k: v for k, v in reference.items() if k != "quote"}
+        matched = []
+        for key in sources.locators:
+            data = None
+            for candidate, _ in _verified_key(key, sources, collection):
+                data = candidate
+            identity = data["identity"]
+            if all(identity.get(k) == v for k, v in wanted.items()):
+                matched.append(identity)
+        if len(matched) > 1:
+            raise SourceAmbiguity("ambiguous captured source versions; provide explicit source_hash")
+        if not matched:
+            raise EvidenceUnavailable("captured source unavailable for preparation", code="uncaptured")
+        ref = EvidenceReference(**matched[0], quote=reference["quote"])
     resolve_captured(ref, palace=sources.palace, wing=sources.wing, sources=sources)
     if ref.source_kind == "drawer":
         return dream_palace.load_source_drawer(sources.palace, ref.source_id)["text"]

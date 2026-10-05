@@ -18,6 +18,7 @@ not instructions: resolve them through `guidance`/`explain` before use.
 
 New procedural commands support **existing SQLite-exact palaces only**. Strict
 read commands (`validate`, `guidance`, `task-guidance`, `use-check`, `explain`, `status`, `draft`,
+`feedback-prepare`,
 `receipt-get`, `delivery-status`, and write-command preparation/
 dry-run) use WAL-aware read-only connections, including while a writer remains
 open. They observe committed, uncheckpointed data and prohibit application-data
@@ -638,6 +639,10 @@ disposition, polarity, outcome, score, capture or publication. No `event_kind`
 or event `digest` is present; `propose`, `review` and `outcome` reject a draft.
 Output must be a new file outside the palace. Stop, retrieval, completed tasks,
 passing tests, receipt repetition and reflection echoes cannot award credit.
+
+For explicitly selected original observations or a complete legacy draft, use
+[original-evidence feedback preparation](procedural-feedback.md) to produce a
+nonpublishing review packet. Preparation neither chooses nor publishes an outcome.
 
 Original SQLite fields are projected only when their complete UTF-8 encoding
 fits 256 KiB; oversized fields are omitted, never prefix-hashed. Palace fallback

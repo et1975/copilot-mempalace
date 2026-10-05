@@ -41,13 +41,19 @@ def _parser():
     commands = parser.add_subparsers(dest="command", required=True, parser_class=Parser)
     for name in ("propose", "review", "outcome", "validate", "guidance", "explain",
                  "capture-sources", "status", "draft", "task-guidance", "use-check",
-                 "receipt", "receipt-get", "delivery-status"):
+                 "receipt", "receipt-get", "delivery-status", "feedback-prepare"):
         sub = commands.add_parser(name)
         sub.add_argument("--palace", required=True)
         sub.add_argument("--wing", required=True)
         sub.add_argument("--session-store", required=name == "capture-sources",
                          help="Original Copilot SQLite session store; opened read-only for acquisition")
-        if name == "receipt":
+        if name == "feedback-prepare":
+            sub.add_argument("--repository", required=True)
+            sub.add_argument("--input", required=True)
+            sub.add_argument("--out", required=True)
+            sub.add_argument("--receipt", help="Optional legacy schema-1 transport lineage, not G1 receipts")
+            sub.add_argument("--draft-origin", help="Original legacy schema-1 draft file")
+        elif name == "receipt":
             sub.add_argument("--input", required=True)
             sub.add_argument("--permissions", help="Fresh permission witness; required for new effects")
             mode = sub.add_mutually_exclusive_group()
@@ -192,6 +198,8 @@ def _execute(args):
         return _delivery(args, palace, as_of)
     if args.command in {"receipt", "receipt-get", "delivery-status"}:
         return _receipts(args, palace, as_of)
+    if args.command == "feedback-prepare":
+        return _feedback(args, palace, as_of)
     if args.command == "status":
         from dream_procedural_palace import procedural_status
         return procedural_status(palace, args.wing, args.repository, as_of=as_of)
@@ -295,6 +303,31 @@ def _execute(args):
     return result.data
 
 
+def _feedback(args, palace, as_of):
+    import dream_procedural_feedback as feedback
+    if args.session_store is not None and not args.session_store.strip():
+        raise RequestError("--session-store must name an explicit original store")
+    output = Path(args.out).expanduser().absolute()
+    if any(part.is_symlink() for part in (output, *output.parents)):
+        raise RequestError("feedback output must be a new regular file, not a symlink")
+    target = _artifact_path(args.out, palace)
+    selection = feedback.read_json(args.input, feedback.MAX_SELECTION_BYTES)
+    if not isinstance(selection, dict) or selection.get("repository") != args.repository:
+        raise RequestError("selection and CLI repository must match exactly")
+    receipt = (feedback.read_json(args.receipt, feedback.MAX_RECEIPT_BYTES)
+               if args.receipt is not None else None)
+    draft = (feedback.read_json(args.draft_origin, feedback.MAX_DRAFT_BYTES)
+             if args.draft_origin is not None else None)
+    reader = (AdmissionReader(palace, args.wing, args.session_store)
+              if args.session_store is not None else EvidenceReader(palace, args.wing))
+    events = read_events(palace, args.wing)
+    projection = project_rules(events, as_of=as_of, policy=Policy())
+    result = feedback.prepare_feedback(selection, projection=projection, reader=reader, as_of=as_of,
+                                       receipt=receipt, draft_origin=draft)
+    _write_artifact(target, result)
+    return result
+
+
 def _receipts(args, palace, as_of):
     import dream_procedural_receipts as receipts
     from dream_procedural_delivery import MAX_CONTEXT_BYTES, MAX_PERMISSION_BYTES, read_json
@@ -342,7 +375,7 @@ def main(argv=None) -> int:
     try:
         args = _parser().parse_args(argv)
         from dream_procedural_palace import nonmutating_read
-        read_only = args.command in {"validate", "guidance", "explain", "status", "draft",
+        read_only = args.command in {"validate", "guidance", "explain", "status", "draft", "feedback-prepare",
                                      "task-guidance", "use-check", "receipt-get", "delivery-status"} or \
             getattr(args, "dry_run", False) or getattr(args, "prepare", False)
         # Imported handlers/models may print; keep the command's stdout strictly JSON.
