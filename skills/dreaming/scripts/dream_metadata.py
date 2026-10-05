@@ -10,7 +10,7 @@ from typing import Any
 MARKER = "<!--dreaming-meta:"
 GENERATED_TRANSPORT_KINDS = frozenset({
     "procedural_delivery_packet", "procedural_applicability_witness", "procedural_use_check",
-    "procedural_receipt",
+    "procedural_receipt", "procedural_feedback", "procedural_feedback_abstention",
 })
 GENERATED_KINDS = frozenset({"lesson", "reflect", "procedural_event", "procedural_source"}) \
     | GENERATED_TRANSPORT_KINDS

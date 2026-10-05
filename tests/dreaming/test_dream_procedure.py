@@ -32,7 +32,9 @@ class CommandTests(GroundedFixture):
         self.invoke("propose", self.proposal())
         self.invoke("review", self.review())
         transports = [wrapped_packet("Original commentary:\n{}\nEnd."), *[
-            "Original commentary:\n" + canonical_json(canonical_json(r)) for r in receipts()[:2]]]
+            "Original commentary:\n" + canonical_json(canonical_json(r)) for r in receipts()[:2]], *[
+            "Original commentary:\n" + canonical_json(canonical_json({"kind": kind, "quote": "parser"}))
+            for kind in ("procedural_feedback", "procedural_feedback_abstention")]]
         for field, text in product(("user_message", "assistant_response", "drawer"), transports):
             session = self.refs[3]["session_id"]
             if field == "drawer":
