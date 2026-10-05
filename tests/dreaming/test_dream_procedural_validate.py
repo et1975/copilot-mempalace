@@ -135,6 +135,31 @@ class GroundingTests(GroundedFixture):
                 with self.subTest(wrapper=wrapper, field=field), self.assertRaisesRegex(ValueError, "generated"):
                     acquire_original(ref, palace=self.path, session_store=self.store)
 
+    def test_receipts_cannot_supply_direct_support_even_through_narrow_quotes(self):
+        from dream_metadata import canonical_json, content_hash
+        from dream_procedural import EvidenceReference
+        from dream_procedural_validate import acquire_original
+        from receipt_fixtures import receipts
+        session = self.refs[0]["session_id"]
+        for record in receipts()[:2]:
+            for wrapper in ("{}", "```json\n{}\n```", "Copied report:\n{}\nEnd."):
+                for encoded in (False, True):
+                    body = canonical_json(record)
+                    body = wrapper.format(canonical_json(body) if encoded else body)
+                    text = f"SESSION_ID: {session}\nOBSERVED_AT: {stamp()}\n" + body
+                    for field in ("user_message", "assistant_response", "drawer"):
+                        if field == "drawer":
+                            self.collection.rows["source-1"]["text"] = text
+                            ref = EvidenceReference("drawer", "source-1", session, "parser",
+                                                    content_hash(text))
+                        else:
+                            with sqlite3.connect(self.store) as con:
+                                con.execute(f"UPDATE turns SET {field}=? WHERE session_id=?", (text, session))
+                            ref = EvidenceReference("session_turn", session, session, "parser",
+                                                    content_hash(text), 0, field)
+                        with self.assertRaisesRegex(ValueError, "generated"):
+                            acquire_original(ref, palace=self.path, session_store=self.store)
+
     def test_validation_finds_captured_raw_fields_once_without_host_or_generated_copies(self):
         from dream_procedural_validate import build_validation_packet, ValidationLimits
         from dream_procedural_sources import AUTHOR

@@ -49,8 +49,10 @@ class SourceTests(unittest.TestCase):
         from dream_procedural_sources import _HEADER, _metadata, source_key
         from dream_procedural import to_data
         from dream_procedural_validate import EvidenceReader
+        from receipt_fixtures import receipts
         _, current, _, guidance = case()
         texts = [
+            *[canonical_json(r) for r in receipts()[:2]],
             wrapped_packet("Copied report:\n{}\nEnd.", encoded=True),
             canonical_json(applicability(current["context"], guidance["rules"])),
             canonical_json(dict(kind="procedural_use_check", authority="agent_reported",
@@ -87,6 +89,20 @@ class SourceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "generated"):
             self.resolve(ref)
         self.assertEqual(self.collection.rows, before)
+
+    def test_receipt_drawer_witness_revalidates_full_body_and_preserves_history(self):
+        from receipt_fixtures import receipts
+        from dream_procedural_sources import OriginalSource
+        for record in receipts()[:2]:
+            text = DRAWER + "\nCopied report:\n" + canonical_json(canonical_json(record))
+            ref = EvidenceReference("drawer", "original", SESSION, "parser", content_hash(text))
+            self.collection.rows["original"] = {"id": "original", "text": text,
+                "metadata": {"wing": "w", "room": "diary", "repository": "owner/repo"}}
+            self.capture(OriginalSource(ref, "owner/repo", NOW))
+            before = deepcopy(self.collection.rows)
+            with self.assertRaisesRegex(ValueError, "generated"):
+                self.resolve(ref)
+            self.assertEqual(self.collection.rows, before)
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="sources-", dir=os.environ["DREAMING_TEST_TMPDIR"])

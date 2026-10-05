@@ -86,6 +86,8 @@ def test_replay_preflight_refuses_each_procedural_metadata_indicator():
         {"kind": "procedural_event"}, {"kind": "procedural_source"},
         {"added_by": "dream-procedure"}, {"added_by": "dream-procedure-source"},
         {"agent": "dream-procedure"}, {"agent": "dream-procedure-source"},
+        {"room": "procedural-receipts"}, {"kind": "procedural_receipt"},
+        {"added_by": "dream-procedure-receipt"}, {"agent": "dream-procedure-receipt"},
     ):
         for container in (None, "extra", "metadata"):
             record = lib.drawer_record("w", "general", "malformed payload", None, None, "d1", {})
@@ -95,7 +97,7 @@ def test_replay_preflight_refuses_each_procedural_metadata_indicator():
 
 def test_replay_preflight_checks_all_procedural_trailers():
     for trailer in ("dreaming-meta", "wing-meta"):
-        for kind in ("procedural_event", "procedural_source"):
+        for kind in ("procedural_event", "procedural_source", "procedural_receipt"):
             body = f'payload\n\n<!--{trailer}: {{"kind":"{kind}"}}-->'
             body = lib.encode_trailer(body, {"topic": "ordinary outer metadata"})
             record = lib.drawer_record("w", "general", body, None, None, "d1", {})

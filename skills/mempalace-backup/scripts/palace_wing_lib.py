@@ -194,10 +194,10 @@ def validate_manifest(obj: Any) -> None:
 
 
 _PROCEDURAL_METADATA = {
-    "room": ("procedural", "procedural-sources"),
-    "kind": ("procedural_event", "procedural_source"),
-    "added_by": ("dream-procedure", "dream-procedure-source"),
-    "agent": ("dream-procedure", "dream-procedure-source"),
+    "room": ("procedural", "procedural-sources", "procedural-receipts"),
+    "kind": ("procedural_event", "procedural_source", "procedural_receipt"),
+    "added_by": ("dream-procedure", "dream-procedure-source", "dream-procedure-receipt"),
+    "agent": ("dream-procedure", "dream-procedure-source", "dream-procedure-receipt"),
 }
 _METADATA_COMMENT = re.compile(r"<!--(?:dreaming-meta|wing-meta)\b")
 _METADATA_VALUE_PREFIX = re.compile(r"\s*:\s*")
@@ -211,7 +211,7 @@ def _validate_replay_metadata(metadata: Any) -> None:
         value = metadata.get(field)
         if value in protected:
             raise ValueError(
-                "Cannot replay procedural events or procedural sources: new drawer IDs "
+                "Cannot replay procedural events, sources or receipts: new drawer IDs "
                 "cannot preserve immutable references and digests. Use whole-palace "
                 "physical backup/restore instead."
             )

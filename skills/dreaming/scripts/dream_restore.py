@@ -4,7 +4,7 @@
 Restores archived logical drawers by adding new drawers with the original
 wing/room and reconstructed content. The original physical ids and chunking are
 not resurrected: mempalace mints new drawer ids and recomputes embeddings.
-Procedural events/source records are refused before any selected archive
+Procedural events/source records/receipts are refused before any selected archive
 record is replayed, including during dry-run. Use coherent physical recovery
 for identity-bound procedural state.
 
@@ -103,7 +103,7 @@ def _archive_metadata_claims(drawer: dict[str, Any]) -> Iterable[dict[str, Any]]
 def _reject_procedural_metadata(metadata: dict[str, Any]) -> None:
     if is_procedural_record({"metadata": metadata}) or is_source_record_metadata(metadata):
         raise ValueError(
-            "Cannot replay procedural events or source records with new drawer IDs; "
+            "Cannot replay procedural events, source records or receipts with new drawer IDs; "
             "use a coherent whole-palace physical backup/restore instead")
 
 

@@ -1016,8 +1016,9 @@ def load_logical_drawers(
         kwargs["where"] = where
     res = col.get(**kwargs)
     rows = _rows_from_collection_result(res)
-    from dream_metadata import decode_procedural_chunks, is_source_record_metadata
-    rows = [r for r in rows if not is_source_record_metadata(r.get("metadata", {}))]
+    from dream_metadata import decode_procedural_chunks, is_source_record_metadata, is_receipt_record_metadata
+    rows = [r for r in rows if not is_source_record_metadata(r.get("metadata", {}))
+            and not is_receipt_record_metadata(r.get("metadata", {}))]
     procedural = [r for r in rows if (r.get("metadata") or {}).get("room") == "procedural"]
     ordinary = [r for r in rows if (r.get("metadata") or {}).get("room") != "procedural"]
     return _group_by_parent(ordinary, ("parent_drawer_id",)) + decode_procedural_chunks(procedural)
@@ -1090,8 +1091,9 @@ def load_observation_entries(
             kwargs["where"] = where
         rows.extend(_rows_from_collection_result(col.get(**kwargs)))
 
-    from dream_metadata import is_source_record_metadata
-    rows = [r for r in rows if not is_source_record_metadata(r.get("metadata", {}))]
+    from dream_metadata import is_source_record_metadata, is_receipt_record_metadata
+    rows = [r for r in rows if not is_source_record_metadata(r.get("metadata", {}))
+            and not is_receipt_record_metadata(r.get("metadata", {}))]
     entries = []
     for logical in _group_by_parent(rows, ("parent_entry_id", "parent_drawer_id")):
         from dream_metadata import decode_dream_metadata, content_hash

@@ -249,7 +249,8 @@ def test_procedural_source_archive_blocks_complete_batch_before_writes(dry_run, 
 @pytest.mark.parametrize("location", ("archive-scope", "archive-metadata", "row-metadata",
                                      "omitted-row", "row-trailer", "wrapped-trailer", "split-trailer"))
 @pytest.mark.parametrize("kind,room", (("procedural_source", "procedural-sources"),
-                                    ("procedural_event", "procedural")))
+                                    ("procedural_event", "procedural"),
+                                    ("procedural_receipt", "procedural-receipts")))
 def test_all_archive_provenance_channels_preflight_before_ordinary_replay(location, kind, room):
     record = _record("protected")
     if location == "archive-scope":
@@ -384,7 +385,7 @@ def _logical_archive(text, split_at=None, *, added_by="dreaming"):
     return record
 
 
-@pytest.mark.parametrize("kind", ("procedural_source", "procedural_event"))
+@pytest.mark.parametrize("kind", ("procedural_source", "procedural_event", "procedural_receipt"))
 @pytest.mark.parametrize("split", (False, True), ids=("whole", "split-marker"))
 @pytest.mark.parametrize("dry_run", (False, True))
 def test_unfinished_fence_writer_trailer_and_wrapper_block_whole_batch(kind, split, dry_run):

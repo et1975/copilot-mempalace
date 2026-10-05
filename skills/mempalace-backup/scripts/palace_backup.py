@@ -567,10 +567,10 @@ def staged_data_path(stage, palace, override=None):
 
 
 _PROCEDURAL_MARKERS = {
-    "room": ("procedural", "procedural-sources"),
-    "kind": ("procedural_event", "procedural_source"),
-    "added_by": ("dream-procedure", "dream-procedure-source"),
-    "agent": ("dream-procedure", "dream-procedure-source"),
+    "room": ("procedural", "procedural-sources", "procedural-receipts"),
+    "kind": ("procedural_event", "procedural_source", "procedural_receipt"),
+    "added_by": ("dream-procedure", "dream-procedure-source", "dream-procedure-receipt"),
+    "agent": ("dream-procedure", "dream-procedure-source", "dream-procedure-receipt"),
 }
 
 
@@ -586,11 +586,12 @@ def _has_procedural_storage(data):
                                (table,)).fetchone():
                 continue
             if table == "documents":
-                clauses = [f"json_extract(metadata_json, '$.{key}') IN (?, ?)"
-                           for key in _PROCEDURAL_MARKERS]
+                clauses = [f"json_extract(metadata_json, '$.{key}') IN ({','.join('?' for _ in values)})"
+                           for key, values in _PROCEDURAL_MARKERS.items()]
                 params = [value for values in _PROCEDURAL_MARKERS.values() for value in values]
             else:
-                clauses = ["(key=? AND string_value IN (?, ?))" for _ in _PROCEDURAL_MARKERS]
+                clauses = [f"(key=? AND string_value IN ({','.join('?' for _ in values)}))"
+                           for values in _PROCEDURAL_MARKERS.values()]
                 params = [value for key, values in _PROCEDURAL_MARKERS.items()
                           for value in (key, *values)]
             if con.execute(f"SELECT 1 FROM {table} WHERE " + " OR ".join(clauses) + " LIMIT 1",
@@ -656,6 +657,7 @@ def _validate_procedural_stage(stage, data):
             import dream_palace
             from dream_procedural_palace import nonmutating_read
             from dream_procedural_validate import inspect_published_sources
+            from dream_procedural_receipts import read_receipts
 
             with _staged_procedural_environment(stage, data), nonmutating_read(str(data)):
                 collection = dream_palace.procedural_collection(str(data))
@@ -682,6 +684,7 @@ def _validate_procedural_stage(stage, data):
                 if not wings:
                     raise BackupError("Procedural storage exists but the selected collection cannot read it")
                 for wing in sorted(wings):
+                    read_receipts(str(data), wing)
                     report = inspect_published_sources(str(data), wing)
                     if report["status"] != "ok":
                         codes = sorted({failure["code"] for failure in report["failures"]})

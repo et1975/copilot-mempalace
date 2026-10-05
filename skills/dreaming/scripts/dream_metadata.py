@@ -10,6 +10,7 @@ from typing import Any
 MARKER = "<!--dreaming-meta:"
 GENERATED_TRANSPORT_KINDS = frozenset({
     "procedural_delivery_packet", "procedural_applicability_witness", "procedural_use_check",
+    "procedural_receipt",
 })
 GENERATED_KINDS = frozenset({"lesson", "reflect", "procedural_event", "procedural_source"}) \
     | GENERATED_TRANSPORT_KINDS
@@ -117,7 +118,8 @@ def split_dream_metadata(drawer: dict) -> tuple[str, dict]:
     # Writers append one canonical JSON line. Inline examples and quoted code
     # are content, not provenance, even when they contain the marker.
     generated_writer = native.get("added_by") in {
-        "dreaming", "dream-reflect", "dream-procedure", "dream-procedure-source"}
+        "dreaming", "dream-reflect", "dream-procedure", "dream-procedure-source",
+        "dream-procedure-receipt"}
     if lines and (fence is None or generated_writer) and lines[-1].startswith(MARKER):
         decoder = json.JSONDecoder(object_pairs_hook=_unique_pairs, parse_constant=_invalid_constant,
                                    parse_float=_finite_float)
@@ -146,8 +148,9 @@ def is_generated_observation(drawer: dict) -> bool:
     return (metadata.get("kind") in GENERATED_KINDS
             or metadata.get("source_kind") in GENERATED_KINDS
             or metadata.get("generated_from") in GENERATED_KINDS
-            or metadata.get("added_by") in {"dream-procedure", "dream-reflect", "dream-procedure-source"}
-            or metadata.get("room") == "procedural-sources"
+            or metadata.get("added_by") in {"dream-procedure", "dream-reflect", "dream-procedure-source",
+                                           "dream-procedure-receipt"}
+            or metadata.get("room") in {"procedural-sources", "procedural-receipts"}
             or bool(metadata.get("generated_summary"))
             or generated_transport_kind(drawer.get("text", "")) is not None)
 
@@ -155,7 +158,17 @@ def is_generated_observation(drawer: dict) -> bool:
 def is_procedural_record(drawer: dict) -> bool:
     metadata = decode_dream_metadata(drawer)
     return (metadata.get("kind") in {"procedural_event", "procedural_source"}
-            or metadata.get("room") in {"procedural", "procedural-sources"})
+            or metadata.get("room") in {"procedural", "procedural-sources"}
+            or is_receipt_record_metadata(metadata))
+
+
+def is_receipt_record_metadata(metadata: dict) -> bool:
+    """Conservative reservation without parsing a possibly corrupt receipt."""
+    if not isinstance(metadata, dict):
+        raise ValueError("drawer metadata must be an object")
+    return (metadata.get("kind") == "procedural_receipt"
+            or metadata.get("room") == "procedural-receipts"
+            or metadata.get("added_by") == "dream-procedure-receipt")
 
 
 def exact_chunk_groups(rows: list[dict]) -> list[tuple[str, list[dict], dict]]:

@@ -441,6 +441,8 @@ def live_protected_drawer_ids(palace: str, *, collection=None) -> set[str]:
     # Keep their distinct author out of the legacy global event selector.
     from dream_procedural_sources import source_record_ids
     protected.update(source_record_ids(col))
+    from dream_procedural_receipts import receipt_record_ids
+    protected.update(receipt_record_ids(col))
     return protected
 
 

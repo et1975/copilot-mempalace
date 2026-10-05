@@ -40,13 +40,25 @@ def _parser():
     parser = Parser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True, parser_class=Parser)
     for name in ("propose", "review", "outcome", "validate", "guidance", "explain",
-                 "capture-sources", "status", "draft", "task-guidance", "use-check"):
+                 "capture-sources", "status", "draft", "task-guidance", "use-check",
+                 "receipt", "receipt-get", "delivery-status"):
         sub = commands.add_parser(name)
         sub.add_argument("--palace", required=True)
         sub.add_argument("--wing", required=True)
         sub.add_argument("--session-store", required=name == "capture-sources",
                          help="Original Copilot SQLite session store; opened read-only for acquisition")
-        if name in {"task-guidance", "use-check"}:
+        if name == "receipt":
+            sub.add_argument("--input", required=True)
+            sub.add_argument("--permissions", help="Fresh permission witness; required for new effects")
+            mode = sub.add_mutually_exclusive_group()
+            mode.add_argument("--prepare", action="store_true", help="Fill only missing digest")
+            mode.add_argument("--dry-run", action="store_true")
+            sub.add_argument("--out", help="Exclusive prepared artifact destination")
+        elif name == "receipt-get":
+            sub.add_argument("--receipt-id", required=True)
+        elif name == "delivery-status":
+            sub.add_argument("--context", required=True)
+        elif name in {"task-guidance", "use-check"}:
             sub.add_argument("--current", required=True,
                              help="Fresh independent {context, checked_at} observation")
             sub.add_argument("--permissions", required=True, help="Fresh separate permission witness")
@@ -178,6 +190,8 @@ def _execute(args):
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
     if args.command in {"task-guidance", "use-check"}:
         return _delivery(args, palace, as_of)
+    if args.command in {"receipt", "receipt-get", "delivery-status"}:
+        return _receipts(args, palace, as_of)
     if args.command == "status":
         from dream_procedural_palace import procedural_status
         return procedural_status(palace, args.wing, args.repository, as_of=as_of)
@@ -281,12 +295,55 @@ def _execute(args):
     return result.data
 
 
+def _receipts(args, palace, as_of):
+    import dream_procedural_receipts as receipts
+    from dream_procedural_delivery import MAX_CONTEXT_BYTES, MAX_PERMISSION_BYTES, read_json
+    if args.command == "delivery-status":
+        return receipts.delivery_status(palace, args.wing,
+            read_json(args.context, MAX_CONTEXT_BYTES + 1), now=as_of)
+    if args.command == "receipt-get":
+        receipts.receipt_id(args.receipt_id)
+        records = receipts.read_receipts(palace, args.wing, now=as_of)
+        if args.receipt_id not in records:
+            raise RequestError("receipt not found")
+        return {"status": "ok", "receipt": records[args.receipt_id], "notice": receipts.NOTICE}
+    if bool(args.prepare) != bool(args.out):
+        raise RequestError("--prepare requires --out; --out is only for preparation")
+    record = read_json(args.input, receipts.MAX_RECORD_BYTES)
+
+    def permissions():
+        if not args.permissions:
+            raise RequestError("new receipt requires current --permissions")
+        return read_json(args.permissions, MAX_PERMISSION_BYTES)
+
+    if not args.prepare and not args.dry_run:
+        return receipts.append_receipt(palace, args.wing, record, permissions=permissions, clock=now_utc)
+    if not isinstance(record, dict) or not isinstance(record.get("payload"), dict):
+        raise RequestError("expected receipt envelope and payload")
+    records, count = receipts._read_receipts(palace, args.wing, as_of, True)
+    parent = records.get(record["payload"].get("delivery_receipt_id"))
+    if args.prepare:
+        record = receipts.prepare_receipt(record, as_of, parent=parent, wing=args.wing)
+    else:
+        receipts.validate_receipt(record, as_of, parent=parent, wing=args.wing)
+    if receipts._prior(records, record):
+        return receipts._result("already_exists", record)
+    if count >= receipts.MAX_RECEIPTS:
+        raise RequestError("receipt limit exceeded")
+    receipts.receipt_preflight(record, records, args.wing, permissions(), now_utc())
+    if args.prepare:
+        if Path(args.out).expanduser().is_symlink():
+            raise RequestError("receipt output must be a new regular file, not a symlink")
+        _write_artifact(_artifact_path(args.out, palace), record)
+    return receipts._result("prepared" if args.prepare else "dry_run", record)
+
+
 def main(argv=None) -> int:
     try:
         args = _parser().parse_args(argv)
         from dream_procedural_palace import nonmutating_read
         read_only = args.command in {"validate", "guidance", "explain", "status", "draft",
-                                     "task-guidance", "use-check"} or \
+                                     "task-guidance", "use-check", "receipt-get", "delivery-status"} or \
             getattr(args, "dry_run", False) or getattr(args, "prepare", False)
         # Imported handlers/models may print; keep the command's stdout strictly JSON.
         with redirect_stdout(sys.stderr), (nonmutating_read(args.palace) if read_only else nullcontext()):

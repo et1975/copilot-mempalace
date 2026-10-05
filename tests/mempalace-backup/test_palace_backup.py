@@ -201,7 +201,7 @@ def _make_wal_db(path: Path, rows: int) -> None:
 
 
 @contextlib.contextmanager
-def _published_procedural_palace(tmp_path, *, retired=False, orphan=False, origin=False):
+def _published_procedural_palace(tmp_path, *, retired=False, orphan=False, origin=False, receipts=False):
     """Real installed handlers; session input and all palace state are disposable."""
     # MemPalace strips inherited PYTHONPATH on first import; preserve this
     # runner's already selected fixture/pytest paths, not package resolution.
@@ -266,6 +266,18 @@ def _published_procedural_palace(tmp_path, *, retired=False, orphan=False, origi
                     source = acquire_original(ref, palace=str(data), session_store=fixture.store)
                     capture_source(source, palace=str(data), wing="orphans", writer=writer,
                                    captured_at=NOW, captured_by="fixture")
+            if receipts:
+                from receipt_fixtures import receipts as receipt_case, resign
+                from dream_procedural_delivery import hash_data
+                from dream_procedural_receipts import append_receipt
+                delivery, application, permission = receipt_case()
+                packet = delivery["payload"]["packet"]
+                packet["guidance"]["rules"][0]["rule_id"] = events[0].rule_id
+                packet["guidance_digest"] = hash_data(packet["guidance"])
+                application["payload"]["rule_id"] = events[0].rule_id
+                for receipt in (resign(delivery), resign(application)):
+                    append_receipt(str(data), "w", receipt, permissions=lambda: permission,
+                                   writer_factory=lambda: writer, clock=lambda: NOW)
         # The source store is not a recovery input after publication.
         Path(fixture.store).unlink()
         yield home, data, fixture, events
@@ -389,6 +401,37 @@ def _assert_procedural_stage_damage_blocked(tmp_path, damage, expected, **option
         assert not list(tmp_path.glob("original.bak-*"))
         assert not (home / pb.RESTORE_MARKER).exists()
         assert staged_data.is_dir()
+
+
+def test_receipt_stage_missing_parent_blocks_before_publication(tmp_path):
+    def damage(con, fixture):
+        con.execute("DELETE FROM documents WHERE json_extract(metadata_json, '$.room') = "
+                    "'procedural-receipts' AND COALESCE(json_extract(metadata_json, '$.parent_drawer_id'), id) "
+                    "IN (SELECT COALESCE(json_extract(metadata_json, '$.parent_drawer_id'), id) "
+                    "FROM documents WHERE document LIKE '%\"record_type\":\"delivery\"%')")
+    _assert_procedural_stage_damage_blocked(tmp_path, damage, "parent", receipts=True)
+
+
+def test_receipt_stage_corruption_blocks_without_changing_rule_projection(tmp_path):
+    def damage(con, fixture):
+        con.execute("UPDATE documents SET document='corrupt receipt' WHERE "
+                    "json_extract(metadata_json, '$.room') = 'procedural-receipts'")
+    _assert_procedural_stage_damage_blocked(tmp_path, damage, "receipt", receipts=True)
+
+
+def test_receipt_physical_stage_roundtrip_without_original_host(tmp_path):
+    from dream_procedural_receipts import read_receipts
+    with _published_procedural_palace(tmp_path, receipts=True) as (home, data, fixture, events):
+        before = read_receipts(str(data), "w")
+        projection = _procedural_projection(data)
+        stage = tmp_path / "stage"
+        shutil.copytree(home, stage)
+        shutil.rmtree(home)
+        with _palace_only_reads():
+            pb._validate_stage(stage, stage / "custom")
+            assert read_receipts(str(stage / "custom"), "w") == before
+            assert _procedural_projection(stage / "custom") == projection
+        assert len(before) == 2 and not Path(fixture.store).exists()
 
 
 def test_procedural_stage_missing_capture_blocks_before_publication(tmp_path):

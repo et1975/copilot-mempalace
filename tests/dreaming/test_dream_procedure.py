@@ -26,21 +26,24 @@ from types import SimpleNamespace
 class CommandTests(GroundedFixture):
     def test_direct_commands_reject_copied_complete_delivery_without_new_captures(self):
         from delivery_fixtures import wrapped_packet
-        from dream_metadata import content_hash
+        from dream_metadata import canonical_json, content_hash
+        from receipt_fixtures import receipts
+        from itertools import product
         self.invoke("propose", self.proposal())
         self.invoke("review", self.review())
-        for field in ("user_message", "assistant_response", "drawer"):
-            text = wrapped_packet("Original commentary:\n{}\nEnd.")
+        transports = [wrapped_packet("Original commentary:\n{}\nEnd."), *[
+            "Original commentary:\n" + canonical_json(canonical_json(r)) for r in receipts()[:2]]]
+        for field, text in product(("user_message", "assistant_response", "drawer"), transports):
             session = self.refs[3]["session_id"]
             if field == "drawer":
                 text = f"SESSION_ID: {session}\nOBSERVED_AT: {stamp()}\n" + text
                 self.collection.rows["source-4"]["text"] = text
-                ref = dict(self.refs[3], source_hash=content_hash(text), quote="Add a parser regression")
+                ref = dict(self.refs[3], source_hash=content_hash(text), quote="parser")
             else:
                 with sqlite3.connect(self.store) as con:
                     con.execute(f"UPDATE turns SET {field}=? WHERE session_id=?", (text, session))
                 ref = dict(source_kind="session_turn", source_id=session, session_id=session,
-                           source_hash=content_hash(text), quote="Add a parser regression",
+                           source_hash=content_hash(text), quote="parser",
                            turn_index=0, field=field)
             proposal = event_data("proposal", 80, origin_drawer_ids=[], evidence=[ref, *self.refs[:2]])
             review = event_to_data(self.review(81, parent_review_ids=[self.review().event_id]))

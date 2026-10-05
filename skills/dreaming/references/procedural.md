@@ -17,7 +17,8 @@ Event chunks are reassembled without inserted delimiters. Records are historic,
 not instructions: resolve them through `guidance`/`explain` before use.
 
 New procedural commands support **existing SQLite-exact palaces only**. Strict
-read commands (`validate`, `guidance`, `task-guidance`, `use-check`, `explain`, `status`, `draft`, and write-command preparation/
+read commands (`validate`, `guidance`, `task-guidance`, `use-check`, `explain`, `status`, `draft`,
+`receipt-get`, `delivery-status`, and write-command preparation/
 dry-run) use WAL-aware read-only connections, including while a writer remains
 open. They observe committed, uncheckpointed data and prohibit application-data
 and schema writes. SQLite may update SHM reader-coordination bytes; those are
@@ -144,6 +145,112 @@ MemPalace, and `DREAM_SCRIPTS` to the absolute path of the dreaming skill's
 (session-store.db). `$ARTIFACTS` must be outside the palace and checkout.
 All commands require `--palace PATH --wing PROJECT`.
 
+### Separately consented historical receipts
+
+`receipt` stores optional **agent-reported history**, never an outcome, original
+observation, scope-transfer assessment, permission grant or eligibility token.
+Receipt publication cannot increase support, score, maturity or KG authority.
+The actual target repository/rule and task context remain those of the original
+packet; foreign source helpfulness and consent do not transfer.
+The legacy schema-1 adapter receipt used by `draft` is unchanged and is not this
+new persisted envelope.
+
+```bash
+"$MPY" "$DREAM_SCRIPTS/dream_procedure.py" receipt --palace "$PALACE" --wing project \
+  --input "$ARTIFACTS/unsigned-receipt.json" --permissions "$ARTIFACTS/permissions.json" \
+  --prepare --out "$ARTIFACTS/receipt.json"
+"$MPY" "$DREAM_SCRIPTS/dream_procedure.py" receipt --palace "$PALACE" --wing project \
+  --input "$ARTIFACTS/receipt.json" --permissions "$ARTIFACTS/permissions.json" --dry-run
+"$MPY" "$DREAM_SCRIPTS/dream_procedure.py" receipt --palace "$PALACE" --wing project \
+  --input "$ARTIFACTS/receipt.json" --permissions "$ARTIFACTS/permissions.json"
+"$MPY" "$DREAM_SCRIPTS/dream_procedure.py" receipt-get --palace "$PALACE" --wing project \
+  --receipt-id "delivery:$REQUEST_UUID"
+"$MPY" "$DREAM_SCRIPTS/dream_procedure.py" delivery-status --palace "$PALACE" --wing project \
+  --context "$ARTIFACTS/context.json"
+```
+
+Preparation fills **only a missing digest**; identity, time, acknowledgment,
+action and permission-reference facts must already be supplied. It never grants
+publication. Prepare/dry-run/history do not construct a writer. Outputs use
+exclusive creation outside the palace. `context.json` contains `TaskContext`
+itself, not the current-use `{context, checked_at}` wrapper.
+
+The exact receipt fields are `schema_version:1`, `kind:"procedural_receipt"`,
+`receipt_id`, `record_type`, UTC `recorded_at`, `authority:"agent_reported"`,
+`context_digest`, `receipt_permission_ref`, `payload`, and `digest`.
+The digest is SHA-256 of canonical UTF-8 JSON excluding `digest` itself.
+Unknown fields (including outcome, score, scope or independent-evidence claims)
+are rejected, not ignored.
+
+* Delivery: ID `delivery:<packet request UUID>`, `record_type:"delivery"`,
+  payload `{packet, acknowledgment:"read_full_packet"}`. Report only after
+  reading the complete packet. The packet and full context are stored **once**.
+  The receipt time cannot precede packet generation.
+* Application: ID `application:<action UUID>`, `record_type:"application"`,
+  payload `{delivery_receipt_id, rule_id, disposition, action, action_reference}`.
+  `disposition` is `applied` (already performed, not intended) or `not_applied`.
+  `action` is nonblank, at most 1,600 characters; for `not_applied` it is the
+  explicit reason. `action_reference` is null or a nonblank locator of at most
+  512 characters. Resolve context from the retained delivery parent, verify
+  exact context digest and rule membership, and report no earlier than the
+  parent. An empty packet cannot have applications. Missing reports mean
+  **unknown**, not nonapplication or success.
+
+Every **new** prepare/dry-run/append requires fresh separate advice and receipt
+permissions for the packet's exact repository/wing/session/actor; both must be
+`allow`, with distinct user-message references. The receipt's
+`receipt_permission_ref` must equal current `receipts_ref`. The witness expires
+after 60 seconds and future times fail. Publication rereads the permission file
+under the sanctioned MCP writer lease **and** palace mutation lock, after a
+second race lookup. Receipt-only opt-out leaves ordinary advice possible;
+advice opt-out also stops fresh receipt publication. These are cooperative
+checks, not host-authenticated consent or an atomic guarantee against an
+external revocation after the last check.
+
+An initial **read-only exact-ID/digest lookup precedes writer construction and
+permission access**. Identical committed retries return `already_exists` even
+after opt-out, without `--permissions`, or when the installed writer is disabled.
+A changed envelope at that ID is a conflict. New records return `appended` only
+after exact readback. Ambiguous write/readback failures return
+`receipt_outcome_unknown` (nonzero): preserve and retry the **identical artifact**,
+never manufacture a replacement occurrence ID. Missing permission is allowed
+only for that verified already-committed acknowledgment.
+
+Historical reporting deliberately does **not** call `use-check`, re-rank rules,
+or require present-day rule eligibility: a truthful retrospective report can
+mention a now-retired rule or an old packet. Fresh persistence permission is
+still required. History remains readable after host artifacts are lost.
+`delivery-status` reports exact matching and prior-revision delivery IDs,
+application reports and `(delivery_receipt_id, rule_id)` pairs with unknown
+application history. Its notice is “Agent-reported history; not current
+eligibility or helpfulness.” Empty history is neither disabled advice nor
+healthy empty guidance. Existing procedural health/status projections do not
+read receipt bodies.
+
+Receipts live in `procedural-receipts`, with `kind=procedural_receipt`,
+`generated_summary=true`, and author `dream-procedure-receipt`. One shared
+encoder enforces a 32-KiB packet, 4-KiB wrapper, 2-KiB metadata/header budget and
+64-KiB complete UTF-8 receipt budget including serialized newlines, native
+metadata **and** fallback trailer. Escaping counts; no truncation is allowed.
+Strict paged exact chunk reads cap each wing at 5,000 logical storage records,
+including identical physical copies. Corruption, incomplete chunks, missing
+delivery parents, disagreement and overflow are errors, never empty history.
+
+Native/trailer metadata and identifiable full-text copies are generated evidence.
+Direct original admission, captured revalidation and draft echo checks reject
+whole receipt fields even when a narrow quote omits the marker, including
+raw/fenced/prose/JSON-string wrappers. Genuine later independent originals remain
+subject to the existing source gates. Deliberately removed markers or paraphrases
+are not reliably detectable.
+
+Reserved receipt drawers and all their physical chunks remain protected from
+package deletion even if their bodies are corrupt. Existing rule/source-parent
+retention remains unchanged after retirement; a corrupt receipt does not alter
+rule projection. Whole-palace physical restore validates receipts and parent
+closure before publication. Logical wing import and `dream_restore` refuse
+identity-reminting replay, including wrapped trailers and partial selections.
+Keep these guards when disabling receipt production or rolling back delivery.
+
 ### Task-bound delivery and cooperative use checks
 
 `guidance` retains its existing interface and v1 meaning. The additive
@@ -192,9 +299,9 @@ The first four fields must match the context. References are actual
 user-message locators, at most 512 characters, nullable unless the corresponding
 permission is `allow`. Advice-only permission uses `receipts=deny`.
 Candidate delivery additionally requires `trials=allow`; source-repository
-consent or approval is not target permission. The API's receipt preflight
-requires both permissions and separate references, but **receipt publication
-is not implemented by these commands**.
+consent or approval is not target permission. The separate `receipt` command
+requires both permissions and separate references; `task-guidance` and
+`use-check` never publish receipts implicitly.
 
 All witnesses require explicit UTC timestamps, neither future nor more than
 60 seconds old, rechecked after source/model work. The CLI also rereads current,
@@ -321,8 +428,8 @@ unavailable without fallback to another checkout.
 #### Generated packet exclusion before admission
 
 `dream_metadata.generated_transport_kind` and `reject_generated_transport`
-recognize `procedural_delivery_packet` throughout the **complete source
-field/body**, as well as the actual transient `procedural_applicability_witness`
+recognize `procedural_delivery_packet` and `procedural_receipt` throughout the
+**complete source field/body**, as well as the transient `procedural_applicability_witness`
 and `procedural_use_check` transports. These two markers prevent assessment and
 refreshed-advice copies from becoming a new evidence route; they introduce no
 persisted packet, receipt or authority. Raw/fenced/prose-wrapped copies, mixed commentary, JSON-equivalent
@@ -341,8 +448,8 @@ generated metadata checks remain independently required. Deliberately removed
 markers, paraphrases and otherwise unrecognizable provenance cannot be
 reliably classified; a negative result never certifies independence.
 Genuinely independent later observations remain eligible under existing
-scope/hash/time/review requirements. Future receipt producers must extend the
-same helper and source guards before emitting their new transport kind.
+scope/hash/time/review requirements. Receipt production uses this same registry
+and source guards rather than introducing a separate classifier.
 
 ```bash
 "$MPY" "$DREAM_SCRIPTS/dream_procedure.py" propose --palace "$PALACE" --wing project \
