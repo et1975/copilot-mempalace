@@ -129,6 +129,42 @@ class CommandTests(GroundedFixture):
         self.assertEqual(self.collection.rows, before)
         self.assertEqual(self.invoke("propose", json.loads(path.read_text()))[0], 0)
 
+    def test_feedback_adjudicate_is_a_read_command_with_explicit_decision_and_scope(self):
+        from dream_metadata import canonical_json
+        from dream_procedural_feedback import prepare_feedback
+        self.publish(self.proposal())
+        packet = prepare_feedback(
+            {"schema_version": 1, "repository": "owner/repo", "rule_id": self.proposal().rule_id,
+             "evidence": self.refs[:1]}, projection=self.projection(self.proposal()),
+            reader=self.published_reader(), as_of=NOW)
+        decision = Path(self.tmp.name, "decision.json")
+        decision.write_text(canonical_json({
+            "schema_version": 1, "packet_id": packet["packet_id"], "decision": "abstain",
+            "actor_kind": "human", "session_id": "legacy-reviewer", "recorded_at": stamp(),
+            "reason": "Original task success does not establish a rule-specific effect.",
+        }))
+        target = Path(self.tmp.name, "abstained.json")
+        flags = ("--repository", "owner/repo", "--decision", str(decision), "--out", str(target))
+        before = deepcopy(self.collection.rows)
+        with patch("dream_sessions.default_store_path", side_effect=AssertionError("hidden host")), \
+             patch("dream_procedural_validate._session_repository", side_effect=AssertionError("host")):
+            code, result, error = self.invoke("feedback-adjudicate", packet, *flags)
+        self.assertEqual(code, 0, error)
+        self.assertEqual(json.loads(target.read_text()), result)
+        self.assertEqual(result["kind"], "procedural_feedback_abstention")
+        self.assertEqual(self.collection.rows, before)
+        target.unlink()
+        for extra in (("--as-of", stamp()), ("--prepare",), ("--dry-run",),
+                      ("--receipt", str(decision)), ("--repository", "Owner/Repo"),
+                      ("--session-store", "")):
+            code, _, _ = self.invoke("feedback-adjudicate", packet, *flags, *extra)
+            self.assertNotEqual(code, 0, extra)
+            self.assertFalse(target.exists())
+        code, _, _ = self.invoke("feedback-adjudicate", packet,
+                                "--repository", "owner/repo", "--out", str(target))
+        self.assertEqual(code, 2)
+        self.assertFalse(target.exists())
+
     def test_explicit_polarities_count_once_per_source_session(self):
         self.invoke("propose", self.proposal())
         self.invoke("review", self.review())
