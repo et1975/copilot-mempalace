@@ -40,13 +40,25 @@ def _parser():
     parser = Parser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True, parser_class=Parser)
     for name in ("propose", "review", "outcome", "validate", "guidance", "explain",
-                 "capture-sources", "status", "draft"):
+                 "capture-sources", "status", "draft", "task-guidance", "use-check"):
         sub = commands.add_parser(name)
         sub.add_argument("--palace", required=True)
         sub.add_argument("--wing", required=True)
         sub.add_argument("--session-store", required=name == "capture-sources",
                          help="Original Copilot SQLite session store; opened read-only for acquisition")
-        if name in {"propose", "review", "outcome"}:
+        if name in {"task-guidance", "use-check"}:
+            sub.add_argument("--current", required=True,
+                             help="Fresh independent {context, checked_at} observation")
+            sub.add_argument("--permissions", required=True, help="Fresh separate permission witness")
+            if name == "task-guidance":
+                sub.add_argument("--request-id", required=True)
+                sub.add_argument("--out", required=True)
+            else:
+                sub.add_argument("--packet", required=True)
+                sub.add_argument("--rule-id", action="append", required=True)
+                sub.add_argument("--applicability",
+                    help="Fresh explicit condition/exception/constraint assessment; absent means withheld")
+        elif name in {"propose", "review", "outcome"}:
             sub.add_argument("--input", required=True)
             mode = sub.add_mutually_exclusive_group()
             mode.add_argument("--dry-run", action="store_true")
@@ -109,6 +121,53 @@ def _write_artifact(path, value):
         fh.write(canonical_json(value) + "\n")
 
 
+def _delivery(args, palace, as_of):
+    import dream_procedural_delivery as delivery
+    current = delivery.read_json(args.current, delivery.MAX_CURRENT_BYTES)
+    permission = delivery.read_json(args.permissions, delivery.MAX_PERMISSION_BYTES)
+    context = delivery.validate_current(current, as_of)
+    if context["wing"] != args.wing:
+        raise RequestError("current context wing mismatch")
+    applicability = (delivery.read_json(args.applicability, delivery.MAX_APPLICABILITY_BYTES)
+                     if getattr(args, "applicability", None) else None)
+
+    def refresh(context, now):
+        return delivery.refresh_guidance(palace, context, now)
+
+    def final_check():
+        latest_current = delivery.read_json(args.current, delivery.MAX_CURRENT_BYTES)
+        latest_permission = delivery.read_json(args.permissions, delivery.MAX_PERMISSION_BYTES)
+        latest_applicability = (delivery.read_json(args.applicability, delivery.MAX_APPLICABILITY_BYTES)
+                                if applicability is not None else None)
+        now = now_utc()
+        delivery.validate_current(latest_current, now)
+        delivery.consent(context, latest_permission, now)
+        if latest_current != current or latest_permission != permission:
+            raise RequestError("current context or permission changed during delivery")
+        if latest_applicability != applicability:
+            raise RequestError("applicability changed during delivery")
+        return now
+
+    if args.command == "task-guidance":
+        if Path(args.out).expanduser().is_symlink():
+            raise RequestError("packet output must be a new regular file, not a symlink")
+        target = _artifact_path(args.out, palace)
+        result = delivery.build_packet(current, permission, args.request_id, refresh, as_of,
+                                       clock=final_check)
+        _write_artifact(target, result)
+        return result
+    packet = delivery.read_json(args.packet, delivery.MAX_PACKET_BYTES)
+    try:
+        items = delivery.preflight_use(packet, current, permission, args.rule_id, refresh, as_of,
+                                       applicability=applicability, clock=final_check)
+    except delivery.AdviceWithheld as exc:
+        return {"kind": "procedural_use_check", "authority": "agent_reported",
+                "status": "withheld", "items": [], "checked_at": to_data(now_utc()), "reason": str(exc)}
+    return {"kind": "procedural_use_check", "authority": "agent_reported",
+            "status": "usable", "items": items, "checked_at": to_data(now_utc()),
+            "notice": "Cooperative current check, not semantic proof or a durable authorization token; recheck before action."}
+
+
 def _execute(args):
     palace = os.path.realpath(os.path.expanduser(args.palace))
     from dream_procedural_palace import _wing
@@ -117,6 +176,8 @@ def _execute(args):
     # Offline before any installed-library lazy import (including storage).
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    if args.command in {"task-guidance", "use-check"}:
+        return _delivery(args, palace, as_of)
     if args.command == "status":
         from dream_procedural_palace import procedural_status
         return procedural_status(palace, args.wing, args.repository, as_of=as_of)
@@ -224,7 +285,8 @@ def main(argv=None) -> int:
     try:
         args = _parser().parse_args(argv)
         from dream_procedural_palace import nonmutating_read
-        read_only = args.command in {"validate", "guidance", "explain", "status", "draft"} or \
+        read_only = args.command in {"validate", "guidance", "explain", "status", "draft",
+                                     "task-guidance", "use-check"} or \
             getattr(args, "dry_run", False) or getattr(args, "prepare", False)
         # Imported handlers/models may print; keep the command's stdout strictly JSON.
         with redirect_stdout(sys.stderr), (nonmutating_read(args.palace) if read_only else nullcontext()):

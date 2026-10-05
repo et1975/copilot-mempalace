@@ -3,11 +3,59 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from typing import Any
 
 MARKER = "<!--dreaming-meta:"
-GENERATED_KINDS = frozenset({"lesson", "reflect", "procedural_event", "procedural_source"})
+GENERATED_TRANSPORT_KINDS = frozenset({
+    "procedural_delivery_packet", "procedural_applicability_witness", "procedural_use_check",
+})
+GENERATED_KINDS = frozenset({"lesson", "reflect", "procedural_event", "procedural_source"}) \
+    | GENERATED_TRANSPORT_KINDS
+_JSON_STRING = r'"(?:[^"\\\x00-\x1f]|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))*"'
+_TRANSPORT_PAIRS = re.compile(rf'(?P<key>{_JSON_STRING})\s*:\s*(?P<value>{_JSON_STRING})')
+_TRANSPORT_TOKENS = re.compile(_JSON_STRING)
+
+
+class GeneratedTransportEvidence(ValueError):
+    code = "generated_transport"
+
+
+class TransportInspectionLimit(ValueError):
+    code = "transport_inspection_limit"
+
+
+def generated_transport_kind(full_text: str) -> str | None:
+    """Recognize marked copies, including JSON strings in prose/fences.
+
+    This is not a classifier for deliberately stripped provenance or agent prose.
+    Four decoding layers bound supported wrappers; uncertainty is not evidence.
+    """
+    if not isinstance(full_text, str):
+        raise ValueError("transport inspection requires a complete text field")
+    pending = [full_text]
+    for _ in range(4):
+        decoded = []
+        for text in pending:
+            for match in _TRANSPORT_PAIRS.finditer(text):
+                key, value = (json.loads(match.group(name)) for name in ("key", "value"))
+                if key == "kind" and value in GENERATED_TRANSPORT_KINDS:
+                    return value
+            for match in _TRANSPORT_TOKENS.finditer(text):
+                value = json.loads(match.group())
+                if '"' in value or "\\" in value:
+                    decoded.append(value)
+        if not decoded:
+            return None
+        pending = decoded
+    raise TransportInspectionLimit("bounded full-source transport check is inconclusive")
+
+
+def reject_generated_transport(full_text: str) -> None:
+    kind = generated_transport_kind(full_text)
+    if kind is not None:
+        raise GeneratedTransportEvidence(f"generated transport is not original evidence: {kind}")
 
 
 def canonical_json(value: Any) -> str:
@@ -32,8 +80,16 @@ def _invalid_constant(value):
     raise ValueError(f"non-finite JSON value: {value}")
 
 
+def _finite_float(value):
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        _invalid_constant(value)
+    return parsed
+
+
 def strict_json(text: str) -> Any:
-    return json.loads(text, object_pairs_hook=_unique_pairs, parse_constant=_invalid_constant)
+    return json.loads(text, object_pairs_hook=_unique_pairs, parse_constant=_invalid_constant,
+                      parse_float=_finite_float)
 
 
 def split_dream_metadata(drawer: dict) -> tuple[str, dict]:
@@ -63,7 +119,8 @@ def split_dream_metadata(drawer: dict) -> tuple[str, dict]:
     generated_writer = native.get("added_by") in {
         "dreaming", "dream-reflect", "dream-procedure", "dream-procedure-source"}
     if lines and (fence is None or generated_writer) and lines[-1].startswith(MARKER):
-        decoder = json.JSONDecoder(object_pairs_hook=_unique_pairs, parse_constant=_invalid_constant)
+        decoder = json.JSONDecoder(object_pairs_hook=_unique_pairs, parse_constant=_invalid_constant,
+                                   parse_float=_finite_float)
         body = lines[-1][len(MARKER):].lstrip()
         metadata, end = decoder.raw_decode(body)
         if not isinstance(metadata, dict) or body[end:].strip() != "-->":
@@ -91,7 +148,8 @@ def is_generated_observation(drawer: dict) -> bool:
             or metadata.get("generated_from") in GENERATED_KINDS
             or metadata.get("added_by") in {"dream-procedure", "dream-reflect", "dream-procedure-source"}
             or metadata.get("room") == "procedural-sources"
-            or bool(metadata.get("generated_summary")))
+            or bool(metadata.get("generated_summary"))
+            or generated_transport_kind(drawer.get("text", "")) is not None)
 
 
 def is_procedural_record(drawer: dict) -> bool:

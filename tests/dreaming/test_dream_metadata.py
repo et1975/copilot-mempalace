@@ -195,3 +195,56 @@ class AdmissionTests(unittest.TestCase):
             {"a": "alpha", "b": "beta"})
         self.assertFalse(result["ok"])
         self.assertIn("ungrounded", result["rejects"])
+def test_packet_transport_detection_handles_complete_wrapped_escaped_envelopes():
+    from delivery_fixtures import wrapped_packet
+    from dream_metadata import reject_generated_transport, is_generated_observation
+    import pytest
+    for wrapper in ("{}", "```json\n{}\n```", "Copied report:\n{}\nEnd."):
+        for encoded in (False, True):
+            text = wrapped_packet(wrapper, encoded)
+            with pytest.raises(ValueError, match="generated"):
+                reject_generated_transport(text)
+            assert is_generated_observation({"text": text, "metadata": {}})
+    reject_generated_transport("The parser failed later on input X; the observed error was Y.")
+
+
+def test_transport_inspection_depth_is_explicit_not_independent_evidence():
+    from dream_metadata import canonical_json, reject_generated_transport
+    import pytest
+    text = '{"ki\\u006ed":"procedural_delivery_packet"}'
+    with pytest.raises(ValueError, match="generated"):
+        reject_generated_transport(text)
+    for _ in range(6):
+        text = canonical_json(text)
+    with pytest.raises(ValueError, match="inconclusive"):
+        reject_generated_transport(text)
+
+
+def test_strict_json_rejects_numeric_overflow_not_just_nonstandard_constants():
+    from dream_metadata import canonical_json, strict_json, decode_dream_metadata
+    import pytest
+    for value in ("1e999", "-1e999", "NaN", "Infinity"):
+        with pytest.raises(ValueError, match="finite"):
+            strict_json('{"score":' + value + "}")
+        with pytest.raises(ValueError, match="finite"):
+            decode_dream_metadata({"metadata": {}, "text": '\n<!--dreaming-meta: {"score":' + value + "}-->"})
+    for value in (float("nan"), float("inf"), -float("inf")):
+        with pytest.raises(ValueError):
+            canonical_json({"score": value})
+
+
+def test_transient_applicability_and_use_results_are_generated_not_new_support():
+    from delivery_fixtures import applicability, case
+    from dream_metadata import canonical_json, reject_generated_transport
+    import pytest
+    packet, current, _, guidance = case()
+    artifacts = [
+        applicability(current["context"], guidance["rules"]),
+        dict(kind="procedural_use_check", authority="agent_reported", status="usable",
+             items=guidance["rules"], checked_at=guidance["as_of"],
+             notice="Cooperative current check, not semantic proof or a durable authorization token; recheck before action."),
+    ]
+    for artifact in artifacts:
+        for wrapped in (canonical_json(artifact), canonical_json(canonical_json(artifact))):
+            with pytest.raises(ValueError, match="generated"):
+                reject_generated_transport("Copied result:\n" + wrapped + "\nEnd.")

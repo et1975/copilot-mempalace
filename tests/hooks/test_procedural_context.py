@@ -29,11 +29,11 @@ def packet():
         "policy_version": "procedural-v1", "as_of": "2026-09-26T20:00:00Z",
         "repository": "owner/repo", "status": "ok", "item_count": 1,
         "omitted_count": 0, "rules": [{
-            "rule_id": "rule-one", "rule_type": "rule", "statement": "Keep original evidence.",
+            "rule_id": "proc:" + "a" * 64, "rule_type": "rule", "statement": "Keep original evidence.",
             "applies_when": "Changing memory adapters", "exceptions": ["Not generated lineage"],
             "maturity": "established", "effective_score": 1.0, "relevance": 0.8,
             "latest_validation": "2026-09-26T20:00:00Z",
-            "evidence": [{"source_kind": "session", "source_id": "original-one"}],
+            "evidence": [{"source_kind": "session_turn", "source_id": "original-one"}],
             "delivery": "guidance",
         }], "anti_patterns": [], "trials": [],
     }
@@ -81,6 +81,9 @@ class AdapterTests(unittest.TestCase):
             "    with out.open('x') as f: f.write(json.dumps(draft)+'\\n')\n"
             "    print(json.dumps(draft))\n", encoding="utf-8")
         self.backend.chmod(0o600)
+        core = SCRIPT.parent.parent / "skills" / "dreaming" / "scripts"
+        for name in ("dream_metadata", "dream_procedural", "dream_procedural_guidance"):
+            shutil.copyfile(core / f"{name}.py", self.backend.parent / f"{name}.py")
         self.config = self.root / "config.json"
         self.settings = {
             "schema_version": 1, "mode": "guidance_drafts", "python": sys.executable,
@@ -158,6 +161,72 @@ class AdapterTests(unittest.TestCase):
         self.invoke("prompt", self.event("prompt", dialect=dialect))
         self.invoke("before-tool", self.event("before-tool", dialect=dialect))
         return self.invoke("after-tool", self.event("after-tool", dialect=dialect))
+
+    def test_standalone_hook_uses_separately_configured_checkout_for_delivery_and_receipt(self):
+        standalone = self.root / "standalone"
+        standalone.mkdir()
+        hook = standalone / "procedural_context.py"
+        shutil.copyfile(SCRIPT, hook)
+        checkout = self.root / "configured-checkout"
+        checkout.mkdir()
+        for path in (self.backend, self.result, *[
+                self.root / f"{name}.py" for name in
+                ("dream_metadata", "dream_procedural", "dream_procedural_guidance")]):
+            path.rename(checkout / path.name)
+        self.backend = checkout / self.backend.name
+        self.result = checkout / self.result.name
+        self.calls = checkout / self.calls.name
+        self.settings["procedure_script"] = str(self.backend)
+        self.write_config()
+        self.assertFalse((hook.parent.parent / "skills").exists())
+        with patch(__name__ + ".SCRIPT", hook):
+            result = self.deliver()
+            self.assertEqual(json.loads(self.pointer(result).read_text()), packet())
+            stopped = self.invoke("stop")
+        self.assertIn("review-only draft", stopped.stderr)
+        self.assertEqual([args[0] for args in self.recorded_calls()], ["guidance", "draft"])
+
+    def test_configured_validator_absence_or_untrusted_path_never_falls_back_to_hook_checkout(self):
+        validator = self.backend.parent / "dream_procedural_guidance.py"
+        for defect in ("missing", "symlink", "writable"):
+            with self.subTest(defect=defect):
+                original = validator.read_bytes()
+                if defect == "missing":
+                    validator.unlink()
+                elif defect == "symlink":
+                    validator.unlink()
+                    validator.symlink_to(SCRIPT.parent.parent / "skills" / "dreaming" / "scripts"
+                                         / "dream_procedural_guidance.py")
+                else:
+                    validator.chmod(0o666)
+                result = self.deliver()
+                self.assertEqual(result.stdout, "")
+                self.assertIn("unavailable", result.stderr)
+                if validator.is_symlink():
+                    validator.unlink()
+                validator.write_bytes(original)
+                validator.chmod(0o600)
+
+    def test_foreign_import_cache_cannot_override_configured_validator_or_dependencies(self):
+        from types import ModuleType
+        module = self.load_adapter()
+        cfg = module.load_config(str(self.config), str(self.repo))
+        foreign = {}
+        for name in ("dream_metadata", "dream_procedural", "dream_procedural_guidance"):
+            foreign[name] = ModuleType(name)
+            foreign[name].__file__ = str(self.root / "foreign" / f"{name}.py")
+        foreign["dream_procedural_guidance"].validate_guidance = lambda *args, **kwargs: packet()
+        prior_path = list(sys.path)
+        with patch.dict(sys.modules, foreign):
+            for mode in ("prompt", "before-tool"):
+                module.handle(cfg, module.normalize(mode, self.event(mode)))
+            malformed = dict(packet(), item_count=True)
+            with self.assertRaisesRegex(module.Unavailable, "count"):
+                module.handle(cfg, module.normalize("after-tool", self.event("after-tool")),
+                              lambda *args: encode(malformed).encode())
+            for name, cached in foreign.items():
+                self.assertIs(sys.modules[name], cached)
+            self.assertEqual(sys.path, prior_path)
 
     def test_missing_or_off_config_has_no_state_or_child_side_effects(self):
         self.invoke("prompt", config=False)
@@ -401,7 +470,7 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(receipt["schema_version"], 1)
         self.assertEqual(receipt["session_id"], "session-one")
         self.assertEqual(receipt["task_digest"], hashlib.sha256(b"Implement evidence adapter").hexdigest())
-        self.assertEqual(receipt["delivered_rule_ids"], ["rule-one"])
+        self.assertEqual(receipt["delivered_rule_ids"], ["proc:" + "a" * 64])
         self.assertEqual(result.stdout, "")
         self.assertIn("draft", result.stderr)
         self.invoke("stop")

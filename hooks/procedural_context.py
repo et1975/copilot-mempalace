@@ -9,6 +9,7 @@ evidence that the agent read or benefited from a rule.
 from __future__ import annotations
 
 import argparse
+import builtins
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -27,6 +28,7 @@ import sys
 import time
 import traceback
 from typing import Callable, Iterator
+from types import ModuleType
 import unicodedata
 import uuid
 
@@ -443,45 +445,40 @@ def utc(value: object) -> bool:
         return False
 
 
-def validate_guidance(raw: bytes, repository: str) -> dict:
-    require(len(raw) <= MAX_PACKET, "guidance exceeds byte budget")
-    serialized = raw.decode("utf-8")
-    require(serialized.endswith("\n") and len(serialized) <= 6000,
-            "guidance exceeds character budget or lacks serialized newline")
-    data = parse_json(serialized)
-    require(not any(key in data for key in ("error", "errors"))
-            and data.get("isError") is not True and data.get("success") is not False,
-            "guidance evidence unavailable")
-    require(data.get("repository") == repository, "guidance repository scope mismatch")
-    require(text(data.get("policy_version")) and utc(data.get("as_of")), "invalid guidance policy or time")
-    require(data.get("status") in ("ok", "no_rules", "no_eligible_rules"),
-            "guidance status unavailable")
-    require(data.get("trials") == [], "automatic candidate trials forbidden")
-    require(isinstance(data.get("rules"), list) and isinstance(data.get("anti_patterns"), list),
-            "invalid guidance sections")
-    items = data["rules"] + data["anti_patterns"]
-    require(natural(data.get("item_count")) and data["item_count"] == len(items) <= 5
-            and natural(data.get("omitted_count")), "invalid combined guidance count")
-    require((data["status"] == "ok") == bool(items), "inconsistent guidance status")
-    ids = set()
-    for item in items:
-        require(isinstance(item, dict), "invalid guidance item")
-        require(all(text(item.get(k)) for k in ("rule_id", "statement", "applies_when")),
-                "incomplete guidance rule")
-        require(item["rule_id"] not in ids, "duplicate guidance rule")
-        ids.add(item["rule_id"])
-        require(item.get("maturity") in ("established", "proven")
-                and item.get("delivery") == "guidance", "ineligible automatic guidance")
-        require(isinstance(item.get("exceptions"), list)
-                and all(isinstance(v, str) for v in item["exceptions"]), "invalid rule exceptions")
-        require(all(type(item.get(k)) in (int, float) and math.isfinite(item[k])
-                    for k in ("effective_score", "relevance")), "invalid guidance scores")
-        require(utc(item.get("latest_validation")), "guidance validation unavailable")
-        require(isinstance(item.get("evidence"), list) and bool(item["evidence"])
-                and all(isinstance(ref, dict) and text(ref.get("source_kind"))
-                        and text(ref.get("source_id")) for ref in item["evidence"]),
-                "guidance evidence unavailable")
-    return data
+def validate_guidance(raw: bytes, repository: str, procedure: Path) -> dict:
+    """Load the configured checkout's pure validator without foreign module reuse."""
+    directory = trusted_path(str(procedure)).parent
+    names = ("dream_metadata", "dream_procedural", "dream_procedural_guidance")
+    paths = {name: trusted_path(str(directory / f"{name}.py")) for name in names}
+    modules = {}
+
+    def local_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if level == 0 and name in names:
+            require(name in modules, "invalid shared validator dependency order")
+            return modules[name]
+        return builtins.__import__(name, globals, locals, fromlist, level)
+
+    try:
+        for name in names:
+            path = paths[name]
+            module = ModuleType(f"_procedural_context_{uuid.uuid4().hex}_{name}")
+            module.__file__ = str(path)
+            module.__dict__["__builtins__"] = {**vars(builtins), "__import__": local_import}
+            # Dataclasses resolve their defining module during construction.
+            # Only private invocation-local names enter sys.modules; neither
+            # ambient core modules nor sys.path are changed or trusted.
+            modules[name] = module
+            sys.modules[module.__name__] = module
+            exec(compile(path.read_bytes(), str(path), "exec"), module.__dict__)
+        return modules["dream_procedural_guidance"].validate_guidance(
+            raw, repository, as_of=datetime.now(timezone.utc))
+    except (ImportError, AttributeError, SyntaxError) as exc:
+        raise Unavailable(f"configured shared validator unavailable: {exc}") from exc
+    except ValueError as exc:
+        raise Unavailable(str(exc)) from exc
+    finally:
+        for module in modules.values():
+            sys.modules.pop(module.__name__, None)
 
 
 def search_succeeded(event: Event) -> bool:
@@ -582,7 +579,8 @@ def checked_receipt(config: Config, store: State, value: dict) -> dict:
     attempt = value["attempt"]
     require(isinstance(attempt, str) and re.fullmatch(r"[a-f0-9]{32}", attempt) is not None,
             "receipt has no delivery attempt")
-    packet = validate_guidance(store.read(f"guidance-{attempt}.json"), config.scope.repository)
+    packet = validate_guidance(store.read(f"guidance-{attempt}.json"),
+                               config.scope.repository, config.procedure)
     require(receipt.get("guidance_as_of") == packet["as_of"]
             and receipt.get("delivered_rule_ids") == [
                 item["rule_id"] for item in packet["rules"] + packet["anti_patterns"]],
@@ -653,7 +651,7 @@ def handle(config: Config, event: Event, runner: Runner = run_child) -> bytes:
             "--max-bytes", "8192",
         ]
         raw = runner(argv, config.scope.root, MAX_PACKET)
-        data = validate_guidance(raw, config.scope.repository)
+        data = validate_guidance(raw, config.scope.repository, config.procedure)
         name = f"guidance-{snapshot['attempt']}.json"
         output = context_output(event, f"[procedural-context] {data['status']}; complete packet: {store.path / name}")
         with store.locked() as value:

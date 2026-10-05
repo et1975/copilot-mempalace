@@ -24,6 +24,45 @@ from types import SimpleNamespace
 
 
 class CommandTests(GroundedFixture):
+    def test_direct_commands_reject_copied_complete_delivery_without_new_captures(self):
+        from delivery_fixtures import wrapped_packet
+        from dream_metadata import content_hash
+        self.invoke("propose", self.proposal())
+        self.invoke("review", self.review())
+        for field in ("user_message", "assistant_response", "drawer"):
+            text = wrapped_packet("Original commentary:\n{}\nEnd.")
+            session = self.refs[3]["session_id"]
+            if field == "drawer":
+                text = f"SESSION_ID: {session}\nOBSERVED_AT: {stamp()}\n" + text
+                self.collection.rows["source-4"]["text"] = text
+                ref = dict(self.refs[3], source_hash=content_hash(text), quote="Add a parser regression")
+            else:
+                with sqlite3.connect(self.store) as con:
+                    con.execute(f"UPDATE turns SET {field}=? WHERE session_id=?", (text, session))
+                ref = dict(source_kind="session_turn", source_id=session, session_id=session,
+                           source_hash=content_hash(text), quote="Add a parser regression",
+                           turn_index=0, field=field)
+            proposal = event_data("proposal", 80, origin_drawer_ids=[], evidence=[ref, *self.refs[:2]])
+            review = event_to_data(self.review(81, parent_review_ids=[self.review().event_id]))
+            packet = review["payload"]["validation_packet"]
+            packet["evidence"][0] = ref
+            review["payload"]["validation_digest"] = sha(packet)
+            review["payload"]["dispositions"][0] = dict(evidence_id=ref["source_id"],
+                disposition="supports", reason="Original observed support.", evidence=[ref])
+            review = resign(review)
+            outcome = event_data("outcome", 82, source_session_id=session, evidence=[ref])
+            for command, event in (("propose", proposal), ("review", review), ("outcome", outcome)):
+                for mode in ("append", "dry-run", "prepare"):
+                    before = deepcopy(self.collection.rows)
+                    target = Path(self.tmp.name, f"{field}-{command}-{mode}.json")
+                    flags = (() if mode == "append" else ("--dry-run",) if mode == "dry-run"
+                             else ("--prepare", "--out", str(target)))
+                    code, result, err = self.invoke(command, event, *flags)
+                    self.assertNotEqual(code, 0, (field, command, mode, err))
+                    self.assertIn("generated", result["error"])
+                    self.assertEqual(self.collection.rows, before)
+                    self.assertFalse(target.exists())
+
     def invoke(self, command, event=None, *extra):
         from dream_procedure import main
         args = [command, "--palace", self.path, "--wing", "w"]

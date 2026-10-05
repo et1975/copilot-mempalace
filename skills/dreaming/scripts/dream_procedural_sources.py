@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Literal
 import dream_palace
 from dream_metadata import (
     assemble_exact_chunks, canonical_json, content_hash, decode_dream_metadata,
-    exact_chunk_groups, is_generated_observation, strict_json,
+    exact_chunk_groups, is_generated_observation, reject_generated_transport, strict_json,
 )
 from dream_procedural import EvidenceReference, _evidence, repository_key, to_data, utc_datetime
 from dream_procedural_palace import _wing
@@ -110,7 +110,10 @@ def _substantive(source: OriginalSource) -> dict:
 
 
 def _check_text(ref: EvidenceReference, text: str) -> None:
-    if not isinstance(text, str) or content_hash(text) != ref.source_hash \
+    if not isinstance(text, str):
+        raise ValueError(f"source must be a complete text field: {ref.source_id}")
+    reject_generated_transport(text)
+    if content_hash(text) != ref.source_hash \
             or not ref.quote.strip() or ref.quote not in text:
         raise ValueError(f"source hash/quote drift: {ref.source_id}")
 
@@ -312,6 +315,7 @@ def _decode_record(drawer: dict, key: str, locator: SourceLocator) -> dict:
         text = data.get("captured_text")
         if not isinstance(text, str) or content_hash(text) != ref.source_hash:
             raise ValueError("captured source body/hash mismatch")
+        reject_generated_transport(text)
     elif "captured_text" in data:
         raise ValueError("drawer witnesses must not copy original bodies")
     return data

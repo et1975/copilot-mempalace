@@ -12,7 +12,8 @@ import sys
 import dream_palace
 import dream_sessions
 from dream_metadata import (canonical_json, content_hash, decode_dream_metadata,
-                            is_generated_observation, is_source_record_metadata)
+                            is_generated_observation, is_source_record_metadata,
+                            reject_generated_transport)
 from dream_procedural import (
     EvidenceReference, OutcomePayload, Policy, ProposalPayload, ReviewPayload,
     ValidationPacket, adverse_evidence_ids, canonical_rule_id, event_evidence, project_rules,
@@ -118,7 +119,10 @@ def acquire_original(ref: EvidenceReference, *, palace: str, session_store: str)
                                       code="original_turn_missing")
         text = matches[0].get(ref.field)
         observed = utc_datetime(matches[0]["timestamp"])
-    if not isinstance(text, str) or content_hash(text) != ref.source_hash \
+    if not isinstance(text, str):
+        raise ValueError(f"original source must be a complete text field: {ref.source_id}")
+    reject_generated_transport(text)
+    if content_hash(text) != ref.source_hash \
             or not ref.quote.strip() or ref.quote not in text:
         raise ValueError(f"source hash/quote drift: {ref.source_id}")
     return OriginalSource(ref, repository, observed,

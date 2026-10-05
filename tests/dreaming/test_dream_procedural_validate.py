@@ -86,6 +86,55 @@ class GroundedFixture(unittest.TestCase):
 
 
 class GroundingTests(GroundedFixture):
+    def test_transient_applicability_and_use_result_are_not_original_turn_or_drawer_support(self):
+        from delivery_fixtures import applicability, case
+        from dream_metadata import canonical_json, content_hash
+        from dream_procedural import EvidenceReference
+        from dream_procedural_validate import acquire_original
+        _, current, _, guidance = case()
+        session = self.refs[0]["session_id"]
+        artifacts = [
+            applicability(current["context"], guidance["rules"]),
+            dict(kind="procedural_use_check", authority="agent_reported", status="usable",
+                 items=guidance["rules"], checked_at=guidance["as_of"],
+                 notice="Cooperative current check, not semantic proof or a durable authorization token; recheck before action."),
+        ]
+        for artifact in artifacts:
+            copied = canonical_json(artifact)
+            for field in ("user_message", "assistant_response", "drawer"):
+                text = f"SESSION_ID: {session}\nOBSERVED_AT: {stamp()}\n```json\n{copied}\n```"
+                if field == "drawer":
+                    self.collection.rows["source-1"]["text"] = text
+                    ref = EvidenceReference("drawer", "source-1", session, "parser", content_hash(text))
+                else:
+                    with sqlite3.connect(self.store) as con:
+                        con.execute(f"UPDATE turns SET {field}=? WHERE session_id=?", (text, session))
+                    ref = EvidenceReference("session_turn", session, session, "parser",
+                                            content_hash(text), 0, field)
+                with self.assertRaisesRegex(ValueError, "generated"):
+                    acquire_original(ref, palace=self.path, session_store=self.store)
+
+    def test_complete_transport_rejected_in_both_original_turn_fields_and_drawer(self):
+        from delivery_fixtures import wrapped_packet
+        from dream_metadata import content_hash
+        from dream_procedural import EvidenceReference
+        from dream_procedural_validate import acquire_original
+        session = self.refs[0]["session_id"]
+        for wrapper in ("{}", "```json\n{}\n```", "Copied report:\n{}\nEnd."):
+            for field in ("user_message", "assistant_response", "drawer"):
+                text = f"SESSION_ID: {session}\nOBSERVED_AT: {stamp()}\n" + wrapped_packet(wrapper)
+                if field == "drawer":
+                    self.collection.rows["source-1"]["text"] = text
+                    ref = EvidenceReference("drawer", "source-1", session,
+                                            "Add a parser regression", content_hash(text))
+                else:
+                    with sqlite3.connect(self.store) as con:
+                        con.execute(f"UPDATE turns SET {field}=? WHERE session_id=?", (text, session))
+                    ref = EvidenceReference("session_turn", session, session,
+                        "Add a parser regression", content_hash(text), 0, field)
+                with self.subTest(wrapper=wrapper, field=field), self.assertRaisesRegex(ValueError, "generated"):
+                    acquire_original(ref, palace=self.path, session_store=self.store)
+
     def test_validation_finds_captured_raw_fields_once_without_host_or_generated_copies(self):
         from dream_procedural_validate import build_validation_packet, ValidationLimits
         from dream_procedural_sources import AUTHOR

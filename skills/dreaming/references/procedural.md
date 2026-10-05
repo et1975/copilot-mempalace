@@ -17,7 +17,7 @@ Event chunks are reassembled without inserted delimiters. Records are historic,
 not instructions: resolve them through `guidance`/`explain` before use.
 
 New procedural commands support **existing SQLite-exact palaces only**. Strict
-read commands (`validate`, `guidance`, `explain`, `status`, `draft`, and write-command preparation/
+read commands (`validate`, `guidance`, `task-guidance`, `use-check`, `explain`, `status`, `draft`, and write-command preparation/
 dry-run) use WAL-aware read-only connections, including while a writer remains
 open. They observe committed, uncheckpointed data and prohibit application-data
 and schema writes. SQLite may update SHM reader-coordination bytes; those are
@@ -143,6 +143,206 @@ MemPalace, and `DREAM_SCRIPTS` to the absolute path of the dreaming skill's
 `scripts/` directory. Examples also use `$PALACE`, `$ARTIFACTS` and `$STORE`
 (session-store.db). `$ARTIFACTS` must be outside the palace and checkout.
 All commands require `--palace PATH --wing PROJECT`.
+
+### Task-bound delivery and cooperative use checks
+
+`guidance` retains its existing interface and v1 meaning. The additive
+`task-guidance` command offers complete eligible advice in a bounded packet;
+it is not acknowledgment, intention, application, helpfulness, enrollment or
+an authorization token. Ordinary recall and actual repository opt-in precede
+these commands. They never write palace records or construct a writer.
+
+```bash
+"$MPY" "$DREAM_SCRIPTS/dream_procedure.py" task-guidance \
+  --palace "$PALACE" --wing project --current "$ARTIFACTS/current.json" \
+  --permissions "$ARTIFACTS/permissions.json" --request-id "$REQUEST_UUID" \
+  --out "$ARTIFACTS/delivery.json"
+"$MPY" "$DREAM_SCRIPTS/dream_procedure.py" use-check \
+  --palace "$PALACE" --wing project --packet "$ARTIFACTS/delivery.json" \
+  --current "$ARTIFACTS/current.json" --permissions "$ARTIFACTS/permissions.json" \
+  --rule-id 'proc:SHA256' --applicability "$ARTIFACTS/applicability.json"
+```
+
+Both commands require a freshly, independently authored current observation:
+`{"context": TaskContext, "checked_at": UTC}`. Do not copy it from the packet,
+retained history or a previous session. Resolve current assignment, constraints,
+actual session and actor from the live conversation. Unknown identity abstains;
+never invent a worker identity. `TaskContext` has **exactly**:
+
+| Field | Contract |
+|---|---|
+| `repository`, `wing` | Canonical exact scope; each at most 256 UTF-8 bytes |
+| `session_id`, `actor_id`, `task_id` | Canonical UUIDs; `task_id` is an activity occurrence, not a durable task claim |
+| `revision` | Nonnegative integer, never boolean |
+| `task` | Nonblank, at most 16,384 UTF-8 bytes |
+| `constraints` | Explicit list of at most eight strings, at most 512 characters each |
+| `mode` | `established` or deliberate `approved_candidate_trial` |
+
+The canonical encoded context is at most 20 KiB. Changed requirements,
+constraints, actor, occurrence, repository or wing require a new context and
+packet; update the revision for changed requirements. Identical task wording
+does not identify the same occurrence. Constraint ordering is part of the
+exact context identity: reordering invalidates the packet, even if the same
+strings remain. Inputs are never silently sorted.
+
+The independent permission witness has exactly `repository`, `wing`,
+`session_id`, `actor_id`, `checked_at`, `advice`, `receipts`, `trials`,
+`advice_ref`, `receipts_ref`. Decisions are `allow`, `deny` or `unknown`.
+The first four fields must match the context. References are actual
+user-message locators, at most 512 characters, nullable unless the corresponding
+permission is `allow`. Advice-only permission uses `receipts=deny`.
+Candidate delivery additionally requires `trials=allow`; source-repository
+consent or approval is not target permission. The API's receipt preflight
+requires both permissions and separate references, but **receipt publication
+is not implemented by these commands**.
+
+All witnesses require explicit UTC timestamps, neither future nor more than
+60 seconds old, rechecked after source/model work. The CLI also rereads current,
+permission and applicability files before returning usable advice or emitting
+a packet; changed input refuses the operation. This catches old/changed
+snapshots, not fabrication or dishonest relabeling of stale input.
+
+The exact packet fields are `schema_version:1`,
+`kind:"procedural_delivery_packet"`, `status:"bound_guidance"`, `request_id`,
+`context`, `context_digest`, `guidance`, `guidance_digest`. Digests are SHA-256
+of canonical JSON (sorted keys, compact separators, Unicode retained, no
+nonfinite numbers, no trailing newline). Complete packet serialization,
+including its newline, is at most 32 KiB. Guidance retains the existing combined
+five-item, 6,000-character limit and adds the 8,192-byte transport bound.
+Whole items can be omitted to fit; conditions and exceptions are never
+truncated. Unknown fields, duplicate JSON keys, nonfinite/bool scores, malformed
+IDs, wrong sections, unsupported policy/mode and future times are rejected.
+Output files are exclusively created outside the palace.
+
+#### Applicability is explicit reasoning, not a ranking oracle
+
+Before intended use, read the **complete** offered condition, exceptions and
+sources. `use-check` requires a separate transient applicability witness to
+return usable items. It does not embed new scope/maturity annotations in the
+packet or enroll another repository. Missing or materially unknown fit
+withholds action. Similarity only ranks candidate advice; no keyword/model
+classifier determines whether an architecture, task or constraint is compatible.
+
+The applicability witness has exactly:
+
+```json
+{
+  "schema_version": 1,
+  "kind": "procedural_applicability_witness",
+  "authority": "agent_reported",
+  "context_digest": "<canonical TaskContext SHA-256>",
+  "checked_at": "<fresh UTC>",
+  "assessments": [{
+    "rule_id": "proc:<SHA-256>",
+    "rule_digest": "<complete rule-content SHA-256>",
+    "condition": {
+      "text": "<complete applies_when>",
+      "verdict": "satisfied",
+      "reason": "<why this condition holds in the live task>"
+    },
+    "exceptions": [{
+      "text": "<complete exception, in original order>",
+      "verdict": "absent",
+      "reason": "<why this exception does not apply>"
+    }],
+    "constraints": [{
+      "text": "<complete current constraint, in original order>",
+      "verdict": "compatible",
+      "reason": "<how the advice respects this constraint>"
+    }],
+    "supported_context": {
+      "verdict": "compatible",
+      "reason": "<compare supported target conditions with current architecture/tooling>"
+    }
+  }]
+}
+```
+
+Use empty exception/constraint arrays only when the complete rule/context
+arrays are empty. Assessments cover exactly the selected IDs (repeat
+`--rule-id` to select multiple). `rule_digest` hashes canonical JSON containing
+only `rule_id`, `rule_type`, `statement`, `applies_when`, `exceptions`, `evidence`;
+`dream_procedural_delivery.rule_content_digest` provides the implementation.
+Volatile ranking/decay scores do not invalidate a still-complete assessment.
+Every reason is nonblank and at most 512 characters; the entire transient
+witness including newline is at most 32 KiB.
+It is a transient generated transport, never an original observation or new
+support. Its marker is mandatory; do not remove it when copying the artifact.
+
+Condition verdicts are `satisfied|not_satisfied|unknown`; exception verdicts
+`absent|present|unknown`; constraint and supported-context verdicts
+`compatible|incompatible|unknown`. Only the first verdict of each set permits
+use. This is a cooperative reasoning witness, not semantic proof: fabricated
+reasons cannot be detected without an independent host/reviewer.
+The digest is compared with the **fresh** item's complete content, not the
+packet's old copy. Changed content rejects the stale witness. Recovery is a
+new `task-guidance` offer, complete rereading, and a newly authored current
+assessment; neither refreshing a timestamp nor rehashing without reassessment
+establishes fit. Each command still enforces the same 60-second/future boundary.
+
+Compatible, already enrolled local advice needs no repeat enrollment, dossier,
+fixed new evidence count or transfer assessment. Same-repository architecture
+drift, a present exception or materially unknown support withholds use without
+erasing evidence or demoting maturity. Foreign proven advice remains lineage
+for a target hypothesis: packet relabeling and attestations cannot bypass fresh
+exact-repository source, eligibility and target-original review gates.
+Legacy v1 records need no new annotation migration.
+
+Every use check executes fresh `read_events → project_rules(now) →
+revalidate_sources(EvidenceReader) → get_task_guidance`, even when context is
+unchanged. Ranking input is canonical `{"task": ..., "constraints": [...]}`.
+Selected IDs must occur in both the packet and fresh result. Return
+`status=usable`, fresh full `items`, and `checked_at`; act on that text, not
+cached items/scores. Use-check responses carry `kind=procedural_use_check` and
+`authority=agent_reported`; successful mechanical checks do not verify semantic
+applicability. Harm, retirement, conflicting reviews, staleness or healthy
+nonselection returns exit 0, `status=withheld`, no usable items.
+Missing/corrupt/drifted sources, unavailable models and storage failures remain
+nonzero errors, never a healthy empty result. Invalid contexts/witnesses are
+nonzero invalid requests.
+
+Sequence: ordinary recall/live permission → offer → full reading → use-check →
+visible intent. Recheck immediately before each advised action whenever any
+tool, event or time intervened. No atomic guarantee spans a cooperative check
+and later work; external writers or user changes require another check.
+Compaction/resume independently refreshes identity, context and permissions.
+Cached text, compact projections, old grants and future receipts cannot renew
+permission or postpone revocation. Hooks remain off; this is an explicit CLI
+path, not a claim of authenticated host interception.
+
+The optional adapter resolves shared validation from the trusted configured
+`procedure_script` directory, not from the hook's installation directory.
+Keep `dream_procedural_guidance.py`, `dream_procedural.py` and
+`dream_metadata.py` beside that script. Both delivery and retained-packet
+checks load these files in an isolated invocation scope; foreign module caches
+are neither reused nor replaced. Missing or untrusted files make advice
+unavailable without fallback to another checkout.
+
+#### Generated packet exclusion before admission
+
+`dream_metadata.generated_transport_kind` and `reject_generated_transport`
+recognize `procedural_delivery_packet` throughout the **complete source
+field/body**, as well as the actual transient `procedural_applicability_witness`
+and `procedural_use_check` transports. These two markers prevent assessment and
+refreshed-advice copies from becoming a new evidence route; they introduce no
+persisted packet, receipt or authority. Raw/fenced/prose-wrapped copies, mixed commentary, JSON-equivalent
+escaped markers and supported JSON-string wrappers are generated evidence,
+even with genuine session/repository/time stamps and a narrow quote omitting
+the marker. Direct proposal/review/outcome preparation/admission, capture
+construction, retained raw captures, live drawer witnesses and drafts share
+this check. Old marked captures remain stored but cannot supply current
+evidence; there is no host fallback, automatic splitting, deletion or rewriting.
+
+The helper is a narrow transport-kind registry, not a new runtime authority or
+semantic classifier. Four decoding layers bound inspection; exceeding them is
+explicit `transport_inspection_limit`, not independent evidence.
+Recognized copies report a generated-evidence diagnostic. Native/trailer
+generated metadata checks remain independently required. Deliberately removed
+markers, paraphrases and otherwise unrecognizable provenance cannot be
+reliably classified; a negative result never certifies independence.
+Genuinely independent later observations remain eligible under existing
+scope/hash/time/review requirements. Future receipt producers must extend the
+same helper and source guards before emitting their new transport kind.
 
 ```bash
 "$MPY" "$DREAM_SCRIPTS/dream_procedure.py" propose --palace "$PALACE" --wing project \

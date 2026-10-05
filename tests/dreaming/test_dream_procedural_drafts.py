@@ -48,6 +48,16 @@ class DraftFixture(GroundedFixture):
         return self.run_command("draft", *args, receipt=receipt or self.receipt())
 
 
+def test_shared_transport_guard_rejects_packet_echo_and_accepts_independent_later_observation():
+    from delivery_fixtures import applicability, case, wrapped_packet
+    from dream_procedural_drafts import is_procedural_echo
+    for wrapper in ("{}", "```json\n{}\n```", "Copied:\n{}\nLater commentary"):
+        assert is_procedural_echo(wrapped_packet(wrapper, encoded=True))
+    _, current, _, guidance = case()
+    assert is_procedural_echo(canonical_json(applicability(current["context"], guidance["rules"])))
+    assert not is_procedural_echo("A later run independently failed on input X with error Y.")
+
+
 class StatusTests(DraftFixture):
     def test_empty_health_needs_no_host_writer_or_embedder(self):
         before = deepcopy(self.collection.rows)

@@ -6,7 +6,7 @@ import re
 import sqlite3
 import stat
 
-from dream_metadata import canonical_json, content_hash, strict_json
+from dream_metadata import canonical_json, content_hash, generated_transport_kind, strict_json
 from dream_procedural import EvidenceReference, repository_key, to_data, utc_datetime
 
 MAX_RECEIPT_BYTES = 24576
@@ -58,6 +58,8 @@ def validate_receipt(receipt: dict, repository: str) -> dict:
 
 def is_procedural_echo(text: str) -> bool:
     """Known generated transport markers, not semantic evidence classification."""
+    if generated_transport_kind(text) is not None:
+        return True
     if "[procedural-context]" in text:
         return True
     # Rendered/fenced transport packets often accompany ordinary transcript

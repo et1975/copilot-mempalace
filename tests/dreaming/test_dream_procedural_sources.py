@@ -36,6 +36,58 @@ def original(text=RAW, **changes):
 
 
 class SourceTests(unittest.TestCase):
+    def test_new_packet_capture_is_rejected_before_any_writer_call(self):
+        from delivery_fixtures import wrapped_packet
+        text = wrapped_packet()
+        before = deepcopy(self.collection.rows)
+        with self.assertRaisesRegex(ValueError, "generated"):
+            self.capture(original(text, quote="Add a parser regression"))
+        self.assertEqual(self.collection.rows, before)
+
+    def test_pre_upgrade_captured_transport_rejected_without_host_or_rewrite(self):
+        from delivery_fixtures import applicability, case, wrapped_packet
+        from dream_procedural_sources import _HEADER, _metadata, source_key
+        from dream_procedural import to_data
+        from dream_procedural_validate import EvidenceReader
+        _, current, _, guidance = case()
+        texts = [
+            wrapped_packet("Copied report:\n{}\nEnd.", encoded=True),
+            canonical_json(applicability(current["context"], guidance["rules"])),
+            canonical_json(dict(kind="procedural_use_check", authority="agent_reported",
+                status="usable", items=guidance["rules"], checked_at=guidance["as_of"],
+                notice="Cooperative current check, not semantic proof or a durable authorization token; recheck before action.")),
+        ]
+        for text in texts:
+            ref = reference(text, quote="parser")
+            key = source_key(ref)
+            # Deliberately seed old bytes without the now-guarded capture constructor.
+            data = dict(schema_version=1, identity={k: v for k, v in to_data(ref).items() if k != "quote"},
+                        repository="owner/repo", observed_at="2026-09-23T00:00:00Z",
+                        captured_at="2026-09-23T00:00:00Z", captured_by="legacy", captured_text=text)
+            payload = canonical_json(data)
+            digest = content_hash(payload)
+            sanctioned_writer(self.path, self.collection).add_drawer(
+                "w", "procedural-sources", _HEADER.format(key=key, digest=digest) + payload,
+                added_by="dream-procedure-source", metadata=_metadata(key, digest))
+            before = deepcopy(self.collection.rows)
+            with self.assertRaisesRegex(ValueError, "generated"):
+                EvidenceReader(self.path, "w").resolve(ref)
+            self.assertEqual(self.collection.rows, before)
+
+    def test_pre_upgrade_drawer_witness_does_not_rescue_transport_body(self):
+        from delivery_fixtures import wrapped_packet
+        from dream_procedural_sources import OriginalSource
+        text = DRAWER + "\n" + wrapped_packet()
+        ref = EvidenceReference("drawer", "original", SESSION, "Add a parser regression",
+                                content_hash(text))
+        self.collection.rows["original"] = {"id": "original", "text": text,
+            "metadata": {"wing": "w", "room": "diary", "repository": "owner/repo"}}
+        self.capture(OriginalSource(ref, "owner/repo", NOW))
+        before = deepcopy(self.collection.rows)
+        with self.assertRaisesRegex(ValueError, "generated"):
+            self.resolve(ref)
+        self.assertEqual(self.collection.rows, before)
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="sources-", dir=os.environ["DREAMING_TEST_TMPDIR"])
         self.addCleanup(self.tmp.cleanup)
@@ -516,6 +568,34 @@ class SourceTests(unittest.TestCase):
 
 
 class InstalledSourceTests(unittest.TestCase):
+    def test_real_chunked_legacy_packet_capture_is_retained_but_rejected(self):
+        from delivery_fixtures import wrapped_packet
+        from dream_procedural import to_data
+        from dream_procedural_sources import _HEADER, _metadata, source_key
+        from dream_procedural_validate import EvidenceReader
+        from mempalace.palace import get_collection
+        with tempfile.TemporaryDirectory(dir=os.environ["DREAMING_TEST_TMPDIR"]) as path, \
+             installed_palace(path) as server:
+            get_collection(path, backend="sqlite_exact", create=True)
+            text = wrapped_packet("Copied field:\n{}\nIndependent-looking commentary.", encoded=True)
+            ref = reference(text, quote="Add a parser regression")
+            data = dict(schema_version=1, identity={k: v for k, v in to_data(ref).items() if k != "quote"},
+                        repository="owner/repo", observed_at="2026-09-23T00:00:00Z",
+                        captured_at="2026-09-23T00:00:00Z", captured_by="legacy", captured_text=text)
+            payload, key = canonical_json(data), source_key(ref)
+            digest = content_hash(payload)
+            writer = dream_palace.MempalaceWriter()
+            with patch.dict(server._config._file_config, {"chunk_size": 79}):
+                stored = writer.add_drawer(
+                    "w", "procedural-sources", _HEADER.format(key=key, digest=digest) + payload,
+                    added_by="dream-procedure-source", metadata=_metadata(key, digest))
+            col = server._get_collection()
+            before = tuple(col._handle.conn.iterdump())
+            with self.assertRaisesRegex(ValueError, "generated"):
+                EvidenceReader(path, "w").resolve(ref)
+            self.assertEqual(tuple(col._handle.conn.iterdump()), before)
+            self.assertIsNotNone(dream_palace.load_source_drawer(path, stored["drawer_id"]))
+
     def test_real_multichunk_drawer_witness_resolves_physical_identity_without_copying_body(self):
         from dream_procedural_sources import OriginalSource, capture_source, read_source_records, resolve_captured
         from mempalace.palace import get_collection
