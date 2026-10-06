@@ -23,6 +23,7 @@ refused rather than silently omitted. The table shows the default layout.
 | `config.json`, `tunnels.json` | include | Small JSON config/link state. |
 | `knowledge_graph.sqlite3` plus `-wal`, `-shm` | include | SQLite KG store; checkpoint before snapshot. |
 | `palace/chroma.sqlite3` plus `-wal`, `-shm` | include | Chroma metadata; checkpoint before snapshot. |
+| `palace/sqlite_exact.sqlite3` plus `-wal`, `-shm` | include | SQLite-exact drawers, including procedural events and source captures/witnesses. |
 | `palace/logstream.sqlite3` plus `-wal`, `-shm` | include | Events, complete task protocol bodies, artifacts and their links share this database. |
 | `palace/replica.json` | include | Stable provenance identity; never rotate it as a restore epoch. |
 | `.palace-backup.json` | include | Captured layout, expected authorities and task-content digest; not another task authority store. |
@@ -66,7 +67,7 @@ export destinations belong in the external session workspace, not the skill.
 
 The helper refuses active or malformed/unreadable hub/daemon records, acquires
 the real current-user HOME-relative MemPalace writer lease, checkpoints existing
-KG/Chroma/logstream databases, then holds bounded-acquisition SQLite
+KG/Chroma/SQLite-exact/logstream databases, then holds bounded-acquisition SQLite
 `BEGIN IMMEDIATE` writer exclusions through restic capture and verification.
 This keeps each main DB/WAL pair stable. It validates task history/artifacts and
 writes `.palace-backup.json` into the same HOME subtree before snapshotting.
@@ -98,6 +99,23 @@ incomplete restore marker is an error.
 Genuinely legacy palaces without logstream retain the old best-effort
 daemon/mine/checkpoint path and emergency `--force` behavior. That path is not
 a task-safe capture. Missing optional legacy logstream creates no database.
+
+### Published procedural evidence
+
+Procedural events, full raw-turn captures and original-drawer witnesses travel
+with palace storage. The host session database is ingestion-only once evidence
+is published; no companion host-store snapshot is required. Original drawers
+must remain in the same coherent physical snapshot because witnesses do not
+copy their bodies. Preserve the offline boundary: SQLite-exact inventory and
+writer guards do not make legacy backup online or task-safe.
+
+Before restore publication, the helper checks all retained source bodies,
+including orphan captures, and evidence/origin references in adverse and retired
+history. Missing/corrupt captures or original-drawer drift cannot be repaired by
+host fallback. Keep the complete sibling `dreaming/scripts` tree and an already
+installed MemPalace interpreter for procedural inspection. A stage without
+procedural records retains the generic memory-only path; task history still
+separately requires the task package.
 
 ### 4. Verify
 
@@ -135,6 +153,12 @@ restic init
 ```
 
 ## Wing-scoped logical export
+
+Procedural events and source records are archival only in logical exports.
+JSONL/markdown/legacy import rejects them across the complete bundle before
+writes, including clone/force modes: new drawer IDs cannot preserve immutable
+references and digests. Use a coherent whole-palace physical snapshot instead.
+The logical exporter currently reads Chroma SQLite, not SQLite-exact.
 
 `restic` backup is **physical and whole-palace only** — wings share the same
 ChromaDB collections, HNSW index, and SQLite databases, so a file snapshot cannot

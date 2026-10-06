@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Tests for palace_backup.py.
 
-Split into pure-function unit tests (no external tools) and SQLite integration
-tests (stdlib sqlite3 module only — no CLI, no restic, no live palace).
+Pure-function and SQLite tests plus installed-handler procedural integration.
+MemPalace and its model cache must already be installed for the latter; restic
+uses a physical-copy seam. All homes/storage are disposable, never a live palace.
 
 From the repository root, with ``PYTHONDONTWRITEBYTECODE=1`` exported:
 ``$TEST_PY -m pytest tests/mempalace-backup/test_palace_backup.py -q``.
@@ -22,6 +23,8 @@ from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 from uuid import UUID, uuid5
+
+import pytest
 
 import palace_backup as pb
 
@@ -199,6 +202,589 @@ def _make_wal_db(path: Path, rows: int) -> None:
     con.close()
 
 
+@contextlib.contextmanager
+def _published_procedural_palace(tmp_path, *, retired=False, orphan=False, origin=False, receipts=False):
+    """Real installed handlers; session input and all palace state are disposable."""
+    # MemPalace strips inherited PYTHONPATH on first import; preserve this
+    # runner's already selected fixture/pytest paths, not package resolution.
+    with patch.object(sys, "path", list(sys.path)):
+        import mempalace
+    import dream_palace
+    from chromadb.utils.embedding_functions.onnx_mini_lm_l6_v2 import ONNXMiniLM_L6_V2
+    from dream_procedural_palace import append_event
+    from dream_procedural import event_to_data
+    from test_dream_procedural import NOW
+    from test_dream_procedural_palace import installed_palace
+    from test_dream_procedural_validate import GroundedFixture
+
+    fixture = GroundedFixture()
+    fixture.setUp()
+    try:
+        fixture.storage_patch.stop()
+        home = tmp_path / "original"
+        data = home / "custom"
+        data.mkdir(parents=True)
+        (data / ".mempalace").mkdir()
+        (data / ".mempalace/origin.json").write_text("{}", encoding="utf-8")
+        fixture.path = str(data)
+        (home / "config.json").write_text(json.dumps({
+            "palace_path": str(data), "backend": "sqlite_exact"}), encoding="utf-8")
+        for ref in fixture.refs[:2]:
+            ref.update(source_kind="session_turn", source_id=ref["session_id"],
+                       turn_index=0, field="user_message")
+        cache = os.environ["DREAMING_TEST_MODEL_CACHE"]
+        with patch.object(ONNXMiniLM_L6_V2, "DOWNLOAD_PATH", cache), \
+                installed_palace(str(data)):
+            writer = dream_palace.MempalaceWriter()
+            with writer.mutation():
+                stored = writer.add_drawer("w", "diary", fixture.refs[2]["quote"])
+                fixture.refs[2]["source_id"] = stored["drawer_id"]
+                events = [fixture.proposal(), fixture.review()]
+                if origin:
+                    from dream_procedural import parse_event
+                    from test_dream_procedural import event_data
+                    stored = writer.add_drawer("w", "diary", "Generated lesson: lineage, not evidence.")
+                    fixture.origin_id = stored["drawer_id"]
+                    events[0] = parse_event(event_data(
+                        origin_drawer_ids=[fixture.origin_id], evidence=fixture.refs[:3]))
+                fixture.refs[3].update(source_kind="session_turn",
+                    source_id=fixture.refs[3]["session_id"], turn_index=0, field="user_message")
+                if retired:
+                    held = fixture.review(3, verdict="hold", parent_review_ids=[events[1].event_id],
+                        dispositions=[*event_to_data(events[1])["payload"]["dispositions"],
+                            {"evidence_id": fixture.refs[3]["source_id"], "disposition": "contradicts",
+                             "reason": "Original adverse observation.", "evidence": [fixture.refs[3]]}])
+                    events.extend([held, fixture.review(4, verdict="retire",
+                                                       parent_review_ids=[held.event_id])])
+                for event in events:
+                    append_event(str(data), "w", event, writer=writer,
+                                 session_store=fixture.store, clock=lambda: NOW)
+                if orphan:
+                    from dream_procedural import parse_event
+                    from dream_procedural_sources import capture_source
+                    from dream_procedural_validate import acquire_original
+                    from test_dream_procedural import event_data
+                    ref = parse_event(event_data(evidence=[fixture.refs[3]])).payload.evidence[0]
+                    source = acquire_original(ref, palace=str(data), session_store=fixture.store)
+                    capture_source(source, palace=str(data), wing="orphans", writer=writer,
+                                   captured_at=NOW, captured_by="fixture")
+            if receipts:
+                from receipt_fixtures import receipts as receipt_case, resign
+                from dream_procedural_delivery import hash_data
+                from dream_procedural_receipts import append_receipt
+                delivery, application, permission = receipt_case()
+                packet = delivery["payload"]["packet"]
+                packet["guidance"]["rules"][0]["rule_id"] = events[0].rule_id
+                packet["guidance_digest"] = hash_data(packet["guidance"])
+                application["payload"]["rule_id"] = events[0].rule_id
+                for receipt in (resign(delivery), resign(application)):
+                    append_receipt(str(data), "w", receipt, permissions=lambda: permission,
+                                   writer_factory=lambda: writer, clock=lambda: NOW)
+        # The source store is not a recovery input after publication.
+        Path(fixture.store).unlink()
+        yield home, data, fixture, events
+    finally:
+        fixture.doCleanups()
+
+
+@contextlib.contextmanager
+def _palace_only_reads():
+    import dream_palace
+    with patch("dream_procedural_validate._session_repository",
+               side_effect=AssertionError("host session repository")), \
+            patch("dream_procedural_validate.acquire_original",
+                  side_effect=AssertionError("original acquisition")), \
+            patch.object(dream_palace, "MempalaceWriter",
+                         side_effect=AssertionError("writer construction")), \
+            patch.object(dream_palace, "ensure_firewall_schema",
+                         side_effect=AssertionError("schema repair")):
+        yield
+
+
+def _procedural_projection(data):
+    from dream_procedural import Policy, project_rules
+    from dream_procedural_palace import nonmutating_read, read_events, revalidate_sources
+    from dream_procedural_validate import EvidenceReader
+    from test_dream_procedural import NOW
+
+    with nonmutating_read(str(data)):
+        events = read_events(str(data), "w")
+        projection = project_rules(events, as_of=NOW, policy=Policy())
+        projection, diagnostics = revalidate_sources(
+            projection, evidence_reader=EvidenceReader(str(data), "w"), as_of=NOW)
+    assert not diagnostics
+    return events, projection
+
+
+def test_procedural_physical_backup_stage_recovers_without_host_or_original_palace(tmp_path):
+    from dream_procedural import event_evidence
+    from dream_procedural_validate import inspect_published_sources
+
+    with _published_procedural_palace(tmp_path) as (home, data, fixture, events):
+        # Native fixture setup already initializes the empty logstream.
+        pb._validate_logstream(data / "logstream.sqlite3")
+        with contextlib.closing(sqlite3.connect(data / "logstream.sqlite3")) as con:
+            assert con.execute("SELECT count(*) FROM events").fetchone()[0] == 0
+        with _palace_only_reads():
+            before_events, before_projection = _procedural_projection(data)
+        assert set(before_events) == set(events)
+        assert before_projection.rules[0].review_heads == (events[1].event_id,)
+        assert before_projection.rules[0].eligible
+        snapshot, stage = tmp_path / "physical-snapshot", tmp_path / "restore-stage"
+
+        def physical_copy(argv, *, dry_run=False):
+            assert not dry_run
+            if argv[:2] == ["restic", "backup"]:
+                assert argv[2] == str(home)
+                # Prove current SQLite exclusion is held at the capture seam.
+                with contextlib.closing(sqlite3.connect(
+                        data / "sqlite_exact.sqlite3", timeout=0)) as contender:
+                    _assert_raises(sqlite3.OperationalError,
+                                   lambda: contender.execute("BEGIN IMMEDIATE"), "locked")
+                shutil.copytree(home, snapshot)
+            elif argv[:2] == ["restic", "restore"]:
+                assert argv[2] == "saved:" + str(home)
+                assert argv[-1] == str(stage)
+                shutil.copytree(snapshot, stage, dirs_exist_ok=True)
+            else:
+                assert argv[:2] in (["restic", "snapshots"], ["restic", "check"])
+            return 0
+
+        backup = pb.build_parser().parse_args([
+            "--palace", str(home), "backup", "--offline", "--require-logstream"])
+        restore = pb.build_parser().parse_args([
+            "--palace", str(home), "restore", "saved", "--target", str(stage)])
+        with patch.object(pb, "require_restic_env"), \
+                patch.object(pb, "run", side_effect=physical_copy), _palace_only_reads():
+            assert pb.cmd_backup(backup) == 0
+            shutil.rmtree(home)
+            assert not Path(fixture.store).exists()
+            # A poisoned ambient path must not redirect stage inspection.
+            with patch.dict(os.environ, {"MEMPALACE_PALACE_PATH": str(home / "missing")}):
+                with patch("dream_procedural_validate.inspect_published_sources",
+                           wraps=inspect_published_sources) as inspect:
+                    assert pb.cmd_restore(restore) == 0
+                    assert inspect.call_count
+                    assert all(call.args == (str(stage / "custom"), "w")
+                               for call in inspect.call_args_list)
+            after_events, after_projection = _procedural_projection(stage / "custom")
+            assert set(after_events) == set(before_events)
+            assert {ref.source_hash for event in after_events for ref in event_evidence(event)} == {
+                ref.source_hash for event in before_events for ref in event_evidence(event)}
+            assert after_projection == before_projection
+            assert not home.exists()
+            publish = pb.build_parser().parse_args([
+                "--palace", str(home), "restore", "saved", "--target", str(stage),
+                "--from-stage", "--in-place", "--offline"])
+            with patch.object(pb, "run", side_effect=AssertionError("no startup/task replay")):
+                assert pb.cmd_restore(publish) == 0
+            assert _procedural_projection(home / "custom") == (after_events, before_projection)
+
+
+def _assert_procedural_stage_damage_blocked(tmp_path, damage, expected, **options):
+    with _published_procedural_palace(tmp_path, **options) as (home, data, fixture, events):
+        stage = tmp_path / "stage"
+        shutil.copytree(home, stage)
+        staged_data = stage / "custom"
+        with contextlib.closing(sqlite3.connect(staged_data / "sqlite_exact.sqlite3")) as con:
+            damage(con, fixture)
+            con.commit()
+        before = {p.relative_to(home): p.read_bytes() for p in home.rglob("*") if p.is_file()}
+        args = pb.build_parser().parse_args([
+            "--palace", str(home), "restore", "saved", "--target", str(stage),
+            "--from-stage", "--in-place", "--offline"])
+        with _palace_only_reads(), \
+                patch.object(pb, "run", side_effect=AssertionError("restic/repair/startup")):
+            _assert_raises(pb.BackupError, lambda: pb.cmd_restore(args), expected)
+        assert {p.relative_to(home): p.read_bytes() for p in home.rglob("*") if p.is_file()} == before
+        assert not list(tmp_path.glob("original.bak-*"))
+        assert not (home / pb.RESTORE_MARKER).exists()
+        assert staged_data.is_dir()
+
+
+def test_receipt_stage_missing_parent_blocks_before_publication(tmp_path):
+    def damage(con, fixture):
+        con.execute("DELETE FROM documents WHERE json_extract(metadata_json, '$.room') = "
+                    "'procedural-receipts' AND COALESCE(json_extract(metadata_json, '$.parent_drawer_id'), id) "
+                    "IN (SELECT COALESCE(json_extract(metadata_json, '$.parent_drawer_id'), id) "
+                    "FROM documents WHERE document LIKE '%\"record_type\":\"delivery\"%')")
+    _assert_procedural_stage_damage_blocked(tmp_path, damage, "parent", receipts=True)
+
+
+def test_receipt_stage_corruption_blocks_without_changing_rule_projection(tmp_path):
+    def damage(con, fixture):
+        con.execute("UPDATE documents SET document='corrupt receipt' WHERE "
+                    "json_extract(metadata_json, '$.room') = 'procedural-receipts'")
+    _assert_procedural_stage_damage_blocked(tmp_path, damage, "receipt", receipts=True)
+
+
+def test_receipt_physical_stage_roundtrip_without_original_host(tmp_path):
+    from dream_procedural_receipts import read_receipts
+    with _published_procedural_palace(tmp_path, receipts=True) as (home, data, fixture, events):
+        before = read_receipts(str(data), "w")
+        projection = _procedural_projection(data)
+        stage = tmp_path / "stage"
+        shutil.copytree(home, stage)
+        shutil.rmtree(home)
+        with _palace_only_reads():
+            pb._validate_stage(stage, stage / "custom")
+            assert read_receipts(str(stage / "custom"), "w") == before
+            assert _procedural_projection(stage / "custom") == projection
+        assert len(before) == 2 and not Path(fixture.store).exists()
+
+
+def test_procedural_stage_missing_capture_blocks_before_publication(tmp_path):
+    def damage(con, fixture):
+        con.execute("DELETE FROM documents WHERE json_extract(metadata_json, '$.room') = "
+                    "'procedural-sources'")
+    _assert_procedural_stage_damage_blocked(tmp_path, damage, "uncaptured")
+
+
+def test_procedural_stage_corrupt_capture_blocks_before_publication(tmp_path):
+    def damage(con, fixture):
+        con.execute("UPDATE documents SET document = 'corrupt capture' WHERE "
+                    "json_extract(metadata_json, '$.room') = 'procedural-sources'")
+    _assert_procedural_stage_damage_blocked(tmp_path, damage, "source record")
+
+
+def test_procedural_stage_deleted_original_is_distinct_from_missing_capture(tmp_path):
+    def damage(con, fixture):
+        from dream_transport import call_tool
+        from chromadb.utils.embedding_functions.onnx_mini_lm_l6_v2 import ONNXMiniLM_L6_V2
+        from test_dream_procedural_palace import installed_palace
+        data = str(Path(con.execute("PRAGMA database_list").fetchone()[2]).parent)
+        with patch.object(ONNXMiniLM_L6_V2, "DOWNLOAD_PATH",
+                          os.environ["DREAMING_TEST_MODEL_CACHE"]), installed_palace(data):
+            result = call_tool(data, "mempalace_delete_drawer",
+                               {"drawer_id": fixture.refs[2]["source_id"]}, vector=True)
+            assert result["success"], result
+    _assert_procedural_stage_damage_blocked(tmp_path, damage, "original_drawer_missing")
+
+def test_procedural_stage_missing_only_retired_origin_blocks_publication(tmp_path):
+    def damage(con, fixture):
+        import dream_palace
+        from chromadb.utils.embedding_functions.onnx_mini_lm_l6_v2 import ONNXMiniLM_L6_V2
+        from dream_procedural_validate import EvidenceReader
+        from test_dream_procedural_palace import installed_palace
+        data = str(Path(con.execute("PRAGMA database_list").fetchone()[2]).parent)
+        con.execute("DELETE FROM documents WHERE id = ? OR "
+                    "json_extract(metadata_json, '$.parent_drawer_id') = ?",
+                    (fixture.origin_id, fixture.origin_id))
+        con.commit()
+        with patch.object(ONNXMiniLM_L6_V2, "DOWNLOAD_PATH",
+                          os.environ["DREAMING_TEST_MODEL_CACHE"]), \
+                installed_palace(data), _palace_only_reads():
+            reader = EvidenceReader(data, "w")
+            for ref in fixture.proposal().payload.evidence:
+                reader.resolve(ref)
+            assert reader.sources.record_count == 4
+            assert dream_palace.load_source_drawer(data, fixture.origin_id) is None
+    _assert_procedural_stage_damage_blocked(
+        tmp_path, damage, "origin_drawer_missing", origin=True, retired=True)
+
+
+def test_procedural_stage_retired_adverse_source_is_still_required(tmp_path):
+    def damage(con, fixture):
+        con.execute("DELETE FROM documents WHERE "
+                    "coalesce(json_extract(metadata_json, '$.parent_drawer_id'), id) IN ("
+                    "SELECT coalesce(json_extract(metadata_json, '$.parent_drawer_id'), id) "
+                    "FROM documents WHERE json_extract(metadata_json, '$.room') = "
+                    "'procedural-sources' AND document LIKE ?)",
+                    ("%" + fixture.refs[3]["session_id"] + "%",))
+    _assert_procedural_stage_damage_blocked(tmp_path, damage, "uncaptured", retired=True)
+
+
+def test_procedural_stage_checks_orphan_sources_in_other_wings(tmp_path):
+    def damage(con, fixture):
+        con.execute("UPDATE documents SET document = 'corrupt orphan' WHERE "
+                    "json_extract(metadata_json, '$.wing') = 'orphans'")
+    _assert_procedural_stage_damage_blocked(tmp_path, damage, "source record", orphan=True)
+
+
+def test_procedural_stage_moved_event_room_cannot_be_silently_omitted(tmp_path):
+    def damage(con, fixture):
+        con.execute("UPDATE documents SET metadata_json=json_set(metadata_json, '$.room', 'diary') "
+                    "WHERE json_extract(metadata_json, '$.room') = 'procedural'")
+    _assert_procedural_stage_damage_blocked(tmp_path, damage, "wing/room")
+
+
+def test_procedural_stage_refuses_custom_collection_instead_of_validating_default(tmp_path):
+    with _published_procedural_palace(tmp_path) as (home, data, fixture, events):
+        (home / "config.json").write_text(json.dumps({
+            "palace_path": str(data), "backend": "sqlite_exact", "collection_name": "other"}),
+            encoding="utf-8")
+        with _palace_only_reads():
+            _assert_raises(pb.BackupError, lambda: pb._validate_stage(home, data), "collection")
+
+
+def test_procedural_stage_unavailable_inspector_or_runtime_never_skips_validation(tmp_path):
+    import builtins
+    with _published_procedural_palace(tmp_path) as (home, data, fixture, events):
+        before = (data / "sqlite_exact.sqlite3").read_bytes()
+        with patch.dict(sys.modules, {"dream_procedural_validate": None}):
+            _assert_raises(pb.BackupError, lambda: pb._validate_stage(home, data), "requires")
+        real_import = builtins.__import__
+
+        def without_mempalace(name, *args, **kwargs):
+            if name == "mempalace":
+                raise ImportError("runtime unavailable")
+            return real_import(name, *args, **kwargs)
+
+        with patch.object(builtins, "__import__", side_effect=without_mempalace):
+            _assert_raises(pb.BackupError, lambda: pb._validate_stage(home, data), "requires")
+        assert (data / "sqlite_exact.sqlite3").read_bytes() == before
+
+
+def test_procedural_stage_refuses_configured_backend_mismatch_without_writes(tmp_path):
+    with _published_procedural_palace(tmp_path) as (home, data, fixture, events):
+        (home / "config.json").write_text(json.dumps({
+            "palace_path": str(data), "backend": "chroma"}), encoding="utf-8")
+        before = {p.relative_to(home): p.read_bytes() for p in home.rglob("*")
+                  if p.is_file() and not p.name.endswith("-shm")}
+        files_before = {p.relative_to(home) for p in home.rglob("*") if p.is_file()}
+        with _palace_only_reads(), patch.dict(os.environ, {"MEMPALACE_BACKEND_EXPLICIT": ""}):
+            _assert_raises(pb.BackupError, lambda: pb._validate_stage(home, data), "backend")
+        assert {p.relative_to(home): p.read_bytes() for p in home.rglob("*")
+                if p.is_file() and not p.name.endswith("-shm")} == before
+        assert {p.relative_to(home) for p in home.rglob("*") if p.is_file()} == files_before
+
+
+def test_procedural_stage_read_is_closed_nonmutating_and_ignores_live_home_config(tmp_path):
+    import dream_palace
+    with _published_procedural_palace(tmp_path) as (home, data, fixture, events):
+        stage = tmp_path / "stage"
+        shutil.copytree(home, stage)
+        # Make this the live default HOME config: even reading it is forbidden.
+        live_config = Path.home() / ".mempalace/config.json"
+        live_config.parent.mkdir()
+        live_config.write_text("{broken live config", encoding="utf-8")
+        before = {p.relative_to(stage): p.read_bytes() for p in stage.rglob("*")
+                  if p.is_file() and not p.name.endswith("-shm")}
+        files_before = {p.relative_to(stage) for p in stage.rglob("*") if p.is_file()}
+        read_bytes = Path.read_bytes
+        read_text = Path.read_text
+        opener = dream_palace.procedural_collection
+        opened = []
+
+        def guarded_bytes(path, *args, **kwargs):
+            assert path != live_config, "read live target configuration"
+            return read_bytes(path, *args, **kwargs)
+
+        def guarded_text(path, *args, **kwargs):
+            assert path != live_config, "read live target configuration"
+            return read_text(path, *args, **kwargs)
+
+        def remember_handle(path):
+            collection = opener(path)
+            opened.append(collection)
+            return collection
+
+        args = pb.build_parser().parse_args([
+            "--palace", str(home), "restore", "saved", "--target", str(stage), "--from-stage"])
+        with _palace_only_reads(), \
+                patch.object(Path, "read_bytes", guarded_bytes), \
+                patch.object(Path, "read_text", guarded_text), \
+                patch.object(dream_palace, "procedural_collection", side_effect=remember_handle), \
+                patch.object(pb, "run", side_effect=AssertionError("no live operations")):
+            assert pb.cmd_restore(args) == 0
+        assert {p.relative_to(stage): p.read_bytes() for p in stage.rglob("*")
+                if p.is_file() and not p.name.endswith("-shm")} == before
+        assert {p.relative_to(stage) for p in stage.rglob("*") if p.is_file()} == files_before
+        assert opened
+        _assert_raises(sqlite3.ProgrammingError,
+                       lambda: opened[0]._handle.conn.execute("SELECT 1"), "closed")
+        assert live_config.read_text(encoding="utf-8") == "{broken live config"
+
+
+def test_legacy_stage_without_procedural_state_needs_no_mempalace_or_dreaming(tmp_path):
+    import builtins
+    home = tmp_path / "stage"
+    data = _make_exact_palace(home)
+    real_import = builtins.__import__
+
+    def without_optional_runtime(name, *args, **kwargs):
+        assert not name.startswith(("mempalace", "dream_")), name
+        return real_import(name, *args, **kwargs)
+
+    with patch.object(builtins, "__import__", side_effect=without_optional_runtime):
+        assert pb._validate_stage(home, data) is None
+
+
+def test_procedural_fresh_cli_loads_sibling_tree_through_installed_script_symlink(tmp_path):
+    with _published_procedural_palace(tmp_path) as (home, data, fixture, events):
+        stage = tmp_path / "stage"
+        shutil.copytree(home, stage)
+        script = tmp_path / "installed-palace-backup.py"
+        script.symlink_to(Path(pb.__file__).resolve())
+        before = {p.relative_to(stage): p.read_bytes() for p in stage.rglob("*")
+                  if p.is_file() and not p.name.endswith("-shm")}
+        # Deliberately omit dreaming scripts from PYTHONPATH and use another cwd.
+        sidecar = Path(pb.__file__).resolve().parents[3] / "sidecar/src"
+        env = {**os.environ, "PYTHONPATH": str(sidecar), "MEMPALACE_MCP_READ_ONLY": "1",
+               "COPILOT_SESSION_STORE": str(tmp_path / "absent-host.db"),
+               "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1", "ANONYMIZED_TELEMETRY": "False"}
+        result = subprocess.run([
+            sys.executable, str(script), "--palace", str(home), "restore", "saved",
+            "--from-stage", "--target", str(stage)], cwd=tmp_path, env=env,
+            capture_output=True, text=True, timeout=30)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "Validated private stage" in result.stderr
+        assert {p.relative_to(stage): p.read_bytes() for p in stage.rglob("*")
+                if p.is_file() and not p.name.endswith("-shm")} == before
+        assert not (tmp_path / "absent-host.db").exists()
+
+
+def _make_exact_palace(home, *, configured_home=None):
+    data = home / "custom"
+    (data / ".mempalace").mkdir(parents=True)
+    (data / ".mempalace/origin.json").write_text("{}", encoding="utf-8")
+    (home / "config.json").write_text(json.dumps({
+        "palace_path": str((configured_home or home) / "custom")}), encoding="utf-8")
+    _make_wal_db(data / "sqlite_exact.sqlite3", 1)
+    return data
+
+
+def test_sqlite_exact_only_inventory_and_checkpoint_include_committed_wal(tmp_path):
+    home = tmp_path / "home"
+    data = _make_exact_palace(home)
+    db = data / "sqlite_exact.sqlite3"
+    with contextlib.closing(sqlite3.connect(db)) as writer:
+        writer.execute("PRAGMA wal_autocheckpoint=0")
+        writer.execute("INSERT INTO t VALUES (99)")
+        writer.commit()
+        wal = data / "sqlite_exact.sqlite3-wal"
+        assert wal.stat().st_size > 0
+        assert set(pb.backup_inventory(home)) == {
+            db, wal, data / "sqlite_exact.sqlite3-shm",
+        }
+        assert pb.checkpoint_all(home)
+        assert wal.stat().st_size == 0
+        with contextlib.closing(sqlite3.connect(db)) as reader:
+            assert reader.execute("SELECT id FROM t ORDER BY id").fetchall() == [(0,), (99,)]
+    assert not (data / "chroma.sqlite3").exists()
+    assert not (data / "logstream.sqlite3").exists()
+    assert not (data / "replica.json").exists()
+
+
+def test_sqlite_exact_busy_writer_prevents_clean_checkpoint(tmp_path):
+    home = tmp_path / "home"
+    data = _make_exact_palace(home)
+    with contextlib.closing(sqlite3.connect(data / "sqlite_exact.sqlite3")) as writer:
+        writer.execute("BEGIN IMMEDIATE")
+        assert pb.checkpoint_all(home) is False
+        writer.rollback()
+        assert pb.checkpoint_all(home) is True
+
+
+def test_sqlite_exact_orphan_sidecars_refuse_before_checkpoint(tmp_path):
+    for suffix in ("-wal", "-shm"):
+        home = tmp_path / suffix
+        data = home / "palace"
+        data.mkdir(parents=True)
+        sidecar = data / ("sqlite_exact.sqlite3" + suffix)
+        sidecar.write_bytes(b"orphan")
+        _assert_raises(pb.BackupError, lambda: pb.checkpoint_all(home), "missing")
+        assert sidecar.read_bytes() == b"orphan"
+        assert not (data / "sqlite_exact.sqlite3").exists()
+
+
+def test_sqlite_exact_corruption_refuses_force_backup_before_checkpoint(tmp_path):
+    home = tmp_path / "home"
+    data = _make_exact_palace(home)
+    db = data / "sqlite_exact.sqlite3"
+    db.write_bytes(b"not a SQLite database")
+    args = pb.build_parser().parse_args([
+        "--palace", str(home), "backup", "--offline", "--force", "--no-quiesce"])
+    with patch.object(pb, "require_restic_env"), \
+            patch.object(pb, "checkpoint_db", side_effect=AssertionError("must validate first")), \
+            patch.object(pb, "run", side_effect=AssertionError("must not snapshot")):
+        _assert_raises(pb.BackupError, lambda: pb.cmd_backup(args), "sqlite_exact")
+    assert db.read_bytes() == b"not a SQLite database"
+
+
+def test_sqlite_exact_only_physical_restore_preserves_committed_wal(tmp_path):
+    home, stage = tmp_path / "home", tmp_path / "stage"
+    data = _make_exact_palace(home)
+    db = data / "sqlite_exact.sqlite3"
+    checkpoint = pb.checkpoint_all
+    with contextlib.closing(sqlite3.connect(db)) as writer:
+        writer.execute("PRAGMA wal_autocheckpoint=0")
+
+        def checkpoint_then_commit(*args, **kwargs):
+            clean = checkpoint(*args, **kwargs)
+            writer.execute("INSERT INTO t VALUES (99)")
+            writer.commit()
+            return clean
+
+        def capture(argv, *, dry_run=False):
+            if argv[:2] == ["restic", "backup"]:
+                assert (data / "sqlite_exact.sqlite3-wal").stat().st_size > 0
+                shutil.copytree(home, stage)
+            return 0
+
+        args = pb.build_parser().parse_args([
+            "--palace", str(home), "backup", "--offline", "--no-quiesce"])
+        with patch.object(pb, "require_restic_env"), \
+                patch.object(pb, "checkpoint_all", side_effect=checkpoint_then_commit), \
+                patch.object(pb, "run", side_effect=capture):
+            assert pb.cmd_backup(args) == 0
+        writer.execute("INSERT INTO t VALUES (100)")
+        writer.commit()
+    args = pb.build_parser().parse_args([
+        "--palace", str(home), "restore", "latest", "--target", str(stage),
+        "--from-stage", "--in-place", "--offline"])
+    with patch.object(pb, "run", side_effect=AssertionError("no live operations")):
+        assert pb.cmd_restore(args) == 0
+    with contextlib.closing(sqlite3.connect(db)) as reader:
+        assert reader.execute("SELECT id FROM t ORDER BY id").fetchall() == [(0,), (99,)]
+    assert pb.integrity_check(db) == "ok"
+    assert (data / ".mempalace/origin.json").read_text(encoding="utf-8") == "{}"
+    assert not (data / "chroma.sqlite3").exists()
+    assert not (data / "logstream.sqlite3").exists()
+
+
+def _assert_exact_restore_refuses_writer(tmp_path, busy_stage):
+    home, stage = tmp_path / "home", tmp_path / "stage"
+    data = _make_exact_palace(home)
+    staged_data = _make_exact_palace(stage, configured_home=home)
+    (home / "untouched").write_text("live", encoding="utf-8")
+    locked_data = staged_data if busy_stage else data
+    args = pb.build_parser().parse_args([
+        "--palace", str(home), "restore", "latest", "--target", str(stage),
+        "--from-stage", "--in-place", "--offline"])
+    with contextlib.closing(sqlite3.connect(locked_data / "sqlite_exact.sqlite3")) as writer:
+        writer.execute("BEGIN IMMEDIATE")
+        with patch.object(pb, "run", side_effect=AssertionError("no live operations")):
+            _assert_raises(pb.BackupError, lambda: pb.cmd_restore(args), "writer")
+    assert (home / "untouched").read_text(encoding="utf-8") == "live"
+    assert (staged_data / "sqlite_exact.sqlite3").exists()
+    assert not list(home.parent.glob(home.name + ".bak-*"))
+    assert not (home / pb.RESTORE_MARKER).exists()
+
+
+def test_sqlite_exact_restore_guard_refuses_live_writer(tmp_path):
+    _assert_exact_restore_refuses_writer(tmp_path, busy_stage=False)
+
+
+def test_sqlite_exact_restore_guard_refuses_stage_writer(tmp_path):
+    _assert_exact_restore_refuses_writer(tmp_path, busy_stage=True)
+
+
+def test_sqlite_exact_corrupt_stage_refuses_before_publication(tmp_path):
+    home, stage = tmp_path / "home", tmp_path / "stage"
+    data = _make_exact_palace(home)
+    staged_data = _make_exact_palace(stage, configured_home=home)
+    (staged_data / "sqlite_exact.sqlite3").write_bytes(b"corrupt stage")
+    before = (data / "sqlite_exact.sqlite3").read_bytes()
+    args = pb.build_parser().parse_args([
+        "--palace", str(home), "restore", "latest", "--target", str(stage),
+        "--from-stage", "--in-place", "--offline"])
+    with patch.object(pb, "run", side_effect=AssertionError("no live operations")):
+        _assert_raises(pb.BackupError, lambda: pb.cmd_restore(args), "sqlite_exact")
+    assert (data / "sqlite_exact.sqlite3").read_bytes() == before
+    assert (staged_data / "sqlite_exact.sqlite3").read_bytes() == b"corrupt stage"
+
+
 def test_checkpoint_db_truncates_clean(tmp_path):
     db = tmp_path / "kg.sqlite3"
     _make_wal_db(db, 5)
@@ -210,6 +796,43 @@ def test_integrity_check_ok(tmp_path):
     db = tmp_path / "kg.sqlite3"
     _make_wal_db(db, 3)
     assert pb.integrity_check(db) == "ok"
+
+
+def test_inventory_closed_wal_databases_remain_byte_for_byte_unchanged(tmp_path):
+    home = tmp_path / "palace-home"
+    data = _make_exact_palace(home)
+    with contextlib.closing(_make_logstream(data)):
+        pass
+    before = {p.relative_to(home): p.read_bytes() for p in home.rglob("*") if p.is_file()}
+    inventory = pb.backup_inventory(home, data, require_logstream=True)
+    assert data / "sqlite_exact.sqlite3" in inventory
+    assert data / "logstream.sqlite3" in inventory
+    assert {p.relative_to(home): p.read_bytes() for p in home.rglob("*") if p.is_file()} == before
+
+
+@pytest.mark.parametrize("missing", ["-wal", "-shm"])
+def test_inventory_refuses_incomplete_wal_pair_without_repair(tmp_path, missing):
+    home = tmp_path / "palace-home"
+    data = _make_exact_palace(home)
+    with contextlib.closing(sqlite3.connect(data / "sqlite_exact.sqlite3")) as writer:
+        writer.execute("INSERT INTO t VALUES (2)")
+        writer.commit()
+        stage = tmp_path / "stage"
+        shutil.copytree(home, stage)
+    (stage / "custom" / ("sqlite_exact.sqlite3" + missing)).unlink()
+    before = {p.relative_to(stage): p.read_bytes() for p in stage.rglob("*") if p.is_file()}
+    _assert_raises(pb.BackupError,
+                   lambda: pb.backup_inventory(stage, stage / "custom"), "incomplete WAL")
+    assert {p.relative_to(stage): p.read_bytes() for p in stage.rglob("*") if p.is_file()} == before
+
+
+def test_inventory_refuses_rollback_journal_without_recovery(tmp_path):
+    home = tmp_path / "palace-home"
+    data = _make_exact_palace(home)
+    (data / "sqlite_exact.sqlite3-journal").write_bytes(b"pending rollback")
+    before = {p.relative_to(home): p.read_bytes() for p in home.rglob("*") if p.is_file()}
+    _assert_raises(pb.BackupError, lambda: pb.backup_inventory(home, data), "rollback journal")
+    assert {p.relative_to(home): p.read_bytes() for p in home.rglob("*") if p.is_file()} == before
 
 
 def test_checkpoint_all_skips_absent(tmp_path):
@@ -380,7 +1003,8 @@ def test_inventory_does_not_normalize_away_a_symlink_in_home(tmp_path):
 def test_symlink_database_sidecars_and_replica_are_refused(tmp_path):
     for name in ("logstream.sqlite3", "logstream.sqlite3-wal",
                  "logstream.sqlite3-shm", "replica.json", "chroma.sqlite3",
-                 "knowledge_graph.sqlite3"):
+                 "knowledge_graph.sqlite3", "sqlite_exact.sqlite3",
+                 "sqlite_exact.sqlite3-wal", "sqlite_exact.sqlite3-shm"):
         home = tmp_path / name
         data = home / "palace"
         data.mkdir(parents=True)
@@ -773,6 +1397,7 @@ def test_task_backup_sqlite_writers_are_excluded_through_restic_snapshot(tmp_pat
     from mempalace_tasks.snapshot import validate_task_snapshot
     home = tmp_path / "home"
     data = _make_task_palace(home, "custom")
+    _make_wal_db(data / "sqlite_exact.sqlite3", 1)
     commands = []
 
     def restic(argv, *, dry_run=False):
@@ -782,6 +1407,9 @@ def test_task_backup_sqlite_writers_are_excluded_through_restic_snapshot(tmp_pat
             with contextlib.closing(sqlite3.connect(data / "logstream.sqlite3", timeout=0)) as writer:
                 _assert_raises(sqlite3.OperationalError,
                                lambda: writer.execute("UPDATE events SET status='blocked'"), "locked")
+            with contextlib.closing(sqlite3.connect(data / "sqlite_exact.sqlite3", timeout=0)) as writer:
+                _assert_raises(sqlite3.OperationalError,
+                               lambda: writer.execute("INSERT INTO t VALUES (99)"), "locked")
             manifest = json.loads((home / pb.BACKUP_MANIFEST).read_text(encoding="utf-8"))
             assert manifest["data_relative"] == "custom"
             assert manifest["logstream_required"] is True

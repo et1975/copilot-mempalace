@@ -1,0 +1,90 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "type": "command",
+        "exec": "/absolute/path/to/python",
+        "args": [
+          "/absolute/path/to/hooks/procedural_context.py",
+          "--config", "/absolute/private/adapter-config.json",
+          "--event", "start"
+        ],
+        "timeoutSec": 3
+      }
+    ],
+    "userPromptSubmitted": [
+      {
+        "type": "command",
+        "exec": "/absolute/path/to/python",
+        "args": [
+          "/absolute/path/to/hooks/procedural_context.py",
+          "--config", "/absolute/private/adapter-config.json",
+          "--event", "prompt"
+        ],
+        "timeoutSec": 3
+      }
+    ],
+    "preToolUse": [
+      {
+        "type": "command",
+        "exec": "/absolute/path/to/python",
+        "args": [
+          "/absolute/path/to/hooks/procedural_context.py",
+          "--config", "/absolute/private/adapter-config.json",
+          "--event", "before-tool"
+        ],
+        "timeoutSec": 3
+      }
+    ],
+    "postToolUse": [
+      {
+        "type": "command",
+        "exec": "/absolute/path/to/python",
+        "args": [
+          "/absolute/path/to/hooks/procedural_context.py",
+          "--config", "/absolute/private/adapter-config.json",
+          "--event", "after-tool"
+        ],
+        "matcher": "mempalace-mempalace_search|mempalace_search",
+        "timeoutSec": 30
+      }
+    ],
+    "postToolUseFailure": [
+      {
+        "type": "command",
+        "exec": "/absolute/path/to/python",
+        "args": [
+          "/absolute/path/to/hooks/procedural_context.py",
+          "--config", "/absolute/private/adapter-config.json",
+          "--event", "after-tool"
+        ],
+        "timeoutSec": 30
+      }
+    ],
+    "preCompact": [
+      {
+        "type": "command",
+        "exec": "/absolute/path/to/python",
+        "args": [
+          "/absolute/path/to/hooks/procedural_context.py",
+          "--config", "/absolute/private/adapter-config.json",
+          "--event", "compact"
+        ],
+        "timeoutSec": 30
+      }
+    ],
+    "agentStop": [
+      {
+        "type": "command",
+        "exec": "/absolute/path/to/python",
+        "args": [
+          "/absolute/path/to/hooks/procedural_context.py",
+          "--config", "/absolute/private/adapter-config.json",
+          "--event", "stop"
+        ],
+        "timeoutSec": 30
+      }
+    ]
+  }
+}

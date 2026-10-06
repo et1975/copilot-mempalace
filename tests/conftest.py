@@ -40,6 +40,9 @@ def external_test_environment(tmp_path_factory):
     root = str(tmp_path_factory.getbasetemp())
     _validate_root("pytest temporary root", root)
     with pytest.MonkeyPatch.context() as environment:
+        if "DREAMING_TEST_MODEL_CACHE" not in os.environ:
+            environment.setenv("DREAMING_TEST_MODEL_CACHE", str(
+                Path.home() / ".cache" / "chroma" / "onnx_models" / "all-MiniLM-L6-v2"))
         for name in ("DREAMING_TEST_TMPDIR", "MPTASK_TEST_TMPDIR"):
             if name not in os.environ:
                 environment.setenv(name, root)

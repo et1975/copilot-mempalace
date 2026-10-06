@@ -54,6 +54,28 @@ SQLite, lock, rollback and real staging-CLI integration checks run on Linux.
 
 ## Total loss / new machine
 
+For published procedural evidence, include DATA/sqlite_exact.sqlite3 and its
+coherent WAL/SHM state with all referenced original drawers. Full raw-turn
+captures survive host-session loss; drawer witnesses preserve provenance, not
+copies of original bodies. No companion host session database is required for
+already published evidence.
+
+Private-stage inspection discovers every procedural wing, validates orphan
+captures and retained adverse/retired evidence and origins, and never acquires
+or repairs sources. `uncaptured` means the snapshot lacks a needed witness;
+`original_drawer_missing` or drift means a witness cannot reconstruct its
+original. Restore a coherent earlier snapshot, rather than rewriting hashes or
+falling back to a host database. Source integrity is distinct from current
+rule eligibility.
+
+Keep preinstalled MemPalace and the complete sibling `dreaming/scripts` tree
+with the backup helper, including symlink-based deployments. Unsupported
+backends/custom collections or unavailable runtime/helpers fail when procedural
+state exists; unrelated legacy memory-only recovery remains independent.
+Only stages with task storage require the epoch-aware task package.
+JSONL/markdown/legacy replay cannot preserve procedural IDs/digests and is
+rejected before writes, including under clone/force flags.
+
 If the machine or home directory is gone, the `restic` repository is the only
 thing that had to survive.
 

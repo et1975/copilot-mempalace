@@ -705,6 +705,16 @@ Read [the exact artifact/CLI contract](references/procedural.md) first.
    --repository` returns eligible established/proven advice only.
    `--include-candidates` deliberately opts into labeled approved trials;
    choose a safe bounded task, never expose harm just to gather data.
+   `status --repository` provides strict read-only source health, coverage,
+   capacity and suppression counts without embeddings or host-session input.
+   Hook consumers may request `guidance --max-bytes 8192`; core formatting
+   retains the existing combined five-item / 6,000-character limits and drops
+   whole lowest-ranked items, never applicability or exceptions.
+   `draft --repository --input RECEIPT --out NEW_FILE` optionally reads an
+   explicit `--session-store`, otherwise uses bounded captured originals.
+   It creates only a review packet outside the palace. Missing current turns
+   stay `pending_original_evidence`; drafts, receipts and reflection echoes
+   are not outcomes or additional independent support.
 4. **Outcome:** at task end, record `helpful`, `harmful` or `neutral` **only**
    with original evidence and a specific attribution of what following that
    rule changed. Overall success, a passing test and repeated retrieval are
@@ -727,6 +737,20 @@ scripts rely on. A shadow palace for search-based preview (instead of file-based
 review) remains a future enhancement. The historical native-salience proposal
 (MemPalace/mempalace#1921) records the motivation; current usage reads retain
 the complete-metadata and protection-only limits described above.
+
+## Optional offline tool-activity evidence
+
+For recorded tool-calling intent or artifact-reuse evidence, use the separate
+[offline activity workflow](references/activity-intent.md). It reads an explicit
+host event file or selected session batch through `dream_harvest.py --task
+activity`, preserves attributed source evidence and observed outcomes, and
+supports activities with or without artifacts. Batch harvesting streams each
+source once, keeps detailed reports outside context and returns a compact summary.
+It does not require FSX or an
+orchestration skill, add foreground hooks, run a model, execute artifacts or
+promote scripts. Its optional artifact view is a review packet, not a usefulness
+verdict. Ordinary survey, reflection, adoption and procedural enrollment remain
+unchanged.
 
 ## Tests
 

@@ -18,8 +18,7 @@ import time
 from typing import Callable, Iterable, Literal
 
 import dream_palace
-from dream_metadata import (canonical_json, decode_procedural_chunks, is_generated_observation,
-                            is_procedural_record)
+from dream_metadata import canonical_json, decode_procedural_chunks, is_procedural_record
 from dream_procedural import (ProceduralEvent, Projection, Policy, ProposalPayload, ReviewPayload,
                               OutcomePayload, event_evidence, event_to_data, parse_event, project_rules,
                               repository_key, to_data, utc_datetime)
@@ -114,6 +113,7 @@ class GuidanceLimits:
     max_items: int = 5
     max_chars: int = 6000
     min_similarity: float = .25
+    max_bytes: int | None = None
 
     def __post_init__(self):
         if type(self.max_items) is not int or not 1 <= self.max_items <= 5:
@@ -122,6 +122,8 @@ class GuidanceLimits:
             raise ValueError("guidance max_chars must be between 512 and 6000")
         if not math.isfinite(self.min_similarity) or not .25 <= self.min_similarity <= 1:
             raise ValueError("guidance similarity threshold must be between .25 and one")
+        if self.max_bytes is not None and (type(self.max_bytes) is not int or self.max_bytes < 512):
+            raise ValueError("guidance max_bytes must be at least 512")
 
 
 @dataclass(frozen=True)
@@ -178,7 +180,8 @@ def revalidate_sources(projection: Projection, *, evidence_reader, as_of: dateti
                             any(r.repository != state.definition.scope.key for r in support)):
                         raise ValueError("approval lacks three independent in-scope supporting sessions")
             except (ValueError, RuntimeError, OSError) as exc:
-                failures.append({"event_id": event.event_id, "error": str(exc)})
+                failures.append({"event_id": event.event_id,
+                                 "code": getattr(exc, "code", "invalid_evidence"), "error": str(exc)})
         if failures:
             state = replace(state, eligible=False,
                 suppression_reasons=tuple(sorted(set(state.suppression_reasons) | {"evidence_unavailable"})))
@@ -247,11 +250,51 @@ def get_task_guidance(projection: Projection, *, task: str, repository: str, emb
     while True:
         data = bundle(selected)
         serialized = canonical_json(data) + "\n"
-        if len(serialized) <= limits.max_chars:
+        if len(serialized) <= limits.max_chars and (
+                limits.max_bytes is None or len(serialized.encode("utf-8")) <= limits.max_bytes):
             return GuidanceResult(data, serialized)
         if not selected:
             raise ValueError("requested budget cannot contain the guidance envelope")
         selected.pop()
+
+
+def procedural_status(palace: str, wing: str, repository: str, *, as_of: datetime) -> dict:
+    """Palace-only health; wing-wide capture integrity and repository policy."""
+    from collections import Counter
+    from dream_procedural_validate import EvidenceReader, inspect_published_sources
+    repository = repository_key(repository)
+    with nonmutating_read(palace):
+        coverage = inspect_published_sources(palace, wing)
+        projection = project_rules(read_events(palace, wing), as_of=as_of, policy=Policy())
+        if projection.errors:
+            raise RuntimeError(f"procedural projection integrity: {to_data(projection.errors)}")
+        projection, diagnostics = revalidate_sources(
+            projection, evidence_reader=EvidenceReader(palace, wing), as_of=as_of, repository=repository)
+        scoped = [s for s in projection.rules if s.definition and s.definition.scope.key == repository]
+        counts = Counter({"candidate": 0, "established": 0, "proven": 0})
+        counts.update(s.maturity for s in scoped)
+        counts.update(total=len(scoped), eligible=sum(s.eligible for s in scoped),
+                      deliverable=sum(s.eligible and s.maturity in {"established", "proven"} for s in scoped))
+        errors = coverage["failures"] + [
+            dict(failure, rule_id=rule_id) for rule_id, failures in diagnostics.items() for failure in failures]
+        for state in projection.rules:
+            if state.definition is None:
+                errors.append({"rule_id": state.rule_id, "code": "missing_definition",
+                               "error": "rule has no repository-scoped definition"})
+        suppression = Counter(reason for state in scoped for reason in state.suppression_reasons)
+        blocked = bool(errors)
+        return {
+            "schema_version": 1, "repository": repository, "as_of": to_data(as_of),
+            "status": "blocked" if blocked else "ok",
+            "readiness": ("blocked" if blocked else "no_rules" if not scoped else
+                          "ready" if counts["deliverable"] else "requires_review"),
+            "capture_coverage": {
+                **{k: coverage[k] for k in ("event_count", "reference_count", "source_count", "failed")},
+                "resolved_reference_count": coverage["reference_count"] - coverage["failed"]},
+            "rule_counts": dict(counts), "suppression_counts": dict(suppression),
+            "evidence_errors": errors, "coverage_scope": "wing",
+            **{k: coverage[k] for k in ("record_count", "encoded_bytes", "warnings", "capacity")},
+        }
 
 
 def explain_rule(projection: Projection, rule_id: str, *, as_of: datetime, source_diagnostics=None) -> dict:
@@ -275,6 +318,7 @@ class AppendResult:
     event_id: str
     drawer_ids: tuple[str, ...]
     projection: Projection
+    warnings: tuple[str, ...] = ()
 
 
 def _record_body(event: ProceduralEvent) -> str:
@@ -393,6 +437,12 @@ def live_protected_drawer_ids(palace: str, *, collection=None) -> set[str]:
         protected.add(parent)
         protected.update(row["id"] for row in dream_palace._rows_from_collection_result(col.get(
             where={"parent_drawer_id": parent}, include=["metadatas"])))
+    # Source payloads can be large and are not needed for conservative retention.
+    # Keep their distinct author out of the legacy global event selector.
+    from dream_procedural_sources import source_record_ids
+    protected.update(source_record_ids(col))
+    from dream_procedural_receipts import receipt_record_ids
+    protected.update(receipt_record_ids(col))
     return protected
 
 
@@ -403,33 +453,24 @@ def exclude_protected_drawers(palace: str, drawers: list[dict]) -> list[dict]:
 
 
 def verify_event_sources(palace: str, event: ProceduralEvent) -> None:
-    """Basic locked referential integrity; Task 4 adds enrollment/packet policy.
+    """Legacy drawer text-integrity helper, NOT admission or publication.
 
-    Re-read actual source text, exact quotes, hashes and original session stamps.
-    Generated lineage is allowed only in proposal.origin_drawer_ids.
+    Kept for existing chunk-integrity callers. Raw evidence must use an explicit
+    wing's EvidenceReader; this helper never opens a host session store.
     """
-    from dream_metadata import content_hash
-    import dream_sessions
-
+    from dream_metadata import content_hash, is_generated_observation
     for ref in event_evidence(event):
-        if ref.source_kind == "drawer":
-            source = dream_palace.load_source_drawer(palace, ref.source_id)
-            if source is None:
-                raise ValueError(f"missing source drawer: {ref.source_id}")
-            if is_generated_observation(source):
-                raise ValueError(f"generated independent evidence: {ref.source_id}")
-            text = source["text"]
-            session_id, ambiguous = dream_palace._session_id_state(text)
-            if ref.session_id is not None and (ambiguous or session_id != ref.session_id):
-                raise ValueError(f"source session mismatch: {ref.source_id}")
-        else:
-            turns = dream_sessions.load_session_turns(ref.source_id)
-            matches = [t for t in turns if t["turn_index"] == ref.turn_index]
-            if len(matches) != 1:
-                raise ValueError(f"missing source turn: {ref.source_id}/{ref.turn_index}")
-            text = matches[0].get(ref.field)
-            if not isinstance(text, str):
-                raise ValueError("source turn field unavailable")
+        if ref.source_kind != "drawer":
+            raise ValueError("raw evidence requires a wing-scoped EvidenceReader")
+        source = dream_palace.load_source_drawer(palace, ref.source_id)
+        if source is None:
+            raise ValueError(f"missing source drawer: {ref.source_id}")
+        if is_generated_observation(source):
+            raise ValueError(f"generated independent evidence: {ref.source_id}")
+        text = source["text"]
+        session, ambiguous = dream_palace._session_id_state(text)
+        if ref.session_id is None or ambiguous or session != ref.session_id:
+            raise ValueError(f"source session mismatch: {ref.source_id}")
         if content_hash(text) != ref.source_hash or not ref.quote.strip() or ref.quote not in text:
             raise ValueError(f"source hash/quote drift: {ref.source_id}")
     if isinstance(event.payload, ProposalPayload):
@@ -456,13 +497,14 @@ def _scope_check(event: ProceduralEvent, existing: list[ProceduralEvent]) -> Non
 
 def append_event(palace: str, wing: str, event: ProceduralEvent, *,
                  writer: dream_palace.MempalaceWriter,
+                 session_store: str | None = None,
                  preflight: Callable[[ProceduralEvent, Projection], None] | None = None,
                  clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)) -> AppendResult:
     """Append through sanctioned handlers, then verify exact committed readback.
 
-    The optional Task-4 preflight hook runs *inside* the mutation lock and only
-    for new events. Callers must not perform freshness/head checks ahead of this
-    retry gate. A failed readback is retryable using the same immutable artifact.
+    Admission is mandatory even without the optional supplemental callback.
+    Duplicate recognition precedes acquisition, freshness checks and capture.
+    Sources are captured and read back before the event can be published.
     """
     palace = os.path.realpath(os.path.expanduser(palace))
     wing = _wing(wing)
@@ -495,8 +537,10 @@ def append_event(palace: str, wing: str, event: ProceduralEvent, *,
             if state and event.payload.verdict == "approve" \
                     and {"retired", "replaced"}.intersection(state.suppression_reasons):
                 raise ValueError("terminal rule identity cannot be approved again")
-        if preflight is None:
-            verify_event_sources(palace, event)
+        from dream_procedural_validate import AdmissionReader, EvidenceReader, preflight_event
+        reader = AdmissionReader(palace, wing, session_store)
+        preflight_event(event, projection=projection, evidence_reader=reader, as_of=as_of)
+        reader.preflight_captures(at=as_of, actor=event.session_id)
         prospective = project_rules([*events, event], as_of=as_of, policy=Policy())
         invalid = {"missing_review_parent", "review_cycle", "review_time_order", "replacement_cycle",
                    "missing_replacement", "definition_conflict", "missing_declared_evidence"}
@@ -505,6 +549,10 @@ def append_event(palace: str, wing: str, event: ProceduralEvent, *,
         if preflight is not None:
             preflight(event, projection)
         body, metadata = record_data(event)
+        warnings = reader.persist(writer=writer, at=as_of, actor=event.session_id)
+        # No prewrite memoized result or original-input fallback at publication.
+        preflight_event(event, projection=projection,
+                        evidence_reader=EvidenceReader(palace, wing), as_of=as_of)
         result = writer.add_drawer(wing, "procedural", body, added_by="dream-procedure", metadata=metadata)
         if not isinstance(result, dict) or result.get("success") is False:
             raise RuntimeError(f"procedural append failed: {result}")
@@ -517,4 +565,4 @@ def append_event(palace: str, wing: str, event: ProceduralEvent, *,
         projection = project_rules([parse_event(d["metadata"]["event"]) for d in readback],
                                    as_of=as_of, policy=Policy())
         return AppendResult("appended", event.event_id,
-                            tuple(pid for d in committed for pid in d["member_ids"]), projection)
+                            tuple(pid for d in committed for pid in d["member_ids"]), projection, warnings)

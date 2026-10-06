@@ -38,6 +38,30 @@ class MetadataTests(unittest.TestCase):
         self.assertEqual(result["kind"], "reflect")
         self.assertEqual(result["quote"], meta["quote"])
 
+    def test_split_reports_consumed_empty_trailer_without_changing_decoder_result(self):
+        from dream_metadata import decode_dream_metadata, split_dream_metadata
+        prefix = "original \u2028 content\n\n"
+        native = {"added_by": "dreaming"}
+        drawer = {"text": prefix + "<!--dreaming-meta: {}--> \n", "metadata": native}
+        body, metadata = split_dream_metadata(drawer)
+        self.assertEqual(body, prefix)
+        self.assertEqual(metadata, native)
+        self.assertEqual(metadata, decode_dream_metadata(drawer))
+
+    def test_split_preserves_unconsumed_fences_and_retains_writer_context(self):
+        from dream_metadata import split_dream_metadata
+        prefix = "```html\nunfinished example\n"
+        text = prefix + '<!--dreaming-meta: {"kind":"procedural_source"}-->'
+        self.assertEqual(split_dream_metadata({"text": text}), (text, {}))
+        body, metadata = split_dream_metadata(
+            {"text": text, "metadata": {"added_by": "dreaming"}})
+        self.assertEqual(body, prefix)
+        self.assertEqual(metadata["kind"], "procedural_source")
+        closed = text + "\n```"
+        self.assertEqual(
+            split_dream_metadata({"text": closed, "metadata": {"added_by": "dreaming"}}),
+            (closed, {"added_by": "dreaming"}))
+
     def test_native_and_trailer_agree_and_preserve_source_metadata(self):
         from dream_metadata import decode_dream_metadata
         meta = {"kind": "reflect", "supported_by": ["s1"]}
@@ -60,12 +84,14 @@ class MetadataTests(unittest.TestCase):
 
     def test_generated_classification_native_trailer_and_summary(self):
         from dream_metadata import is_generated_observation, is_procedural_record
-        for kind in ("lesson", "reflect", "procedural_event"):
+        for kind in ("lesson", "reflect", "procedural_event", "procedural_source"):
             for drawer in ({"metadata": {"kind": kind}},
                            {"text": '<!--dreaming-meta: {"kind":"' + kind + '"}-->'},
                            {"metadata": {"kind": "summary", "source_kind": kind}}):
                 self.assertTrue(is_generated_observation(drawer))
         self.assertTrue(is_procedural_record({"metadata": {"kind": "procedural_event"}}))
+        self.assertTrue(is_procedural_record({"metadata": {"room": "procedural-sources"}}))
+        self.assertTrue(is_generated_observation({"metadata": {"added_by": "dream-procedure-source"}}))
         self.assertFalse(is_generated_observation({"text": "ordinary evidence"}))
 
     def test_exact_chunks_split_inside_json_and_digest(self):
@@ -139,7 +165,7 @@ class AdmissionTests(unittest.TestCase):
 
     def test_generated_records_cannot_supply_recurrence(self):
         entries = self.entries()
-        for kind in ("lesson", "reflect", "procedural_event"):
+        for kind in ("lesson", "reflect", "procedural_event", "procedural_source"):
             entries[2]["metadata"] = {"kind": kind}
             self.assertEqual(dream_reflect.converge_seeds_from_recurrence(
                 entries, tau=.9, min_support=3), [])
@@ -169,3 +195,71 @@ class AdmissionTests(unittest.TestCase):
             {"a": "alpha", "b": "beta"})
         self.assertFalse(result["ok"])
         self.assertIn("ungrounded", result["rejects"])
+def test_packet_transport_detection_handles_complete_wrapped_escaped_envelopes():
+    from delivery_fixtures import wrapped_packet
+    from dream_metadata import reject_generated_transport, is_generated_observation
+    import pytest
+    for wrapper in ("{}", "```json\n{}\n```", "Copied report:\n{}\nEnd."):
+        for encoded in (False, True):
+            text = wrapped_packet(wrapper, encoded)
+            with pytest.raises(ValueError, match="generated"):
+                reject_generated_transport(text)
+            assert is_generated_observation({"text": text, "metadata": {}})
+    reject_generated_transport("The parser failed later on input X; the observed error was Y.")
+
+
+def test_transport_inspection_depth_is_explicit_not_independent_evidence():
+    from dream_metadata import canonical_json, reject_generated_transport
+    import pytest
+    text = '{"ki\\u006ed":"procedural_delivery_packet"}'
+    with pytest.raises(ValueError, match="generated"):
+        reject_generated_transport(text)
+    for _ in range(6):
+        text = canonical_json(text)
+    with pytest.raises(ValueError, match="inconclusive"):
+        reject_generated_transport(text)
+
+
+def test_strict_json_rejects_numeric_overflow_not_just_nonstandard_constants():
+    from dream_metadata import canonical_json, strict_json, decode_dream_metadata
+    import pytest
+    for value in ("1e999", "-1e999", "NaN", "Infinity"):
+        with pytest.raises(ValueError, match="finite"):
+            strict_json('{"score":' + value + "}")
+        with pytest.raises(ValueError, match="finite"):
+            decode_dream_metadata({"metadata": {}, "text": '\n<!--dreaming-meta: {"score":' + value + "}-->"})
+    for value in (float("nan"), float("inf"), -float("inf")):
+        with pytest.raises(ValueError):
+            canonical_json({"score": value})
+
+
+def test_transient_applicability_and_use_results_are_generated_not_new_support():
+    from delivery_fixtures import applicability, case
+    from dream_metadata import canonical_json, reject_generated_transport
+    import pytest
+    packet, current, _, guidance = case()
+    artifacts = [
+        applicability(current["context"], guidance["rules"]),
+        dict(kind="procedural_use_check", authority="agent_reported", status="usable",
+             items=guidance["rules"], checked_at=guidance["as_of"],
+             notice="Cooperative current check, not semantic proof or a durable authorization token; recheck before action."),
+    ]
+    for artifact in artifacts:
+        for wrapped in (canonical_json(artifact), canonical_json(canonical_json(artifact))):
+            with pytest.raises(ValueError, match="generated"):
+                reject_generated_transport("Copied result:\n" + wrapped + "\nEnd.")
+
+
+def test_feedback_and_abstention_are_generated_in_raw_wrapped_escaped_and_metadata_forms():
+    from dream_metadata import canonical_json, reject_generated_transport, is_generated_observation
+    import pytest
+    for kind in ("procedural_feedback", "procedural_feedback_abstention"):
+        body = canonical_json({"kind": kind, "quote": "independent-looking observation"})
+        for value in (body, canonical_json(body), body.replace('"kind"', '"ki\\u006ed"')):
+            for wrapper in ("{}", "```json\n{}\n```", "Copied:\n{}\nEnd."):
+                with pytest.raises(ValueError, match="generated"):
+                    reject_generated_transport(wrapper.format(value))
+        for key in ("kind", "source_kind", "generated_from"):
+            assert is_generated_observation({"text": "observation", "metadata": {key: kind}})
+            assert is_generated_observation({"text": "observation\n<!--dreaming-meta: "
+                + canonical_json({key: kind}) + "-->", "metadata": {}})

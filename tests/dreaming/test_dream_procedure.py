@@ -24,6 +24,50 @@ from types import SimpleNamespace
 
 
 class CommandTests(GroundedFixture):
+    def test_direct_commands_reject_copied_complete_delivery_without_new_captures(self):
+        from delivery_fixtures import wrapped_packet
+        from dream_metadata import canonical_json, content_hash
+        from receipt_fixtures import receipts
+        from itertools import product
+        self.invoke("propose", self.proposal())
+        self.invoke("review", self.review())
+        transports = [wrapped_packet("Original commentary:\n{}\nEnd."), *[
+            "Original commentary:\n" + canonical_json(canonical_json(r)) for r in receipts()[:2]], *[
+            "Original commentary:\n" + canonical_json(canonical_json({"kind": kind, "quote": "parser"}))
+            for kind in ("procedural_feedback", "procedural_feedback_abstention")]]
+        for field, text in product(("user_message", "assistant_response", "drawer"), transports):
+            session = self.refs[3]["session_id"]
+            if field == "drawer":
+                text = f"SESSION_ID: {session}\nOBSERVED_AT: {stamp()}\n" + text
+                self.collection.rows["source-4"]["text"] = text
+                ref = dict(self.refs[3], source_hash=content_hash(text), quote="parser")
+            else:
+                with sqlite3.connect(self.store) as con:
+                    con.execute(f"UPDATE turns SET {field}=? WHERE session_id=?", (text, session))
+                ref = dict(source_kind="session_turn", source_id=session, session_id=session,
+                           source_hash=content_hash(text), quote="parser",
+                           turn_index=0, field=field)
+            proposal = event_data("proposal", 80, origin_drawer_ids=[], evidence=[ref, *self.refs[:2]])
+            review = event_to_data(self.review(81, parent_review_ids=[self.review().event_id]))
+            packet = review["payload"]["validation_packet"]
+            packet["evidence"][0] = ref
+            review["payload"]["validation_digest"] = sha(packet)
+            review["payload"]["dispositions"][0] = dict(evidence_id=ref["source_id"],
+                disposition="supports", reason="Original observed support.", evidence=[ref])
+            review = resign(review)
+            outcome = event_data("outcome", 82, source_session_id=session, evidence=[ref])
+            for command, event in (("propose", proposal), ("review", review), ("outcome", outcome)):
+                for mode in ("append", "dry-run", "prepare"):
+                    before = deepcopy(self.collection.rows)
+                    target = Path(self.tmp.name, f"{field}-{command}-{mode}.json")
+                    flags = (() if mode == "append" else ("--dry-run",) if mode == "dry-run"
+                             else ("--prepare", "--out", str(target)))
+                    code, result, err = self.invoke(command, event, *flags)
+                    self.assertNotEqual(code, 0, (field, command, mode, err))
+                    self.assertIn("generated", result["error"])
+                    self.assertEqual(self.collection.rows, before)
+                    self.assertFalse(target.exists())
+
     def invoke(self, command, event=None, *extra):
         from dream_procedure import main
         args = [command, "--palace", self.path, "--wing", "w"]
@@ -85,6 +129,42 @@ class CommandTests(GroundedFixture):
         self.assertEqual(self.collection.rows, before)
         self.assertEqual(self.invoke("propose", json.loads(path.read_text()))[0], 0)
 
+    def test_feedback_adjudicate_is_a_read_command_with_explicit_decision_and_scope(self):
+        from dream_metadata import canonical_json
+        from dream_procedural_feedback import prepare_feedback
+        self.publish(self.proposal())
+        packet = prepare_feedback(
+            {"schema_version": 1, "repository": "owner/repo", "rule_id": self.proposal().rule_id,
+             "evidence": self.refs[:1]}, projection=self.projection(self.proposal()),
+            reader=self.published_reader(), as_of=NOW)
+        decision = Path(self.tmp.name, "decision.json")
+        decision.write_text(canonical_json({
+            "schema_version": 1, "packet_id": packet["packet_id"], "decision": "abstain",
+            "actor_kind": "human", "session_id": "legacy-reviewer", "recorded_at": stamp(),
+            "reason": "Original task success does not establish a rule-specific effect.",
+        }))
+        target = Path(self.tmp.name, "abstained.json")
+        flags = ("--repository", "owner/repo", "--decision", str(decision), "--out", str(target))
+        before = deepcopy(self.collection.rows)
+        with patch("dream_sessions.default_store_path", side_effect=AssertionError("hidden host")), \
+             patch("dream_procedural_validate._session_repository", side_effect=AssertionError("host")):
+            code, result, error = self.invoke("feedback-adjudicate", packet, *flags)
+        self.assertEqual(code, 0, error)
+        self.assertEqual(json.loads(target.read_text()), result)
+        self.assertEqual(result["kind"], "procedural_feedback_abstention")
+        self.assertEqual(self.collection.rows, before)
+        target.unlink()
+        for extra in (("--as-of", stamp()), ("--prepare",), ("--dry-run",),
+                      ("--receipt", str(decision)), ("--repository", "Owner/Repo"),
+                      ("--session-store", "")):
+            code, _, _ = self.invoke("feedback-adjudicate", packet, *flags, *extra)
+            self.assertNotEqual(code, 0, extra)
+            self.assertFalse(target.exists())
+        code, _, _ = self.invoke("feedback-adjudicate", packet,
+                                "--repository", "owner/repo", "--out", str(target))
+        self.assertEqual(code, 2)
+        self.assertFalse(target.exists())
+
     def test_explicit_polarities_count_once_per_source_session(self):
         self.invoke("propose", self.proposal())
         self.invoke("review", self.review())
@@ -112,7 +192,7 @@ class CommandTests(GroundedFixture):
         code, result, err = self.invoke("validate", None, "--rule-id", self.proposal().rule_id,
                                       "--contrast-query", "When does this fail?", "--out", str(out))
         self.assertEqual(code, 0, err)
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls), 4)  # support/contrast, each with an original and capture channel
         self.assertTrue(all(c["n_results"] == 10 for c in calls))
         packet = json.loads(out.read_text())
         self.assertEqual(len(packet["validation_packet"]["evidence"]), 3)
@@ -238,6 +318,22 @@ def guidance_events(rule=None, base=1, count=3):
 
 
 class GuidanceTests(unittest.TestCase):
+    def test_utf8_budget_drops_whole_ranked_items_and_preserves_default(self):
+        from dream_procedural_palace import GuidanceLimits
+        events = guidance_events(definition(statement="漢字" * 180, exceptions=["Never omit this exception."]))
+        events += guidance_events(definition(statement="Second instruction.", rule_type="anti_pattern"), 50)
+        embedder = lambda texts: [[1., 0.] if text != "Second instruction." else [.8, .6] for text in texts]
+        default = self.guidance(events, embedder=embedder)
+        wire = len(default.serialized.encode("utf-8"))
+        self.assertGreater(wire, len(default.serialized))
+        exact = self.guidance(events, embedder=embedder, limits=GuidanceLimits(max_bytes=wire))
+        self.assertEqual(exact, default)
+        smaller = self.guidance(events, embedder=embedder, limits=GuidanceLimits(max_bytes=wire - 1))
+        self.assertEqual(smaller.data["item_count"], 1)
+        self.assertEqual(smaller.data["rules"][0]["exceptions"], ["Never omit this exception."])
+        self.assertLessEqual(len(smaller.serialized.encode("utf-8")), wire - 1)
+        self.assertLessEqual(len(smaller.serialized), 6000)
+
     def guidance(self, events, *, embedder=None, at=NOW, **kwargs):
         from dream_procedural_palace import get_task_guidance, GuidanceLimits
         limits = kwargs.pop("limits", GuidanceLimits())
@@ -329,6 +425,383 @@ class GuidanceTests(unittest.TestCase):
             self.guidance([parsed("review", 2)])
 
 
+class SelfContainedCommandTests(GroundedFixture):
+    invoke = CommandTests.invoke
+
+    def raw_references(self):
+        for ref in self.refs:
+            ref.update(source_kind="session_turn", source_id=ref["session_id"],
+                       turn_index=0, field="user_message")
+
+    def legacy(self, *events):
+        from dream_procedural_palace import record_data
+        for event in events:
+            body, metadata = record_data(event)
+            self.collection.add("w", "procedural", body, "dream-procedure", metadata)
+
+    def test_publication_captures_raw_full_fields_and_drawer_witnesses_before_host_loss(self):
+        from dream_procedural_sources import read_source_records
+        from dream_procedural_validate import EvidenceReader
+        for ref in self.refs[:2]:
+            ref.update(source_kind="session_turn", source_id=ref["session_id"],
+                       turn_index=0, field="user_message", quote="Focused test")
+        proposal = self.proposal()
+        self.assertEqual(self.invoke("propose", proposal)[0], 0)
+        self.assertEqual(read_source_records(self.path, "w").record_count, 3)
+        bodies = [r["text"] for r in self.collection.rows.values()
+                  if r["metadata"]["room"] == "procedural-sources"]
+        self.assertEqual(sum('"captured_text":' in text for text in bodies), 2)
+        os.unlink(self.store)
+        with patch("dream_procedural_validate._session_repository", side_effect=AssertionError("host")):
+            self.assertEqual(self.invoke("review", self.review())[0], 0)
+            outcome = parse_event(event_data("outcome", 3, evidence=[self.refs[0]],
+                                            source_session_id=self.refs[0]["session_id"]))
+            self.assertEqual(self.invoke("outcome", outcome)[0], 0)
+            reader = EvidenceReader(self.path, "w")
+            self.assertEqual(reader.source_text(self.refs[0]),
+                             self.collection.rows["source-1"]["text"])
+            code, result, err = self.invoke("explain", None, "--rule-id", proposal.rule_id)
+            self.assertEqual((code, result["status"]), (0, "ok"), err)
+            self.collection.embedding_function = lambda texts: [[1., 0.] for _ in texts]
+            code, result, err = self.invoke("guidance", None, "--repository", "owner/repo",
+                "--task", "regression", "--include-candidates")
+            self.assertEqual((code, result.get("item_count")), (0, 1), err)
+
+    def test_bare_append_captures_and_enforces_admission_without_callback(self):
+        from dream_procedural_palace import append_event, read_events, verify_event_sources
+        from dream_procedural_sources import read_source_records
+        writer = sanctioned_writer(self.path, self.collection)
+        invalid = parse_event(event_data(origin_drawer_ids=[], evidence=self.refs[:2]))
+        with self.assertRaisesRegex(ValueError, "three"):
+            append_event(self.path, "w", invalid, writer=writer, clock=lambda: NOW)
+        self.assertEqual(read_source_records(self.path, "w").record_count, 0)
+        self.raw_references()
+        proposal = self.proposal()
+        with patch("dream_sessions.load_session_turns", side_effect=AssertionError("hidden host fallback")):
+            with self.assertRaisesRegex(ValueError, "wing-scoped EvidenceReader"):
+                verify_event_sources(self.path, proposal)
+        result = append_event(self.path, "w", proposal, writer=writer, clock=lambda: NOW)
+        self.assertEqual(result.status, "appended")
+        self.assertEqual(read_source_records(self.path, "w").record_count, 3)
+        os.unlink(self.store)
+        with patch("dream_procedural_validate.acquire_original", side_effect=AssertionError("acquire")), \
+             patch.object(writer, "add_drawer", side_effect=AssertionError("write")):
+            retry = append_event(self.path, "w", proposal, writer=writer,
+                                 clock=lambda: NOW - timedelta(days=1))
+        self.assertEqual(retry.status, "already_exists")
+        self.assertEqual(read_events(self.path, "w"), [proposal])
+
+    def test_explicit_legacy_capture_is_read_only_when_dry_and_does_not_rewrite_events(self):
+        from dream_procedural_palace import read_events
+        self.raw_references()
+        proposal, review = self.proposal(), self.review(verdict="retire")
+        self.legacy(proposal, review)
+        code, result, _ = self.invoke("explain", None, "--rule-id", proposal.rule_id)
+        self.assertEqual(code, 1)
+        self.assertEqual(result["source_diagnostics"][0]["code"], "uncaptured")
+        before = deepcopy(self.collection.rows)
+        code, result, err = self.invoke("capture-sources", None, "--session-store", self.store, "--dry-run")
+        self.assertEqual((code, result.get("pending")), (0, 3), err)
+        self.assertEqual(self.collection.rows, before)
+        code, result, err = self.invoke("capture-sources", None, "--session-store", self.store)
+        self.assertEqual((code, result.get("captured")), (0, 3), err)
+        self.assertEqual(read_events(self.path, "w"), [proposal, review])
+        os.unlink(self.store)
+        code, result, err = self.invoke("explain", None, "--rule-id", proposal.rule_id)
+        self.assertEqual((code, result["status"]), (0, "ok"), err)
+        self.assertIn("retired", result["rule"]["suppression_reasons"])
+        code, result, err = self.invoke("capture-sources", None, "--session-store", self.store)
+        self.assertEqual((code, result.get("already_captured")), (0, 3), err)
+
+    def test_null_session_legacy_is_blocked_not_repaired_and_capture_reports_failures(self):
+        from test_dream_procedural import resign
+        data = event_to_data(self.proposal())
+        data["payload"]["evidence"][0]["session_id"] = None
+        legacy = parse_event(resign(data))
+        self.legacy(legacy)
+        before = deepcopy(self.collection.rows)
+        code, result, err = self.invoke("capture-sources", None, "--session-store", self.store)
+        self.assertEqual((code, result.get("status")), (1, "blocked"), err)
+        self.assertEqual(result["failures"][0]["code"], "missing_session")
+        self.assertEqual(self.collection.rows, before)
+
+    def test_partial_capture_retry_uses_captured_originals_after_host_turn_is_removed(self):
+        from dream_procedural_palace import append_event, read_events
+        from dream_procedural_sources import read_source_records
+        self.raw_references()
+        proposal = self.proposal()
+        writer = sanctioned_writer(self.path, self.collection)
+        handler = writer._tools["mempalace_add_drawer"]["handler"]
+        calls = []
+        from functools import wraps
+        @wraps(handler)
+        def interrupted(**kwargs):
+            calls.append(kwargs["room"])
+            if len(calls) == 2:
+                raise RuntimeError("capture interruption")
+            return handler(**kwargs)
+        writer._tools["mempalace_add_drawer"]["handler"] = interrupted
+        with self.assertRaisesRegex(RuntimeError, "capture interruption"):
+            append_event(self.path, "w", proposal, writer=writer, clock=lambda: NOW)
+        self.assertEqual(read_events(self.path, "w"), [])
+        self.assertEqual(read_source_records(self.path, "w").record_count, 1)
+        with sqlite3.connect(self.store) as con:
+            con.execute("DELETE FROM turns WHERE session_id=?", (self.refs[0]["session_id"],))
+            con.execute("DELETE FROM sessions WHERE id=?", (self.refs[0]["session_id"],))
+        result = append_event(self.path, "w", proposal,
+            writer=sanctioned_writer(self.path, self.collection), clock=lambda: NOW)
+        self.assertEqual(result.status, "appended")
+        self.assertEqual(read_source_records(self.path, "w").record_count, 3)
+
+    def test_prepare_requires_hash_for_ambiguous_captured_versions(self):
+        from dream_metadata import content_hash
+        from dream_procedural_sources import capture_source
+        from dream_procedural_validate import acquire_original, EvidenceReader
+        self.raw_references()
+        original = self.proposal().payload.evidence[0]
+        writer = sanctioned_writer(self.path, self.collection)
+        for text in (self.refs[0]["quote"], self.refs[0]["quote"] + "\nAnother version"):
+            with sqlite3.connect(self.store) as con:
+                con.execute("UPDATE turns SET user_message=? WHERE session_id=?", (text, original.session_id))
+            from dataclasses import replace
+            ref = replace(original, source_hash=content_hash(text))
+            capture_source(acquire_original(ref, palace=self.path, session_store=self.store),
+                palace=self.path, wing="w", captured_at=NOW, captured_by="test", writer=writer)
+        os.unlink(self.store)
+        reader = EvidenceReader(self.path, "w")
+        partial = {k: v for k, v in self.refs[0].items() if k != "source_hash"}
+        with self.assertRaisesRegex(ValueError, "explicit source_hash"):
+            reader.source_text(partial)
+        self.assertEqual(reader.source_text(self.refs[0]), self.refs[0]["quote"])
+
+    def test_migration_reports_missing_drawer_and_projected_headroom_without_writes(self):
+        self.legacy(self.proposal())
+        del self.collection.rows["source-1"]
+        before = deepcopy(self.collection.rows)
+        code, result, err = self.invoke("capture-sources", None, "--session-store", self.store)
+        self.assertEqual((code, result.get("status")), (1, "blocked"), err)
+        self.assertEqual(result["failures"][0]["code"], "original_drawer_missing")
+        self.assertEqual((result["source_count"], result["already_captured"],
+                          result["pending"], result["captured"], result["record_count"]), (3, 0, 2, 0, 0))
+        self.assertEqual(self.collection.rows, before)
+        self.collection.rows["source-1"] = {"id": "source-1", "text": self.refs[0]["quote"],
+                                          "metadata": {"wing": "w", "room": "diary"}}
+        with patch("dream_procedural_sources.RECORD_WARNING_THRESHOLD", 3):
+            code, result, err = self.invoke("capture-sources", None, "--session-store", self.store, "--dry-run")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(result["capacity"]["projected_record_count"], 3)
+        self.assertEqual(result["capacity"]["records_until_warning"], 0)
+        self.assertTrue(result["warnings"])
+
+    def test_migration_missing_host_does_not_count_failed_acquisitions_as_captures(self):
+        self.legacy(self.proposal())
+        Path(self.store).unlink()
+        before = deepcopy(self.collection.rows)
+        for options in (("--dry-run",), ()):
+            with self.subTest(options=options):
+                code, result, err = self.invoke("capture-sources", None,
+                    "--session-store", self.store, *options)
+                self.assertEqual((code, result["status"]), (1, "blocked"), err)
+                self.assertEqual((result["source_count"], result["already_captured"],
+                                  result["pending"], result["captured"], result["failed"],
+                                  result["record_count"]), (3, 0, 0, 0, 3, 0))
+                self.assertEqual({failure["code"] for failure in result["failures"]},
+                                 {"session_store_unavailable"})
+                self.assertEqual(self.collection.rows, before)
+
+    def test_migration_counts_only_distinct_verified_captures_among_acquired_and_failed_sources(self):
+        from dream_procedural_sources import capture_source
+        from dream_procedural_validate import acquire_original
+        proposal = self.proposal()
+        ref = proposal.payload.evidence[0]
+        capture_source(acquire_original(ref, palace=self.path, session_store=self.store),
+            palace=self.path, wing="w", captured_at=NOW, captured_by="test",
+            writer=sanctioned_writer(self.path, self.collection))
+        self.refs[0]["quote"] = "Focused test"
+        self.legacy(proposal, self.review())
+        del self.collection.rows["source-3"]
+        before = deepcopy(self.collection.rows)
+        for options in (("--dry-run",), ()):
+            with self.subTest(options=options):
+                code, result, err = self.invoke("capture-sources", None,
+                    "--session-store", self.store, *options)
+                self.assertEqual((code, result["status"]), (1, "blocked"), err)
+                self.assertEqual((result["reference_count"], result["source_count"],
+                                  result["already_captured"], result["pending"],
+                                  result["captured"], result["failed"], result["record_count"]),
+                                 (4, 3, 1, 1, 0, 1, 1))
+                self.assertEqual(result["failures"][0]["code"], "original_drawer_missing")
+                self.assertEqual(self.collection.rows, before)
+        self.collection.rows["source-1"]["text"] = "drifted original"
+        code, result, err = self.invoke("capture-sources", None, "--session-store", self.store)
+        self.assertEqual((code, result["status"]), (1, "blocked"), err)
+        self.assertEqual((result["already_captured"], result["pending"], result["record_count"]), (0, 1, 1))
+
+    def test_postcapture_readback_rechecks_drawer_instead_of_using_prewrite_resolution(self):
+        from dream_procedural_palace import append_event, read_events
+        from functools import wraps
+        writer = sanctioned_writer(self.path, self.collection)
+        handler = writer._tools["mempalace_add_drawer"]["handler"]
+        @wraps(handler)
+        def corrupt_original(**kwargs):
+            result = handler(**kwargs)
+            if kwargs["room"] == "procedural-sources":
+                self.collection.rows["source-1"]["text"] = "changed during capture"
+            return result
+        writer._tools["mempalace_add_drawer"]["handler"] = corrupt_original
+        with self.assertRaisesRegex(ValueError, "drift"):
+            append_event(self.path, "w", self.proposal(), writer=writer, clock=lambda: NOW)
+        self.assertEqual(read_events(self.path, "w"), [])
+
+    def test_failed_source_and_event_ack_readback_boundaries_are_retryable(self):
+        from dream_procedural_palace import append_event, read_events
+        from dream_procedural_sources import read_source_records
+        from functools import wraps
+        self.raw_references()
+        proposal = self.proposal()
+        for boundary in ("source_before", "source_after", "event_before", "event_after"):
+            with self.subTest(boundary=boundary):
+                self.collection.rows = {k: v for k, v in self.collection.rows.items()
+                                        if v["metadata"]["room"] == "diary"}
+                writer = sanctioned_writer(self.path, self.collection)
+                handler = writer._tools["mempalace_add_drawer"]["handler"]
+                count = 0
+                @wraps(handler)
+                def interrupt(**kwargs):
+                    nonlocal count
+                    is_source = kwargs["room"] == "procedural-sources"
+                    count += is_source
+                    selected = (is_source and count == 3) if boundary.startswith("source") else not is_source
+                    if selected and boundary.endswith("before"):
+                        return {"success": True}
+                    result = handler(**kwargs)
+                    if selected:
+                        raise RuntimeError("lost acknowledgment")
+                    return result
+                writer._tools["mempalace_add_drawer"]["handler"] = interrupt
+                with self.assertRaisesRegex(RuntimeError, "readback|acknowledgment"):
+                    append_event(self.path, "w", proposal, writer=writer, clock=lambda: NOW)
+                self.assertEqual(len(read_events(self.path, "w")), int(boundary == "event_after"))
+                self.assertEqual(read_source_records(self.path, "w").record_count,
+                                 2 if boundary == "source_before" else 3)
+                # Captured originals need not survive. Keep only the one never written.
+                if boundary == "source_before":
+                    result = append_event(self.path, "w", proposal,
+                        writer=sanctioned_writer(self.path, self.collection), clock=lambda: NOW)
+                else:
+                    with patch("dream_procedural_validate.acquire_original", side_effect=AssertionError("host")):
+                        result = append_event(self.path, "w", proposal,
+                            writer=sanctioned_writer(self.path, self.collection), clock=lambda: NOW)
+                self.assertEqual(result.status, "already_exists" if boundary == "event_after" else "appended")
+                self.assertEqual(read_events(self.path, "w"), [proposal])
+
+    def test_source_size_rejected_before_any_publication_or_migration_write(self):
+        from dream_metadata import content_hash
+        from dream_procedural_sources import MAX_RECORD_BYTES
+        self.raw_references()
+        text = "oversized " + "x" * MAX_RECORD_BYTES
+        with sqlite3.connect(self.store) as con:
+            con.execute("UPDATE turns SET user_message=? WHERE session_id=?", (text, self.refs[0]["session_id"]))
+        self.refs[0].update(quote="oversized", source_hash=content_hash(text))
+        proposal = self.proposal()
+        before = deepcopy(self.collection.rows)
+        code, result, err = self.invoke("propose", proposal, "--dry-run")
+        self.assertEqual(code, 2, err)
+        self.assertIn("4 MiB", result["error"])
+        code, result, err = self.invoke("propose", proposal)
+        self.assertEqual(code, 2, err)
+        self.assertEqual(self.collection.rows, before)
+        self.legacy(proposal)
+        before = deepcopy(self.collection.rows)
+        code, result, err = self.invoke("capture-sources", None, "--session-store", self.store)
+        self.assertEqual((code, result.get("status")), (1, "blocked"), err)
+        self.assertEqual(result["failures"][0]["code"], "source_size")
+        self.assertEqual(self.collection.rows, before)
+
+    def test_diagnostics_distinguish_missing_drawer_and_corrupt_capture_without_host_fallback(self):
+        from dream_procedural_validate import inspect_published_sources
+        self.publish(self.proposal(), self.review())
+        before = deepcopy(self.collection.rows)
+        with patch("dream_procedural_validate.acquire_original", side_effect=AssertionError("host")), \
+             patch.object(dream_palace, "MempalaceWriter", side_effect=AssertionError("writer")):
+            report = inspect_published_sources(self.path, "w")
+            self.assertEqual((report["status"], report["source_count"]), ("ok", 3))
+            self.assertEqual(self.collection.rows, before)
+        del self.collection.rows["source-1"]
+        report = inspect_published_sources(self.path, "w")
+        self.assertEqual(report["failures"][0]["code"], "original_drawer_missing")
+        self.collection.rows = before
+        source = next(row for row in self.collection.rows.values()
+                      if row["metadata"]["room"] == "procedural-sources")
+        source["text"] = source["text"].replace("owner/repo", "other/repo")
+        code, result, err = self.invoke("explain", None, "--rule-id", self.proposal().rule_id)
+        self.assertEqual(code, 1, err)
+        self.assertEqual(result["source_diagnostics"][0]["code"], "corrupt_capture")
+
+    def test_inspector_requires_retained_origins_separately_from_captured_evidence(self):
+        from dream_procedural_validate import inspect_published_sources
+        proposals = [parse_event(event_data(number=n, origin_drawer_ids=["source-4"],
+                                           evidence=self.refs[:3])) for n in (1, 5)]
+        review = self.review()
+        self.publish(*proposals, review,
+                     self.review(3, verdict="retire", parent_review_ids=[review.event_id]))
+        before = deepcopy(self.collection.rows)
+        with patch("dream_procedural_validate.acquire_original", side_effect=AssertionError("host")), \
+             patch("dream_procedural_validate.project_rules", side_effect=AssertionError("eligibility")), \
+             patch.object(dream_palace, "MempalaceWriter", side_effect=AssertionError("writer")):
+            report = inspect_published_sources(self.path, "w")
+            self.assertEqual((report["status"], report["reference_count"], report["source_count"],
+                              report["record_count"]), ("ok", 3, 3, 3))
+            self.assertEqual(self.collection.rows, before)
+            del self.collection.rows["source-4"]
+            damaged = deepcopy(self.collection.rows)
+            report = inspect_published_sources(self.path, "w")
+            self.assertEqual(report["status"], "blocked")
+            self.assertEqual((report["event_count"], report["origin_count"], report["failed"]), (4, 1, 1))
+            self.assertEqual(report["failures"][0]["code"], "origin_drawer_missing")
+            self.assertEqual(report["failures"][0]["source_id"], "source-4")
+            self.assertEqual(report["failures"][0]["reference_kind"], "origin")
+            self.assertEqual((report["reference_count"], report["source_count"],
+                              report["record_count"]), (3, 3, 3))
+            self.assertEqual(self.collection.rows, damaged)
+
+    def test_inspector_distinguishes_invalid_origin_chunks_from_missing_origin(self):
+        from dream_procedural_validate import inspect_published_sources
+        self.publish(parse_event(event_data(origin_drawer_ids=["source-4"], evidence=self.refs[:3])))
+        del self.collection.rows["source-4"]
+        for index in (0, 2):
+            name = f"source-4_chunk_{index:06d}"
+            self.collection.rows[name] = {"id": name, "text": "lineage", "metadata": {
+                "wing": "w", "room": "diary", "parent_drawer_id": "source-4",
+                "chunk_index": index, "id_recipe": "v3", "added_by": "original-agent"}}
+        before = deepcopy(self.collection.rows)
+        report = inspect_published_sources(self.path, "w")
+        self.assertEqual(report["status"], "blocked")
+        self.assertEqual((report["origin_count"], report["failed"]), (1, 1))
+        self.assertEqual(report["failures"][0]["code"], "origin_drawer_invalid")
+        self.assertIn("incomplete source drawer chunks", report["failures"][0]["error"])
+        self.assertEqual(self.collection.rows, before)
+
+    def test_preparation_and_validation_classify_corrupt_capture_as_integrity_not_request(self):
+        self.publish(self.proposal())
+        source = next(row for row in self.collection.rows.values()
+                      if row["metadata"]["room"] == "procedural-sources")
+        source["text"] = source["text"].replace("owner/repo", "other/repo")
+        draft = event_to_data(self.proposal(number=8))
+        del draft["digest"]
+        del draft["payload"]["evidence"][0]["source_hash"]
+        code, result, err = self.invoke("propose", draft, "--prepare", "--out",
+                                        str(Path(self.tmp.name, "prepared-corrupt.json")))
+        self.assertEqual((code, result.get("code")), (1, "corrupt_capture"), err)
+        self.collection.query = lambda **kwargs: {
+            "ids": [["source-1"]], "documents": [[self.refs[0]["quote"]]],
+            "metadatas": [[self.collection.rows["source-1"]["metadata"]]]}
+        self.collection.embedding_function = lambda texts: [[1., 0.] for _ in texts]
+        code, result, err = self.invoke("validate", None, "--rule-id", self.proposal().rule_id,
+            "--contrast-query", "When does this fail?", "--out", str(Path(self.tmp.name, "corrupt-packet.json")))
+        self.assertEqual((code, result.get("code")), (1, "corrupt_capture"), err)
+
+
 class InstalledCommandTests(GroundedFixture):
     def run_cli(self, command, event, *, env=None):
         artifact = Path(self.tmp.name, f"{command}.json")
@@ -337,6 +810,80 @@ class InstalledCommandTests(GroundedFixture):
         return subprocess.run([sys.executable, str(script),
             command, "--palace", self.path, "--wing", "w", "--session-store", self.store,
             "--input", str(artifact)], capture_output=True, text=True, timeout=90, env=env)
+
+    def test_real_handlers_mixed_sources_survive_entire_host_directory_loss_and_closed_reads(self):
+        from dream_metadata import content_hash
+        from dream_procedural_sources import read_source_records, source_key
+        from dream_procedural_validate import EvidenceReader, inspect_published_sources
+        from dream_procedural_palace import append_event, read_events
+        from dream_procedure import main
+        from mempalace.palace import get_backend_for_palace
+        import shutil
+        self.storage_patch.stop()
+        host = Path(self.tmp.name, "host-session-directory")
+        host.mkdir()
+        moved = host / "session-store.db"
+        Path(self.store).rename(moved)
+        self.store = str(moved)
+        texts = [" \tFull raw user field\n```fsharp\nlet x = \"漢字\"\n```\r\n\u2028tail \n",
+                 "\n Full raw assistant field, not just a quotation. \u2029 \t"]
+        with sqlite3.connect(self.store) as con:
+            for ref, field, text in zip(self.refs[:2], ("user_message", "assistant_response"), texts):
+                con.execute(f"UPDATE turns SET {field}=? WHERE session_id=?", (text, ref["session_id"]))
+                ref.update(source_kind="session_turn", source_id=ref["session_id"], field=field,
+                           turn_index=0, source_hash=content_hash(text), quote="raw")
+        with installed_palace(self.path) as server:
+            writer = dream_palace.MempalaceWriter()
+            with writer.mutation():
+                with patch.dict(server._config._file_config, {"chunk_size": 73}):
+                    stored = writer.add_drawer("w", "diary", self.refs[2]["quote"])
+                physical = stored["drawer_id"] + "_chunk_000001"
+                self.refs[2]["source_id"] = physical
+                events = [self.proposal(), self.review()]
+                for event in events:
+                    append_event(self.path, "w", event, writer=writer,
+                                 session_store=self.store, clock=lambda: NOW)
+                shutil.rmtree(host)
+                col = server._get_collection()
+                col._handle.conn.execute("PRAGMA wal_autocheckpoint=0")
+                before_state = tuple(col._handle.conn.iterdump())
+                before = {p.name: p.read_bytes() for p in Path(self.path).iterdir()
+                          if p.is_file() and not p.name.endswith("-shm")}
+
+                def readonly_commands(suffix):
+                    with patch("dream_procedural_validate._session_repository", side_effect=AssertionError("host")), \
+                         patch.object(dream_palace, "MempalaceWriter", side_effect=AssertionError("writer")), \
+                         patch.object(dream_palace, "ensure_firewall_schema", side_effect=AssertionError("schema")):
+                        reader = EvidenceReader(self.path, "w")
+                        for ref, text in zip(self.refs[:2], texts):
+                            self.assertEqual(reader.source_text(ref), text)
+                        self.assertEqual(reader.resolve(events[0].payload.evidence[2]).reference.source_id, physical)
+                        index = read_source_records(self.path, "w")
+                        self.assertIn(source_key(events[0].payload.evidence[2]), index.locators)
+                        self.assertEqual(inspect_published_sources(self.path, "w")["status"], "ok")
+                        for command, extra in (
+                            ("guidance", ["--task", events[0].payload.definition.statement,
+                                          "--repository", "owner/repo", "--include-candidates"]),
+                            ("explain", ["--rule-id", events[0].rule_id]),
+                            ("validate", ["--rule-id", events[0].rule_id, "--contrast-query", "regression failed",
+                                          "--out", str(Path(self.tmp.name, f"packet-{suffix}.json"))])):
+                            out, err = StringIO(), StringIO()
+                            with redirect_stdout(out), redirect_stderr(err), \
+                                 patch("dream_procedure.now_utc", return_value=NOW):
+                                code = main([command, "--palace", self.path, "--wing", "w",
+                                             "--session-store", self.store, *extra])
+                            self.assertEqual(code, 0, command + ": " + out.getvalue() + err.getvalue())
+                readonly_commands("live")
+                self.assertEqual(tuple(col._handle.conn.iterdump()), before_state)
+                self.assertEqual({p.name: p.read_bytes() for p in Path(self.path).iterdir()
+                                  if p.is_file() and not p.name.endswith("-shm")}, before)
+            get_backend_for_palace(self.path).close_palace(self.path)
+            before = {p.name: p.read_bytes() for p in Path(self.path).iterdir()
+                      if p.is_file() and not p.name.endswith("-shm")}
+            readonly_commands("closed")
+            self.assertEqual({p.name: p.read_bytes() for p in Path(self.path).iterdir()
+                              if p.is_file() and not p.name.endswith("-shm")}, before)
+            self.assertEqual(set(read_events(self.path, "w")), set(events))
 
     def test_fresh_cli_subprocess_propose_review_outcome_persist_without_opener_patch(self):
         from dream_procedural_palace import read_events
@@ -358,10 +905,51 @@ class InstalledCommandTests(GroundedFixture):
                 result = json.loads(completed.stdout)
                 self.assertEqual(result["status"], "appended")
                 self.assertEqual(result["event_id"], event.event_id)
+                if command == "propose":
+                    Path(self.store).unlink()
             self.assertEqual(set(read_events(self.path, "w")), set(events))
             state = project_rules(read_events(self.path, "w"), as_of=NOW, policy=Policy()).rules[0]
             self.assertEqual(state.review_heads, (events[1].event_id,))
             self.assertEqual(state.score.helpful, 1)
+
+    def test_real_cli_legacy_capture_includes_adverse_retired_raw_history(self):
+        from dream_procedural_palace import read_events, record_data
+        from dream_procedural_sources import read_source_records
+        self.storage_patch.stop()
+        for ref in self.refs:
+            ref.update(source_kind="session_turn", source_id=ref["session_id"],
+                       turn_index=0, field="user_message")
+        proposal = self.proposal()
+        held = self.review(verdict="hold", dispositions=[
+            *event_to_data(self.review())["payload"]["dispositions"],
+            {"evidence_id": self.refs[3]["source_id"], "disposition": "contradicts",
+             "reason": "Original adverse observation.", "evidence": [self.refs[3]]}])
+        retired = self.review(4, verdict="retire", parent_review_ids=[held.event_id])
+        events = [proposal, held, retired]
+        with installed_palace(self.path):
+            writer = dream_palace.MempalaceWriter()
+            with writer.mutation():
+                for event in events:
+                    body, metadata = record_data(event)
+                    writer.add_drawer("w", "procedural", body, added_by="dream-procedure", metadata=metadata)
+            def run(command, *extra):
+                script = Path(__file__).resolve().parents[2] / "skills" / "dreaming" / "scripts" / "dream_procedure.py"
+                completed = subprocess.run([sys.executable, str(script),
+                    command, "--palace", self.path, "--wing", "w", "--session-store", self.store, *extra],
+                    capture_output=True, text=True, timeout=90)
+                self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+                return json.loads(completed.stdout)
+            before = set(read_events(self.path, "w"))
+            self.assertEqual(run("capture-sources", "--dry-run")["pending"], 4)
+            self.assertEqual(read_source_records(self.path, "w").record_count, 0)
+            result = run("capture-sources")
+            self.assertEqual((result["captured"], result["failed"]), (4, 0))
+            Path(self.store).unlink()
+            self.assertEqual(run("capture-sources")["already_captured"], 4)
+            explanation = run("explain", "--rule-id", proposal.rule_id)
+            self.assertEqual(explanation["status"], "ok")
+            self.assertIn("retired", explanation["rule"]["suppression_reasons"])
+            self.assertEqual(set(read_events(self.path, "w")), before)
 
     def test_cli_refuses_other_writer_and_operator_readonly_without_appending(self):
         from dream_procedural_palace import read_events
