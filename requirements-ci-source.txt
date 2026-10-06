@@ -1,0 +1,4 @@
+# Approved source build: custom APIs required by the dreaming integration.
+# Immutable fork commit; pip verifies the archive hash before running hatchling.
+mempalace @ https://github.com/et1975/mempalace/archive/e02761d3b8b1f2e366ab017840ef53394474aee9.tar.gz \
+    --hash=sha256:671c756c8f40ab6ec89913f438ea3544620a42613e26bdad621039b5efb574d1

@@ -10,7 +10,7 @@ from typing import Any
 MARKER = "<!--dreaming-meta:"
 GENERATED_TRANSPORT_KINDS = frozenset({
     "procedural_delivery_packet", "procedural_applicability_witness", "procedural_use_check",
-    "procedural_receipt",
+    "procedural_receipt", "procedural_feedback", "procedural_feedback_abstention",
 })
 GENERATED_KINDS = frozenset({"lesson", "reflect", "procedural_event", "procedural_source"}) \
     | GENERATED_TRANSPORT_KINDS
@@ -160,6 +160,13 @@ def is_procedural_record(drawer: dict) -> bool:
     return (metadata.get("kind") in {"procedural_event", "procedural_source"}
             or metadata.get("room") in {"procedural", "procedural-sources"}
             or is_receipt_record_metadata(metadata))
+
+
+def is_control_record(drawer: dict) -> bool:
+    metadata = decode_dream_metadata(drawer)
+    kinds = {"control", "dream_control", "dream_checkpoint", "task", "task_event"}
+    return (metadata.get("kind") in kinds or metadata.get("source_kind") in kinds
+            or metadata.get("room") == "__control__")
 
 
 def is_receipt_record_metadata(metadata: dict) -> bool:

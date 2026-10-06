@@ -53,6 +53,10 @@ class SourceTests(unittest.TestCase):
         _, current, _, guidance = case()
         texts = [
             *[canonical_json(r) for r in receipts()[:2]],
+            *[wrapper.format(body) for kind in ("procedural_feedback", "procedural_feedback_abstention")
+              for value in [canonical_json({"kind": kind, "quote": "parser"})]
+              for body in (value, canonical_json(value))
+              for wrapper in ("{}", "```json\n{}\n```", "Copied:\n{}\nEnd.")],
             wrapped_packet("Copied report:\n{}\nEnd.", encoded=True),
             canonical_json(applicability(current["context"], guidance["rules"])),
             canonical_json(dict(kind="procedural_use_check", authority="agent_reported",
@@ -74,6 +78,21 @@ class SourceTests(unittest.TestCase):
             before = deepcopy(self.collection.rows)
             with self.assertRaisesRegex(ValueError, "generated"):
                 EvidenceReader(self.path, "w").resolve(ref)
+            self.assertEqual(self.collection.rows, before)
+
+    def test_feedback_drawer_witness_cannot_rescue_copied_transport(self):
+        from dream_procedural_sources import OriginalSource
+        for kind in ("procedural_feedback", "procedural_feedback_abstention"):
+            text = DRAWER + "\nCopied:\n" + canonical_json(canonical_json(
+                {"kind": kind, "quote": "original observation"}))
+            ref = EvidenceReference("drawer", "original", SESSION, "original observation",
+                                    content_hash(text))
+            self.collection.rows["original"] = {"id": "original", "text": text,
+                "metadata": {"wing": "w", "room": "diary", "repository": "owner/repo"}}
+            self.capture(OriginalSource(ref, "owner/repo", NOW))
+            before = deepcopy(self.collection.rows)
+            with self.assertRaisesRegex(ValueError, "generated"):
+                self.resolve(ref)
             self.assertEqual(self.collection.rows, before)
 
     def test_pre_upgrade_drawer_witness_does_not_rescue_transport_body(self):
@@ -285,19 +304,16 @@ class SourceTests(unittest.TestCase):
     def test_discovery_rejects_valid_format_header_digest_substitution_before_routing(self):
         self._assert_discovery_rejects_header_substitution("Digest", "source_digest")
 
-    def test_discovery_checks_claims_but_defers_full_body_validation(self):
-        from dream_procedural_sources import read_source_records, resolve_captured, source_record_data
+    def test_discovery_reconciles_structural_body_before_routing(self):
+        from dream_procedural_sources import read_source_records, source_record_data
         text = RAW * 100
         source = original(text)
         body, meta = source_record_data(source, captured_at=NOW, captured_by="test")
         body = body.replace("owner/repo", "other/repo")
         sanctioned_writer(self.path, self.collection, chunk_size=79).add_drawer(
             "w", "procedural-sources", body, added_by="dream-procedure-source", metadata=meta)
-        index = read_source_records(self.path, "w")
-        self.assertEqual(index.record_count, 1)
-        self.assertNotIn("captured_text", repr(index))
         with self.assertRaisesRegex(ValueError, "body/digest mismatch"):
-            resolve_captured(source.reference, palace=self.path, wing="w", sources=index)
+            read_source_records(self.path, "w")
 
     def test_chunks_missing_duplicate_indices_conflicting_metadata_and_bad_identity_fail_closed(self):
         from dream_procedural_sources import read_source_records
@@ -447,8 +463,19 @@ class SourceTests(unittest.TestCase):
 
     def test_old_merge_prune_worklists_and_actual_harvest_exclude_source_records(self):
         result = self.capture()
+        other = self.capture(original(RAW + "another exact observation"))
         target = result.drawer_ids[0]
-        with patch("mempalace.palace.get_collection", return_value=self.collection):
+        parents = [self.collection.rows[item.drawer_ids[0]]["metadata"]["parent_drawer_id"]
+                   for item in (result, other)]
+
+        def native_duplicates(**params):
+            return {"params": {**params, "neighbor_bound": self.collection.count()},
+                    "clusters": [{"drawer_ids": parents,
+                                  "pairs": [{"a": parents[0], "b": parents[1], "distance": 0.0}]}]}
+
+        server = SimpleNamespace(TOOLS={"mempalace_find_duplicates": {"handler": native_duplicates}})
+        with patch("mempalace.palace.get_collection", return_value=self.collection), \
+                patch.object(dream_palace, "_embedded_mcp_server", return_value=server):
             self.assertEqual(dream_palace.load_logical_drawers(self.path, "w"), [])
             self.assertEqual(dream_palace.load_observation_entries(
                 self.path, "w", rooms=("procedural-sources",)), [])

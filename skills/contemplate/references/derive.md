@@ -14,7 +14,8 @@ relative worklists and decisions outside the checkout and installed skill.
 ## Layered responsibilities
 
 - **Substrate — mempalace**: palace-local temporal KG at
-  `<palace>/knowledge_graph.sqlite3`.
+  `<palace>/knowledge_graph.sqlite3`, plus native artifacts/events for ontology
+  configuration/candidates and derive skip markers.
 - **Mechanics — shared Python scripts**: `dream_lib.py`, `dream_palace.py`,
   `dream_harvest.py`, and `dream_adopt.py` under `skills/dreaming/scripts/`.
 - **Cognition — the contemplate skill**: approve ontology rules and adjudicate
@@ -24,16 +25,16 @@ relative worklists and decisions outside the checkout and installed skill.
 
 | Phase | Reads | Writes |
 |-------|-------|--------|
-| Harvest | active KG triples (`valid_to IS NULL`), `<palace>/ontology.json` or `--rules`, skip-markers | `worklist.json` only. Harvest writes nothing to the palace |
+| Harvest | active KG triples (`valid_to IS NULL`), native ontology, native skip-markers | `worklist.json` export; no conclusion adoption, but legacy premise loading may reconcile provenance |
 | Adjudicate | `worklist.json`, rule rationales, user intent | `decisions.json` (same document with actions filled) |
 | Adopt | `decisions.json`, active KG, ontology, skip-markers | approved derived triples, `kg_derivations`, skip-markers |
-| Verify | active KG, ontology, skip-markers | no palace writes; reports residual candidates |
+| Verify | active KG, ontology, skip-markers | reports residual candidates; legacy premise-loading caveat still applies |
 
 Run:
 
 ```bash
 "$MPY" "$DREAM_SCRIPTS/dream_harvest.py" --task derive \
-  --palace <p> --rules <p>/ontology.json --out worklist.json
+  --palace <p> --out worklist.json
 # fill actions in worklist.json and save as decisions.json
 "$MPY" "$DREAM_SCRIPTS/dream_adopt.py" --task derive \
   --palace <p> --decisions decisions.json --verify
@@ -44,12 +45,22 @@ an operational fixpoint. Under `--dry-run` nothing is written, so the residual/`
 skipped; a dry run still exits non-zero if any decision produced an error (the preview surfaces
 materialize failures).
 
-## `ontology.json`
+## Ontology configuration
 
-The ontology config is explicit. Empty or missing config ⇒ no enabled rules ⇒
-zero candidates. The top-level document is versioned; the scripts also compute
+The ontology config is explicit and stored natively. No configured rules in
+healthy native storage ⇒ zero candidates; missing/corrupt native storage is an
+error, not permission to reset state. File flags remain explicit legacy imports
+and exports, not default sidecar authority or implicit enablement. The top-level
+document is versioned; the scripts also compute
 an `ontology_version` content hash from enabled-rule semantics and echo it into
 worklists, skip-markers, and derivation lineage.
+
+A coherent full-palace backup/restore retains native artifacts and event history
+for ontology and derive skips; a wing-only export does not. Native inspection is
+read-only and does not bootstrap storage. Explicit initialization is for a
+genuinely new control store in a valid palace, never repair for a failed restore.
+Original evidence, approved-rule semantics and separate procedural opt-in gates
+remain unchanged.
 
 ```jsonc
 {
@@ -95,19 +106,35 @@ Fields:
 
 There is no `allow_reflexive`: v1 closure is unconditionally anti-reflexive.
 
+## Native ontology file compatibility
+
+The `dream_contemplate.py` driver defaults to native ontology and skip records.
+Its `--rules` and `--skips` flags are explicit read-only input overrides during
+reconnaissance. Approved enable/disable with `--rules` imports the resulting
+approved configuration natively under the shared lock; it does not modify the
+legacy input file. Bootstrap's optional `--out` export is a working copy:
+disabled candidates are always retained natively. File selection alone neither
+enables rules nor enrolls procedural learning.
+
+For `dream_adopt.py --task derive`, non-dry adoption imports explicit `--rules`
+and any existing `--skips` input natively before KG writer creation or effects.
+A supplied missing rules file is an error; a missing skips file is allowed as
+a new optional export target. Dry-run imports nothing, and harvest previews do
+not publish their compatibility inputs.
+
 ## Bootstrapping ontology rules
 
-`ontology.json` may start empty. That is deliberate: predicate names are not
-semantics, and empty or missing config must emit zero deductive candidates
+The native ontology may start empty. That is deliberate: predicate names are not
+semantics, and no configured rules must emit zero deductive candidates
 instead of guessing. Two generator tasks can populate disabled candidate rules
 for review:
 
 ```bash
 # name-heuristic bootstrap
-"$MPY" "$DREAM_SCRIPTS/dream_harvest.py" --task suggest-rules --palace <p> --ontology-out <p>/ontology.json
+"$MPY" "$DREAM_SCRIPTS/dream_harvest.py" --task suggest-rules --palace <p>
 # evidence induction
-"$MPY" "$DREAM_SCRIPTS/dream_harvest.py" --task induce-rules --palace <p> --min-support 2 --ontology-out <p>/ontology.json
-# then a HUMAN reviews ontology.json and flips enabled:true only on approved rules
+"$MPY" "$DREAM_SCRIPTS/dream_harvest.py" --task induce-rules --palace <p> --min-support 2
+# then a HUMAN reviews native candidates and explicitly enables approved rules
 ```
 
 - `suggest-rules` scans distinct predicate names and proposes transitive,
@@ -116,11 +143,14 @@ for review:
 - `induce-rules` scans observed base triples and proposes inverse, symmetric,
   or transitive candidates from actual co-occurrence at `--min-support`.
 
-Generator output uses the `ontology.json` rule schema above rather than a
+Generator output uses the ontology document schema above rather than a
 separate worklist schema. Each generated rule is a disabled candidate:
 `enabled: false`, with a `rationale` describing the name heuristic or evidence
-support. Humans review the file and edit only approved rules to
-`enabled: true`; generators never approve rules themselves.
+support. Humans review candidates and enable only approved rules;
+generators never approve rules themselves. `--ontology-out` requests an explicit
+file export and is output only even if the file exists; its contents are never
+imported. `--rules` is the sole ontology file import input. Editing an export
+alone does not update native configuration.
 
 Guardrails:
 
@@ -208,7 +238,8 @@ field:
 `materialize` writes the derived triple and lineage. `skip` writes a
 skip-marker. `reject_rule` writes skip-markers for every current-worklist
 candidate from that rule, giving an operational fixpoint for the current
-`ontology_version`; the durable fix is to edit `ontology.json`.
+`ontology_version`; the durable fix is to explicitly disable or update the native
+rule, not edit an exported file alone.
 
 ## `kg_derivations`
 

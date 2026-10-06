@@ -33,11 +33,33 @@ interpreter. It must have **pytest 8.4.2**, pinned only in
 dependency, not part of `sidecar/pyproject.toml` or `sidecar/requirements.lock`.
 
 A full-suite environment also needs the sidecar's declared production
-dependencies and the existing MemPalace/model prerequisites in that interpreter.
+dependencies, a compatible MemPalace build and the local model prerequisites in
+that interpreter. The custom fork selected by
+[`requirements-ci-source.txt`](../requirements-ci-source.txt) supplies
+`mempalace_find_duplicates` and `mempalace.dynamics.drawer_salience`, which are
+absent from public MemPalace 3.8.0. To match CI, provision the same source and
+locked dependencies using the [two-phase setup below](#github-actions-ci)
+before running tests.
 It additionally requires preinstalled `uv` on PATH and the sidecar's
 [`[build-system]` prerequisites](../sidecar/pyproject.toml) in `TEST_PY`:
 `setuptools>=68`, plus `wheel` if the chosen backend requires it. These are
 development/build prerequisites, not runtime dependencies.
+
+Dreaming's read-only logstream reader accepts that pinned native schema,
+including `events.topic`, and the exact pre-topic schema still present in
+existing palaces. Reading either layout must not initialize, migrate or
+checkpoint storage, including an open writer's committed WAL. Other missing
+or unknown columns remain errors; native writers own schema migration.
+Local validation must use the same MemPalace source pin, not an older
+installation exposed through `PYTHONPATH` or a `.pth` file.
+Check the environment's `mempalace-*.dist-info/direct_url.json` against the
+source URL and archive hash in `requirements-ci-source.txt`.
+
+Incremental memory coverage uses complete, count-checked metadata pages rather
+than an unbounded Chroma query, which can exceed SQLite's variable limit on
+large palaces. Pagination must retain every source and reassemble chunks across
+page boundaries; short backend pages are not a source cap. Repeated, malformed
+or incomplete pages fail instead of publishing partial coverage.
 
 [`test_distribution.py`](test_distribution.py) is part of the default root
 suite. It builds a real wheel and source distribution, then rebuilds a wheel
@@ -58,9 +80,8 @@ partial run is not full-suite validation.
 Task-setup regressions in `tests/test_task_setup.py` and
 `tests/test_task_setup_runtime.py` run directly in Python,
 using the same prepared sidecar environment. They exercise isolated fixtures,
-not the user's real task authority, and require no F#/.NET runtime. Native
-platform-specific cases report their own prerequisites; the setup suite is
-not skipped wholesale for lack of .NET or for running outside Linux.
+not the user's real task authority. Native platform-specific cases report their
+own prerequisites; the common setup suite runs across supported platforms.
 
 ## External storage and bytecode
 
@@ -133,6 +154,10 @@ Select the smallest relevant suite while developing:
 "$TEST_PY" -W error -m pytest --basetemp "$SESSION_FILES/pytest-task-setup" \
   tests/test_task_setup.py tests/test_task_setup_runtime.py -q
 
+# Offline activity-intent core, Copilot adapter and subprocess CLI (stdlib only).
+"$TEST_PY" -m pytest --basetemp "$SESSION_FILES/pytest-activity-intent" \
+  tests/dreaming/test_dream_activity*.py -q
+
 # Procedural command/replay integration.
 "$TEST_PY" -m pytest --basetemp "$SESSION_FILES/pytest-procedural" \
   tests/dreaming/test_dream_procedure.py \
@@ -160,6 +185,11 @@ prerequisites; they have not been made opt-in. Existing optional-hook and platfo
 skips are not passing tests, and Linux results do not certify native macOS/Windows
 behavior.
 
+Run the real-hub gate when updating the installed MemPalace runtime: protocol
+fixtures alone do not verify its advertised schema. The pinned hub describes
+ascending `order` as a string rather than an enum; replay must still explicitly
+request `asc` and use append-order cursors.
+
 Root configuration disables pytest's repository-local cache and uses `prepend`
 imports to preserve existing bare-module identities. Do not add parallel
 execution: tests share process-global module and environment state.
@@ -171,15 +201,49 @@ requests and manual `workflow_dispatch` runs. It uses Ubuntu 24.04 with Python
 3.12 and read-only repository permissions. Official actions are pinned to commit
 SHAs; CI dependency pins live in [`requirements-ci.txt`](../requirements-ci.txt),
 with the pytest pin retained in
-[`requirements-test.txt`](../requirements-test.txt). CI installs the full
-transitive [`requirements-ci.lock`](../requirements-ci.lock) with hash
-verification. After changing any input requirements, regenerate that lock with
-the `uv` version pinned in `requirements-ci.txt`:
+[`requirements-test.txt`](../requirements-test.txt).
+
+[`requirements-ci-source.txt`](../requirements-ci-source.txt) is the authoritative
+source provenance: it pins a full-commit GitHub archive URL and SHA-256 from the
+published [`et1975/mempalace`](https://github.com/et1975/mempalace)
+`copilot/local-with-prs` line (package version 3.10.0). The branch name and package
+version are context, not installation selectors. This custom source provides
+the dreaming APIs described above; substituting the public 3.8.0 package does
+not satisfy that contract.
+
+`requirements-ci.txt` includes the source manifest and pins its `hatchling`
+build backend. The generated
+[`requirements-ci.lock`](../requirements-ci.lock) contains the transitive
+dependency and build-tool wheels, but deliberately omits MemPalace itself.
+CI installs those hash-verified wheels first, then builds and installs the
+hash-verified source without dependency resolution or build isolation. To
+prepare a local environment the same way, select an existing Python 3.12
+environment with pip as `TEST_PY`, and run these provisioning commands from the
+repository root **before** test execution:
+
+```bash
+"$TEST_PY" -m pip install --require-hashes --only-binary=:all: \
+  -r requirements-ci.lock
+PIP_NO_INDEX=1 "$TEST_PY" -m pip install --require-hashes --no-deps \
+  --no-build-isolation --no-cache-dir -r requirements-ci-source.txt
+```
+
+The second phase disables package-index lookup and caching while fetching the
+pinned archive directly, then uses the already installed build backend and
+dependencies; there are no build-time dependency downloads. After changing any input
+requirements (including the source manifest or sidecar lock), regenerate the
+wheel lock using preinstalled **uv 0.12.1**, pinned in `requirements-ci.txt`:
 
 ```bash
 uv pip compile requirements-ci.txt --python-version 3.12 --universal \
-  --only-binary=:all: --generate-hashes --output-file requirements-ci.lock
+  --only-binary=:all: --generate-hashes --no-emit-package mempalace \
+  --output-file requirements-ci.lock
 ```
+
+The included source manifest remains a resolver input so its dependencies are
+locked even though `--no-emit-package mempalace` excludes its source entry from
+the wheel-only lock. Keep the source pin, build-backend pin and generated lock
+in sync; a successful lock regeneration alone is not full-suite validation.
 
 Provisioning is separate from test execution: CI prepares the Python/runtime and
 build prerequisites, including `uv`, and preprovisions the MiniLM model cache
@@ -188,9 +252,11 @@ sources; the tests do not install missing prerequisites. In particular, the
 wheel/sdist build and wheel-from-sdist roundtrip remain offline.
 
 CI runs the full root pytest suite serially, including the distribution
-regression, with an isolated temporary HOME and external disposable test
-storage. The prepared model cache is available in that isolated environment;
+regression, followed by the offline installed-wheel smoke check, with an
+isolated temporary HOME and external disposable test storage.
+The prepared model cache is available in that isolated environment;
 no real palace, user credentials or publishing step is required or used.
+No tests are skipped or mocked merely to accommodate the source build.
 Existing integration gates and platform skips remain intact:
 `MPTASK_LIVE_HUB=1` is an explicit opt-in, not part of default CI. Linux CI does
 not certify native Windows or macOS behavior.

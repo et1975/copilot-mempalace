@@ -58,6 +58,15 @@ def test_shared_transport_guard_rejects_packet_echo_and_accepts_independent_late
     assert not is_procedural_echo("A later run independently failed on input X with error Y.")
 
 
+def test_feedback_copy_is_draft_lineage_not_original_even_when_escaped():
+    from dream_procedural_drafts import is_procedural_echo
+    for kind in ("procedural_feedback", "procedural_feedback_abstention"):
+        body = canonical_json({"kind": kind, "quote": "observed defect"})
+        for wrapper in ("{}", "```json\n{}\n```", "Copied:\n{}\nEnd."):
+            for value in (body, canonical_json(body)):
+                assert is_procedural_echo(wrapper.format(value))
+
+
 class StatusTests(DraftFixture):
     def test_empty_health_needs_no_host_writer_or_embedder(self):
         before = deepcopy(self.collection.rows)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 import sys
 from typing import Any
 
@@ -157,6 +158,11 @@ def render_worklist(worklist: dict[str, Any], *, task: str | None = None, full: 
     if onto:
         header += f" ontology_version={onto}"
     lines = [header]
+    if "incremental" in worklist:
+        run = worklist["incremental"]
+        reviewed = sum(isinstance(source.get("review"), dict) for source in worklist["coverage"])
+        lines.append(f"run_id={run['run_id']} scope={json.dumps(run['scope'], sort_keys=True)}")
+        lines.append(f"coverage={len(worklist['coverage'])} reviewed={reviewed} upper={run['upper']}")
     for index, item in enumerate(items):
         kind = task or item.get("kind") or resolved_task
         renderer = _RENDERERS.get(kind, _render_unknown)
@@ -166,14 +172,34 @@ def render_worklist(worklist: dict[str, Any], *, task: str | None = None, full: 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--worklist", required=True, help="Path to worklist JSON")
+    source = ap.add_mutually_exclusive_group(required=True)
+    source.add_argument("--worklist", help="Path to explicit preview/worklist JSON")
+    source.add_argument("--run-id", help="Load native Dreaming run")
+    ap.add_argument("--palace", help="Palace owning --run-id")
+    ap.add_argument("--out", help="Optional complete JSON export")
     ap.add_argument("--task", choices=sorted(_RENDERERS), help="Override worklist task/kind")
     ap.add_argument("--full", action="store_true", help="Show untruncated ids and text")
     args = ap.parse_args(argv)
 
-    with open(args.worklist, encoding="utf-8") as fh:
-        worklist = json.load(fh)
+    try:
+        if args.run_id:
+            if not args.palace:
+                ap.error("--run-id requires --palace")
+            import dream_incremental
+            worklist = dream_incremental.load_run(args.palace, args.run_id)
+            status = dream_incremental.run_status(args.palace, args.run_id)
+        else:
+            with open(args.worklist, encoding="utf-8") as fh:
+                worklist = json.load(fh)
+        if args.out:
+            with open(args.out, "w", encoding="utf-8") as fh:
+                json.dump(worklist, fh, indent=2, ensure_ascii=False)
+    except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
+        print(f"show: {exc}", file=sys.stderr)
+        return 2
     print(render_worklist(worklist, task=args.task, full=args.full), end="")
+    if args.run_id:
+        print(json.dumps(status, sort_keys=True))
     return 0
 
 

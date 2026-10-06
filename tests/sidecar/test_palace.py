@@ -375,6 +375,31 @@ class PalaceTests(unittest.TestCase):
             self.assertIs(False, arguments["preview"])
             self.assertEqual(500, arguments["limit"])
 
+    def test_pinned_native_string_order_replays_with_explicit_ascending_order(self):
+        self.hub.tools[1]["inputSchema"]["properties"]["order"] = {
+            "type": "string",
+            "description": (
+                "'desc' (newest first, default without cursor) or 'asc' "
+                "(chronological forward, default with since_event_id, optional)"
+            ),
+        }
+        self.hub.events = [stored_event(i) for i in range(1, 502)]
+
+        events = list(self.client.replay_events())
+
+        self.assertEqual([f"evt-{i:06}" for i in range(1, 502)], [e["id"] for e in events])
+        calls = self.hub.calls("mempalace_event_list")
+        self.assertEqual([None, "evt-000500", "evt-000501"],
+                         [arguments.get("since_event_id") for arguments in calls])
+        self.assertTrue(all(arguments["order"] == "asc" for arguments in calls))
+
+    def test_unbounded_order_string_without_known_contract_is_rejected(self):
+        self.hub.tools[1]["inputSchema"]["properties"]["order"] = {
+            "type": "string", "description": "Unspecified ordering",
+        }
+        self.assert_palace_error("unsupported_schema", self.client.discover)
+        self.assertEqual([], self.hub.calls("mempalace_event_list"))
+
     def test_known_legacy_fingerprint_omits_order(self):
         self.hub.tools = tool_fixture(ordered=False)
         self.hub.events = [stored_event(1)]

@@ -18,6 +18,7 @@ not instructions: resolve them through `guidance`/`explain` before use.
 
 New procedural commands support **existing SQLite-exact palaces only**. Strict
 read commands (`validate`, `guidance`, `task-guidance`, `use-check`, `explain`, `status`, `draft`,
+`feedback-prepare`, `feedback-adjudicate`,
 `receipt-get`, `delivery-status`, and write-command preparation/
 dry-run) use WAL-aware read-only connections, including while a writer remains
 open. They observe committed, uncheckpointed data and prohibit application-data
@@ -639,6 +640,14 @@ or event `digest` is present; `propose`, `review` and `outcome` reject a draft.
 Output must be a new file outside the palace. Stop, retrieval, completed tasks,
 passing tests, receipt repetition and reflection echoes cannot award credit.
 
+For explicitly selected original observations or a complete legacy draft, use
+[original-evidence feedback and explicit adjudication](procedural-feedback.md)
+to prepare a nonpublishing review packet, then deliberately choose an ordinary
+outcome artifact or abstention. `feedback-adjudicate` freshly compares the entire
+packet and original draft mapping, validates explicit reviewer rationale, and
+still does not publish. Only the separate existing `outcome` command captures
+and appends; unsupported attribution abstains rather than receiving neutral credit.
+
 Original SQLite fields are projected only when their complete UTF-8 encoding
 fits 256 KiB; oversized fields are omitted, never prefix-hashed. Palace fallback
 verifies at most 64 stored records / 8 MiB of canonical bodies and reports
@@ -834,6 +843,14 @@ dominates helpful. The earliest timestamp for the winning polarity anchors
 decay. Later submissions cannot refresh weight. Correctness of causal wording
 remains the reviewer's responsibility: code does not prove causality.
 
+For the read-only original-review bridge, see
+[feedback adjudication and immutable retries](procedural-feedback.md#explicit-review-outcome-artifact-or-abstention).
+Its `publish` decision produces only an ordinary outcome artifact; use this
+existing `outcome` path for dry-run/publication and exact-ID/digest retries.
+Target fit, drift and relevant foreign counterexamples belong in explicit
+review rationale; foreign success, retrieval metrics, code verdicts and
+compaction summaries do not become original target evidence or pooled credit.
+
 ## Prune-archive replay boundary
 
 `dream_restore.py` is a logical replay, not identity-preserving recovery. It
@@ -861,6 +878,10 @@ Use a coherent whole-palace physical snapshot for procedural recovery. A
 historical archive or generated source witness cannot authorize new identities.
 
 ## Guidance and explanation
+
+For deliberate one-task candidate use, follow the
+[bounded trial playbook](procedural-trials.md), including compatible-local reuse,
+target-original enrollment, current permission and fresh applicability/use checks.
 
 After ordinary evidence recall, explicitly opt into repository-scoped advice:
 

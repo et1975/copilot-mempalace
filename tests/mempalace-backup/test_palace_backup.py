@@ -24,6 +24,8 @@ from pathlib import Path
 from unittest.mock import patch
 from uuid import UUID, uuid5
 
+import pytest
+
 import palace_backup as pb
 
 
@@ -319,13 +321,10 @@ def test_procedural_physical_backup_stage_recovers_without_host_or_original_pala
     from dream_procedural_validate import inspect_published_sources
 
     with _published_procedural_palace(tmp_path) as (home, data, fixture, events):
-        # Empty task storage selects the existing guarded capture path without
-        # creating task authorities or requiring a task activation subprocess.
-        with contextlib.closing(_make_logstream(data)) as con:
-            con.execute("DELETE FROM event_artifacts")
-            con.execute("DELETE FROM artifacts")
-            con.execute("DELETE FROM events")
-            con.commit()
+        # Native fixture setup already initializes the empty logstream.
+        pb._validate_logstream(data / "logstream.sqlite3")
+        with contextlib.closing(sqlite3.connect(data / "logstream.sqlite3")) as con:
+            assert con.execute("SELECT count(*) FROM events").fetchone()[0] == 0
         with _palace_only_reads():
             before_events, before_projection = _procedural_projection(data)
         assert set(before_events) == set(events)
@@ -450,17 +449,15 @@ def test_procedural_stage_corrupt_capture_blocks_before_publication(tmp_path):
 
 def test_procedural_stage_deleted_original_is_distinct_from_missing_capture(tmp_path):
     def damage(con, fixture):
-        import dream_palace
+        from dream_transport import call_tool
         from chromadb.utils.embedding_functions.onnx_mini_lm_l6_v2 import ONNXMiniLM_L6_V2
         from test_dream_procedural_palace import installed_palace
         data = str(Path(con.execute("PRAGMA database_list").fetchone()[2]).parent)
         with patch.object(ONNXMiniLM_L6_V2, "DOWNLOAD_PATH",
-                          os.environ["DREAMING_TEST_MODEL_CACHE"]), installed_palace(data) as server:
-            writer = dream_palace.MempalaceWriter()
-            with writer.mutation():
-                result = server.TOOLS["mempalace_delete_drawer"]["handler"](
-                    drawer_id=fixture.refs[2]["source_id"])
-                assert result["success"], result
+                          os.environ["DREAMING_TEST_MODEL_CACHE"]), installed_palace(data):
+            result = call_tool(data, "mempalace_delete_drawer",
+                               {"drawer_id": fixture.refs[2]["source_id"]}, vector=True)
+            assert result["success"], result
     _assert_procedural_stage_damage_blocked(tmp_path, damage, "original_drawer_missing")
 
 def test_procedural_stage_missing_only_retired_origin_blocks_publication(tmp_path):
@@ -799,6 +796,43 @@ def test_integrity_check_ok(tmp_path):
     db = tmp_path / "kg.sqlite3"
     _make_wal_db(db, 3)
     assert pb.integrity_check(db) == "ok"
+
+
+def test_inventory_closed_wal_databases_remain_byte_for_byte_unchanged(tmp_path):
+    home = tmp_path / "palace-home"
+    data = _make_exact_palace(home)
+    with contextlib.closing(_make_logstream(data)):
+        pass
+    before = {p.relative_to(home): p.read_bytes() for p in home.rglob("*") if p.is_file()}
+    inventory = pb.backup_inventory(home, data, require_logstream=True)
+    assert data / "sqlite_exact.sqlite3" in inventory
+    assert data / "logstream.sqlite3" in inventory
+    assert {p.relative_to(home): p.read_bytes() for p in home.rglob("*") if p.is_file()} == before
+
+
+@pytest.mark.parametrize("missing", ["-wal", "-shm"])
+def test_inventory_refuses_incomplete_wal_pair_without_repair(tmp_path, missing):
+    home = tmp_path / "palace-home"
+    data = _make_exact_palace(home)
+    with contextlib.closing(sqlite3.connect(data / "sqlite_exact.sqlite3")) as writer:
+        writer.execute("INSERT INTO t VALUES (2)")
+        writer.commit()
+        stage = tmp_path / "stage"
+        shutil.copytree(home, stage)
+    (stage / "custom" / ("sqlite_exact.sqlite3" + missing)).unlink()
+    before = {p.relative_to(stage): p.read_bytes() for p in stage.rglob("*") if p.is_file()}
+    _assert_raises(pb.BackupError,
+                   lambda: pb.backup_inventory(stage, stage / "custom"), "incomplete WAL")
+    assert {p.relative_to(stage): p.read_bytes() for p in stage.rglob("*") if p.is_file()} == before
+
+
+def test_inventory_refuses_rollback_journal_without_recovery(tmp_path):
+    home = tmp_path / "palace-home"
+    data = _make_exact_palace(home)
+    (data / "sqlite_exact.sqlite3-journal").write_bytes(b"pending rollback")
+    before = {p.relative_to(home): p.read_bytes() for p in home.rglob("*") if p.is_file()}
+    _assert_raises(pb.BackupError, lambda: pb.backup_inventory(home, data), "rollback journal")
+    assert {p.relative_to(home): p.read_bytes() for p in home.rglob("*") if p.is_file()} == before
 
 
 def test_checkpoint_all_skips_absent(tmp_path):

@@ -170,8 +170,25 @@ def sqlite_paths(palace: Path, data_path: Path) -> tuple[Path, ...]:
             data_path / "logstream.sqlite3")
 
 
+def _readonly_sqlite(db_path: Path) -> sqlite3.Connection:
+    """Inspect a coherent image without creating sidecars or recovering journals.
+
+    Callers must exclude writers while using an inventory/stage. Immutable reads
+    are only safe without WAL; a captured WAL must retain its existing SHM.
+    """
+    db = _absolute(db_path)
+    if os.path.lexists(str(db) + "-journal"):
+        raise BackupError(f"Rollback journal present; capture a clean offline image: {db}")
+    sidecars = [Path(str(db) + suffix) for suffix in ("-wal", "-shm")]
+    present = [os.path.lexists(path) for path in sidecars]
+    if any(present) and (not all(present) or not all(path.is_file() for path in sidecars)):
+        raise BackupError(f"Incomplete WAL sidecar set; require captured -wal and -shm: {db}")
+    uri = db.as_uri() + "?mode=ro" + ("&readonly_shm=1" if all(present) else "&immutable=1")
+    return sqlite3.connect(uri, uri=True)
+
+
 def _validate_logstream(db_path: Path) -> None:
-    with closing(sqlite3.connect(db_path.as_uri() + "?mode=ro", uri=True)) as con:
+    with closing(_readonly_sqlite(db_path)) as con:
         tables = {row[0] for row in con.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table'")}
         for table, required in LOGSTREAM_COLUMNS.items():
@@ -308,7 +325,7 @@ def checkpoint_db(db_path: Path) -> tuple[int, int, int]:
 
 def integrity_check(db_path: Path) -> str:
     """Return the SQLite ``integrity_check`` result (``"ok"`` when healthy)."""
-    con = sqlite3.connect(_absolute(db_path).as_uri() + "?mode=ro", uri=True)
+    con = _readonly_sqlite(db_path)
     try:
         return "\n".join(row[0] for row in con.execute("PRAGMA integrity_check"))
     finally:
@@ -581,7 +598,7 @@ def _has_procedural_storage(data):
         db = data / filename
         if not db.is_file():
             continue
-        with closing(sqlite3.connect(db.as_uri() + "?mode=ro", uri=True)) as con:
+        with closing(_readonly_sqlite(db)) as con:
             if not con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
                                (table,)).fetchone():
                 continue
@@ -713,9 +730,11 @@ def _validate_stage(stage, data, *, required=False, expected=(), allow_incomplet
     origin = _covered_path(stage, data / ".mempalace/origin.json")
     if not origin.is_file():
         raise BackupError(f"Restored tree lacks embedder identity: {origin}")
-    _validate_procedural_stage(stage, data)
     if not (data / "logstream.sqlite3").exists():
+        _validate_procedural_stage(stage, data)
         return None
+    # Load task dependencies before MemPalace's procedural import strips
+    # inherited PYTHONPATH entries from a fresh process.
     with task_safety() as (restore, snapshot):
         if not allow_incomplete_preparation and (data / restore.PREPARE_MARKER).exists():
             raise BackupError("Incomplete task restore activation; inspect or retry offline publication")
@@ -723,6 +742,7 @@ def _validate_stage(stage, data, *, required=False, expected=(), allow_incomplet
                                                   expected_authorities=expected)
         if manifest and task_snapshot_digest(summary) != manifest["snapshot_sha256"]:
             raise BackupError("Staged task contents do not match the captured inventory digest")
+        _validate_procedural_stage(stage, data)
         return summary
 
 

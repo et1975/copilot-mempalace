@@ -248,3 +248,18 @@ def test_transient_applicability_and_use_results_are_generated_not_new_support()
         for wrapped in (canonical_json(artifact), canonical_json(canonical_json(artifact))):
             with pytest.raises(ValueError, match="generated"):
                 reject_generated_transport("Copied result:\n" + wrapped + "\nEnd.")
+
+
+def test_feedback_and_abstention_are_generated_in_raw_wrapped_escaped_and_metadata_forms():
+    from dream_metadata import canonical_json, reject_generated_transport, is_generated_observation
+    import pytest
+    for kind in ("procedural_feedback", "procedural_feedback_abstention"):
+        body = canonical_json({"kind": kind, "quote": "independent-looking observation"})
+        for value in (body, canonical_json(body), body.replace('"kind"', '"ki\\u006ed"')):
+            for wrapper in ("{}", "```json\n{}\n```", "Copied:\n{}\nEnd."):
+                with pytest.raises(ValueError, match="generated"):
+                    reject_generated_transport(wrapper.format(value))
+        for key in ("kind", "source_kind", "generated_from"):
+            assert is_generated_observation({"text": "observation", "metadata": {key: kind}})
+            assert is_generated_observation({"text": "observation\n<!--dreaming-meta: "
+                + canonical_json({key: kind}) + "-->", "metadata": {}})

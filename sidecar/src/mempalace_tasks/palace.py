@@ -33,6 +33,10 @@ _RESPONSE_LIMIT = 160 * 1024 * 1024
 # This is the deployed hub's implicit-order list API, not an old task envelope.
 _LEGACY_PROFILE = "mempalace-legacy-append-order-v1"
 _ORDERED_PROFILE = "mempalace-ordered-v1"
+_NATIVE_ORDER_DESCRIPTION = (
+    "'desc' (newest first, default without cursor) or 'asc' "
+    "(chronological forward, default with since_event_id, optional)"
+)
 _PROTOCOL_VERSIONS = ("2024-11-05", "2025-03-26", "2025-06-18")
 _LIST_TYPES = {
     "stream": "string", "room": "string", "type": "string",
@@ -554,12 +558,18 @@ class PalaceClient:
                                 "before_event_id": "string", "order": "string"}
             if set(properties) != set(expected_ordered):
                 _fail("unsupported_profile", "Unknown ordered event-list profile")
-            orders = properties["order"].get("enum")
+            order_schema = properties["order"]
+            orders = order_schema.get("enum")
+            enumerated_order = (isinstance(orders, list)
+                                and all(isinstance(order, str) for order in orders)
+                                and set(orders) == {"asc", "desc"})
+            native_string_order = (
+                "enum" not in order_schema
+                and order_schema.get("description") == _NATIVE_ORDER_DESCRIPTION
+            )
             if (any(properties[key].get("type") != kind
                     for key, kind in expected_ordered.items())
-                    or not isinstance(orders, list)
-                    or any(not isinstance(order, str) for order in orders)
-                    or set(orders) != {"asc", "desc"}):
+                    or not (enumerated_order or native_string_order)):
                 _fail("unsupported_schema", "Required ascending order is not supported")
             profile = _ORDERED_PROFILE
         else:

@@ -5,8 +5,9 @@ description: Use when the user wants deliberate, on-demand deductive reasoning o
 
 # Contemplate
 
-On-demand reasoning for a mempalace palace. Where `dreaming` is
-unattended off-hours consolidation, `contemplate` is deliberate inline
+On-demand reasoning for a mempalace palace. Where `dreaming` defaults to
+off-hours review of all new sessions and original memories since its last
+completed checkpoint, `contemplate` is deliberate inline
 cognition: derive what follows from the active KG under explicitly-approved
 rules, query for relevant past sessions, propose ontology rules, and report
 knowledge gaps — without automatically adopting new KG conclusions/drawers.
@@ -119,7 +120,7 @@ conclusions, ranked by **DUC** (how many conclusions each gap would unblock).
 
 ```bash
 "$MPY" "$DREAM_SCRIPTS/dream_harvest.py" --palace <p> --task gaps \
-  [--target-subject "<entity id or name>"] [--rules <p>/ontology.json] \
+  [--target-subject "<entity id or name>"] \
   [--max-candidates 500] --out worklist.json
 ```
 
@@ -183,20 +184,22 @@ written to the palace.
 
 ## The 5-phase pipeline
 
-Artifacts go in the session workspace — never commit them. Use the interpreter
-that owns the `mempalace` package:
+Optional working-file exports go in the session workspace — never commit them.
+Native ontology configuration/candidates and derive skip markers live in
+MemPalace artifacts/events, not default sidecar files. Use the interpreter that
+owns the `mempalace` package:
 
 ```bash
 "$MPY" "$DREAM_SCRIPTS/dream_harvest.py" --task derive \
-  --palace <p> --rules <p>/ontology.json --out worklist.json
+  --palace <p> --out worklist.json
 ```
 
 | # | Phase | Who | Command / action |
 |---|-------|-----|------------------|
-| 1 | Harvest | script | Read active KG triples and `ontology.json`; compute bounded closure; write `worklist.json`. No new conclusions adopted; legacy premise loading may reconcile provenance |
+| 1 | Harvest | script | Read active KG triples and native ontology; compute bounded closure; export `worklist.json`. No new conclusions adopted; legacy premise loading may reconcile provenance |
 | 2 | Adjudicate | **you** | For each `derive` item, choose `materialize`, `skip`, or `reject_rule` |
-| 3 | Approve rules | human/config | If a rule is wrong, do not trust the candidate. `reject_rule` suppresses this worklist under the current ontology; edit `ontology.json` for the durable fix |
-| 4 | Adopt | script | Materialize approved facts and lineage, append skip-markers for skips/rejected rules |
+| 3 | Approve rules | human/config | If a rule is wrong, do not trust the candidate. `reject_rule` suppresses this worklist under the current ontology; explicitly disable the rule in native configuration for the durable fix |
+| 4 | Adopt | script | Materialize approved facts and lineage, publish native skip-markers for skips/rejected rules |
 | 5 | Verify | script | Re-harvest under the same rules; with approved materializations and skip-markers, expect an operational fixpoint |
 
 Adopt and verify:
@@ -226,8 +229,28 @@ Every candidate is a proposed derived KG triple with a proof:
   ```
 
 Rule rejection is two-step discipline: the current adoption writes skip-markers
-so verify can converge now; the durable fix is to disable or edit the rule in
-`<palace>/ontology.json`, which changes `ontology_version`.
+so verify can converge now; the durable fix is to explicitly disable or update
+the native rule, which changes `ontology_version`. A local file edit alone does
+not change native rule authority.
+
+File flags remain explicit legacy imports/exports; they do not automatically
+enable rules or migrate old files. A coherent full-palace restore retains native
+ontology and skip history. A wing-only export does not include that control
+state. Native inspection does not initialize missing/corrupt storage; explicit
+control-store bootstrap is separate from ontology enablement and restore.
+These storage changes do not enroll procedural learning or weaken original
+evidence, approval or deductive inference gates.
+
+## Native ontology file compatibility
+
+`dream_contemplate.py` uses native ontology and skip state by default for
+reconnaissance, proposals, bootstrap and approved enable/disable operations.
+`--rules` and `--skips` are explicit read-only input overrides for reconnaissance,
+not automatic migrations. When approved enable/disable uses `--rules`, it
+imports the resulting approved configuration natively under the shared lock
+and does not modify the legacy input file.
+Bootstrap's `--out` is an optional export; candidates are always retained
+natively and remain disabled until explicitly approved and enabled.
 
 ## Rule-approval discipline
 
@@ -250,7 +273,7 @@ The ontology starts empty on purpose: predicate names are not semantics. An
 empty ontology yields zero deductive candidates rather than guessing that a name
 like `depends_on` is transitive, inverse-bearing, or symmetric in this palace.
 
-Two generator tasks can populate review candidates in `<palace>/ontology.json`:
+Two generator tasks can populate review candidates in the native ontology:
 
 - `suggest-rules` — day-1 name-heuristic bootstrap. It scans distinct KG
   predicate names and proposes candidate transitive, inverse, and symmetric
@@ -262,13 +285,13 @@ Two generator tasks can populate review candidates in `<palace>/ontology.json`:
 
 Both generators write disabled candidates only: `enabled: false` plus a
 `rationale` explaining the heuristic or evidence. The workflow is always
-generate → human review → edit approved rules to `enabled: true` → run
+generate → human review → explicitly enable approved rules → run
 `derive`. Never auto-enable generated rules; a wrong rule pollutes the KG and
 closure amplifies the mistake.
 
 Generator guardrails:
 
-- **Never auto-enable** — enabling a rule is a deliberate human edit.
+- **Never auto-enable** — enabling a rule is an explicit approved configuration change.
 - **Base-triples only** — induction reads observed facts and excludes derived
   `*_closure` triples / derivation lineage, avoiding self-reinforcing loops.
 - **Support threshold** — induction requires `--min-support` co-occurrences;
@@ -334,6 +357,14 @@ surfaces:
 shared_constraint, converge) is **not** part of contemplate. Use the dreaming
 skill's `reflect` task for on-demand meditation or scheduled generative
 consolidation.
+
+## Ordinary lessons are not KG premises
+
+Use ordinary `mempalace_search` and the mempalace skill's task-relevant lessons
+recipe for accepted lesson recall. This does not require `derive`, ontology
+enablement or a procedural lifecycle. Check applicability and original sources;
+lesson prose is fallible context, not a KG premise or instruction. Generated
+lessons are not independent evidence for recurrence or logical truth.
 
 ## Optional procedural advice: no authority transfer
 

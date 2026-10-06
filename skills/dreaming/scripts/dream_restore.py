@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""dream_restore — restore drawers from the append-only prune archive.
+"""dream_restore — restore drawers from native MemPalace archive artifacts.
 
 Restores archived logical drawers by adding new drawers with the original
 wing/room and reconstructed content. The original physical ids and chunking are
 not resurrected: mempalace mints new drawer ids and recomputes embeddings.
-Procedural events/source records/receipts are refused before any selected archive
-record is replayed, including during dry-run. Use coherent physical recovery
-for identity-bound procedural state.
+Procedural events/source records/receipts are refused before native import,
+export or replay of the selected archives, including during dry-run. Use
+coherent physical recovery for identity-bound procedural state.
 
 Usage:
     "$MPY" "$DREAM_SCRIPTS/dream_restore.py" --palace ~/.mempalace/palace
@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from collections.abc import Callable, Iterable
 from typing import Any, TextIO
@@ -68,6 +67,18 @@ def iter_archive_records(
     return records
 
 
+def load_native_archive_records(palace: str) -> list[dict[str, Any]]:
+    """Read complete verified archives without initializing or migrating storage."""
+    from dream_store import DreamStore
+
+    store = DreamStore(palace)
+    records = [store.get_document(event["document"]) for event in store.events()
+               if event["record_type"] == "archive"]
+    for record in records:
+        dream_palace._validate_archive_record(record)
+    return records
+
+
 def _ordered_rows(record: dict[str, Any]) -> list[dict[str, Any]]:
     rows = record.get("rows") or []
     by_id = {row.get("id"): row for row in rows if isinstance(row, dict)}
@@ -84,8 +95,20 @@ def _ordered_rows(record: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def record_to_content(record: dict[str, Any]) -> str:
-    """Reconstruct a logical drawer by concatenating row documents in member order."""
-    return "\n".join(str(row.get("document") or "") for row in _ordered_rows(record))
+    """Reconstruct canonical content in member order, preserving exact sources."""
+    ordered_rows = _ordered_rows(record)
+    logical = {
+        "id": record["id"],
+        "member_ids": [row["id"] for row in ordered_rows],
+        "metadata": {},
+        "text": "\n".join(str(row.get("document") or "") for row in ordered_rows),
+    }
+    physical = {
+        row["id"]: {"id": row["id"], "text": str(row.get("document") or ""),
+                    "metadata": row.get("metadata") or {}}
+        for row in ordered_rows
+    }
+    return dream_palace._canonical_drawer(logical, physical)["text"]
 
 
 def _archive_metadata_claims(drawer: dict[str, Any]) -> Iterable[dict[str, Any]]:
@@ -215,8 +238,9 @@ def main(argv: list[str] | None = None, *, writer_factory: Callable[[], Any] | N
     ap.add_argument("--palace", required=True, help="Path to the mempalace palace directory")
     ap.add_argument(
         "--archive-file",
-        help="Archive JSONL path (default: <palace>/dream-archive.jsonl)",
+        help="Explicit legacy JSONL import; retained natively before non-dry restoration",
     )
+    ap.add_argument("--export-file", help="Explicit JSONL export of the selected native archives")
     ap.add_argument("--dry-run", action="store_true", help="Preview restore actions; write nothing")
     ap.add_argument("--id", dest="id_filter", help="Restore only one archived logical id")
     ap.add_argument("--reason", dest="reason_filter", help="Restore only archive records with this reason")
@@ -224,11 +248,12 @@ def main(argv: list[str] | None = None, *, writer_factory: Callable[[], Any] | N
     args = ap.parse_args(argv)
 
     palace_path = dream_palace.bind_palace(args.palace)
-    archive_path = args.archive_file or os.path.join(palace_path, "dream-archive.jsonl")
+    archive_path = args.archive_file or "native MemPalace archives"
 
     try:
-        all_records = iter_archive_records(archive_path, strict=args.strict)
-    except (OSError, ValueError) as ex:
+        all_records = (iter_archive_records(args.archive_file, strict=args.strict)
+                       if args.archive_file else load_native_archive_records(palace_path))
+    except (OSError, ValueError, RuntimeError) as ex:
         print(f"ERROR reading archive {archive_path}: {ex}", file=sys.stderr)
         return 1
 
@@ -242,6 +267,14 @@ def main(argv: list[str] | None = None, *, writer_factory: Callable[[], Any] | N
         for error in errors:
             print(f"  ERROR {error['id']}: {error['error']}", file=sys.stderr)
         return 1
+    if args.archive_file and not args.dry_run:
+        try:
+            dream_palace.retain_archive_records(palace_path, all_records)
+        except (OSError, ValueError, RuntimeError) as ex:
+            print(f"ERROR retaining archive {archive_path}: {ex}", file=sys.stderr)
+            return 1
+    if args.export_file and not args.dry_run:
+        dream_palace._append_jsonl_export(args.export_file, records)
     writer = writer_factory() if writer_factory is not None else (object() if args.dry_run else dream_palace.MempalaceWriter())
 
     report = restore(records, writer, dry_run=args.dry_run)

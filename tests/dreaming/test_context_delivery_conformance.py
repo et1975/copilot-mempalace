@@ -159,8 +159,9 @@ def test_installed_manual_delivery_context_trial_and_receipt_boundaries(tmp_path
             permission["advice"] = "allow"
             write(permission_file, permission)
             from mempalace import mcp_server
-            with writer.mutation():
-                mcp_server._get_collection().update(
+            from test_dream_procedural_palace import installed_mutation
+            with installed_mutation(mcp_server) as collection:
+                collection.update(
                     ids=[fixture.refs[0]["source_id"]], documents=["changed original"])
             code, error = invoke("task-guidance", *scope, "--request-id", str(UUID(int=999)),
                                  "--out", str(tmp_path / "unavailable.json"))

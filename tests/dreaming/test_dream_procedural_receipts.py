@@ -570,8 +570,11 @@ def test_reserved_receipt_retention_is_body_independent_not_rule_projection(stor
     with pytest.raises(ValueError):
         core().read_receipts(path, "w", now=NOW)
     import mempalace.palace
-    monkeypatch.setattr(mempalace.palace, "get_collection", lambda path: collection)
+    from unittest.mock import Mock
+    opener = Mock(return_value=collection)
+    monkeypatch.setattr(mempalace.palace, "get_collection", opener)
     assert dream_palace.load_logical_drawers(path) == []
+    opener.assert_called_once_with(path, create=False, read_only=True)
     assert dream_palace.load_observation_entries(path, rooms=("procedural-receipts",)) == []
 
 
@@ -763,8 +766,9 @@ class InstalledReceiptLifecycleTests(GroundedFixture):
             for pid in reserved["ids"]:
                 with self.assertRaisesRegex(ValueError, "protected"):
                     writer.delete_drawer(pid)
-            with writer.mutation():
-                server._get_collection().update(ids=[reserved["ids"][0]], documents=["corrupt receipt"])
+            from test_dream_procedural_palace import installed_mutation
+            with installed_mutation(server) as collection:
+                collection.update(ids=[reserved["ids"][0]], documents=["corrupt receipt"])
             self.assertEqual(self.projection(*read_events(self.path, "w")), before)
             from dream_procedural_palace import procedural_status
             self.assertEqual(procedural_status(self.path, "w", "owner/repo", as_of=NOW)["status"], "ok")

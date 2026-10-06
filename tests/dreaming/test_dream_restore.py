@@ -14,6 +14,8 @@ from unittest.mock import Mock
 import pytest
 
 import dream_restore
+from test_dream_procedural_palace import installed_palace
+from test_dream_maintenance_state import initialize_logstream
 
 
 def _test_tmpdir():
@@ -134,6 +136,27 @@ class TestRecordToContent(unittest.TestCase):
             "logical-1 second\nlogical-1 first",
         )
 
+    def test_native_contiguous_chunks_restore_without_inventing_newlines(self):
+        record = _record("logical")
+        for row in record["rows"]:
+            index = row["metadata"]["chunk_index"]
+            row["id"] = f"logical_chunk_{index:06d}"
+            row["metadata"].update(id_recipe="v3", parent_drawer_id="logical", added_by="dreaming")
+        record["member_ids"] = ["logical_chunk_000000", "logical_chunk_000001"]
+        self.assertEqual(dream_restore.record_to_content(record), "logical secondlogical first")
+
+    def test_mined_v3_chunks_keep_newline_reconstruction(self):
+        record = {
+            "id": "legacy", "member_ids": ["legacy_chunk_000000", "legacy_chunk_000001"],
+            "rows": [
+                {"id": f"legacy_chunk_{index:06d}", "document": text,
+                 "metadata": {"id_recipe": "v3", "parent_drawer_id": "legacy",
+                              "chunk_index": index, "added_by": "copilot-cli", "normalize_version": 1}}
+                for index, text in enumerate(["first", "second"])
+            ],
+        }
+        self.assertEqual(dream_restore.record_to_content(record), "first\nsecond")
+
 
 class TestRestore(unittest.TestCase):
     def test_restores_each_record_with_original_location_content_and_metadata(self):
@@ -178,7 +201,9 @@ class TestRestore(unittest.TestCase):
         self.assertIn("chars=32", out.getvalue())
 
     def test_main_id_filter_restores_only_matching_record_with_fake_writer(self):
-        with _test_tmpdir() as td:
+        with _test_tmpdir() as td, installed_palace(td):
+            from dream_store import DreamStore
+            initialize_logstream(td)
             archive = os.path.join(td, "archive.jsonl")
             _write_archive(archive, [_record("logical-1"), _record("logical-2")])
             writer = FakeWriter()
@@ -191,6 +216,7 @@ class TestRestore(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertEqual(len(writer.calls), 1)
             self.assertEqual(writer.calls[0]["metadata"]["original_id"], "logical-2")
+            self.assertEqual(len(dream_restore.load_native_archive_records(td)), 2)
 
     def test_record_failure_is_recorded_and_does_not_stop_later_records(self):
         records = [_record("bad"), _record("good")]
@@ -223,6 +249,7 @@ def _source_archive_record():
         "id": "captured-source",
         "document": body + "\n\n<!--dreaming-meta: " + canonical_json(metadata) + "-->",
         "metadata": {"room": "procedural-sources", "added_by": "dream-procedure-source"},
+        "embedding": [1.0],
     }]
     return record
 
@@ -301,11 +328,17 @@ def test_malformed_selected_trailer_cannot_hide_protected_metadata():
 
 
 @pytest.mark.parametrize("dry_run", (False, True))
-def test_cli_rejects_selected_procedural_archive_before_writer_construction(tmp_path, capsys, dry_run):
+def test_cli_rejects_selected_procedural_archive_before_writer_construction(
+    tmp_path, capsys, dry_run, monkeypatch,
+):
     archive = tmp_path / "archive.jsonl"
     _write_archive(str(archive), [_record("ordinary"), _source_archive_record()])
     before = archive.read_bytes()
     factory = Mock(return_value=FakeWriter())
+    monkeypatch.setattr(
+        dream_restore.dream_palace, "retain_archive_records",
+        Mock(side_effect=AssertionError("preflight must precede native archive publication")),
+    )
     args = ["--palace", str(tmp_path), "--archive-file", str(archive)]
     if dry_run:
         args.append("--dry-run")
@@ -325,9 +358,12 @@ def test_cli_preflight_is_scoped_to_selected_records_and_preserves_ordinary_rest
     _write_archive(str(archive), [_source_archive_record(), _record("ordinary")])
     writer = FakeWriter()
 
-    result = dream_restore.main(
-        ["--palace", str(tmp_path), "--archive-file", str(archive), "--id", "ordinary"],
-        writer_factory=lambda: writer)
+    with installed_palace(str(tmp_path)):
+        initialize_logstream(str(tmp_path))
+        result = dream_restore.main(
+            ["--palace", str(tmp_path), "--archive-file", str(archive), "--id", "ordinary"],
+            writer_factory=lambda: writer)
+        assert len(dream_restore.load_native_archive_records(str(tmp_path))) == 2
 
     assert result == 0
     assert [call["metadata"]["original_id"] for call in writer.calls] == ["ordinary"]
@@ -376,7 +412,7 @@ def _logical_archive(text, split_at=None, *, added_by="dreaming"):
     pieces = [text] if split_at is None else [text[:split_at], text[split_at:]]
     rows = [
         {"id": f"logical-{index}", "document": piece,
-         "metadata": {"added_by": added_by, "chunk_index": index}}
+         "metadata": {"added_by": added_by, "chunk_index": index}, "embedding": [1.0]}
         for index, piece in enumerate(pieces)
     ]
     record = _record("logical")

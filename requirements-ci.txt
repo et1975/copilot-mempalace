@@ -1,10 +1,14 @@
 # CI-only dependencies. Regenerate requirements-ci.lock with the pinned uv:
 # uv pip compile requirements-ci.txt --python-version 3.12 --universal \
-#   --only-binary=:all: --generate-hashes --output-file requirements-ci.lock
+#   --only-binary=:all: --generate-hashes --no-emit-package mempalace \
+#   --output-file requirements-ci.lock
+# Install the wheel lock first, then the separately hashed source without
+# dependencies or build isolation (see .github/workflows/ci.yml).
 -r requirements-test.txt
 -r sidecar/requirements.lock
+-r requirements-ci-source.txt
 
-mempalace==3.8.0
+hatchling==1.32.4
 setuptools==80.9.0
 wheel==0.45.1
 uv==0.12.1

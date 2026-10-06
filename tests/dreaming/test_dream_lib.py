@@ -680,6 +680,123 @@ class TestDrawerSalience(unittest.TestCase):
         self.assertEqual(scored["age_days"], 30)
         self.assertEqual(missing["age_days"], 0)
 
+    def test_missing_or_zero_access_usage_preserves_original_scoring_exactly(self):
+        for usage in (None, {}, {"strength": 5.0},
+                      {"access_count": 0, "strength": 5.0, "stability": 200,
+                       "last_activated": "2026-07-03T20:20:11Z"}):
+            with self.subTest(usage=usage):
+                score = dl.drawer_salience(self._drawer(), 0.2, 1, self.now, usage=usage)
+
+                self.assertEqual(score, {
+                    "id": "d1", "age_days": 180, "kg_degree": 1,
+                    "redundancy": 0.2, "negatives": False, "v": 0.1672,
+                    "usage": usage or {}, "usage_boost": 0.0,
+                })
+
+    def test_usage_normalizes_strength_on_native_floor_to_cap_scale(self):
+        for strength, expected_boost, expected_v in (
+            (0, 0.05, 0.1972), (0.05, 0.05, 0.1972),
+            (2.525, 0.1, 0.2472), (5, 0.15, 0.2972), (50, 0.15, 0.2972),
+        ):
+            with self.subTest(strength=strength):
+                score = dl.drawer_salience(
+                    self._drawer(), 0.0, 0, self.now,
+                    usage={"access_count": 1, "strength": strength},
+                )
+
+                self.assertEqual(score["usage_boost"], expected_boost)
+                self.assertEqual(score["v"], expected_v)
+
+    def test_access_count_monotonically_increases_protection(self):
+        scores = [
+            dl.drawer_salience(
+                self._drawer(), 0.0, 0, self.now,
+                usage={"access_count": count, "strength": 0.05},
+            )
+            for count in (0, 1, 4, 9)
+        ]
+
+        self.assertEqual([score["usage_boost"] for score in scores], [0.0, 0.05, 0.08, 0.09])
+        self.assertEqual([score["v"] for score in scores], [0.1472, 0.1972, 0.2272, 0.2372])
+
+    def test_usage_only_increases_scores_and_keeps_original_safety_gates(self):
+        drawers = [
+            {"id": "used", "filed_at": "2025-07-03", "text": "durable", "room": "r"},
+            {"id": "pinned", "filed_at": "2025-07-03", "text": "durable", "room": "r", "pinned": True},
+            {"id": "kg", "filed_at": "2025-07-03", "text": "durable", "room": "r"},
+            {"id": "recent", "filed_at": "2026-07-03", "text": "durable", "room": "r"},
+            {"id": "unique", "filed_at": "2025-07-03", "text": "durable", "room": "only"},
+        ]
+        for drawer in drawers:
+            degree = 1 if drawer["id"] == "kg" else 0
+            without = dl.drawer_salience(drawer, 0.0, degree, self.now)
+            drawer["salience"] = dl.drawer_salience(
+                drawer, 0.0, degree, self.now,
+                usage={"access_count": 9, "strength": 5.0},
+            )
+            self.assertGreaterEqual(drawer["salience"]["v"], without["v"])
+
+        self.assertEqual(dl.select_prune_candidates(drawers, 0.2, 180), [])
+
+    def test_custom_usage_weight_is_protection_only_and_can_be_disabled(self):
+        usage = {"access_count": 1, "strength": 2.525}
+        disabled = dl.drawer_salience(
+            self._drawer(), 0.0, 0, self.now, weights={"usage": 0.0}, usage=usage,
+        )
+        custom = dl.drawer_salience(
+            self._drawer(), 0.0, 0, self.now, weights={"usage": 0.4}, usage=usage,
+        )
+        saturated = dl.drawer_salience(
+            self._drawer(), 0.0, 0, self.now, weights={"usage": 4.0}, usage=usage,
+        )
+
+        self.assertEqual(disabled["v"], 0.1472)
+        self.assertEqual(disabled["usage_boost"], 0.0)
+        self.assertEqual(custom["v"], 0.3472)
+        self.assertEqual(saturated["v"], 1.0)
+        for weight in (-0.2, True, "0.2", None, float("nan"), float("inf")):
+            with self.subTest(weight=weight), self.assertRaisesRegex(ValueError, "usage"):
+                dl.drawer_salience(
+                    self._drawer(), 0.0, 0, self.now, weights={"usage": weight}, usage=usage,
+                )
+
+    def test_usage_snapshot_retains_telemetry_without_mutating_input(self):
+        usage = {"access_count": 1, "strength": 0.05, "stability": 2.0,
+                 "last_activated": "2026-07-03T20:20:11Z"}
+
+        score = dl.drawer_salience(self._drawer(), 0.0, 0, self.now, usage=usage)
+
+        self.assertEqual(score["usage"], usage)
+        self.assertEqual(score["usage_boost"], 0.05)
+        self.assertEqual(usage, {"access_count": 1, "strength": 0.05, "stability": 2.0,
+                                "last_activated": "2026-07-03T20:20:11Z"})
+        self.assertIsNot(score["usage"], usage)
+
+    def test_malformed_present_usage_is_rejected_even_with_zero_access(self):
+        malformed = [
+            [], "", False,
+            *({"access_count": value} for value in
+              (None, "1", True, -1, 1.5, float("nan"), float("inf"))),
+            *({"access_count": 0, "strength": value} for value in
+              (None, "1", True, -1, float("nan"), float("inf"), float("-inf"))),
+            *({"access_count": 0, "stability": value} for value in
+              (None, "1", True, -1, float("nan"), float("inf"))),
+            *({"access_count": 0, "last_activated": value} for value in
+              ("bad timestamp", "", 42, float("nan"), [])),
+        ]
+        for usage in malformed:
+            with self.subTest(usage=usage), self.assertRaisesRegex(ValueError, "usage"):
+                dl.drawer_salience(self._drawer(), 0.0, 0, self.now, usage=usage)
+
+    def test_absent_optional_usage_fields_are_not_invented(self):
+        score = dl.drawer_salience(
+            self._drawer(), 0.0, 0, self.now,
+            usage={"access_count": 1, "last_activated": None},
+        )
+
+        self.assertEqual(score["usage_boost"], 0.05)
+        self.assertEqual(score["usage"], {"access_count": 1, "last_activated": None})
+
 
 class TestSelectPruneCandidates(unittest.TestCase):
     def _drawer(self, _id, v, age_days, kg_degree=0, pinned=False, topic=None, room="r"):
@@ -887,7 +1004,7 @@ class _FakeKgWriter:
         failed = self.fail_triple_ids.intersection(triple_ids)
         if failed:
             raise RuntimeError(f"cannot invalidate {sorted(failed)[0]}")
-        return {"invalidated": len(triple_ids)}
+        return len(triple_ids)
 
 
 class _FakePatternWriter:
@@ -1035,6 +1152,212 @@ class TestApplyPatternDecisions(unittest.TestCase):
 
 
 class TestApplyContradictionDecisions(unittest.TestCase):
+    def _supersede_decision(self, **changes):
+        return {
+            "action": "supersede", "subject": "project", "predicate": "uses",
+            "old_object": "old runtime", "new_object": "current runtime",
+            "invalidate": [11, 12], "keep_triple_ids": [21],
+            **changes,
+        }
+
+    def _supersede_result(self, **changes):
+        return {
+            "invalidated": 2, "retired_ids": [11, 12], "kept_ids": [21],
+            "cascaded_ids": [31, 32, 33], "survived_ids": [41],
+            **changes,
+        }
+
+    def test_supersede_forwards_canonical_identity_and_counts_only_roots(self):
+        writer = mock.Mock(spec=["supersede", "invalidate_triples"])
+        result = self._supersede_result()
+        writer.supersede.return_value = result
+        decision = self._supersede_decision(
+            invalidate=[11, 12, 11], keep_triple_ids=[21, 21],
+        )
+
+        report = dl.apply_contradiction_decisions([decision], writer)
+
+        writer.supersede.assert_called_once_with(
+            "project", "uses", "old runtime", "current runtime",
+            old_triple_ids=[11, 12], keep_triple_ids=[21],
+        )
+        writer.invalidate_triples.assert_not_called()
+        self.assertEqual(report["invalidated"], 2)
+        self.assertEqual(report["invalidated_facts"], [
+            {"triple_id": 11}, {"triple_id": 12},
+        ])
+        self.assertEqual(report["superseded"], [result])
+        self.assertEqual(report["skipped"], 0)
+        self.assertEqual(report["errors"], [])
+
+    def test_supersede_passes_explicit_boundary_without_inventing_one(self):
+        writer = mock.Mock(spec=["supersede"])
+        writer.supersede.return_value = self._supersede_result()
+
+        report = dl.apply_contradiction_decisions(
+            [self._supersede_decision(at="2026-09-28T12:00:00")], writer,
+        )
+
+        self.assertEqual(writer.supersede.call_args.kwargs["at"], "2026-09-28T12:00:00")
+        self.assertEqual(report["errors"], [])
+
+    def test_supersede_kept_successor_may_also_have_a_surviving_alternate_proof(self):
+        writer = mock.Mock(spec=["supersede"])
+        result = self._supersede_result(survived_ids=[21, 41])
+        writer.supersede.return_value = result
+
+        report = dl.apply_contradiction_decisions([self._supersede_decision()], writer)
+
+        self.assertEqual(report["errors"], [])
+        self.assertEqual(report["invalidated"], 2)
+        self.assertEqual(report["superseded"], [result])
+
+    def test_supersede_shortfall_reports_actual_root_ids_not_cascades(self):
+        for retired in ([], [12]):
+            with self.subTest(retired=retired):
+                writer = mock.Mock(spec=["supersede"])
+                result = self._supersede_result(invalidated=len(retired), retired_ids=retired)
+                writer.supersede.return_value = result
+
+                report = dl.apply_contradiction_decisions(
+                    [self._supersede_decision()], writer,
+                )
+
+                self.assertEqual(report["invalidated"], len(retired))
+                self.assertEqual(report["invalidated_facts"], [
+                    {"triple_id": tid} for tid in retired
+                ])
+                self.assertEqual(report["superseded"], [result])
+                self.assertEqual(report["errors"][0]["stage"], "failed_adopt")
+                self.assertEqual(report["errors"][0]["expected"], 2)
+                self.assertEqual(report["errors"][0]["actual"], len(retired))
+
+    def test_supersede_writer_failure_does_not_claim_mutation(self):
+        writer = mock.Mock(spec=["supersede", "invalidate_triples"])
+        writer.supersede.side_effect = RuntimeError("target drifted")
+        writer.invalidate_triples.return_value = 1
+
+        report = dl.apply_contradiction_decisions([
+            self._supersede_decision(),
+            {"action": "invalidate", "invalidate": [99]},
+        ], writer)
+
+        self.assertEqual(report["invalidated"], 1)
+        self.assertEqual(report["invalidated_facts"], [{"triple_id": 99}])
+        self.assertEqual(report["superseded"], [])
+        self.assertEqual(report["errors"][0]["stage"], "supersede")
+        self.assertIn("target drifted", report["errors"][0]["error"])
+
+    def test_supersede_missing_or_malformed_identity_is_rejected_before_write(self):
+        changes = (
+            {"subject": None}, {"predicate": ""}, {"old_object": []},
+            {"new_object": " "}, {"keep_triple_ids": []},
+            {"keep_triple_ids": [11]}, {"invalidate": []},
+            {"invalidate": "11"}, {"keep_triple_ids": [None]},
+        )
+        for change in changes:
+            with self.subTest(change=change):
+                writer = mock.Mock(spec=["supersede", "invalidate_triples"])
+
+                report = dl.apply_contradiction_decisions(
+                    [self._supersede_decision(**change)], writer,
+                )
+
+                writer.supersede.assert_not_called()
+                writer.invalidate_triples.assert_not_called()
+                self.assertEqual(report["invalidated"], 0)
+                self.assertEqual(report["errors"][0]["stage"], "groundedness")
+
+    def test_supersede_invalid_result_is_not_success(self):
+        malformed = [
+            None, 2, {}, self._supersede_result(invalidated=True),
+            self._supersede_result(invalidated=3),
+            self._supersede_result(invalidated=1),
+            self._supersede_result(retired_ids=[11, 11]),
+            self._supersede_result(retired_ids=[11, 99]),
+            self._supersede_result(kept_ids=[]),
+            self._supersede_result(cascaded_ids=[21]),
+            self._supersede_result(cascaded_ids=[11]),
+            self._supersede_result(survived_ids=[31]),
+            self._supersede_result(survived_ids=[11]),
+            self._supersede_result(survived_ids=None),
+        ]
+        for result in malformed:
+            with self.subTest(result=result):
+                writer = mock.Mock(spec=["supersede"])
+                writer.supersede.return_value = result
+
+                report = dl.apply_contradiction_decisions(
+                    [self._supersede_decision()], writer,
+                )
+
+                self.assertEqual(report["invalidated"], 0)
+                self.assertEqual(report["invalidated_facts"], [])
+                self.assertEqual(report["superseded"], [])
+                self.assertEqual(report["errors"][0]["stage"], "failed_adopt")
+
+    def test_zero_or_partial_rowcount_is_failed_adopt_without_guessed_ids(self):
+        for affected in (0, 1):
+            with self.subTest(affected=affected):
+                writer = mock.Mock(spec=["invalidate_triples"])
+                writer.invalidate_triples.return_value = affected
+                decision = {"action": "invalidate", "invalidate": ["a", "b"]}
+
+                report = dl.apply_contradiction_decisions([decision], writer)
+
+                self.assertEqual(report["invalidated"], affected)
+                self.assertEqual(report["invalidated_facts"], [])
+                self.assertEqual(report["errors"][0]["stage"], "failed_adopt")
+                self.assertEqual(report["errors"][0]["triple_ids"], ["a", "b"])
+                self.assertEqual(report["errors"][0]["expected"], 2)
+                self.assertEqual(report["errors"][0]["actual"], affected)
+
+    def test_partial_result_keeps_only_known_ids_from_other_decisions(self):
+        writer = mock.Mock(spec=["invalidate_triples"])
+        writer.invalidate_triples.side_effect = [1, 1, 1]
+        decisions = [
+            {"action": "invalidate", "invalidate": ["before"]},
+            {"action": "invalidate", "invalidate": ["a", "b"]},
+            {"action": "invalidate", "invalidate": ["after"]},
+        ]
+
+        report = dl.apply_contradiction_decisions(decisions, writer)
+
+        self.assertEqual(report["invalidated"], 3)
+        self.assertEqual(report["invalidated_facts"], [
+            {"triple_id": "before"}, {"triple_id": "after"},
+        ])
+        self.assertEqual(len(report["errors"]), 1)
+
+    def test_duplicate_ids_are_written_and_counted_once_in_request_order(self):
+        writer = _FakeKgWriter()
+        decision = {"action": "invalidate", "invalidate": ["b", "a", "b", "a"]}
+
+        report = dl.apply_contradiction_decisions([decision], writer)
+
+        self.assertEqual(writer.calls, [["b", "a"]])
+        self.assertEqual(report["invalidated"], 2)
+        self.assertEqual(report["invalidated_facts"], [
+            {"triple_id": "b"}, {"triple_id": "a"},
+        ])
+        self.assertEqual(report["errors"], [])
+
+    def test_invalid_rowcounts_fail_explicitly_without_claiming_success(self):
+        for affected in (None, True, False, -1, 3, 1.0, "1", float("nan"),
+                         float("inf"), {"invalidated": 1}):
+            with self.subTest(affected=affected):
+                writer = mock.Mock(spec=["invalidate_triples"])
+                writer.invalidate_triples.return_value = affected
+
+                report = dl.apply_contradiction_decisions(
+                    [{"action": "invalidate", "invalidate": ["a", "b"]}], writer,
+                )
+
+                self.assertEqual(report["invalidated"], 0)
+                self.assertEqual(report["invalidated_facts"], [])
+                self.assertEqual(report["errors"][0]["stage"], "failed_adopt")
+                self.assertIn("rowcount", report["errors"][0]["error"])
+
     def test_invalidate_calls_writer_for_exact_triple_ids_and_counts_skip(self):
         w = _FakeKgWriter()
         decisions = [
