@@ -432,6 +432,17 @@ scripts rely on. A shadow palace for search-based preview (instead of file-based
 review) and upstream native drawer salience (MemPalace/mempalace#1921) are
 documented future enhancements.
 
+## Optional offline tool-activity evidence
+
+For recorded tool-calling intent or artifact-reuse evidence, use the separate
+[offline activity workflow](references/activity-intent.md). It reads an explicit
+host event file, preserves attributed source evidence and observed outcomes, and
+supports activities with or without artifacts. It does not require FSX or an
+orchestration skill, add foreground hooks, run a model, execute artifacts or
+promote scripts. Its optional artifact view is a review packet, not a usefulness
+verdict. Ordinary survey, reflection, adoption and procedural enrollment remain
+unchanged.
+
 ## Tests
 
 These are repository-only developer checks under `tests/dreaming`, not files

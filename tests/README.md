@@ -133,6 +133,10 @@ Select the smallest relevant suite while developing:
 "$TEST_PY" -W error -m pytest --basetemp "$SESSION_FILES/pytest-task-setup" \
   tests/test_task_setup.py tests/test_task_setup_runtime.py -q
 
+# Offline activity-intent core, Copilot adapter and subprocess CLI (stdlib only).
+"$TEST_PY" -m pytest --basetemp "$SESSION_FILES/pytest-activity-intent" \
+  tests/dreaming/test_dream_activity*.py -q
+
 # Procedural command/replay integration.
 "$TEST_PY" -m pytest --basetemp "$SESSION_FILES/pytest-procedural" \
   tests/dreaming/test_dream_procedure.py \
