@@ -816,3 +816,124 @@ def test_bounded_json_encoder_stops_before_materializing_expanded_string():
     finally:
         tracemalloc.stop()
     assert peak_bytes < 1_000_000
+
+
+def test_compact_artifact_index_resolves_every_observation_against_canonical_report():
+    from dream_activity import apply_reviews, artifact_review
+
+    paths = ["./query.sql", "./program.py", "./automation.fsx", "./extensionless",
+             "./config.unusual", "./a/../query.sql"]
+    root = completed(call("root", claims=[claim("Inspect deployment failures")]),
+                     line=2, success=False)
+    root["artifacts"] = [artifact(path) for path in paths]
+    child = call("child", parent="root", line=3)
+    child["artifacts"] = [artifact("./query.sql", "read", line=3)]
+    separate = call("separate", line=4)
+    separate["artifacts"] = [artifact("./query.sql", "modified", line=4)]
+    report = build_activities(packet(root, child, separate))
+    report = apply_reviews(report, [review_for(report["activities"][0])])
+    before = deepcopy(report)
+
+    index = artifact_review(report, compact=True)
+
+    assert set(index) == {"schema_version", "kind", "source", "candidates"}
+    assert index["kind"] == "artifact_reuse_index"
+    assert index["schema_version"] == 1
+    assert index["source"] == report["source"]
+    assert [candidate["path"] for candidate in index["candidates"]] == paths
+    activities = {item["activity_id"]: item for item in report["activities"]}
+    observations = []
+    for candidate in index["candidates"]:
+        assert set(candidate) == {"path", "assessment", "activity_ids", "observations"}
+        assert candidate["assessment"] == "needs_review"
+        assert candidate["activity_ids"] == list(dict.fromkeys(
+            observation["activity_id"] for observation in candidate["observations"]
+        ))
+        for observation in candidate["observations"]:
+            assert set(observation) == {"activity_id", "call_id", "relation", "source"}
+            activity = activities[observation["activity_id"]]
+            resolved = next(item for item in activity["calls"]
+                            if item["call_id"] == observation["call_id"])
+            assert {
+                "path": candidate["path"],
+                "relation": observation["relation"],
+                "source": observation["source"],
+            } in resolved["artifacts"]
+            observations.append(observation)
+    assert len(observations) == len(paths) + 2
+    assert index["candidates"][0]["activity_ids"] == list(activities)
+    assert report == before
+    index["source"]["path"] = "changed"
+    observations[0]["source"]["field"] = "changed"
+    assert report == before
+
+
+def test_compact_index_fits_default_bound_when_full_projection_does_not():
+    from dream_activity import artifact_review, encode_json
+
+    calls = []
+    for index in range(2):
+        observed = call(str(index), line=index + 1,
+                        claims=[claim("x" * 2000, line=index + 1)])
+        observed["artifacts"] = [
+            artifact(f"./probe-{index}-{number}.sql", line=index + 1)
+            for number in range(256)
+        ]
+        calls.append(observed)
+    report = build_activities(packet(*calls))
+    with pytest.raises(ValueError, match="output.*limit"):
+        artifact_review(report)
+
+    index = artifact_review(report, compact=True)
+    compact_bytes = len(encode_json(index))
+    # The larger bound measures the legacy shape, not a new production default.
+    full = artifact_review(report, max_output_bytes=8 * 1024 * 1024)
+    full_bytes = len(encode_json(full, max_output_bytes=8 * 1024 * 1024))
+    canonical_bytes = len(encode_json(report))
+
+    assert compact_bytes < 4 * 1024 * 1024 < full_bytes
+    assert compact_bytes * 10 < full_bytes
+    assert [candidate["path"] for candidate in index["candidates"]] == [
+        candidate["path"] for candidate in full["candidates"]
+    ]
+    print(f"Synthetic bytes: canonical={canonical_bytes}, full={full_bytes}, compact={compact_bytes}")
+
+
+def test_compact_index_retains_exact_utf8_envelope_and_newline_budget():
+    from dream_activity import artifact_review, encode_json
+
+    first = call("first")
+    first["artifacts"] = [artifact("./分析.sql"), artifact("./分析.sql", "read")]
+    second = call("second", line=2)
+    second["artifacts"] = [artifact("./分析.sql", "modified", line=2)]
+    report = build_activities(packet(first, second))
+    index = artifact_review(report, compact=True)
+    exact = len(encode_json(index))
+
+    assert artifact_review(report, compact=True, max_output_bytes=exact) == index
+    with pytest.raises(ValueError, match="output.*limit"):
+        artifact_review(report, compact=True, max_output_bytes=exact - 1)
+
+
+@pytest.mark.parametrize("compact", [None, 0, 1, "true", []])
+def test_compact_mode_requires_boolean(compact):
+    from dream_activity import artifact_review
+
+    with pytest.raises(ValueError):
+        artifact_review(build_activities(packet()), compact=compact)
+
+
+def test_compact_projection_keeps_validation_and_full_default_shape():
+    from dream_activity import artifact_review
+
+    observed = call()
+    observed["artifacts"] = [artifact("./test.sql")]
+    report = build_activities(packet(observed))
+    full = artifact_review(report)
+    assert artifact_review(report, compact=False) == full
+    assert full["kind"] == "artifact_reuse_review"
+    assert "claims" in full["candidates"][0]["observations"][0]
+    assert artifact_review(build_activities(packet(call())), compact=True)["candidates"] == []
+    report["activities"][0]["calls"][0]["execution_status"] = "succeeded"
+    with pytest.raises(ValueError):
+        artifact_review(report, compact=True)

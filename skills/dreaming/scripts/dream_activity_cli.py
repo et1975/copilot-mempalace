@@ -10,7 +10,11 @@ from pathlib import Path
 import sys
 
 from dream_activity import apply_reviews, artifact_review, build_activities, encode_json
-from dream_activity_copilot import load_evidence
+from dream_activity_copilot import (
+    DEFAULT_MAX_BYTES, DEFAULT_MAX_CALLS, DEFAULT_MAX_EVENTS, DEFAULT_MAX_LINE_BYTES,
+    DEFAULT_MAX_RETAINED_BYTES, DEFAULT_MAX_TEXT_CHARS, load_evidence,
+)
+from dream_activity_io import publish_report
 
 
 def _positive(value: str) -> int:
@@ -30,10 +34,12 @@ def _arguments(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--out", required=True, help="New private JSON output file")
     parser.add_argument("--view", choices=("activities", "artifacts"), default="activities")
     parser.add_argument("--reviews", help="Explicit snapshot-bound inference reviews")
-    parser.add_argument("--max-bytes", type=_positive, default=16 * 1024 * 1024)
-    parser.add_argument("--max-events", type=_positive, default=20_000)
-    parser.add_argument("--max-calls", type=_positive, default=2_000)
-    parser.add_argument("--max-text-chars", type=_positive, default=2_000)
+    parser.add_argument("--max-bytes", type=_positive, default=DEFAULT_MAX_BYTES)
+    parser.add_argument("--max-events", type=_positive, default=DEFAULT_MAX_EVENTS)
+    parser.add_argument("--max-calls", type=_positive, default=DEFAULT_MAX_CALLS)
+    parser.add_argument("--max-text-chars", type=_positive, default=DEFAULT_MAX_TEXT_CHARS)
+    parser.add_argument("--max-line-bytes", type=_positive, default=DEFAULT_MAX_LINE_BYTES)
+    parser.add_argument("--max-retained-bytes", type=_positive, default=DEFAULT_MAX_RETAINED_BYTES)
     parser.add_argument("--max-output-bytes", type=_positive, default=4 * 1024 * 1024)
     return parser.parse_args(argv)
 
@@ -52,26 +58,6 @@ def _read_reviews(path: str, max_bytes: int) -> list[dict]:
     return reviews
 
 
-def _publish(path: Path, encoded: bytes) -> None:
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    identity = os.fstat(descriptor)
-    try:
-        with os.fdopen(descriptor, "wb") as stream:
-            stream.write(encoded)
-            stream.flush()
-            os.fsync(stream.fileno())
-    except BaseException:
-        # Remove only our incomplete file, never a concurrently replaced path.
-        try:
-            current = path.lstat()
-        except FileNotFoundError:
-            pass
-        else:
-            if (current.st_dev, current.st_ino) == (identity.st_dev, identity.st_ino):
-                path.unlink()
-        raise
-
-
 def main(argv: list[str] | None = None) -> int:
     args = _arguments(argv)
     stage = "output destination"
@@ -87,18 +73,20 @@ def main(argv: list[str] | None = None) -> int:
             max_events=args.max_events,
             max_calls=args.max_calls,
             max_text_chars=args.max_text_chars,
+            max_line_bytes=args.max_line_bytes,
+            max_retained_bytes=args.max_retained_bytes,
         )
         stage = "activity evidence"
         report = build_activities(packet)
         if args.reviews:
             stage = "inference review"
-            report = apply_reviews(report, _read_reviews(args.reviews, args.max_bytes))
+            report = apply_reviews(report, _read_reviews(args.reviews, args.max_retained_bytes))
         if args.view == "artifacts":
             stage = "artifact review"
             report = artifact_review(report, max_output_bytes=args.max_output_bytes)
         stage = "output"
         encoded = encode_json(report, max_output_bytes=args.max_output_bytes)
-        _publish(output, encoded)
+        publish_report(output, encoded)
     except FileExistsError:
         print("activity evidence: output already exists; choose a new --out path", file=sys.stderr)
         return 1

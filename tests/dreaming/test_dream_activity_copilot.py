@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
+import tracemalloc
 
 import pytest
 
@@ -331,7 +333,9 @@ def test_bad_json_utf8_and_partial_lines_have_content_free_errors(tmp_path, raw)
     assert error.value.__suppress_context__
 
 
-@pytest.mark.parametrize("limit", ["max_bytes", "max_events", "max_calls", "max_text_chars"])
+@pytest.mark.parametrize("limit", [
+    "max_bytes", "max_events", "max_calls", "max_text_chars", "max_line_bytes", "max_retained_bytes",
+])
 @pytest.mark.parametrize("value", [0, -1, True, 1.2, float("inf"), "2", None])
 def test_limits_are_finite_positive_integers(tmp_path, limit, value):
     with pytest.raises(ValueError):
@@ -538,3 +542,271 @@ def test_shell_script_bodies_do_not_supply_path_tokens(tmp_path, command):
 def test_array_index_is_included_in_source_field_length_bound(tmp_path):
     with pytest.raises(ValueError, match="limit"):
         load(tmp_path, [start(arguments={"x" * 4075: {"paths": ["./file.xyz"]}})])
+
+
+def test_streaming_defaults_are_shared_with_callers():
+    import dream_activity_copilot as adapter
+
+    defaults = {
+        "max_bytes": 512 * 1024 * 1024,
+        "max_events": 100000,
+        "max_calls": 20000,
+        "max_text_chars": 2000,
+        "max_line_bytes": 16 * 1024 * 1024,
+        "max_retained_bytes": 16 * 1024 * 1024,
+    }
+    signature = inspect.signature(adapter.load_evidence)
+    for name, value in defaults.items():
+        assert getattr(adapter, f"DEFAULT_{name.upper()}") == value
+        assert signature.parameters[name].default == value
+
+
+def test_records_are_projected_before_reading_the_whole_source(tmp_path, monkeypatch):
+    import dream_activity_copilot as adapter
+
+    path = tmp_path / "events.jsonl"
+    row = json.dumps(event("future.event", {"content": "x" * 4000})).encode() + b"\n"
+    with path.open("wb") as output:
+        for _ in range(128):
+            output.write(row)
+    original_read = adapter.os.read
+    original_parse = adapter._json_line
+    bytes_read = parses = 0
+
+    def bounded_read(fd, size):
+        nonlocal bytes_read
+        assert 0 < size <= 65536
+        if bytes_read >= 65536:
+            assert parses > 0, "source was buffered instead of projecting records while scanning"
+        chunk = original_read(fd, size)
+        bytes_read += len(chunk)
+        return chunk
+
+    def observed_parse(raw):
+        nonlocal parses
+        parses += 1
+        return original_parse(raw)
+
+    monkeypatch.setattr(adapter.os, "read", bounded_read)
+    monkeypatch.setattr(adapter, "_json_line", observed_parse)
+    packet = adapter.load_evidence(str(path), "session-1")
+    assert packet["source"]["events"] == parses == 128
+    assert packet["source"]["bytes"] == bytes_read == len(row) * 128
+
+
+def test_large_source_streams_with_small_useful_evidence_and_bounded_peak(tmp_path, record_property):
+    import dream_activity_copilot as adapter
+
+    path = tmp_path / "events.jsonl"
+    filler = json.dumps(event("future.event", {"content": "x" * (256 * 1024)})).encode() + b"\r\n"
+    first = json.dumps(start(arguments={"description": "Small retained statement"})).encode() + b"\n"
+    last = json.dumps(complete(result={"content": "x" * (256 * 1024)}, success=True)).encode()
+    digest = hashlib.sha256()
+    with path.open("wb") as output:
+        output.write(first)
+        digest.update(first)
+        for _ in range(80):
+            output.write(filler)
+            digest.update(filler)
+        output.write(last)
+        digest.update(last)
+    del filler, first, last
+    assert path.stat().st_size > 16 * 1024 * 1024
+    tracemalloc.start()
+    try:
+        packet = adapter.load_evidence(str(path), "session-1")
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    record_property("stream_source_bytes", path.stat().st_size)
+    record_property("stream_peak_traced_bytes", peak)
+    assert peak < 8 * 1024 * 1024, f"scan retained source-sized memory: {peak}"
+    assert packet["source"]["sha256"] == digest.hexdigest()
+    assert packet["source"]["bytes"] == path.stat().st_size
+    assert packet["source"]["events"] == 82
+    assert len(packet["calls"]) == 1
+    assert packet["calls"][0]["outcome"]["source"]["line"] == 82
+
+
+@pytest.mark.parametrize("ending", [b"\n", b"\r\n", b""])
+def test_record_byte_limit_includes_multibyte_text_and_terminator(tmp_path, ending):
+    import dream_activity_copilot as adapter
+
+    raw = json.dumps(start(arguments={"description": "é猫🙂"}), ensure_ascii=False).encode() + ending
+    path = tmp_path / "events.jsonl"
+    path.write_bytes(raw)
+    packet = adapter.load_evidence(str(path), "session-1", max_line_bytes=len(raw))
+    assert packet["source"]["sha256"] == hashlib.sha256(raw).hexdigest()
+    with pytest.raises(ValueError, match="record_byte_limit"):
+        adapter.load_evidence(str(path), "session-1", max_line_bytes=len(raw) - 1)
+
+
+def test_blank_record_is_not_exempt_from_record_limit(tmp_path):
+    import dream_activity_copilot as adapter
+
+    path = tmp_path / "events.jsonl"
+    path.write_bytes(b" " * 50 + b"\n")
+    with pytest.raises(ValueError, match="record_byte_limit"):
+        adapter.load_evidence(str(path), "session-1", max_line_bytes=50)
+
+
+def test_mixed_line_endings_and_chunk_split_unicode_have_exact_provenance(tmp_path, monkeypatch):
+    import dream_activity_copilot as adapter
+
+    path = tmp_path / "events.jsonl"
+    raw = b"\r\n \t\n" + json.dumps(
+        start(arguments={"description": "é猫🙂"}), ensure_ascii=False,
+    ).encode() + b"\r\n\n" + json.dumps(complete()).encode()
+    path.write_bytes(raw)
+    original_read = adapter.os.read
+    monkeypatch.setattr(adapter.os, "read", lambda fd, size: original_read(fd, min(size, 7)))
+    packet = adapter.load_evidence(str(path), "session-1")
+    assert packet["source"]["sha256"] == hashlib.sha256(raw).hexdigest()
+    assert packet["source"]["bytes"] == len(raw)
+    assert packet["source"]["events"] == 2
+    assert packet["calls"][0]["source"]["line"] == 3
+    assert packet["calls"][0]["outcome"]["source"]["line"] == 5
+    assert packet["calls"][0]["claims"][0]["text"] == "é猫🙂"
+
+
+def compact_bytes(value):
+    return len(json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8"))
+
+
+def test_retention_budget_charges_normalized_call_not_discarded_body(tmp_path):
+    rows = [start(arguments={"description": "é猫🙂", "content": "x" * (1024 * 1024)})]
+    call = load(tmp_path, rows)["calls"][0]
+    exact = compact_bytes({"c1": call})
+    assert load(tmp_path, rows, max_retained_bytes=exact)["calls"] == [call]
+    with pytest.raises(ValueError, match="evidence_byte_limit"):
+        load(tmp_path, rows, max_retained_bytes=exact - 1)
+
+
+def test_retention_budget_charges_completion_entry_and_agent_binding(tmp_path):
+    call = load(tmp_path, [start()])["calls"][0]
+    completion = {
+        "call_id": "c1", "tool_name": None, "agent_id": None, "parent_call_id": None,
+        "outcome": {"completion_observed": True, "tool_success": None, "exit_code": None,
+                    "source": reference(2)},
+    }
+    exact = compact_bytes({"c1": call}) + compact_bytes({"c1": completion})
+    rows = [start(), complete()]
+    assert load(tmp_path, rows, max_retained_bytes=exact)["calls"][0]["outcome"]["completion_observed"]
+    with pytest.raises(ValueError, match="evidence_byte_limit"):
+        load(tmp_path, rows, max_retained_bytes=exact - 1)
+    rows.append(event("subagent.started", {"toolCallId": "c1", "agentId": "worker"}))
+    binding_bytes = compact_bytes({"worker": "c1"})
+    assert load(tmp_path, rows, max_retained_bytes=exact + binding_bytes)["calls"]
+    with pytest.raises(ValueError, match="evidence_byte_limit"):
+        load(tmp_path, rows, max_retained_bytes=exact + binding_bytes - 1)
+
+
+def test_retention_budget_accumulates_and_stops_before_later_reads(tmp_path, monkeypatch):
+    import dream_activity_copilot as adapter
+
+    path = tmp_path / "events.jsonl"
+    first = json.dumps(start("a")).encode() + b"\n"
+    second = json.dumps(start("b")).encode() + b"\n"
+    normalized = load(tmp_path, [start("a")])["calls"][0]
+    cap = compact_bytes({"a": normalized})
+    path.write_bytes(first + second + b" " * 100000)
+    original_read = adapter.os.read
+    reads = 0
+
+    def one_read_only(fd, size):
+        nonlocal reads
+        reads += 1
+        assert reads == 1, "retention overflow must fail without scanning later records"
+        return original_read(fd, size)
+
+    monkeypatch.setattr(adapter.os, "read", one_read_only)
+    with pytest.raises(ValueError, match="evidence_byte_limit"):
+        adapter.load_evidence(str(path), "session-1", max_retained_bytes=cap)
+
+
+@pytest.mark.parametrize("suffix,diagnostic", [
+    (b',"malformed":}\n', "invalid_json"),
+    (b',"nested":' + b"[" * 70 + b"0" + b"]" * 70 + b"}\n", "payload_depth_limit"),
+    (b',"bad":"\xff"}\n', "invalid_utf8"),
+    (b',"bad":"\\ud800"}\n', "invalid_unicode"),
+])
+def test_large_ignored_records_still_validate_entire_payload(tmp_path, suffix, diagnostic):
+    import dream_activity_copilot as adapter
+
+    path = tmp_path / "events.jsonl"
+    path.write_bytes(b'{"type":"future.event","content":"' + b"x" * (1024 * 1024) + b'"' + suffix)
+    with pytest.raises(ValueError, match=diagnostic):
+        adapter.load_evidence(str(path), "session-1")
+
+
+def test_event_id_duplicates_after_many_ignored_records_are_not_forgotten(tmp_path):
+    rows = [event("future.event", id="same")]
+    rows.extend(event("future.event", id=f"e-{n}") for n in range(100))
+    rows.append(event("future.event", id="same"))
+    with pytest.raises(ValueError, match="duplicate_event_id"):
+        load(tmp_path, rows)
+
+
+def test_record_limit_across_read_chunks_fails_before_parsing(tmp_path, monkeypatch):
+    import dream_activity_copilot as adapter
+
+    path = tmp_path / "events.jsonl"
+    path.write_bytes(b'{"type":"future.event","content":"' + b"x" * 131072 + b'"}\n')
+
+    def must_not_parse(raw):
+        pytest.fail("over-budget record reached the JSON parser")
+
+    monkeypatch.setattr(adapter, "_json_line", must_not_parse)
+    with pytest.raises(ValueError, match="record_byte_limit"):
+        adapter.load_evidence(str(path), "session-1", max_line_bytes=100000)
+
+
+def test_source_change_during_final_record_projection_fails(tmp_path, monkeypatch):
+    import dream_activity_copilot as adapter
+
+    path = tmp_path / "events.jsonl"
+    path.write_bytes(json.dumps(start()).encode())
+    original_parse = adapter._json_line
+
+    def parse_then_change(raw):
+        result = original_parse(raw)
+        with path.open("ab") as output:
+            output.write(b"\n")
+        return result
+
+    monkeypatch.setattr(adapter, "_json_line", parse_then_change)
+    with pytest.raises(ValueError, match="source_changed"):
+        adapter.load_evidence(str(path), "session-1")
+
+
+def test_retention_failure_closes_the_stream_descriptor(tmp_path, monkeypatch):
+    import dream_activity_copilot as adapter
+
+    path = tmp_path / "events.jsonl"
+    path.write_bytes(json.dumps(start()).encode() + b"\n" + b" " * 100000)
+    original_open = adapter.os.open
+    descriptors = []
+
+    def observed_open(*args, **kwargs):
+        fd = original_open(*args, **kwargs)
+        descriptors.append(fd)
+        return fd
+
+    monkeypatch.setattr(adapter.os, "open", observed_open)
+    with pytest.raises(ValueError, match="evidence_byte_limit"):
+        adapter.load_evidence(str(path), "session-1", max_retained_bytes=1)
+    assert len(descriptors) == 1
+    with pytest.raises(OSError):
+        adapter.os.fstat(descriptors[0])
+
+
+def test_structural_validation_ignores_escaped_json_string_punctuation(tmp_path):
+    text = 'escaped quote " slash \\ and brackets [[[{{{}}}]]]' * 100
+    packet = load(tmp_path, [
+        start(arguments={"description": text}),
+        event("future.event", {"content": text}),
+        complete(result={"content": text}),
+    ])
+    claim = packet["calls"][0]["claims"][0]
+    assert claim["text"] == text[:2000]
+    assert claim["truncated"]

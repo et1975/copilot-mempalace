@@ -436,8 +436,11 @@ documented future enhancements.
 
 For recorded tool-calling intent or artifact-reuse evidence, use the separate
 [offline activity workflow](references/activity-intent.md). It reads an explicit
-host event file, preserves attributed source evidence and observed outcomes, and
-supports activities with or without artifacts. It does not require FSX or an
+host event file or selected session batch through `dream_harvest.py --task
+activity`, preserves attributed source evidence and observed outcomes, and
+supports activities with or without artifacts. Batch harvesting streams each
+source once, keeps detailed reports outside context and returns a compact summary.
+It does not require FSX or an
 orchestration skill, add foreground hooks, run a model, execute artifacts or
 promote scripts. Its optional artifact view is a review packet, not a usefulness
 verdict. Ordinary survey, reflection, adoption and procedural enrollment remain

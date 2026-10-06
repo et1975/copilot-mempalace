@@ -6,8 +6,8 @@ The envelope hash identifies the exact input snapshot for every source reference
 """
 from __future__ import annotations
 
+from contextlib import closing
 import hashlib
-import io
 import json
 import math
 import os
@@ -16,6 +16,13 @@ import re
 import shlex
 import stat
 
+
+DEFAULT_MAX_BYTES = 512 * 1024 * 1024
+DEFAULT_MAX_EVENTS = 100000
+DEFAULT_MAX_CALLS = 20000
+DEFAULT_MAX_TEXT_CHARS = 2000
+DEFAULT_MAX_LINE_BYTES = 16 * 1024 * 1024
+DEFAULT_MAX_RETAINED_BYTES = 16 * 1024 * 1024
 
 _MAX_DEPTH = 64
 _MAX_NODES = 20000
@@ -37,6 +44,8 @@ _FILE_RELATIONS = {
 _SHELL_TOOLS = {"bash", "shell", "powershell", "terminal", "run_in_terminal"}
 _PATCH_HEADER = re.compile(r"^\*\*\* (Add|Update|Delete) File: (.+)$")
 _SURROGATE = re.compile(r"[\ud800-\udfff]")
+_JSON_STRUCTURE = re.compile(r'["\\{}\[\]]')
+_RETAIN_ENCODER = json.JSONEncoder(ensure_ascii=False, separators=(",", ":"), allow_nan=False)
 
 
 class EvidenceError(ValueError):
@@ -63,7 +72,8 @@ def _identity(info) -> tuple:
     return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
 
 
-def _snapshot(path: Path, max_bytes: int) -> bytes:
+def _records(path: Path, max_bytes: int, max_line_bytes: int, digest):
+    """Yield bounded binary records; only exhaustion establishes a stable scan."""
     fd = None
     try:
         before = os.stat(path)
@@ -77,23 +87,40 @@ def _snapshot(path: Path, max_bytes: int) -> bytes:
             _fail("source_changed")
         if opened.st_size > max_bytes:
             _fail("source_byte_limit")
-        chunks = []
+        record = bytearray()
         total = 0
         while total <= max_bytes:
             chunk = os.read(fd, min(65536, max_bytes + 1 - total))
             if not chunk:
                 break
-            chunks.append(chunk)
             total += len(chunk)
+            if total > max_bytes:
+                _fail("source_byte_limit")
+            digest.update(chunk)
+            offset = 0
+            while offset < len(chunk):
+                end = chunk.find(b"\n", offset)
+                stop = len(chunk) if end < 0 else end + 1
+                if len(record) + stop - offset > max_line_bytes:
+                    _fail("record_byte_limit")
+                record.extend(chunk[offset:stop])
+                offset = stop
+                if end >= 0:
+                    raw = bytes(record)
+                    record.clear()
+                    yield raw
+                    del raw
+        if record:
+            raw = bytes(record)
+            record.clear()
+            yield raw
+            del raw
         after = os.fstat(fd)
         named_after = os.stat(path)
         if _identity(opened) != _identity(after) or _identity(after) != _identity(named_after):
             _fail("source_changed")
-        if total > max_bytes:
-            _fail("source_byte_limit")
         if total != opened.st_size:
             _fail("source_changed")
-        return b"".join(chunks)
     except OSError:
         _fail("source_io_error")
     finally:
@@ -112,13 +139,16 @@ def _pairs(pairs: list[tuple]) -> dict:
 
 def _json_line(line: str) -> dict:
     depth = 0
-    quoted = escaped = False
-    for char in line:
+    quoted = False
+    escaped_position = -1
+    for match in _JSON_STRUCTURE.finditer(line):
+        position = match.start()
+        char = match.group()
         if quoted:
-            if escaped:
-                escaped = False
+            if position == escaped_position:
+                continue
             elif char == "\\":
-                escaped = True
+                escaped_position = position + 1
             elif char == '"':
                 quoted = False
         elif char == '"':
@@ -368,19 +398,73 @@ def _link(calls: dict, completions: dict, bindings: dict) -> list[str]:
     return warnings
 
 
+def _project(raw: bytes, line: int, session_id: str, text_cap: int):
+    """Validate one entire record and release its payload after projection."""
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeError:
+        _fail("invalid_utf8")
+    if not text or text.isspace():
+        return None
+    event = _json_line(text)
+    kind = _text(event.get("type"))
+    event_id = _text(event.get("id"), optional=True)
+    _text(event.get("timestamp"), optional=True)
+    entry = None
+    if kind in {"tool.execution_start", "tool.execution_complete", "subagent.started", "session.start"}:
+        data = event.get("data")
+        if not isinstance(data, dict):
+            _fail("invalid_event_data")
+        declared_session = _declared(event, data, "sessionId", required=kind == "session.start")
+        if declared_session is not None and declared_session != session_id:
+            _fail("session_identity_mismatch")
+        if kind == "tool.execution_start":
+            entry = _start(event, data, line, text_cap)
+        elif kind == "tool.execution_complete":
+            entry = _completion(event, data, line)
+        elif kind == "subagent.started":
+            agent = _declared(event, data, "agentId", required=True)
+            parent = _declared(event, data, "toolCallId", required=True)
+            _declared(event, data, "parentToolCallId")
+            entry = (agent, parent)
+    return event_id, kind, entry
+
+
+def _charge_retained(key: str, value, used: int, limit: int) -> int:
+    for part in _RETAIN_ENCODER.iterencode({key: value}):
+        used += len(part.encode("utf-8"))
+        if used > limit:
+            _fail("evidence_byte_limit")
+    return used
+
+
 def load_evidence(
     events_path: str,
     session_id: str,
     *,
-    max_bytes: int = 16777216,
-    max_events: int = 20000,
-    max_calls: int = 2000,
-    max_text_chars: int = 2000,
+    max_bytes: int = DEFAULT_MAX_BYTES,
+    max_events: int = DEFAULT_MAX_EVENTS,
+    max_calls: int = DEFAULT_MAX_CALLS,
+    max_text_chars: int = DEFAULT_MAX_TEXT_CHARS,
+    max_line_bytes: int = DEFAULT_MAX_LINE_BYTES,
+    max_retained_bytes: int = DEFAULT_MAX_RETAINED_BYTES,
 ) -> dict:
     """Load an explicit event snapshot without accessing referenced artifacts.
 
     Limits are positive integers; overflow raises content-free ``EvidenceError``
     (a ``ValueError``), never a successful partial packet. Only quotes truncate.
+    Scan bytes and retained evidence have independent limits. Each physical
+    record, including its LF/CRLF terminator, must fit ``max_line_bytes``.
+    Records are hashed, validated, projected and discarded in one pass.
+
+    ``max_retained_bytes`` charges the compact UTF-8 JSON size of each normalized
+    single-entry call/completion/binding mapping once, before storing it. Both
+    start and completion entries count, even when later linked. This is an
+    evidence-size budget, not an exact Python heap limit: container overhead,
+    the final envelope/warnings, the current record, and the event-ID set are
+    excluded. Event IDs are separately bounded by ``max_events`` and the
+    identifier cap; raw argument/result bodies never count as retained evidence.
+
     Additional defensive caps: 64 JSON nesting levels, 20,000 nodes per event,
     1,024-character identifiers, 4,096-character paths/field references and 256
     artifact observations per call. Shell tokenization caps command text at
@@ -389,67 +473,57 @@ def load_evidence(
     ``data.shellExecution.exitCode`` is the only process outcome source; result
     text cannot establish an exit code. ``parentId`` is never a call link.
     """
-    for limit in (max_bytes, max_events, max_calls, max_text_chars):
+    for limit in (max_bytes, max_events, max_calls, max_text_chars, max_line_bytes, max_retained_bytes):
         if type(limit) is not int or limit <= 0:
             _fail("invalid_limit")
     _text(events_path, cap=32768)
     _text(session_id)
     path = Path(events_path).absolute()
-    snapshot = _snapshot(path, max_bytes)
-    try:
-        text = snapshot.decode("utf-8")
-    except UnicodeError:
-        _fail("invalid_utf8")
+    digest = hashlib.sha256()
     calls = {}
     completions = {}
     bindings = {}
     event_ids = set()
-    count = 0
-    for line, raw in enumerate(io.StringIO(text), 1):
-        if not raw.strip():
-            continue
-        count += 1
-        if count > max_events:
-            _fail("event_limit")
-        event = _json_line(raw)
-        kind = _text(event.get("type"))
-        event_id = _text(event.get("id"), optional=True)
-        _text(event.get("timestamp"), optional=True)
-        if event_id is not None:
-            if event_id in event_ids:
-                _fail("duplicate_event_id")
-            event_ids.add(event_id)
-        if kind not in {"tool.execution_start", "tool.execution_complete", "subagent.started", "session.start"}:
-            continue
-        data = event.get("data")
-        if not isinstance(data, dict):
-            _fail("invalid_event_data")
-        declared_session = _declared(event, data, "sessionId", required=kind == "session.start")
-        if declared_session is not None and declared_session != session_id:
-            _fail("session_identity_mismatch")
-        if kind == "tool.execution_start":
-            if len(calls) >= max_calls:
-                _fail("call_limit")
-            call = _start(event, data, line, max_text_chars)
-            if call["call_id"] in calls:
-                _fail("duplicate_call")
-            calls[call["call_id"]] = call
-        elif kind == "tool.execution_complete":
-            completed = _completion(event, data, line)
-            if completed["call_id"] in completions:
-                _fail("duplicate_completion")
-            if len(completions) >= max_calls:
-                _fail("completion_limit")
-            completions[completed["call_id"]] = completed
-        elif kind == "subagent.started":
-            agent = _declared(event, data, "agentId", required=True)
-            parent = _declared(event, data, "toolCallId", required=True)
-            _declared(event, data, "parentToolCallId")
-            if agent in bindings:
-                _fail("ambiguous_agent_binding")
-            if len(bindings) >= max_calls:
-                _fail("binding_limit")
-            bindings[agent] = parent
+    count = byte_count = retained_bytes = 0
+    with closing(_records(path, max_bytes, max_line_bytes, digest)) as records:
+        for line, raw in enumerate(records, 1):
+            byte_count += len(raw)
+            projected = _project(raw, line, session_id, max_text_chars)
+            del raw
+            if projected is None:
+                continue
+            count += 1
+            if count > max_events:
+                _fail("event_limit")
+            event_id, kind, entry = projected
+            if event_id is not None:
+                if event_id in event_ids:
+                    _fail("duplicate_event_id")
+                event_ids.add(event_id)
+            if kind == "tool.execution_start":
+                if len(calls) >= max_calls:
+                    _fail("call_limit")
+                call_id = entry["call_id"]
+                if call_id in calls:
+                    _fail("duplicate_call")
+                retained_bytes = _charge_retained(call_id, entry, retained_bytes, max_retained_bytes)
+                calls[call_id] = entry
+            elif kind == "tool.execution_complete":
+                call_id = entry["call_id"]
+                if call_id in completions:
+                    _fail("duplicate_completion")
+                if len(completions) >= max_calls:
+                    _fail("completion_limit")
+                retained_bytes = _charge_retained(call_id, entry, retained_bytes, max_retained_bytes)
+                completions[call_id] = entry
+            elif kind == "subagent.started":
+                agent, parent = entry
+                if agent in bindings:
+                    _fail("ambiguous_agent_binding")
+                if len(bindings) >= max_calls:
+                    _fail("binding_limit")
+                retained_bytes = _charge_retained(agent, parent, retained_bytes, max_retained_bytes)
+                bindings[agent] = parent
     warnings = _link(calls, completions, bindings)
     return {
         "schema_version": 1,
@@ -457,8 +531,8 @@ def load_evidence(
             "kind": "copilot_events",
             "path": str(path),
             "session_id": session_id,
-            "sha256": hashlib.sha256(snapshot).hexdigest(),
-            "bytes": len(snapshot),
+            "sha256": digest.hexdigest(),
+            "bytes": byte_count,
             "events": count,
         },
         "calls": list(calls.values()),

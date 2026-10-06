@@ -178,7 +178,8 @@ def test_output_budget_counts_utf8_bytes(tmp_path, view):
 
 @pytest.mark.parametrize(
     "flag",
-    ["--max-bytes", "--max-events", "--max-calls", "--max-text-chars", "--max-output-bytes"],
+    ["--max-bytes", "--max-events", "--max-calls", "--max-text-chars", "--max-output-bytes",
+     "--max-line-bytes", "--max-retained-bytes"],
 )
 def test_nonpositive_limits_are_argument_errors(tmp_path, flag):
     source = history(tmp_path / "events.jsonl")

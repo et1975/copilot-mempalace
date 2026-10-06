@@ -385,13 +385,17 @@ def apply_reviews(report: dict, reviews: list[dict]) -> dict:
     return result
 
 
-def artifact_review(report: dict, *, max_output_bytes: int = _DEFAULT_OUTPUT_BYTES) -> dict:
-    """Project review candidates within a serialized-byte budget, never promotion."""
+def artifact_review(
+    report: dict, *, max_output_bytes: int = _DEFAULT_OUTPUT_BYTES, compact: bool = False,
+) -> dict:
+    """Project bounded review candidates; compact IDs resolve in the input report."""
     _output_limit(max_output_bytes)
+    if type(compact) is not bool:
+        raise ValueError("compact must be a boolean")
     _validate_report(report)
     result = {
         "schema_version": 1,
-        "kind": "artifact_reuse_review",
+        "kind": "artifact_reuse_index" if compact else "artifact_reuse_review",
         "source": report["source"],
         "candidates": [],
     }
@@ -424,15 +428,18 @@ def artifact_review(report: dict, *, max_output_bytes: int = _DEFAULT_OUTPUT_BYT
                     "call_id": call["call_id"],
                     "relation": artifact["relation"],
                     "source": artifact["source"],
-                    "call_source": call["source"],
-                    "claims": call["claims"],
-                    "intent": activity["intent"],
-                    "observed_intent": activity.get("observed_intent", activity["intent"]),
-                    "call_intent": call["intent"],
-                    "outcome": call["outcome"],
-                    "execution_status": call["execution_status"],
-                    "review": activity.get("review"),
                 }
+                if not compact:
+                    observation.update({
+                        "call_source": call["source"],
+                        "claims": call["claims"],
+                        "intent": activity["intent"],
+                        "observed_intent": activity.get("observed_intent", activity["intent"]),
+                        "call_intent": call["intent"],
+                        "outcome": call["outcome"],
+                        "execution_status": call["execution_status"],
+                        "review": activity.get("review"),
+                    })
                 # Charge expanded evidence before copying it for another path.
                 remaining = _charge_json(
                     observation, remaining, comma=bool(candidate["observations"]),

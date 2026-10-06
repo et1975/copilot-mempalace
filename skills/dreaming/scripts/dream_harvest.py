@@ -86,10 +86,12 @@ def _degree_for(drawer: dict, degrees: dict[str, int]) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from dream_activity_harvest import add_arguments, run_from_arguments
+
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--palace", help="Path to the mempalace palace directory (default: mempalace config)")
     ap.add_argument("--task", choices=[
-        "merge", "contradiction", "pattern", "prune", "derive", "gaps", "suggest-rules", "induce-rules", "reflect"
+        "merge", "contradiction", "pattern", "prune", "derive", "gaps", "suggest-rules", "induce-rules", "reflect", "activity"
     ], default="merge",
                     help="Dreaming task to harvest (default merge)")
     ap.add_argument("--wing", help="Scope merge harvest to this wing (ignored for contradiction)")
@@ -134,7 +136,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--target-subject", default=None,
                     help="Restrict gaps (--task gaps) to conclusions about this subject (entity id or display name)")
     ap.add_argument("--out", default="worklist.json", help="Output worklist path (default worklist.json)")
+    add_arguments(ap)
     args = ap.parse_args(argv)
+
+    if args.task == "activity":
+        return run_from_arguments(args)
 
     effective_palace = args.palace or _default_palace()
     if effective_palace is None:

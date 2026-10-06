@@ -25,10 +25,55 @@ provided the tool arguments, not silently upgraded to user requests. A session's
 overall user request is not copied into every call. Generic tool schemas,
 command source and result text do not supply intent automatically.
 
-## Run
+## Run through dreaming
+
+The normal entry point is `dream_harvest.py --task activity`. It selects multiple
+sessions and loads each history once, deriving both views in process when
+requested. No per-session subprocess or ad-hoc batch wrapper is needed.
+
+```bash
+"$MPY" "$DREAM_SCRIPTS/dream_harvest.py" --task activity \
+  --session-root "$HOME/.copilot/session-state" \
+  --session-id "$FIRST_SESSION_ID" --session-id "$SECOND_SESSION_ID" \
+  --activity-view both --out "$ARTIFACTS/activity-summary.json"
+```
+
+Alternatively, use the existing read-only session index:
+
+```bash
+"$MPY" "$DREAM_SCRIPTS/dream_harvest.py" --task activity \
+  --session-store "$HOME/.copilot/session-store.db" \
+  --repository owner/repository --since 2026-10-01 --limit-sessions 8 \
+  --out "$ARTIFACTS/activity-summary.json"
+```
+
+Index filters retain the session adapter's creation-time ordering and repository
+substring matching. Explicit IDs cannot be mixed with index filters. Selection
+defaults to eight sessions and cannot exceed 100. A missing index is an error,
+not a successful empty selection.
+
+The summary and stdout contain counts, status, source references and report
+paths, not full prompts or every observation. Detailed reports are private files
+in `<summary-name>.sessions/`, created alongside the summary. `--activity-view`
+accepts `activities` (default) or `both`. Both retains one canonical activity
+report plus a compact `artifact_reuse_index`: observations reference activity
+and call IDs instead of repeating their prompts, intent and outcome bodies.
+The index's `activity_report` points to that canonical report. The summary records
+both file sizes. The referenced-path count is not a count of useful scripts.
+
+Independent session failures do not prevent other selected sessions from being
+processed. The persisted summary explicitly distinguishes `complete`, `partial`
+and `failed`; any session failure produces exit 1. Counts of successful sessions
+exclude failed ones. A valid empty index selection is complete with zero counts.
+Existing summary/report directories are not overwritten. The activity route
+bypasses palace binding, models, adoption and default survey tasks.
+
+## Single-session diagnostic entry point
 
 Use the existing Python 3.11+ interpreter and the dreaming skill's scripts
-directory. This workflow uses only the standard library; it needs no palace,
+directory. The standalone diagnostic entry point and extraction modules use only
+the standard library; the normal dreaming entry point retains its existing
+Python environment prerequisites. Neither activity route needs a palace,
 embedding model, network, package installation or running task service.
 Keep output and review files in a private directory outside the checkout.
 
@@ -121,18 +166,43 @@ usefulness, certify safety, execute files, generalize code, copy to a library,
 install skills or enroll procedural rules. Artifact-free activities are retained
 in the activity view but produce no artifact candidates.
 
+## Output format
+
+JSON is the machine interchange format, not a claim of maximum compactness. It
+uses the standard library, preserves explicit string/number/boolean/null types,
+and fits existing evidence/review readers and bounded deterministic serialization.
+YAML can be more compact or readable for some human-edited documents, but that
+depends on the data and emitter; character count is not model-token count.
+Supporting YAML would also require an agreed parser/schema and serialization
+policy. No YAML parser is installed or implicitly selected by this workflow.
+
+The larger savings are structural: return the compact batch summary to the
+caller, retain detailed evidence outside context, reference shared evidence once
+in the batch artifact index, and derive views without reading/parsing each source
+again. Merely changing delimiters would not remove duplicated claims or make
+low-value artifact references useful. The single-session diagnostic artifact
+view retains the older expanded representation for compatibility; it can still
+hit its output budget on evidence that fits the compact index.
+
 ## Bounds, privacy and limitations
 
 | Flag | Default |
 |---|---|
-| `--max-bytes` | 16 MiB input |
-| `--max-events` | 20,000 events |
-| `--max-calls` | 2,000 calls |
+| `--max-bytes` | 512 MiB scanned input |
+| `--max-line-bytes` | 16 MiB per physical JSONL record |
+| `--max-retained-bytes` | 16 MiB retained normalized evidence accounting |
+| `--max-events` | 100,000 events |
+| `--max-calls` | 20,000 calls |
 | `--max-text-chars` | 2,000 characters per claim |
 | `--max-output-bytes` | 4 MiB serialized JSON, including newline |
 
-All limits must be positive. Input/event/call/output overflow fails explicitly
-before publishing a report. Artifact projection and serialization enforce the
+All limits must be positive. Large histories are streamed and hashed incrementally
+instead of retaining the entire file as bytes, decoded text and a string buffer.
+Only normalized evidence and bounded identity indexes survive each record.
+Scan, single-record and retained-evidence budgets are separate; encoded evidence
+accounting is not an exact process-RSS guarantee. Input/event/call/evidence/output
+overflow fails explicitly before publishing that session's report. Artifact
+projection and serialization enforce the
 output budget while constructing the result, rather than fully expanding an
 oversized report first. Quote shortening is explicit; complete claims are
 not manufactured from clipped text. The adapter checks file identity, size and
