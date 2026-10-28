@@ -130,11 +130,20 @@ class MapHookTests(unittest.TestCase):
 
 @pytest.fixture
 def session(tmp_path, monkeypatch):
+    if _HAS_MEMPALACE:
+        # The provider resolves its default cache once, when first imported.
+        from chromadb.utils.embedding_functions.onnx_mini_lm_l6_v2 import ONNXMiniLM_L6_V2
+        monkeypatch.setattr(
+            ONNXMiniLM_L6_V2, "DOWNLOAD_PATH", Path(os.environ["DREAMING_TEST_MODEL_CACHE"]),
+        )
     home = tmp_path / "copilot"
     directory = home / "session-state" / "session-123"
     directory.mkdir(parents=True)
+    user_home = tmp_path / "home"
+    user_home.mkdir()
+    monkeypatch.setenv("HOME", str(user_home))
+    monkeypatch.setenv("USERPROFILE", str(user_home))
     monkeypatch.setenv("COPILOT_HOME", str(home))
-    monkeypatch.setenv("MEMPALACE_CONFIG_DIR", str(tmp_path / "config"))
     monkeypatch.delenv("MEMPALACE_HOOKS_AUTO_SAVE", raising=False)
     monkeypatch.setenv("MEMPALACE_PYTHON", sys.executable)
     return directory
@@ -387,7 +396,7 @@ def test_disabled_auto_save_is_respected(session, monkeypatch, installed_storage
 
 def test_config_opt_out_is_respected_without_environment_override(session, monkeypatch, installed_storage):
     write_session(session, [("user", "q")])
-    config = Path(os.environ["MEMPALACE_CONFIG_DIR"])
+    config = Path.home() / ".mempalace"
     config.mkdir(exist_ok=True)
     (config / "config.json").write_text('{"hooks":{"auto_save":false}}')
     assert invoke(exit_payload(), run_capture_worker)["code"] == "auto_save_disabled"
@@ -586,11 +595,13 @@ def installed_storage(session, monkeypatch):
         pytest.skip("requires provisioned MemPalace")
     import sys
     from mempalace.backends import embedding_wrapper
+    from mempalace.config import MempalaceConfig
 
     palace = session / "isolated-palace"
     palace.mkdir()
     monkeypatch.setenv("MEMPALACE_PALACE_PATH", str(palace))
     monkeypatch.setenv("MEMPALACE_BACKEND", "sqlite_exact")
+    monkeypatch.setenv("MEMPALACE_BACKEND_EXPLICIT", "sqlite_exact")
     for name in (
         "MEMPALACE_HOOK_WRITE_ROUTING", "MEMPALACE_CLI_WRITE_ROUTING",
         "MEMPALACE_WRITE_ROUTING", "MEMPALACE_HOOKS_DAEMON",
@@ -604,7 +615,9 @@ def installed_storage(session, monkeypatch):
         os.close(saved_fd)
         sys.stdout = saved_stdout
     mcp_server._release_mcp_writer_lock()
-    mcp_server._apply_server_flags(palace=str(palace), backend="sqlite_exact")
+    mcp_server._discard_mcp_storage_handles()
+    monkeypatch.setattr(mcp_server, "_config", MempalaceConfig())
+    monkeypatch.setattr(mcp_server, "_READ_ONLY", False)
     monkeypatch.setattr(embedding_wrapper, "_embed_texts", lambda texts: [[1.0, 0.0] for _ in texts])
 
     class StorageReads:
@@ -683,7 +696,7 @@ def test_actual_hook_routing_ignores_cli_policy_and_never_starts_daemon(
     from mempalace import daemon
 
     collection, _ = installed_storage
-    config = Path(os.environ["MEMPALACE_CONFIG_DIR"])
+    config = Path.home() / ".mempalace"
     config.mkdir(exist_ok=True)
     routing = {"hooks": hooks}
     if cli:
@@ -928,7 +941,7 @@ def test_unprovisioned_worker_fails_before_any_write(session, monkeypatch):
 def test_invalid_hook_policy_does_not_fall_back_to_direct(session, installed_storage):
     import copilot_capture as worker
 
-    config = Path(os.environ["MEMPALACE_CONFIG_DIR"])
+    config = Path.home() / ".mempalace"
     config.mkdir(exist_ok=True)
     (config / "config.json").write_text('{"write_routing":{"hooks":"invalid","cli":"direct"}}')
     result = worker.capture(worker_request(session, [("assistant", "tail")]))
@@ -1105,11 +1118,11 @@ def test_real_project_query_uses_header_when_callback_context_is_absent(
     assert wing_query(collection, "wing_repo").documents == [[]]
 
 
-def test_real_read_only_runtime_refusal_does_not_leave_unknown_intent(session, installed_storage):
+def test_real_read_only_runtime_refusal_does_not_leave_unknown_intent(
+    session, installed_storage, monkeypatch,
+):
     _, server = installed_storage
-    server._apply_server_flags(
-        palace=str(session / "isolated-palace"), backend="sqlite_exact", read_only=True,
-    )
+    monkeypatch.setattr(server, "_READ_ONLY", True)
     write_session(session, [("assistant", "must not write")])
     result = invoke(exit_payload(), run_capture_worker)
     assert result["outcome"] == "failed"
