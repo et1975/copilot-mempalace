@@ -33,7 +33,7 @@ jobs:
       - name: Create isolated storage
         run: |
           root="$RUNNER_TEMP/mempalace-ci"
-          mkdir -p "$root/home" "$root/tmp"
+          mkdir -p "$root/home" "$root/tmp" "$root/toolcache"
           {
             printf 'CI_ROOT=%s\n' "$root"
             printf 'HOME=%s/home\n' "$root"
@@ -47,6 +47,8 @@ jobs:
             printf 'MEMPAL_PALACE_PATH=%s/palace\n' "$root"
             printf 'MEMPALACE_DAEMON_STATE_ROOT=%s/daemon\n' "$root"
             printf 'UV_CACHE_DIR=%s/uv-cache\n' "$root"
+            # setup-python uses this instead of the world-writable hosted tool cache.
+            printf 'AGENT_TOOLSDIRECTORY=%s/toolcache\n' "$root"
           } >> "$GITHUB_ENV"
 
       - name: Check out source
