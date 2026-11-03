@@ -68,6 +68,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import palace_restore_io
+import palace_runtime
 
 DEFAULT_PALACE = Path("~/.mempalace").expanduser()
 
@@ -129,32 +130,36 @@ def resolve_data_path(
     not for inventory/checkpoint. No directories or configuration are created.
     """
     home = _covered_path(palace, palace)
-    env_path = os.environ.get("MEMPALACE_PALACE_PATH") or os.environ.get("MEMPAL_PALACE_PATH")
     if data_path is not None:
         selected = Path(data_path)
-    elif env_path:
-        selected = Path(env_path)
     else:
-        config_file = _covered_path(home, home / "config.json")
         try:
-            config = json.loads(config_file.read_text(encoding="utf-8-sig"))
-        except FileNotFoundError:
-            config = {}
-        except (OSError, ValueError) as exc:
-            raise BackupError(f"Cannot read config {config_file}: {exc}") from exc
-        if not isinstance(config, dict):
-            raise BackupError(f"Config must be a JSON object: {config_file}")
-        if "palace_path" in config:
-            value = config["palace_path"]
-            if not isinstance(value, str) or not value.strip() or "\0" in value:
-                raise BackupError(f"Invalid palace_path in config: {config_file}")
-            selected = Path(value).expanduser()
-            if not selected.is_absolute():
-                raise BackupError(
-                    f"Ambiguous relative palace_path in config {config_file}; "
-                    "supply an explicit --data-path.") from None
+            env_path = palace_runtime.data_environment_path()
+        except palace_runtime.LayoutError as exc:
+            raise BackupError(str(exc)) from exc
+        if env_path:
+            selected = Path(env_path)
         else:
-            selected = home / "palace"
+            config_file = _covered_path(home, home / "config.json")
+            try:
+                config = json.loads(config_file.read_text(encoding="utf-8-sig"))
+            except FileNotFoundError:
+                config = {}
+            except (OSError, ValueError) as exc:
+                raise BackupError(f"Cannot read config {config_file}: {exc}") from exc
+            if not isinstance(config, dict):
+                raise BackupError(f"Config must be a JSON object: {config_file}")
+            if "palace_path" in config:
+                value = config["palace_path"]
+                if not isinstance(value, str) or not value.strip() or "\0" in value:
+                    raise BackupError(f"Invalid palace_path in config: {config_file}")
+                selected = Path(value).expanduser()
+                if not selected.is_absolute():
+                    raise BackupError(
+                        f"Ambiguous relative palace_path in config {config_file}; "
+                        "supply an explicit --data-path.") from None
+            else:
+                selected = home / "palace"
     selected = _covered_path(home, selected)
     if selected.exists() and not selected.is_dir():
         raise BackupError(f"Data path is not a directory: {selected}")
@@ -164,10 +169,43 @@ def resolve_data_path(
 
 
 def sqlite_paths(palace: Path, data_path: Path) -> tuple[Path, ...]:
-    """KG is HOME-relative; Chroma, exact storage and logstream use data."""
-    return (palace / "knowledge_graph.sqlite3",
-            data_path / "chroma.sqlite3", data_path / "sqlite_exact.sqlite3",
-            data_path / "logstream.sqlite3")
+    """Include both legacy and palace-local graphs without duplicating paths."""
+    return tuple(dict.fromkeys((
+        palace / "knowledge_graph.sqlite3",
+        data_path / "knowledge_graph.sqlite3",
+        data_path / "chroma.sqlite3",
+        data_path / "sqlite_exact.sqlite3",
+        data_path / "logstream.sqlite3",
+    )))
+
+
+def ensure_covered_graph(
+    palace: Path, data: Path, selected: Path | None, *, content_data: Path | None = None,
+) -> None:
+    """Refuse an unacknowledged historical KG outside the inventoried locations."""
+    local = data / "knowledge_graph.sqlite3"
+    legacy = palace / "knowledge_graph.sqlite3"
+    if selected is not None:
+        selected = _covered_path(palace, selected)
+        if not any(palace_runtime.same_path(selected, candidate) for candidate in (local, legacy)):
+            raise BackupError("--kg-path must name a DATA-local or HOME legacy graph inside the backup")
+        return
+    state = palace_runtime.state_graph()
+    if any(palace_runtime.same_path(state, candidate) for candidate in (local, legacy)):
+        return
+    family = palace_runtime.runtime_family()
+    state_relevant = (palace_runtime.graph_has_rows(state) if family == "modern"
+                      else palace_runtime.graph_present(state))
+    if not state_relevant:
+        return
+    if family == "modern" and palace_runtime.graph_has_rows(
+            (content_data or data) / "knowledge_graph.sqlite3"):
+        return
+    raise BackupError(
+        f"The current-user historical KG {state} is outside the covered HOME/DATA "
+        "graph locations and may be active. Select a covered server graph explicitly "
+        "with --kg-path, or back up a HOME that covers the active graph."
+    )
 
 
 def _validate_logstream(db_path: Path) -> None:
@@ -434,13 +472,21 @@ def load_backup_manifest(home):
     fields = {"schema_version", "data_relative", "logstream_required", "authorities",
               "snapshot_sha256"}
     if (type(value) is not dict or set(value) != fields
-            or type(value["schema_version"]) is not int or value["schema_version"] != 1
+            or type(value["schema_version"]) is not int
             or type(value["data_relative"]) is not str
             or type(value["logstream_required"]) is not bool
             or type(value["authorities"]) is not list
-            or any(type(item) is not str for item in value["authorities"])
-            or type(value["snapshot_sha256"]) is not str
-            or re.fullmatch("[0-9a-f]{64}", value["snapshot_sha256"]) is None):
+            or any(type(item) is not str for item in value["authorities"])):
+        raise BackupError(f"Unsupported backup inventory manifest: {path}")
+    version = value["schema_version"]
+    digest = value["snapshot_sha256"]
+    if version == 1:
+        if type(digest) is not str or re.fullmatch("[0-9a-f]{64}", digest) is None:
+            raise BackupError(f"Unsupported backup inventory manifest: {path}")
+    elif version == 2:
+        if value["logstream_required"] or value["authorities"] or digest is not None:
+            raise BackupError(f"Unsupported memory-only backup inventory manifest: {path}")
+    else:
         raise BackupError(f"Unsupported backup inventory manifest: {path}")
     relative = Path(value["data_relative"])
     if relative.is_absolute() or ".." in relative.parts or not value["data_relative"]:
@@ -484,6 +530,7 @@ def cmd_backup(args: argparse.Namespace) -> int:
     if (palace / RESTORE_MARKER).exists():
         raise BackupError("Interrupted publication marker present; resolve it before backup")
     data = resolve_data_path(palace, args.data_path)
+    ensure_covered_graph(palace, data, args.kg_path)
     manifest = load_backup_manifest(palace)
     required = (args.require_logstream or bool(args.expected_authority)
                 or bool(manifest and (manifest["logstream_required"] or manifest["authorities"])))
@@ -531,6 +578,12 @@ def cmd_backup(args: argparse.Namespace) -> int:
     if not checkpoint_all(palace, data, require_logstream=args.require_logstream) and not args.force:
         sys.exit("A SQLite WAL is held by a writer; refusing to snapshot an "
                  "inconsistent palace. Re-run once writers stop, or pass --force.")
+    if not args.dry_run:
+        with restore_safety() as restore:
+            restore.write_private_json(palace / BACKUP_MANIFEST, {
+                "schema_version": 2, "data_relative": data.relative_to(palace).as_posix(),
+                "logstream_required": False, "authorities": [], "snapshot_sha256": None,
+            })
     return _snapshot_commands(args, palace)
 
 
@@ -716,6 +769,8 @@ def _validate_stage(stage, data, *, required=False, expected=(), allow_incomplet
     _validate_procedural_stage(stage, data)
     if not (data / "logstream.sqlite3").exists():
         return None
+    if manifest and manifest["snapshot_sha256"] is None:
+        raise BackupError("A memory-only backup manifest cannot declare task storage")
     with task_safety() as (restore, snapshot):
         if not allow_incomplete_preparation and (data / restore.PREPARE_MARKER).exists():
             raise BackupError("Incomplete task restore activation; inspect or retry offline publication")
@@ -864,6 +919,7 @@ def cmd_restore(args: argparse.Namespace) -> int:
         if (palace / RESTORE_MARKER).exists():
             raise BackupError("Interrupted publication marker present; inspect it before retrying")
         target_data = palace / data.relative_to(stage)
+        ensure_covered_graph(palace, target_data, args.kg_path, content_data=data)
         old_data = resolve_data_path(palace, allow_missing=True)
         live_manifest = load_backup_manifest(palace)
         paths = {target_data, old_data}
@@ -953,6 +1009,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Acknowledge all task/hub/raw writers, peer sync and autostarters are stopped.")
     sb.add_argument("--expected-authority", action="append",
                     help="Require an initialized authority UUID (repeatable).")
+    sb.add_argument("--kg-path", type=Path,
+                    help="Assert the server uses this covered DATA or HOME graph.")
     sb.set_defaults(func=cmd_backup)
 
     sr = sub.add_parser("restore", help="Reversible staged restore (+ optional swap).")
@@ -968,6 +1026,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Refuse missing task storage, even in a legacy snapshot without a manifest.")
     sr.add_argument("--expected-authority", action="append",
                     help="Require an initialized authority UUID (repeatable).")
+    sr.add_argument("--kg-path", type=Path,
+                    help="Assert the server uses this covered DATA or HOME graph.")
     sr.set_defaults(func=cmd_restore)
 
     sv = sub.add_parser("verify", help="restic check (+ palace repair-status).")

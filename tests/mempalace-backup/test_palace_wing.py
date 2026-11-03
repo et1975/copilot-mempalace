@@ -99,7 +99,7 @@ def test_export_produces_manifest_and_records_with_counts():
         with patched(
             mempalace_version=lambda: "3.5.0",
             read_wing_drawer_rows=lambda palace, wing: rows,
-            read_wing_triples=lambda palace: triples,
+            read_wing_triples=lambda palace, kg_path=None: triples,
             read_tunnels=lambda palace: tunnels,
         ):
             rc = pw.main(["export", "avs", "--out", str(out), "--palace", "/nope"])
@@ -145,7 +145,7 @@ def test_export_preserves_procedural_payloads_without_replaying_them(tmp_path):
         with patched(
             mempalace_version=lambda: "v",
             read_wing_drawer_rows=lambda palace, wing: rows,
-            read_wing_triples=lambda palace: [],
+            read_wing_triples=lambda palace, kg_path=None: [],
             read_tunnels=lambda palace: [],
         ):
             assert pw.main(["export", "avs", "--format", format, "--out", str(out),
@@ -203,12 +203,13 @@ def test_import_from_md_dir_invokes_writes(tmp_path):
             require_mempalace=lambda: None,
             check_duplicate=lambda content, threshold: {"is_duplicate": False},
             add_drawer=lambda **kw: added.append(kw),
-            open_kg=lambda palace: kg,
+            open_kg=lambda palace, kg_path=None: kg,
             create_tunnel=lambda **kw: tunnels.append(kw) or {"tunnel_id": "x"},
             preflight_import_target=lambda *a, **k: None,
             palace_drawer_count=lambda *a, **k: 2,
         ):
-            rc = pw.main(["import", wing_dir, "--palace", str(tmp_path)])
+            rc = pw.main(["import", wing_dir, "--palace", str(tmp_path),
+                          "--kg-path", str(tmp_path / "palace" / "knowledge_graph.sqlite3")])
         assert rc == 0
         assert len(added) == 2
         assert {a["room"] for a in added} == {"scripting", "general"}
@@ -225,13 +226,14 @@ def test_import_from_manifest_json_path(tmp_path):
         require_mempalace=lambda: None,
         check_duplicate=lambda content, threshold: {"is_duplicate": False},
         add_drawer=lambda **kw: added.append(kw),
-        open_kg=lambda palace: FakeKG(),
+        open_kg=lambda palace, kg_path=None: FakeKG(),
         create_tunnel=lambda **kw: {"tunnel_id": "x"},
         preflight_import_target=lambda *a, **k: None,
         palace_drawer_count=lambda *a, **k: 2,
     ):
         rc = pw.main(["import", str(Path(wing_dir) / "manifest.json"),
-                      "--palace", str(tmp_path)])
+                      "--palace", str(tmp_path),
+                      "--kg-path", str(tmp_path / "palace" / "knowledge_graph.sqlite3")])
     assert rc == 0
     assert len(added) == 2
 
@@ -392,7 +394,7 @@ def test_import_dry_run_invokes_no_write_handlers():
     ])
     add_calls, tunnel_calls, kg_opens = [], [], []
 
-    def _open_kg(palace):
+    def _open_kg(palace, kg_path=None):
         kg_opens.append(palace)
         return FakeKG()
 
@@ -404,7 +406,8 @@ def test_import_dry_run_invokes_no_write_handlers():
             open_kg=_open_kg,
             create_tunnel=lambda **kw: tunnel_calls.append(kw),
         ):
-            rc = pw.main(["import", str(bundle), "--dry-run", "--palace", "/nope"])
+            rc = pw.main(["import", str(bundle), "--dry-run", "--palace", "/nope",
+                          "--kg-path", "/nope/palace/knowledge_graph.sqlite3"])
         assert rc == 0
         assert add_calls == []      # no add_drawer
         assert kg_opens == []       # KG never opened
@@ -425,11 +428,12 @@ def test_import_kg_uses_knowledge_graph_add_triple():
     try:
         with patched(
             require_mempalace=lambda: None,
-            open_kg=lambda palace: kg,
+            open_kg=lambda palace, kg_path=None: kg,
             preflight_import_target=lambda *a, **k: None,
             palace_drawer_count=lambda *a, **k: 1,
         ):
-            rc = pw.main(["import", str(bundle), "--palace", "/nope"])
+            rc = pw.main(["import", str(bundle), "--palace", "/nope",
+                          "--kg-path", "/nope/palace/knowledge_graph.sqlite3"])
         assert rc == 0
         assert len(kg.triples) == 1
         t = kg.triples[0]
@@ -525,7 +529,7 @@ def _assert_import_refused(bundle, palace, flags=()):
         require_mempalace=lambda: initialized.append(True),
         check_duplicate=lambda content, threshold: {"is_duplicate": False},
         add_drawer=lambda **kw: added.append(kw),
-        open_kg=lambda palace: kg,
+        open_kg=lambda palace, kg_path=None: kg,
         create_tunnel=lambda **kw: tunnels.append(kw) or {"tunnel_id": "x"},
         preflight_import_target=lambda *a, **k: None,
         palace_drawer_count=lambda *a, **k: 2,
@@ -724,7 +728,7 @@ def test_ordinary_metadata_with_comment_delimiters_survives_export_import(tmp_pa
         with patched(
             mempalace_version=lambda: "v",
             read_wing_drawer_rows=lambda palace, wing: rows,
-            read_wing_triples=lambda palace: [],
+            read_wing_triples=lambda palace, kg_path=None: [],
             read_tunnels=lambda palace: [],
             require_mempalace=lambda: None,
             check_duplicate=lambda content, threshold: {"is_duplicate": False},
@@ -750,7 +754,7 @@ def test_resolve_palace_layout_default(tmp_path):
     home.mkdir()
     palace_dir, kg = pw.resolve_palace_layout(home)
     assert palace_dir == home / "palace"
-    assert kg == home / "knowledge_graph.sqlite3"
+    assert kg == home / "palace" / "knowledge_graph.sqlite3"
 
 
 def test_resolve_palace_layout_honors_config_palace_path(tmp_path):
@@ -761,7 +765,7 @@ def test_resolve_palace_layout_honors_config_palace_path(tmp_path):
         f'{{"palace_path": "{custom.as_posix()}"}}', encoding="utf-8")
     palace_dir, kg = pw.resolve_palace_layout(home)
     assert palace_dir == custom                       # chroma follows config
-    assert kg == home / "knowledge_graph.sqlite3"     # KG stays home-level
+    assert kg == custom / "knowledge_graph.sqlite3"
 
 
 def test_bind_palace_sets_resolved_chroma_dir_not_home(tmp_path):
@@ -867,7 +871,9 @@ def test_parser_requires_subcommand():
 # --------------------------------------------------------------------------- #
 def _run_without_pytest() -> int:
     import inspect
+    import os
     import tempfile
+    from unittest.mock import patch
 
     fns = [v for k, v in sorted(globals().items())
            if k.startswith("test_") and callable(v)]
@@ -875,13 +881,18 @@ def _run_without_pytest() -> int:
     for fn in fns:
         params = inspect.signature(fn).parameters
         try:
-            if "tmp_path" in params:
-                with tempfile.TemporaryDirectory() as d:
-                    fn(Path(d))
-            else:
-                fn()
+            with tempfile.TemporaryDirectory() as d:
+                user_home = Path(d) / "user"
+                user_home.mkdir()
+                with patch.dict(os.environ, {"HOME": str(user_home), "USERPROFILE": str(user_home),
+                                             "MEMPALACE_PALACE_PATH": "",
+                                             "MEMPALACE_PALACE": "", "MEMPAL_PALACE_PATH": ""}):
+                    if "tmp_path" in params:
+                        fn(Path(d))
+                    else:
+                        fn()
             print(f"ok   {fn.__name__}")
-        except Exception as exc:  # noqa: BLE001
+        except (Exception, SystemExit) as exc:  # noqa: BLE001
             failed += 1
             print(f"FAIL {fn.__name__}: {exc}")
     print(f"\n{len(fns) - failed}/{len(fns)} passed")

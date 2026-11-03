@@ -17,16 +17,20 @@ DATA defaults to HOME/palace but can be configured elsewhere. `--data-path`
 overrides the path environment/configuration. External data roots, links,
 hardlinked task storage and data under preserved control directories are
 refused rather than silently omitted. The table shows the default layout.
+Use the interpreter from the running server's MemPalace installation: runtime
+version is inferred from that interpreter's package metadata, not from the
+running process.
 
 | Path | Back up? | Notes |
 |---|---:|---|
 | `config.json`, `tunnels.json` | include | Small JSON config/link state. |
-| `knowledge_graph.sqlite3` plus `-wal`, `-shm` | include | SQLite KG store; checkpoint before snapshot. |
+| `knowledge_graph.sqlite3` plus `-wal`, `-shm` | include if present | Historical HOME-level SQLite KG. |
+| `palace/knowledge_graph.sqlite3` plus `-wal`, `-shm` | include if present | DATA-local SQLite KG. |
 | `palace/chroma.sqlite3` plus `-wal`, `-shm` | include | Chroma metadata; checkpoint before snapshot. |
 | `palace/sqlite_exact.sqlite3` plus `-wal`, `-shm` | include | SQLite-exact drawers, including procedural events and source captures/witnesses. |
 | `palace/logstream.sqlite3` plus `-wal`, `-shm` | include | Events, complete task protocol bodies, artifacts and their links share this database. |
 | `palace/replica.json` | include | Stable provenance identity; never rotate it as a restore epoch. |
-| `.palace-backup.json` | include | Captured layout, expected authorities and task-content digest; not another task authority store. |
+| `.palace-backup.json` | include | Captured layout and, for task snapshots, expected authorities and task-content digest; not another task authority store. |
 | `palace/<uuid>/*.bin` | include | HNSW vector index binaries. |
 | `palace/<uuid>.drift-*/` | include | Drift snapshots; keep for recovery context. |
 | `palace/.mempalace/origin.json` | **include** | Critical embedder identity; restoring without it breaks search. |
@@ -55,9 +59,10 @@ package. In a repository checkout, `PYTHONPATH=<repo>/sidecar/src` selects it.
 Require preinstalled tools; do not download/install during recovery.
 
 Memory-only backup/restore does not require that optional package. Deploy the
-helper together with its stdlib-only `scripts/palace_restore_io.py` companion,
-which provides generic private-stage, writer-exclusion and publication guards.
-Task history validation and epoch activation remain task-package operations.
+helper with its stdlib-only `scripts/palace_restore_io.py` and
+`scripts/palace_runtime.py` companions. They provide generic private-stage,
+writer-exclusion, publication and runtime-path guards. Task history validation
+and epoch activation remain task-package operations.
 
 For the command examples, set `MPY` to the absolute path of the selected
 preinstalled Python and `BACKUP_SCRIPTS` to the absolute path of this skill's
@@ -67,10 +72,13 @@ export destinations belong in the external session workspace, not the skill.
 
 The helper refuses active or malformed/unreadable hub/daemon records, acquires
 the real current-user HOME-relative MemPalace writer lease, checkpoints existing
-KG/Chroma/SQLite-exact/logstream databases, then holds bounded-acquisition SQLite
-`BEGIN IMMEDIATE` writer exclusions through restic capture and verification.
+HOME and DATA KGs and Chroma/SQLite-exact/logstream databases, then holds
+bounded-acquisition SQLite `BEGIN IMMEDIATE` writer exclusions through restic
+capture and verification.
 This keeps each main DB/WAL pair stable. It validates task history/artifacts and
 writes `.palace-backup.json` into the same HOME subtree before snapshotting.
+Memory-only captures also record the selected DATA layout in this manifest, so
+restores do not silently use a different staged config or old environment.
 
 The lease does not cover raw CLI/peer/file writes. SQLite exclusions cover
 ordinary database writes, not file replacement, HNSW mutation by an uncooperative
@@ -95,6 +103,13 @@ manifest also declares known task storage, so later missing data cannot silently
 become a legacy empty palace. `--force` and `--no-quiesce` do not bypass any task
 safety check. A busy database, corrupt logstream, missing declared storage or
 incomplete restore marker is an error.
+
+If the current user's historical state KG can be active but is outside the
+inventoried HOME/DATA KG locations, backup refuses rather than capturing an
+incomplete graph. If the server is known to use a covered graph, explicitly
+assert it with `backup --kg-path <HOME-or-DATA-graph>`. The option cannot select
+an uncovered graph; if that graph is active, use a separately validated backup
+approach that includes it.
 
 Genuinely legacy palaces without logstream retain the old best-effort
 daemon/mine/checkpoint path and emergency `--force` behavior. That path is not
@@ -179,6 +194,24 @@ whole-palace logstream/artifact recovery unit above.
 # Human-readable, git/OneDrive-friendly markdown directory (lossless round-trip):
 "$MPY" "$BACKUP_SCRIPTS/palace_wing.py" export <wing> --format md --out backups/mempalace-wings
 ```
+
+For wing export and import, `--data-path <DATA>` overrides the path environment
+and HOME config. MemPalace 3.12 recognizes `MEMPALACE_PALACE_PATH`, then
+`MEMPALACE_PALACE`, then `MEMPAL_PALACE_PATH`; 3.8 ignores the middle alias.
+With an unrecognized or missing runtime and that middle alias set, supply
+`--data-path` rather than guessing which alias the server understands.
+
+For MemPalace 3.12, a DATA-local KG with triples or entities wins. An empty or
+absent DATA graph can fall back to a populated historical state KG for the
+default palace; if both contain data, DATA wins. With custom DATA, server launch
+mode can change the fallback. MemPalace 3.8 can also select different graphs
+depending on launch mode even when DATA has rows. In these ambiguous cases,
+and for an unrecognized runtime with an existing KG file or KG writes, the helper
+requires `--kg-path` selecting the server's DATA-local, HOME-level, or
+current-user state KG. An unreadable selected graph is an error, not a reason
+to silently select another. Explicit selection does not merge or delete graphs.
+Wing export still works without importing MemPalace when the graph is selected
+explicitly.
 
 A bundle contains: **drawers** (multi-chunk drawers reassembled), **best-effort
 KG triples** (only those whose `source_drawer_id` resolves to the wing — others

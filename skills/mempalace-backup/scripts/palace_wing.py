@@ -42,10 +42,12 @@ import re
 import sqlite3
 import sys
 from datetime import datetime, timezone
+from functools import wraps
 from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import palace_runtime  # noqa: E402
 import palace_wing_lib as lib  # noqa: E402
 
 DEFAULT_PALACE = Path("~/.mempalace").expanduser()
@@ -58,36 +60,73 @@ _VENV_HINT = "~/.local/share/uv/tools/mempalace/bin/python"
 # --------------------------------------------------------------------------- #
 # Palace layout resolution.
 #
-# ``--palace`` always means the mempalace HOME dir (default ``~/.mempalace``).
-# Under HOME live two separate stores whose paths resolve by DIFFERENT rules —
-# the running MCP server (launched without ``--palace``) reads:
-#   * Chroma vectors at ``<palace_path>/chroma.sqlite3`` where ``palace_path`` is
-#     ``config.json``'s ``palace_path`` (default ``<home>/palace``), and
-#   * the KnowledgeGraph at the HOME-level ``<home>/knowledge_graph.sqlite3``.
-# Conflating the two (e.g. pointing ``MEMPALACE_PALACE_PATH`` at HOME) silently
-# creates a stray second Chroma DB at ``<home>/chroma.sqlite3`` that the server
-# never reads. ``resolve_palace_layout`` centralizes both rules so export and
-# import agree with the server.
+# ``--palace`` means the mempalace HOME dir, not the DATA dir. DATA follows
+# the runtime's environment/config precedence. The KG is normally DATA-local,
+# with the historical HOME graph retained as a fallback for the default palace.
 # --------------------------------------------------------------------------- #
-def resolve_palace_layout(home: str | Path) -> tuple[Path, Path]:
-    """Map a mempalace HOME dir to ``(chroma_palace_dir, kg_db_path)``.
-
-    ``chroma_palace_dir`` is ``config.json``'s ``palace_path`` when present, else
-    ``<home>/palace``. ``kg_db_path`` is the server's HOME-level default
-    ``<home>/knowledge_graph.sqlite3``. Mirrors the mempalace MCP server's own
-    resolution so drawers and KG triples land where the server reads them.
-    """
+def resolve_data_path(home: str | Path) -> Path:
+    """Resolve the selected HOME's DATA path without importing MemPalace."""
     home = Path(home).expanduser()
-    palace_dir = home / "palace"
+    try:
+        env_path = palace_runtime.data_environment_path()
+    except palace_runtime.LayoutError as exc:
+        raise SystemExit(str(exc)) from exc
+    if env_path:
+        return Path(os.path.abspath(os.path.expanduser(env_path)))
     cfg = home / "config.json"
     if cfg.exists():
         try:
-            configured = json.loads(cfg.read_text(encoding="utf-8")).get("palace_path")
+            configured = json.loads(cfg.read_text(encoding="utf-8-sig")).get("palace_path")
         except (OSError, ValueError):
             configured = None
         if configured:
-            palace_dir = Path(configured).expanduser()
-    return palace_dir, home / "knowledge_graph.sqlite3"
+            return Path(configured).expanduser()
+    return home / "palace"
+
+
+def resolve_palace_layout(
+    home: str | Path, kg_path: str | Path | None = None, *, for_write: bool = False,
+) -> tuple[Path, Path]:
+    """Resolve DATA and KG while refusing an ambiguous runtime or launch mode."""
+    home = Path(home).expanduser()
+    data = resolve_data_path(home)
+    local = data / "knowledge_graph.sqlite3"
+    legacy = home / "knowledge_graph.sqlite3"
+    state = palace_runtime.state_graph()
+    if kg_path is not None:
+        requested = Path(kg_path).expanduser()
+        for candidate in (local, legacy, state):
+            if palace_runtime.same_path(requested, candidate):
+                palace_runtime.graph_present(candidate)
+                return data, candidate
+        raise SystemExit("--kg-path must name the DATA, HOME or current-user state knowledge graph.")
+
+    local_present = palace_runtime.graph_present(local)
+    if palace_runtime.runtime_family() != "modern":
+        if not palace_runtime.same_path(local, state) and (
+            for_write or local_present or palace_runtime.graph_present(legacy)
+            or palace_runtime.graph_present(state)
+        ):
+            raise SystemExit(
+                "The server's KG depends on its version and launch mode. "
+                "Select the server's graph explicitly with --kg-path."
+            )
+        return data, local
+
+    if palace_runtime.graph_has_rows(local):
+        return data, local
+    for candidate in (legacy, state):
+        if palace_runtime.same_path(local, candidate) or not palace_runtime.graph_has_rows(candidate):
+            continue
+        if (palace_runtime.same_path(candidate, state)
+                and palace_runtime.same_path(legacy, state)
+                and palace_runtime.same_path(data, state.parent / "palace")):
+            return data, state
+        raise SystemExit(
+            f"Ambiguous KG for custom DATA {data}: a populated legacy graph exists at "
+            f"{candidate}. Select the server's graph explicitly with --kg-path."
+        )
+    return data, local
 
 
 # --------------------------------------------------------------------------- #
@@ -108,7 +147,7 @@ def bind_palace(home: str) -> str:
     Call before importing mempalace.
     """
     home_abs = os.path.abspath(os.path.expanduser(home))
-    palace_dir, _ = resolve_palace_layout(home_abs)
+    palace_dir = resolve_data_path(home_abs)
     os.environ["MEMPALACE_PALACE_PATH"] = os.path.abspath(str(palace_dir))
     return home_abs
 
@@ -153,25 +192,21 @@ def read_wing_drawer_rows(palace: str, wing: str) -> list[dict[str, Any]]:
     value of the ``chroma:document`` key. The returned rows share the shape
     (``{"id", "text", "metadata"}``) consumed by ``_group_logical_drawers``.
     """
-    palace_dir, _ = resolve_palace_layout(palace)
-    db_path = os.path.join(str(palace_dir), "chroma.sqlite3")
-    if not os.path.exists(db_path):
+    palace_dir = resolve_data_path(palace)
+    db_path = palace_dir / "chroma.sqlite3"
+    if not db_path.exists():
         return []
+    con = sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True)
     try:
-        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    except sqlite3.OperationalError:
-        con = sqlite3.connect(db_path)
-    try:
-        chunk_ids = [
-            row[0]
-            for row in con.execute(
-                "SELECT id FROM embedding_metadata "
-                "WHERE key = 'wing' AND string_value = ?",
-                (wing,),
-            ).fetchall()
-        ]
+        chunk_ids = con.execute(
+            "SELECT metadata.id, embeddings.embedding_id "
+            "FROM embedding_metadata AS metadata "
+            "JOIN embeddings ON embeddings.id = metadata.id "
+            "WHERE metadata.key = 'wing' AND metadata.string_value = ?",
+            (wing,),
+        ).fetchall()
         rows = []
-        for chunk_id in chunk_ids:
+        for chunk_id, embedding_id in chunk_ids:
             meta: dict[str, Any] = {}
             for key, sval, ival, fval, bval in con.execute(
                 "SELECT key, string_value, int_value, float_value, bool_value "
@@ -185,7 +220,7 @@ def read_wing_drawer_rows(palace: str, wing: str) -> list[dict[str, Any]]:
                 )
                 meta[key] = value
             text = meta.pop("chroma:document", "") or ""
-            rows.append({"id": chunk_id, "text": text, "metadata": meta})
+            rows.append({"id": embedding_id, "text": text, "metadata": meta})
         return rows
     finally:
         con.close()
@@ -199,14 +234,11 @@ def palace_drawer_count(palace: str, wing: str | None = None) -> int | None:
     refuse writing into a would-be-new/stray palace. Counts distinct
     ``parent_drawer_id`` (falling back to chunk ``id`` for single-chunk drawers).
     """
-    palace_dir, _ = resolve_palace_layout(palace)
-    db_path = os.path.join(str(palace_dir), "chroma.sqlite3")
-    if not os.path.exists(db_path):
+    palace_dir = resolve_data_path(palace)
+    db_path = palace_dir / "chroma.sqlite3"
+    if not db_path.exists():
         return None
-    try:
-        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    except sqlite3.OperationalError:
-        con = sqlite3.connect(db_path)
+    con = sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True)
     try:
         if wing is not None:
             ids = [
@@ -237,8 +269,6 @@ def palace_drawer_count(palace: str, wing: str | None = None) -> int | None:
         parents.update(row[1] for row in rows if row[1])
         parents.update(cid for cid in ids if cid not in have_parent)
         return len(parents)
-    except sqlite3.OperationalError:
-        return 0
     finally:
         con.close()
 
@@ -286,16 +316,16 @@ def create_tunnel(
     )
 
 
-def open_kg(palace: str) -> Any:
+def open_kg(palace: str, kg_path: Path | None = None) -> Any:
     """Open the KnowledgeGraph the running server reads for direct triple writes.
 
-    ``palace`` is the mempalace HOME dir; the KG resolves to the HOME-level
-    ``<home>/knowledge_graph.sqlite3`` via ``resolve_palace_layout`` — matching
-    the server's default — so triples are visible after reconnect.
+    ``palace`` is the mempalace HOME dir. The selected KG is resolved before
+    import starts so preflight and writes use the same graph.
     """
     from mempalace.knowledge_graph import KnowledgeGraph  # lazy
 
-    _, kg_path = resolve_palace_layout(palace)
+    if kg_path is None:
+        _, kg_path = resolve_palace_layout(palace, for_write=True)
     return KnowledgeGraph(db_path=str(kg_path))
 
 
@@ -328,15 +358,13 @@ def add_triple(
     return kg.add_triple(subject, predicate, object, **kwargs)
 
 
-def read_wing_triples(palace: str) -> list[dict[str, Any]]:
+def read_wing_triples(palace: str, kg_path: Path | None = None) -> list[dict[str, Any]]:
     """Read all active triples' provenance-bearing columns (read-only)."""
-    db_path = os.path.join(palace, "knowledge_graph.sqlite3")
-    if not os.path.exists(db_path):
+    if kg_path is None:
+        _, kg_path = resolve_palace_layout(palace)
+    if not palace_runtime.graph_present(kg_path):
         return []
-    try:
-        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    except sqlite3.OperationalError:
-        con = sqlite3.connect(db_path)
+    con = sqlite3.connect(kg_path.resolve().as_uri() + "?mode=ro", uri=True)
     try:
         con.row_factory = sqlite3.Row
         rows = con.execute(
@@ -419,11 +447,31 @@ def _extract_extra(meta: dict[str, Any]) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 # Subcommands.
 # --------------------------------------------------------------------------- #
+def _preserve_palace_path(func):
+    @wraps(func)
+    def run(args):
+        previous = os.environ.get("MEMPALACE_PALACE_PATH")
+        try:
+            return func(args)
+        finally:
+            if previous is None:
+                os.environ.pop("MEMPALACE_PALACE_PATH", None)
+            else:
+                os.environ["MEMPALACE_PALACE_PATH"] = previous
+    return run
+
+
+@_preserve_palace_path
 def cmd_export(args: argparse.Namespace) -> int:
+    if args.data_path is not None:
+        os.environ["MEMPALACE_PALACE_PATH"] = os.path.abspath(
+            os.path.expanduser(str(args.data_path)))
     palace = bind_palace(str(args.palace))
+    data_path, kg_path = resolve_palace_layout(palace, args.kg_path)
     wing = args.wing
 
-    print(f"Exporting wing {wing!r} from {palace}", file=sys.stderr)
+    print(f"Exporting wing {wing!r} from {palace}\n"
+          f"  data: {data_path}\n  knowledge graph: {kg_path}", file=sys.stderr)
 
     rows = read_wing_drawer_rows(palace, wing)
     logical = _group_logical_drawers(rows)
@@ -445,7 +493,7 @@ def cmd_export(args: argparse.Namespace) -> int:
             )
         )
 
-    all_triples = read_wing_triples(palace)
+    all_triples = read_wing_triples(palace, kg_path)
     kept_triples, skipped = lib.filter_wing_triples(all_triples, drawer_ids)
     for triple in kept_triples:
         records.append(
@@ -724,7 +772,7 @@ def _parse_legacy_kg_triples(body: str) -> list[tuple[str, str, str]]:
 
 
 def preflight_import_target(
-    home: str, target_wing: str, create_new_palace: bool
+    home: str, target_wing: str, create_new_palace: bool, kg_path: Path | None = None,
 ) -> None:
     """Stray-palace guard: report resolved paths/counts and refuse a bad target.
 
@@ -733,7 +781,7 @@ def preflight_import_target(
     the classic ``--palace ~/.mempalace/palace`` (DB dir) vs ``~/.mempalace``
     (HOME) mistake that silently created a second palace.
     """
-    palace_dir, kg_path = resolve_palace_layout(home)
+    palace_dir, kg_path = resolve_palace_layout(home, kg_path)
     chroma = os.path.join(str(palace_dir), "chroma.sqlite3")
     total = palace_drawer_count(home)
     existing = palace_drawer_count(home, target_wing)
@@ -755,6 +803,7 @@ def preflight_import_target(
         )
 
 
+@_preserve_palace_path
 def cmd_import(args: argparse.Namespace) -> int:
     bundle_path = Path(os.path.expanduser(args.bundle))
     try:
@@ -771,7 +820,12 @@ def cmd_import(args: argparse.Namespace) -> int:
         sys.exit(f"Invalid bundle for replay: {exc}")
 
     # Validate before any backend import, then bind before its config loads.
+    if args.data_path is not None:
+        os.environ["MEMPALACE_PALACE_PATH"] = os.path.abspath(
+            os.path.expanduser(str(args.data_path)))
     palace = bind_palace(str(args.palace))
+    writes_kg = any(record.get("type") == "kg_triple" for record in records)
+    _, kg_path = resolve_palace_layout(palace, args.kg_path, for_write=writes_kg)
     require_mempalace()
 
     source_wing = manifest["wing"]
@@ -793,7 +847,7 @@ def cmd_import(args: argparse.Namespace) -> int:
         file=sys.stderr,
     )
     if not dry:
-        preflight_import_target(palace, target_wing, args.create_new_palace)
+        preflight_import_target(palace, target_wing, args.create_new_palace, kg_path)
 
     drawers_added = 0
     drawers_skipped = 0
@@ -850,7 +904,7 @@ def cmd_import(args: argparse.Namespace) -> int:
     # KG triples: direct KnowledgeGraph.add_triple; source_drawer_id dropped.
     if triple_records and not dry:
         try:
-            kg = open_kg(palace)
+            kg = open_kg(palace, kg_path)
         except Exception as exc:  # noqa: BLE001
             failed += len(triple_records)
             print(f"  ERROR open KG (all {len(triple_records)} triple(s) failed): "
@@ -920,7 +974,7 @@ def cmd_import(args: argparse.Namespace) -> int:
     if not dry and (drawers_added or triples_added or tunnels_created):
         after = palace_drawer_count(palace, target_wing)
         if after is None:
-            palace_dir, _ = resolve_palace_layout(palace)
+            palace_dir = resolve_data_path(palace)
             print(
                 "  WARNING: no Chroma DB at "
                 f"{os.path.join(str(palace_dir), 'chroma.sqlite3')} after import. "
@@ -964,6 +1018,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="mempalace HOME dir (default: ~/.mempalace), NOT the nested "
              "palace/ DB dir.",
     )
+    se.add_argument("--data-path", type=Path,
+                    help="Override the configured DATA directory.")
+    se.add_argument("--kg-path", type=Path,
+                    help="Select the DATA, HOME or current-user state knowledge graph.")
     se.set_defaults(func=cmd_export)
 
     si = sub.add_parser("import", help="Replay a wing bundle (jsonl) or md dir "
@@ -979,6 +1037,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="mempalace HOME dir (default: ~/.mempalace), NOT the nested "
              "palace/ DB dir.",
     )
+    si.add_argument("--data-path", type=Path,
+                    help="Override the configured DATA directory.")
+    si.add_argument("--kg-path", type=Path,
+                    help="Select the DATA, HOME or current-user state knowledge graph.")
     si.add_argument("--dry-run", action="store_true",
                     help="Report actions without performing any writes.")
     si.add_argument("--force-add", action="store_true",

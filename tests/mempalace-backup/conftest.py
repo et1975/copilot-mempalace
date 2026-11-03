@@ -11,6 +11,7 @@ def isolated_backup_environment(tmp_path, monkeypatch):
     monkeypatch.setenv("USERPROFILE", str(home))
     for name in (
         "MEMPALACE_PALACE_PATH",
+        "MEMPALACE_PALACE",
         "MEMPAL_PALACE_PATH",
         "MEMPALACE_DAEMON_STATE_ROOT",
     ):

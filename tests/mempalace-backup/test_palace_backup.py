@@ -19,6 +19,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import unittest
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
@@ -884,6 +885,214 @@ def test_legacy_environment_data_path_alias(tmp_path):
         assert pb.resolve_data_path(home) == home / "alias"
 
 
+def test_short_environment_data_path_alias(tmp_path):
+    home = tmp_path / "home"
+    (home / "alias").mkdir(parents=True)
+    with patch.dict(os.environ, {"MEMPALACE_PALACE": str(home / "alias")}), \
+            patch("importlib.metadata.version", return_value="3.12.0"):
+        assert pb.resolve_data_path(home) == home / "alias"
+
+
+def test_short_environment_alias_is_ignored_by_mem_palace_38(tmp_path):
+    home = tmp_path / "home"
+    (home / "short").mkdir(parents=True)
+    (home / "legacy").mkdir()
+    with patch.dict(os.environ, {"MEMPALACE_PALACE": str(home / "short"),
+                                 "MEMPAL_PALACE_PATH": str(home / "legacy")}), \
+            patch("importlib.metadata.version", return_value="3.8.0"):
+        assert pb.resolve_data_path(home) == home / "legacy"
+
+
+def test_unknown_runtime_short_alias_requires_explicit_data_path(tmp_path):
+    import importlib.metadata
+
+    home = tmp_path / "home"
+    selected = home / "selected"
+    selected.mkdir(parents=True)
+    with patch.dict(os.environ, {"MEMPALACE_PALACE": str(home / "short")}), \
+            patch("importlib.metadata.version",
+                  side_effect=importlib.metadata.PackageNotFoundError("mempalace")):
+        _assert_raises(pb.BackupError, lambda: pb.resolve_data_path(home), "--data-path")
+        assert pb.resolve_data_path(home, selected) == selected
+
+
+def test_custom_runtime_graph_fallback_depends_on_explicit_server_path():
+    try:
+        from mempalace.paths import knowledge_graph_path
+    except ModuleNotFoundError as exc:
+        if exc.name not in {"mempalace", "mempalace.paths"}:
+            raise
+        raise unittest.SkipTest("MemPalace with the paths module is not installed") from exc
+
+    home = Path.home() / ".mempalace"
+    custom = home / "custom"
+    custom.mkdir(parents=True)
+    legacy = home / "knowledge_graph.sqlite3"
+    with contextlib.closing(sqlite3.connect(legacy)) as con:
+        con.execute("CREATE TABLE entities (id TEXT)")
+        con.execute("INSERT INTO entities VALUES ('present')")
+        con.commit()
+    assert knowledge_graph_path(str(custom), explicit=False) == str(legacy)
+    assert knowledge_graph_path(str(custom), explicit=True) == str(custom / "knowledge_graph.sqlite3")
+
+
+def test_inventory_and_checkpoint_include_both_kg_locations(tmp_path):
+    home = tmp_path / "home"
+    data = home / "palace"
+    legacy = home / "knowledge_graph.sqlite3"
+    active = data / "knowledge_graph.sqlite3"
+    _make_wal_db(legacy, 1)
+    _make_wal_db(active, 1)
+    with contextlib.closing(sqlite3.connect(active)) as writer:
+        writer.execute("PRAGMA wal_autocheckpoint=0")
+        writer.execute("INSERT INTO t VALUES (99)")
+        writer.commit()
+        wal = data / "knowledge_graph.sqlite3-wal"
+        assert wal.stat().st_size > 0
+        files = set(pb.backup_inventory(home))
+        assert {legacy, active, wal, data / "knowledge_graph.sqlite3-shm"} <= files
+        assert pb.checkpoint_all(home)
+        assert wal.stat().st_size == 0
+        assert writer.execute("SELECT id FROM t ORDER BY id").fetchall() == [(0,), (99,)]
+
+
+def test_data_equal_to_home_inventories_graph_once(tmp_path):
+    home = tmp_path / "home"
+    graph = home / "knowledge_graph.sqlite3"
+    _make_wal_db(graph, 1)
+    assert pb.sqlite_paths(home, home).count(graph) == 1
+    assert pb.backup_inventory(home, home).count(graph) == 1
+    assert pb.checkpoint_all(home, home)
+
+
+def test_custom_home_refuses_uncovered_state_graph_without_explicit_selection(tmp_path):
+    home = tmp_path / "alternate"
+    data = home / "palace"
+    data.mkdir(parents=True)
+    state_graph = Path.home() / ".mempalace" / "knowledge_graph.sqlite3"
+    state_graph.parent.mkdir(parents=True)
+    with contextlib.closing(sqlite3.connect(state_graph)) as con:
+        con.execute("CREATE TABLE entities (id TEXT)")
+        con.execute("INSERT INTO entities VALUES ('present')")
+        con.commit()
+    args = pb.build_parser().parse_args([
+        "--palace", str(home), "backup", "--offline", "--no-quiesce"])
+    with patch.object(pb, "require_restic_env"), \
+            patch.object(pb, "run", side_effect=AssertionError("must not snapshot")):
+        _assert_raises(pb.BackupError, lambda: pb.cmd_backup(args), "outside")
+    args = pb.build_parser().parse_args([
+        "--palace", str(home), "backup", "--offline", "--no-quiesce",
+        "--kg-path", str(state_graph)])
+    with patch.object(pb, "require_restic_env"), \
+            patch.object(pb, "run", side_effect=AssertionError("must not snapshot")):
+        _assert_raises(pb.BackupError, lambda: pb.cmd_backup(args), "outside")
+    args = pb.build_parser().parse_args([
+        "--palace", str(home), "backup", "--offline", "--no-quiesce",
+        "--kg-path", str(data / "knowledge_graph.sqlite3")])
+    with patch.object(pb, "require_restic_env"), patch.object(pb, "run", return_value=0):
+        assert pb.cmd_backup(args) == 0
+    assert state_graph.is_file()
+
+
+def test_restore_refuses_uncovered_state_graph_before_publication(tmp_path):
+    home, stage = tmp_path / "alternate", tmp_path / "stage"
+    (home / "palace").mkdir(parents=True)
+    (home / "untouched").write_text("live", encoding="utf-8")
+    _memory_stage(stage)
+    state_graph = Path.home() / ".mempalace" / "knowledge_graph.sqlite3"
+    state_graph.parent.mkdir(parents=True)
+    with contextlib.closing(sqlite3.connect(state_graph)) as con:
+        con.execute("CREATE TABLE entities (id TEXT)")
+        con.execute("INSERT INTO entities VALUES ('present')")
+        con.commit()
+    args = pb.build_parser().parse_args([
+        "--palace", str(home), "restore", "latest", "--target", str(stage),
+        "--from-stage", "--in-place", "--offline"])
+    _assert_raises(pb.BackupError, lambda: pb.cmd_restore(args), "outside")
+    assert (home / "untouched").read_text(encoding="utf-8") == "live"
+    assert not list(home.parent.glob(home.name + ".bak-*"))
+
+
+def test_memory_only_backup_records_overridden_data_for_restore(tmp_path):
+    home = tmp_path / "home"
+    configured = home / "configured"
+    selected = home / "selected"
+    configured.mkdir(parents=True)
+    (selected / ".mempalace").mkdir(parents=True)
+    (selected / ".mempalace/origin.json").write_text("{}", encoding="utf-8")
+    _make_wal_db(selected / "knowledge_graph.sqlite3", 1)
+    (home / "config.json").write_text(
+        json.dumps({"palace_path": str(configured)}), encoding="utf-8")
+    args = pb.build_parser().parse_args([
+        "--palace", str(home), "--data-path", str(selected),
+        "backup", "--offline", "--no-quiesce"])
+    with patch.object(pb, "require_restic_env"), patch.object(pb, "run", return_value=0):
+        assert pb.cmd_backup(args) == 0
+    stage = tmp_path / "stage"
+    shutil.copytree(home, stage)
+    staged_data = pb.staged_data_path(stage, home)
+    assert staged_data == stage / "selected"
+    assert pb.load_backup_manifest(stage)["logstream_required"] is False
+    assert pb._validate_stage(stage, staged_data) is None
+
+
+def test_memory_manifest_cannot_hide_task_storage(tmp_path):
+    stage = tmp_path / "stage"
+    data = _memory_stage(stage)
+    with contextlib.closing(_make_logstream(data)):
+        (stage / pb.BACKUP_MANIFEST).write_text(json.dumps({
+            "schema_version": 2, "data_relative": "palace", "logstream_required": False,
+            "authorities": [], "snapshot_sha256": None,
+        }), encoding="utf-8")
+        _assert_raises(pb.BackupError, lambda: pb._validate_stage(stage, data), "memory-only")
+
+
+def test_corrupt_data_kg_blocks_backup_before_snapshot(tmp_path):
+    home = tmp_path / "home"
+    data = home / "palace"
+    data.mkdir(parents=True)
+    graph = data / "knowledge_graph.sqlite3"
+    graph.write_bytes(b"not a SQLite database")
+    args = pb.build_parser().parse_args([
+        "--palace", str(home), "backup", "--offline", "--force", "--no-quiesce"])
+    with patch.object(pb, "require_restic_env"), \
+            patch.object(pb, "run", side_effect=AssertionError("must not snapshot")):
+        _assert_raises(pb.BackupError, lambda: pb.cmd_backup(args), "knowledge_graph")
+    assert graph.read_bytes() == b"not a SQLite database"
+
+
+def test_orphan_data_kg_sidecar_blocks_inventory(tmp_path):
+    for suffix in ("-wal", "-shm"):
+        home = tmp_path / suffix / "home"
+        data = home / "palace"
+        data.mkdir(parents=True)
+        sidecar = data / f"knowledge_graph.sqlite3{suffix}"
+        sidecar.write_bytes(b"orphan")
+        _assert_raises(pb.BackupError, lambda: pb.backup_inventory(home), "missing")
+        assert not (data / "knowledge_graph.sqlite3").exists()
+
+
+def test_inplace_restore_refuses_busy_data_kg(tmp_path):
+    for busy_stage in (False, True):
+        root = tmp_path / str(busy_stage)
+        home, stage = root / "home", root / "stage"
+        data = _make_exact_palace(home)
+        staged_data = _make_exact_palace(stage, configured_home=home)
+        _make_wal_db(data / "knowledge_graph.sqlite3", 1)
+        _make_wal_db(staged_data / "knowledge_graph.sqlite3", 1)
+        (home / "untouched").write_text("live", encoding="utf-8")
+        locked = staged_data if busy_stage else data
+        args = pb.build_parser().parse_args([
+            "--palace", str(home), "restore", "latest", "--target", str(stage),
+            "--from-stage", "--in-place", "--offline"])
+        with contextlib.closing(sqlite3.connect(locked / "knowledge_graph.sqlite3")) as writer:
+            writer.execute("BEGIN IMMEDIATE")
+            with patch.object(pb, "run", side_effect=AssertionError("no live operations")):
+                _assert_raises(pb.BackupError, lambda: pb.cmd_restore(args), "writer")
+        assert (home / "untouched").read_text(encoding="utf-8") == "live"
+        assert not list(home.parent.glob(home.name + ".bak-*"))
+
+
 def test_custom_data_inventory_keeps_kg_home_relative(tmp_path):
     home = tmp_path / "home"
     data = home / "custom"
@@ -1364,6 +1573,7 @@ def test_task_backup_sqlite_writers_are_excluded_through_restic_snapshot(tmp_pat
     home = tmp_path / "home"
     data = _make_task_palace(home, "custom")
     _make_wal_db(data / "sqlite_exact.sqlite3", 1)
+    _make_wal_db(data / "knowledge_graph.sqlite3", 1)
     commands = []
 
     def restic(argv, *, dry_run=False):
@@ -1374,6 +1584,9 @@ def test_task_backup_sqlite_writers_are_excluded_through_restic_snapshot(tmp_pat
                 _assert_raises(sqlite3.OperationalError,
                                lambda: writer.execute("UPDATE events SET status='blocked'"), "locked")
             with contextlib.closing(sqlite3.connect(data / "sqlite_exact.sqlite3", timeout=0)) as writer:
+                _assert_raises(sqlite3.OperationalError,
+                               lambda: writer.execute("INSERT INTO t VALUES (99)"), "locked")
+            with contextlib.closing(sqlite3.connect(data / "knowledge_graph.sqlite3", timeout=0)) as writer:
                 _assert_raises(sqlite3.OperationalError,
                                lambda: writer.execute("INSERT INTO t VALUES (99)"), "locked")
             manifest = json.loads((home / pb.BACKUP_MANIFEST).read_text(encoding="utf-8"))
@@ -1922,6 +2135,7 @@ def _run_without_pytest() -> int:
                 user_home = Path(d) / "user"
                 user_home.mkdir()
                 with patch.dict(os.environ, {"MEMPALACE_PALACE_PATH": "",
+                                            "MEMPALACE_PALACE": "",
                                             "MEMPAL_PALACE_PATH": "",
                                             "MEMPALACE_DAEMON_STATE_ROOT": "",
                                             "HOME": str(user_home), "USERPROFILE": str(user_home)}):
@@ -1930,6 +2144,8 @@ def _run_without_pytest() -> int:
                     else:
                         fn()
             print(f"ok   {fn.__name__}")
+        except unittest.SkipTest as exc:
+            print(f"skip {fn.__name__}: {exc}")
         except (Exception, SystemExit) as exc:  # noqa: BLE001
             failed += 1
             print(f"FAIL {fn.__name__}: {exc}")

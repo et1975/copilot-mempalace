@@ -77,8 +77,9 @@ needed for materialization, not `--from-stage`. Never install tools implicitly.
 
 Set `MPY` to that Python's absolute path and `BACKUP_SCRIPTS` to the absolute
 path of the companion `mempalace-backup/scripts/` directory (checkout or installed
-skill). This restore skill has no local `scripts/` directory. Use the selected
-interpreter explicitly, rather than the helper's `python3` shebang.
+skill, including `palace_restore_io.py` and `palace_runtime.py`). This restore
+skill has no local `scripts/` directory. Use the interpreter from the running
+server's MemPalace installation, rather than the helper's `python3` shebang.
 
 ```bash
 "$MPY" "$BACKUP_SCRIPTS/palace_backup.py" --palace ~/.mempalace \
@@ -96,13 +97,19 @@ Required membership comes from the selected snapshot and explicit requirements,
 not newer live state. Authorities created after that snapshot may legitimately
 be absent; explicitly requiring one still rejects the older snapshot.
 
+In-place restore refuses when an active historical state KG may be outside the
+covered HOME/DATA KG locations. If the server is known to use a covered graph,
+`restore --kg-path <HOME-or-DATA-graph>` makes that explicit assertion; the
+option does not restore an external graph.
+
 Inspect the restored tree shape. `restic` stores full absolute source paths, so
 a plain `restic restore <snapshot-id> --target ~/.mempalace` recreates the whole
 path under the target, for example
 `~/.mempalace/home/<user>/.mempalace/config.json`. Use the
 `<snapshot-id>:"$HOME/.mempalace"` subpath syntax to strip that prefix so
-`config.json`, `palace/`, `knowledge_graph.sqlite3`, `wal/`, and `tunnels.json`
-land directly under the restore target.
+`config.json`, `palace/`, `wal/`, and `tunnels.json` land directly under the
+restore target. The DATA-local KG stays under `palace/` in the default layout;
+an optional historical HOME-level KG stays alongside `config.json`.
 
 **Procedural closure is checked before publication or reconnection.** The helper
 discovers procedural wings and runs the read-only
@@ -267,11 +274,16 @@ input formats are auto-detected:
 
 > **`--palace` = HOME, and the stray-palace guard.** `--palace` must be the
 > mempalace HOME (`~/.mempalace`), never the nested `~/.mempalace/palace` DB dir.
-> Chroma resolves under `palace_path` while the KG is HOME-level; pointing
-> `--palace` at the DB dir used to silently create a second, invisible palace.
-> Import now **aborts** if the target has no existing Chroma DB (pass
-> `--create-new-palace` to intentionally initialize a fresh one) and prints the
-> resolved Chroma/KG paths + drawer counts before writing.
+> Chroma and the current KG normally resolve under DATA, with a possible legacy
+> HOME-level KG fallback. Pointing `--palace` at DATA can create a second,
+> invisible palace. Import **aborts** if the target has no existing Chroma DB (pass
+> `--create-new-palace` to intentionally initialize a fresh one) or if an
+> existing DB cannot be read as Chroma. It prints the
+> resolved Chroma/KG paths + drawer counts before writing. Use `--data-path` to
+> override DATA. When the runtime or launch mode makes the active graph
+> ambiguous, determine the server's target and pass `--kg-path` for the
+> DATA-local, HOME-level, or current-user state graph. See the
+> [layout reference](../mempalace-backup/references/palace-layout.md).
 
 Behavior and caveats:
 
