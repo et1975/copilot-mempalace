@@ -54,8 +54,8 @@ restic backup ~/.mempalace \
   --tag "$(hostname)"
 ```
 
-Create an on-demand palace snapshot; always exclude locks and keep
-`palace/.mempalace/origin.json` included.
+Create an on-demand palace snapshot; always exclude locks and preserve
+embedder metadata and optional corpus-origin classification when present.
 
 ## Browse and search snapshots
 
@@ -72,10 +72,10 @@ restic ls latest
 List files in the latest snapshot.
 
 ```bash
-restic find palace/.mempalace/origin.json
+restic find mempalace_embedder.json
 ```
 
-Find critical files across snapshots.
+Find Chroma embedder metadata across snapshots.
 
 ```bash
 restic diff <snapshot-a> <snapshot-b>

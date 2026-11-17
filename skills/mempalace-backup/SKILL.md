@@ -33,11 +33,13 @@ running process.
 | `.palace-backup.json` | include | Captured layout and, for task snapshots, expected authorities and task-content digest; not another task authority store. |
 | `palace/<uuid>/*.bin` | include | HNSW vector index binaries. |
 | `palace/<uuid>.drift-*/` | include | Drift snapshots; keep for recovery context. |
-| `palace/.mempalace/origin.json` | **include** | Critical embedder identity; restoring without it breaks search. |
+| `palace/mempalace_embedder.json` | include if present | Chroma embedder identity, keyed by collection. Preserve with its vector store. |
+| `palace/.mempalace/origin.json` | include if present | Optional corpus-origin classification, not embedder identity. Absence does not block restore. |
 | `wal/` | include | MemPalace write-ahead log. |
 | `locks/` | **exclude** | Permanent cooperative lock inodes must remain at their canonical paths; never unlink or restore copies. |
 
-Never add an exclude that can hide `palace/.mempalace/origin.json`.
+Preserve embedder identity and optional corpus-origin metadata when present;
+do not fabricate either file to make an older snapshot look complete.
 
 ## Backup safety model
 

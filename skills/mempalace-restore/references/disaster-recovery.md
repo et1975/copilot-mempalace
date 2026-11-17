@@ -157,12 +157,12 @@ Prefer restore when:
 For focused vector-index recovery, see
 [`mempalace` HNSW recovery](../../mempalace/references/hnsw-recovery.md).
 
-## origin.json / embedder mismatch
+## Embedder mismatch
 
-Critical file:
+Chroma records embedder identity by collection in:
 
 ```text
-~/.mempalace/palace/.mempalace/origin.json
+~/.mempalace/palace/mempalace_embedder.json
 ```
 
 Symptoms after restore:
@@ -172,14 +172,16 @@ Symptoms after restore:
 - Search raises embedder or collection errors.
 - `repair-status` can pass, but semantic search is still wrong.
 
-Cause: the restored vector store and current embedder identity do not match, or
-the restored palace lacks `origin.json`.
+Cause: the restored vector store and current embedding model may not match.
+The optional `.mempalace/origin.json` instead classifies corpus origin for
+entity extraction; its absence is not an embedding or restore error.
 
 Fix:
 
-1. Restore `palace/.mempalace/origin.json` from the same snapshot as the palace.
-2. Do not mix `origin.json`, HNSW `.bin` files, and SQLite metadata from
-   different embedder configurations.
+1. Check the original model and `mempalace_embedder.json` from the same snapshot
+   as the palace; use the matching embedder.
+2. Do not mix embedder metadata, HNSW `.bin` files, and SQLite metadata from
+   different configurations.
 3. If the original embedder cannot be restored, re-embed/rebuild the palace under
    the intended embedder, then run:
 
@@ -219,7 +221,7 @@ Use `restic dump <snapshot-id> <path>` to inspect one file without restoring the
 whole palace:
 
 ```bash
-restic dump <snapshot-id> "$HOME/.mempalace/palace/.mempalace/origin.json"
+restic dump <snapshot-id> "$HOME/.mempalace/palace/mempalace_embedder.json"
 restic dump <snapshot-id> "$HOME/.mempalace/config.json"
 ```
 
@@ -275,7 +277,7 @@ salvage.
 | `repair-status` count mismatch, SQLite counts look plausible | `mempalace repair` | HNSW can usually be rebuilt from SQLite. |
 | `repair` still mismatches after retry | Restore | The on-disk vector metadata may be inconsistent beyond repair. |
 | SQLite database missing, corrupt, or wrong drawer count | Restore | The source of truth is damaged or incomplete. |
-| Search returns no hits after structurally clean restore | Restore matching `origin.json` or re-embed | Embedder identity likely mismatches the restored vector store. |
+| Search returns no hits after structurally clean restore | Check the original model and embedder metadata; deliberately rebuild if needed | The embedding model may mismatch the restored vector store; optional corpus-origin metadata is unrelated. |
 | A bad import or mining run polluted memory | Restore snapshot before the write | Roll back the whole palace to a known-good point. |
 | Only HNSW drift directories exist and search still works | Repair/cleanup | Full restore is unnecessary; see HNSW recovery. |
 | Restic repository reports stale locks | `restic unlock`, then `restic check` | The repo may only have an abandoned lock. |

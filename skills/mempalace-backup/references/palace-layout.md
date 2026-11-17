@@ -16,7 +16,8 @@ dir (default `HOME/palace`). Keep the two distinct when backing up or importing.
     ├── logstream.sqlite3             <- task events AND artifacts/link tables
     ├── replica.json                  <- stable log provenance, not restore epoch
     ├── <uuid>/*.bin                  <- HNSW index
-    └── .mempalace/origin.json        <- embedder identity (critical)
+    ├── mempalace_embedder.json      <- Chroma embedder identity, if present
+    └── .mempalace/origin.json        <- optional corpus-origin classification
 ```
 
 ## DATA and physical backups

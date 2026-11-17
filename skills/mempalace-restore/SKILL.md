@@ -56,7 +56,7 @@ and `daemon wait` requires a job ID, not a wait-for-stop invocation.
 ```bash
 restic snapshots --tag palace
 restic ls <snapshot-id>
-restic find origin.json
+restic find mempalace_embedder.json
 restic find chroma.sqlite3
 restic find sqlite_exact.sqlite3
 ```
@@ -191,22 +191,26 @@ identity problem.
 
 ## Critical: embedder identity
 
-`~/.mempalace/palace/.mempalace/origin.json` is **critical**. It records the
-embedder identity used to build the vector index. If a restore lacks
-`origin.json`, or it mismatches the current embedder, semantic search can return
-nothing or fail even when SQLite data exists.
+For Chroma, `DATA/mempalace_embedder.json` records embedder identity by
+collection. Preserve it when present and use the matching embedding model.
+Other backends can store identity in their own database metadata. A model
+mismatch can break semantic search even when the drawer database is intact.
 
-Before declaring recovery complete:
+`DATA/.mempalace/origin.json` is unrelated: it is optional corpus-origin
+classification used by entity extraction. Preserve it if captured, but its
+absence is not a restore failure and does not require re-embedding. Do not
+fabricate it or require older snapshots to contain it.
+
+Before declaring recovery complete, verify search under the intended embedder:
 
 ```bash
-test -f ~/.mempalace/palace/.mempalace/origin.json
 mempalace search "<known term>"
 ```
 
-If the file is missing or mismatched, restore the matching `origin.json` from the
-same snapshot as the palace, or re-embed/rebuild the palace under the intended
-embedder. Do not mix an index and origin metadata from different embedder
-configurations.
+If the runtime reports unknown or mismatched embedder identity, establish the
+original model from the snapshot/runtime configuration before recording its
+identity or deliberately rebuilding under a different model. Do not mix an
+index and embedder metadata from different configurations.
 
 ## Verify recovery
 
@@ -221,7 +225,7 @@ restic check
 
 - `repair-status`: SQLite rows and HNSW elements match.
 - `status`: wings/rooms/drawers are plausible for the expected snapshot.
-- `search`: known terms return hits, proving the embedder/origin pairing works.
+- `search`: known terms return hits, verifying the embedder/vector-store pairing.
 - `restic check`: the local backup repository is readable for future restores.
 
 The helper uses stdlib SQLite; no sqlite3 executable is required. A checkpoint

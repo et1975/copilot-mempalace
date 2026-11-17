@@ -75,8 +75,6 @@ DEFAULT_PALACE = Path("~/.mempalace").expanduser()
 # Do not snapshot control locks or replace their permanent live inodes.
 EXCLUDE_DIRS = ("locks",)
 
-# Critical file: the embedder identity. A restore missing this breaks search.
-ORIGIN_JSON = "palace/.mempalace/origin.json"
 BACKUP_MANIFEST = ".palace-backup.json"
 RESTORE_MARKER = ".palace-restore-incomplete.json"
 CONTROL_DIRS = {"locks", "server"}
@@ -763,9 +761,6 @@ def _validate_stage(stage, data, *, required=False, expected=(), allow_incomplet
     required = required or bool(manifest and manifest["logstream_required"])
     expected = sorted(set(expected) | set(manifest["authorities"] if manifest else []))
     backup_inventory(stage, data, require_logstream=required or bool(expected))
-    origin = _covered_path(stage, data / ".mempalace/origin.json")
-    if not origin.is_file():
-        raise BackupError(f"Restored tree lacks embedder identity: {origin}")
     _validate_procedural_stage(stage, data)
     if not (data / "logstream.sqlite3").exists():
         return None

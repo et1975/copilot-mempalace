@@ -648,6 +648,39 @@ def _make_exact_palace(home, *, configured_home=None):
     return data
 
 
+def test_memory_only_restore_without_optional_corpus_origin(tmp_path):
+    home, stage = tmp_path / "home", tmp_path / "stage"
+    data = _make_exact_palace(stage, configured_home=home)
+    (data / ".mempalace/origin.json").unlink()
+    (data / ".mempalace").rmdir()
+    args = pb.build_parser().parse_args([
+        "--palace", str(home), "restore", "saved", "--target", str(stage),
+        "--from-stage", "--in-place", "--offline"])
+
+    assert pb.cmd_restore(args) == 0
+
+    restored = home / "custom"
+    with contextlib.closing(sqlite3.connect(restored / "sqlite_exact.sqlite3")) as reader:
+        assert reader.execute("SELECT id FROM t").fetchall() == [(0,)]
+    assert not (restored / ".mempalace/origin.json").exists()
+
+
+def test_task_restore_without_optional_corpus_origin_validates_without_mutation(tmp_path):
+    home, stage = tmp_path / "home", tmp_path / "stage"
+    data = _make_task_palace(stage, configured_home=home)
+    (data / ".mempalace/origin.json").unlink()
+    before = (data / "logstream.sqlite3").read_bytes()
+    args = pb.build_parser().parse_args([
+        "--palace", str(home), "restore", "saved", "--target", str(stage),
+        "--from-stage", "--require-logstream"])
+
+    assert pb.cmd_restore(args) == 0
+
+    assert (data / "logstream.sqlite3").read_bytes() == before
+    assert not (data / ".mempalace/origin.json").exists()
+    assert not home.exists()
+
+
 def test_sqlite_exact_only_inventory_and_checkpoint_include_committed_wal(tmp_path):
     home = tmp_path / "home"
     data = _make_exact_palace(home)
